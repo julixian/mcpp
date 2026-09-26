@@ -20,7 +20,8 @@ import mcpp.pm.index_snapshot;
 import mcpp.platform;
 import mcpp.log;
 import mcpp.home;
-import mcpp.version_req;
+import mcpp.xpkg_version;
+import mcpp.libs.json;
 
 export namespace mcpp::xlings {
 
@@ -157,28 +158,57 @@ namespace paths {
 
     // Where that package's payload is, or nullopt if it is not installed.
     //
-    // A PINNED ref resolves to exactly its version and to nothing else. A
-    // build that asked for 1.8.12 and silently got 1.9.0 is the kind of answer
-    // that is only discovered later, in the artifact. An unpinned ref takes
-    // the highest version present — compared by numeric segments, because a
-    // plain string sort puts "0.4.11" before "0.4.9".
-    //
-    // A CONSTRAINED ref (`>=8.5.0`, `^1.2`) takes the highest INSTALLED version
-    // satisfying it. The version position of an xlings address has accepted
-    // range expressions all along — xlings resolves one when it installs — but
-    // this lookup treated the whole position as a directory name, so a range
-    // installed a payload and then answered that nothing was installed. That
-    // asymmetry is what made `[feature-xlings]` floors unusable: a rule package
-    // could declare `>=8.5.0`, get it installed, and still see `xpkg_dir`
-    // return "".
+    // The answer is the one xlings gave when it resolved the address. A
+    // recorded resolution (below) answers first; without one, the request
+    // selects among the installed directories under xlings' own version
+    // grammar (mcpp.xpkg_version): a literal directory, then written-prefix
+    // equality for three or more segments (1.8.12 matches 1.8.12.4 and never
+    // 1.9.0), a prefix range for one or two (1.7 matches 1.7.0.1, #712), and
+    // ranges for operators. An unpinned ref takes the highest version present.
     std::optional<std::filesystem::path>
     xpkg_payload(const Env& env, const XpkgRef& ref);
 
-    // The same resolution against an explicit xpkgs base. The Env form
-    // delegates here; this one exists so the rule ("pinned means exactly that
-    // version") is testable without constructing a home.
+    // The grammar half of that resolution against an explicit xpkgs base,
+    // without the record. Exists so the rule is testable without a home.
     std::optional<std::filesystem::path>
     xpkg_payload_at(const std::filesystem::path& xpkgsBase, const XpkgRef& ref);
+
+    // ── What xlings resolved each requested address to ──────────────────
+    //
+    // xlings >= 2026.9.27.1 reports, for every address an install was asked
+    // for, the version it selected and where the payload is (the
+    // `install_targets` interface event, protocol 1.1), on every path
+    // including "everything was already installed". mcpp keeps one record per
+    // (xpkgs base, address) under <MCPP_HOME>/provisioned/resolved/, so the
+    // question "which payload did `libglvnd@1.7` select" has xlings' answer
+    // wherever it is asked -- by the root, by a member, by a dependency's build
+    // program. The grammar above answers only when no record exists: an older
+    // xlings, or a payload installed outside mcpp.
+    //
+    // The capability is detected by the event's presence, not by a version
+    // number: an xlings that does not emit it simply leaves no record.
+    struct ResolvedTarget {
+        std::string           request;    // the address as it was sent
+        std::string           ns;
+        std::string           name;
+        std::string           version;    // what the request resolved to
+        int                   revision = 0;
+        std::string           status;     // installed | already_present | failed
+        std::filesystem::path payloadDir;
+    };
+
+    // The targets of one `install_targets` payload (`{"targets":[...]}`).
+    std::vector<ResolvedTarget> parse_install_targets(std::string_view payloadJson);
+
+    // Record every resolved target whose payload exists. Written through a
+    // temporary file and a rename, so concurrent builds never read half a
+    // record.
+    void record_resolutions(const Env& env, std::span<const ResolvedTarget> targets);
+
+    // The recorded payload for that address, if the record exists and its
+    // directory is still the package's payload under this env's store.
+    std::optional<std::filesystem::path>
+    recorded_payload(const Env& env, const XpkgRef& ref);
 
     // From compiler binary, climb parent dirs to find "xpkgs" directory.
     // Replaces 3 duplicate implementations in flags.cppm, ninja_backend.cppm,
@@ -923,13 +953,23 @@ XpkgRef parse_xpkg_ref(std::string_view spec) {
 
 // Where that package's payload is, or nullopt if it is not installed.
 //
-// A PINNED ref resolves to exactly its version and to nothing else. A build
-// that asked for 1.8.12 and silently got 1.9.0 is the kind of answer that is
-// only discovered later, in the artifact. An unpinned ref takes the highest
-// version present — compared by numeric segments, because a plain string sort
-// puts "0.4.11" before "0.4.9" and picking the wrong payload is silent.
+// THE ANSWER IS XLINGS' ANSWER. The address was resolved by xlings, so the
+// payload it selected is found with xlings' grammar (mcpp.xpkg_version), not
+// with the Cargo grammar mcpp reads its own dependencies with. They disagree
+// where it matters (#712): `libglvnd@1.7` installed `1.7.0.1`, and the Cargo
+// reading of `1.7` could not see a four-segment directory at all, so
+// `mcpp::xpkg_dir` answered "" for a payload that was on disk.
+//
+// A literal directory is tried first for every spelling: an installed version
+// whose name does not parse -- `8.0.RC1` is a real one -- is addressable only
+// that way. After that the request selects among the installed directories
+// exactly as xlings would among index keys: a bare version of three or more
+// segments is written-prefix equality (1.8.12 matches 1.8.12.x and never
+// 1.9.0), one or two segments are a prefix range, operators are ranges. With
+// no version the highest installed one is taken, ordered by the same grammar.
 std::optional<std::filesystem::path>
 xpkg_payload(const Env& env, const XpkgRef& ref) {
+    if (auto recorded = recorded_payload(env, ref)) return recorded;
     return xpkg_payload_at(xpkgs_base(env), ref);
 }
 
@@ -939,54 +979,113 @@ xpkg_payload_at(const std::filesystem::path& xpkgsBase, const XpkgRef& ref) {
     const auto root = xpkgsBase / std::format("{}-x-{}", ref.ns, ref.name);
     std::error_code ec;
     if (!ref.version.empty()) {
-        // THE LITERAL DIRECTORY IS TRIED FIRST, AND IT IS TRIED FOR EVERY
-        // SPELLING. An installed version whose name does not parse as a SemVer
-        // — `8.0.RC1` is a real one — is addressable only this way, and a
-        // version that both names a directory and reads as a constraint (`=`
-        // is not part of any directory name, but a future operator might be)
-        // must resolve to the directory it names.
         auto p = root / ref.version;
         if (std::filesystem::is_directory(p, ec)) return p;
-        // A pinned version that is absent is NOT "some other version".
-        if (!mcpp::version_req::is_constraint(ref.version)) return std::nullopt;
-        auto req = mcpp::version_req::parse_req(ref.version);
-        if (!req) return std::nullopt;
-        if (!std::filesystem::is_directory(root, ec)) return std::nullopt;
-        std::optional<std::filesystem::path> pick;
-        std::optional<mcpp::version_req::Version> pickV;
-        for (auto const& e : std::filesystem::directory_iterator(root, ec)) {
-            if (!e.is_directory(ec)) continue;
-            // A directory whose name does not parse cannot be TESTED against a
-            // requirement, so it is not a candidate for one. It remains
-            // addressable by the exact spelling above.
-            auto v = mcpp::version_req::parse_version(e.path().filename().string());
-            if (!v) continue;
-            if (!mcpp::version_req::matches(*req, *v)) continue;
-            if (!pickV || *pickV < *v) { pick = e.path(); pickV = *v; }
-        }
-        return pick;
     }
     if (!std::filesystem::is_directory(root, ec)) return std::nullopt;
-    auto key_of = [](const std::string& s) {
-        std::vector<long long> k;
-        long long cur = 0; bool any = false;
-        for (char c : s) {
-            if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); any = true; }
-            else { if (any) k.push_back(cur); cur = 0; any = false; }
-        }
-        if (any) k.push_back(cur);
-        return k;
-    };
-    std::optional<std::filesystem::path> best;
-    std::vector<long long> bestKey;
-    for (auto const& e : std::filesystem::directory_iterator(root, ec)) {
-        if (!e.is_directory(ec)) continue;
-        auto k = key_of(e.path().filename().string());
-        if (!best || k > bestKey) { best = e.path(); bestKey = k; }
+    std::vector<std::string> installed;
+    for (auto const& e : std::filesystem::directory_iterator(root, ec))
+        if (e.is_directory(ec)) installed.push_back(e.path().filename().string());
+    std::optional<std::string> pick;
+    if (!ref.version.empty()) {
+        pick = mcpp::xpkg_version::select_best(installed, ref.version);
+    } else {
+        for (auto const& k : installed)
+            if (!pick || mcpp::xpkg_version::compare_keys(k, *pick) > 0) pick = k;
     }
-    return best;
+    if (!pick) return std::nullopt;
+    return root / *pick;
 }
 
+
+// ─── Resolution records ────────────────────────────────────────────
+
+namespace {
+
+// One file per (xpkgs base, address). The address is canonicalised through
+// parse_xpkg_ref, so `libglvnd@1.7` and `xim:libglvnd@1.7` share a record, and
+// the base is part of the key, so two homes never answer for each other.
+std::filesystem::path record_path(const Env& env, const XpkgRef& ref) {
+    std::uint64_t h = 1469598103934665603ull;   // FNV-1a
+    const auto key = std::format("{}\n{}:{}@{}",
+        xpkgs_base(env).generic_string(), ref.ns, ref.name, ref.version);
+    for (unsigned char ch : key) { h ^= ch; h *= 1099511628211ull; }
+    return mcpp::home::root() / "provisioned" / "resolved"
+         / std::format("{:016x}.json", h);
+}
+
+} // namespace
+
+std::vector<ResolvedTarget> parse_install_targets(std::string_view payloadJson) {
+    std::vector<ResolvedTarget> out;
+    auto j = nlohmann::json::parse(payloadJson, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object() || !j.contains("targets") || !j["targets"].is_array()) return out;
+    auto str = [](const nlohmann::json& o, const char* k) {
+        return o.contains(k) && o[k].is_string() ? o[k].get<std::string>() : std::string{};
+    };
+    for (auto const& t : j["targets"]) {
+        if (!t.is_object()) continue;
+        ResolvedTarget r;
+        r.request    = str(t, "request");
+        r.ns         = str(t, "namespace");
+        r.name       = str(t, "name");
+        r.version    = str(t, "version");
+        r.status     = str(t, "status");
+        r.payloadDir = str(t, "payload_dir");
+        if (t.contains("revision") && t["revision"].is_number_integer())
+            r.revision = t["revision"].get<int>();
+        if (!r.request.empty()) out.push_back(std::move(r));
+    }
+    return out;
+}
+
+void record_resolutions(const Env& env, std::span<const ResolvedTarget> targets) {
+    for (auto const& t : targets) {
+        if (t.status == "failed" || t.payloadDir.empty()) continue;
+        std::error_code ec;
+        if (!std::filesystem::is_directory(t.payloadDir, ec)) continue;
+        const auto path = record_path(env, parse_xpkg_ref(t.request));
+        std::filesystem::create_directories(path.parent_path(), ec);
+        nlohmann::json j;
+        j["request"]     = t.request;
+        j["namespace"]   = t.ns;
+        j["name"]        = t.name;
+        j["version"]     = t.version;
+        j["revision"]    = t.revision;
+        j["payload_dir"] = t.payloadDir.generic_string();
+        auto tmp = path;
+        tmp += std::format(".{}.tmp",
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        {
+            std::ofstream o{tmp, std::ios::binary | std::ios::trunc};
+            if (!o) continue;
+            o << j.dump();
+        }
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) std::filesystem::remove(tmp, ec);
+    }
+}
+
+std::optional<std::filesystem::path>
+recorded_payload(const Env& env, const XpkgRef& ref) {
+    if (ref.name.empty()) return std::nullopt;
+    std::ifstream in{record_path(env, ref), std::ios::binary};
+    if (!in) return std::nullopt;
+    std::string text{std::istreambuf_iterator<char>(in), {}};
+    auto j = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object() || !j.contains("payload_dir") || !j["payload_dir"].is_string())
+        return std::nullopt;
+    const std::filesystem::path dir = j["payload_dir"].get<std::string>();
+    // A record answers only for a payload that is still there and still this
+    // package's, in this env's store. Anything else -- the payload was
+    // removed, the home moved -- falls through to the grammar, and the
+    // provisioning check treats "no answer" as not installed (#716).
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return std::nullopt;
+    const auto root = xpkgs_base(env) / std::format("{}-x-{}", ref.ns, ref.name);
+    if (dir.parent_path().lexically_normal() != root.lexically_normal()) return std::nullopt;
+    return dir;
+}
 
 std::optional<std::filesystem::path>
 xpkgs_from_compiler(const std::filesystem::path& compilerBin) {

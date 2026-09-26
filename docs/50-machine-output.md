@@ -489,20 +489,21 @@ program's directives: the manifest's own configuration, the toolchain, the
 module graph and the standard-library units are described as usual, and one
 `error` diagnostic, `MCPP_BUILD_DATABASE_PROGRAM_FAILED`, names it, with
 `path` naming its `build.mcpp`. A later failure that follows from the missing
-directives fails the whole member instead, under the rule above. A host tool
-a package requested that fails to build is a warning instead,
-`MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`, naming the tool, its package and the
-first line of the failure; planning continues, and a build program that only
-names the tool configures as it would after a successful build. `mcpp build`
-is unaffected by either: a build program or a host tool that fails there
-still fails the build.
+directives fails the whole member instead, under the rule above. The command
+builds no host tool (mcpp 2026.9.27.1+): a requested tool already in the
+global tool store is used, and one that is not is deferred, reported as the
+note `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` naming the tool and its package.
+The build program that requested it receives the path the tool will be
+published at, and configures as it would after the tool was built. `mcpp build`
+is unaffected: it builds the tool, and a build program or a host tool that
+fails there still fails the build.
 
 | code | severity | |
 |---|---|---|
 | `MCPP_LOCK_WOULD_CHANGE` | warning | the resolution differs from the project's `mcpp.lock`, which the command does not write |
 | `MCPP_GENERATED_FILE_NOT_MATERIALIZED` | warning | a root `[build] generated_files` entry is missing or stale on disk, and the command does not write it |
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | warning | no standard-library build command names its module source, so that unit is not listed |
-| `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT` | warning | a requested host tool failed to build; the tool is still built and its `check` actions still run |
+| `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | note | a requested host tool is not in the tool store and is not built by the command; the plan names the path it will be published at (2026.9.27.1+; replaces the 2026.9.26.2 warning `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`) |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | error | a build program failed; its package is described without its directives |
 
 `--protocol-version` declares `init-mcpp-home`, `read-project`, `network`,

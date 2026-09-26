@@ -5778,6 +5778,41 @@ kind = "shared"
     EXPECT_EQ(m.targets[0].linkageDefault, "shared");
 }
 
+// #714: `sources = []` states that the default build compiles nothing, so a
+// module interface under `src/` is not a library of that build. A build-logic
+// package keeps its module behind a feature that host-module consumers
+// request; inferring a library for it made every build of the package link an
+// archive with no inputs. A glob that happens to match nothing is a different
+// statement and keeps the inferred library (and #533's empty-link refusal).
+TEST(Manifest, AnExplicitlyEmptySourceListInfersNoLibrary) {
+    auto dir = std::filesystem::temp_directory_path()
+        / std::format("mcpp_empty_sources_{}", std::random_device{}());
+    std::filesystem::create_directories(dir / "src");
+    std::ofstream(dir / "src" / "buildlib.cppm") << "export module buildlib;\n";
+    {
+        std::ofstream(dir / "mcpp.toml")
+            << "[package]\nname = \"buildlib\"\nversion = \"0.1.0\"\n\n"
+               "[build]\nsources = []\n\n"
+               "[features.host]\nsources = [\"src/buildlib.cppm\"]\n";
+    }
+    auto empty = mcpp::manifest::load(dir / "mcpp.toml");
+    ASSERT_TRUE(empty) << (empty ? "" : empty.error().message);
+    EXPECT_TRUE(empty->targets.empty());
+
+    {
+        std::ofstream(dir / "mcpp.toml")
+            << "[package]\nname = \"buildlib\"\nversion = \"0.1.0\"\n\n"
+               "[build]\nsources = [\"srcs/**/*.cppm\"]\n";
+    }
+    auto typo = mcpp::manifest::load(dir / "mcpp.toml");
+    ASSERT_TRUE(typo) << (typo ? "" : typo.error().message);
+    ASSERT_EQ(typo->targets.size(), 1u);
+    EXPECT_EQ(typo->targets[0].kind, mcpp::manifest::Target::Library);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 // #649 E6: a consumer reads "every declared target is a program" as "a tool
 // provider that contributes nothing to my graph". A target list the loader
 // INFERRED from the tree is not that statement, so the loader says which of

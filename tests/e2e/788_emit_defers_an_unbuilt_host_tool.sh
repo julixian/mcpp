@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # requires: gcc python3
-# 788 -- under `emit build-database`, a host tool that fails to build is a
-# warning, not a refusal that costs the plan (mcpp-community/mcpp#699 item 2,
-# design 2026-09-26 §4.5).
+# 788 -- `emit build-database` builds no host tool (SPEC-005 R2.5 v1.4,
+# mcpp-community/mcpp#707; before it, #699 item 2).
 #
 # `user` requests the host tool `t` of package `tool`, whose build carries a
-# blocking `check` action that always fails (docs/30's `dep_bin` pattern, and
-# e2e 315's fixture for a blocking check). Before this fix `emit` in `user`
-# reported `MCPP_BUILD_DATABASE_PLAN_FAILED` with no `data` at all (measured
-# in the design record, Appendix A.3) -- the same failure that correctly ends
-# `mcpp build`, which does not plan around missing tools. Criteria:
-#   A. `emit --format json` in `user`: exit 0, `data` present with `user`'s
-#      set, and exactly one warning `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`
-#      naming the tool, its package and the first line of the failure.
-#   B. `mcpp build` in `user` still exits non-zero: the tool's build itself,
-#      and its blocking check, are unchanged.
+# blocking `check` action that fails (docs/30's `dep_bin` pattern, and e2e 315's
+# fixture for a blocking check). Planning describes a build and performs none
+# (R2.2), and a tool sub-build is a whole compile of another package with its
+# own actions: on a fresh store, one `emit` used to compile the tool and run
+# its check. Criteria:
+#   A. `emit --format json` in `user` with the tool not in the store: exit 0,
+#      `data` present with `user`'s set, exactly one note
+#      `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` naming the tool and its
+#      package, and neither the tool's build nor its check ran.
+#   B. `mcpp build` in `user` still exits non-zero on the failing check: the
+#      tool's build itself is unchanged.
+#   C. Once the tool is in the store, `emit` uses it and reports nothing.
 set -e
 
 TMP=$(mktemp -d)
@@ -41,7 +42,7 @@ exit 1
 EOF
 chmod +x "$TMP/tool/check.sh"
 # Same shape as e2e 315's blocking-check fixture: a `check` action, marked
-# `blocking = true`, that always fails.
+# `blocking = true`, that fails.
 cat > "$TMP/tool/build.mcpp" <<'EOF'
 #include <string>
 import mcpp;
@@ -84,11 +85,14 @@ assert sets == ["user"], sets
 diags = e["diagnostics"]
 assert len(diags) == 1, diags
 diag = diags[0]
-assert diag["code"] == "MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT", diag
-assert diag["severity"] == "warning", diag
-assert "t" in diag["message"] and "tool" in diag["message"], diag["message"]
+assert diag["code"] == "MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED", diag
+assert diag["severity"] == "note", diag
+assert "'t'" in diag["message"] and "'tool'" in diag["message"], diag["message"]
 EOF
-echo "ok: A, emit succeeds with user's set and one host-tool warning"
+if grep -q "Building.*host tool\|the check says no" a.err; then
+    fail "A: planning built the tool or ran its check" a.err
+fi
+echo "ok: A, emit defers the tool and builds nothing"
 
 # ── B ──────────────────────────────────────────────────────────────────────
 set +e
@@ -99,4 +103,18 @@ set -e
 grep -q "the check says no" build.log || fail "B: the check's own failure is not on the build's output" build.log
 echo "ok: B, mcpp build still fails on the same blocking check"
 
-echo "PASS: 788_emit_host_tool_unbuilt_is_a_warning"
+# ── C ──────────────────────────────────────────────────────────────────────
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/tool/check.sh"
+"$MCPP" build > build2.log 2>&1 || fail "C: the build with a passing check failed" build2.log
+set +e
+"$MCPP" emit build-database --format json > c.json 2> c.err
+rc=$?
+set -e
+[ "$rc" = 0 ] || fail "C: emit exited $rc, expected 0" c.err c.json
+"$PY" - c.json <<'EOF' || fail "C: the envelope" c.json
+import json, sys
+e = json.load(open(sys.argv[1]))
+assert e["diagnostics"] == [], e["diagnostics"]
+EOF
+echo "ok: C, a stored tool is used and nothing is reported"
+echo "PASS: 788_emit_defers_an_unbuilt_host_tool"

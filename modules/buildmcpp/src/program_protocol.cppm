@@ -96,7 +96,15 @@ export namespace mcpp::build::program_protocol {
 // same reason `deploy` and `runtime_search_dir` do -- a program that uses
 // them fails to COMPILE on an older engine, naming the missing symbol,
 // rather than reaching that engine as a string it misreads.
-inline constexpr int kProtocolVersion = 12;
+// v13 (mcpp#708): adds `mcpp::action::env(name, value)` and
+// `mcpp::action::cwd(dir)` -- the environment and the directory of an
+// action's command, which an argv with no shell cannot express. They reach
+// the engine as the `env` and `cwd` fields of the `action` payload and are
+// omitted when unset, so an action that uses neither serialises to the bytes
+// it did under v12 and no cached entry changes meaning. Same cost as v5's: a
+// package calling `env()` fails on an older engine at the build.mcpp COMPILE,
+// because that engine's bundled module has no such method.
+inline constexpr int kProtocolVersion = 13;
 
 // ── Cache-format epoch ─────────────────────────────────────────────────────
 //

@@ -239,8 +239,9 @@ TEST(XpkgPayload, AConstrainedRefTakesTheHighestInstalledVersionSatisfyingIt) {
 
     // Bounded on both sides, so the highest is NOT the answer -- a test that
     // only used a lower bound would pass on an implementation that ignored the
-    // requirement and took the newest.
-    auto ranged = xp::xpkg_payload_at(base, xp::parse_xpkg_ref("xim:demo@>=8.0.0, <8.7.0"));
+    // requirement and took the newest. Spelled the way xlings reads a
+    // conjunction (space-separated), because xlings is what resolved it.
+    auto ranged = xp::xpkg_payload_at(base, xp::parse_xpkg_ref("xim:demo@>=8.0.0 <8.7.0"));
     ASSERT_TRUE(ranged.has_value());
     EXPECT_EQ(ranged->filename(), "8.5.0");
 
@@ -258,7 +259,7 @@ TEST(XpkgPayload, AConstrainedRefTakesTheHighestInstalledVersionSatisfyingIt) {
 }
 
 // An installed version whose directory name is not a SemVer is addressable by
-// its exact spelling and by nothing else. `8.0.RC1` is a real CANN version.
+// its exact spelling. `8.0.RC1` is a real CANN version.
 TEST(XpkgPayload, AnUnparseableVersionIsStillAddressableExactly) {
     namespace xp = mcpp::xlings::paths;
     auto base = std::filesystem::temp_directory_path()
@@ -270,9 +271,44 @@ TEST(XpkgPayload, AnUnparseableVersionIsStillAddressableExactly) {
     ASSERT_TRUE(exact.has_value());
     EXPECT_EQ(exact->filename(), "8.0.RC1");
 
-    // It cannot be TESTED against a requirement, so it does not answer one.
-    EXPECT_FALSE(xp::xpkg_payload_at(base, xp::parse_xpkg_ref("xim:demo@>=1.0"))
+    // xlings' grammar reads it as 8, 0, RC, 1, so a range can test it, and the
+    // lookup answers what xlings selected. A key with no numeric segment at
+    // all is a name, and a name never answers a range.
+    auto ranged = xp::xpkg_payload_at(base, xp::parse_xpkg_ref("xim:demo@>=1.0"));
+    ASSERT_TRUE(ranged.has_value());
+    EXPECT_EQ(ranged->filename(), "8.0.RC1");
+    std::filesystem::create_directories(base / "xim-x-named" / "nightly");
+    EXPECT_FALSE(xp::xpkg_payload_at(base, xp::parse_xpkg_ref("xim:named@>=1.0"))
                      .has_value());
+
+    std::filesystem::remove_all(base);
+}
+
+// A BARE VERSION MEANS WHAT XLINGS MEANT BY IT (#712). The address
+// `libglvnd@1.7` installed `1.7.0.1`: one or two segments are a prefix range,
+// three or more are written-prefix equality, and a fourth segment is an
+// ordinary version. The lookup answered "" for every one of these before.
+TEST(XpkgPayload, ABareVersionSelectsWhatXlingsSelected) {
+    namespace xp = mcpp::xlings::paths;
+    auto base = std::filesystem::temp_directory_path()
+              / std::format("mcpp-xpkg-test5-{}", ::getpid());
+    std::filesystem::remove_all(base);
+    for (auto v : { "1.7.0.1", "1.2.0", "1.2.5", "1.3.0", "12.9.1.4", "12.9.10" })
+        std::filesystem::create_directories(base / "xim-x-demo" / v);
+
+    auto pick = [&](std::string_view ver) -> std::string {
+        auto p = xp::xpkg_payload_at(base,
+            xp::parse_xpkg_ref(std::format("xim:demo@{}", ver)));
+        return p ? p->filename().string() : std::string{};
+    };
+    EXPECT_EQ(pick("1.7"),     "1.7.0.1");   // prefix range [1.7, 1.8)
+    EXPECT_EQ(pick("1.7.0"),   "1.7.0.1");   // written prefix 1.7.0
+    EXPECT_EQ(pick("1.2"),     "1.2.5");     // the highest 1.2.x, never 1.3
+    EXPECT_EQ(pick("1.2.0"),   "1.2.0");     // three segments: 1.2.0 exactly
+    EXPECT_EQ(pick("12.9.1"),  "12.9.1.4");  // not 12.9.10
+    EXPECT_EQ(pick("1"),       "1.7.0.1");   // [1, 2)
+    EXPECT_EQ(pick("1.2.4"),   "");          // absent is absent
+    EXPECT_EQ(pick("1.8.12"),  "");          // never slides to a later minor
 
     std::filesystem::remove_all(base);
 }

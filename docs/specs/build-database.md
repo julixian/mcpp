@@ -4,12 +4,12 @@
 |---|---|
 | 规范编号 | SPEC-005 |
 | 标题 | mcpp 输出的构建数据库:内容、取值规则与不写工程目录的保证 |
-| 状态 | 评审中 v1.3 |
-| 版本 | 1.3 |
+| 状态 | 评审中 v1.4 |
+| 版本 | 1.4 |
 | 最后修改 | 2026-09-26 |
-| 对应实现 | mcpp >= 2026.9.15.1;v1.3 修改的 R2.5、R3.7、R3.8、R4.1、R5.2 为 mcpp >= 2026.9.26.2 |
+| 对应实现 | mcpp >= 2026.9.15.1;v1.3 修改的 R2.5、R3.7、R3.8、R4.1、R5.2 为 mcpp >= 2026.9.26.2;v1.4 修改的 R2.5 为 mcpp >= 2026.9.27.1 |
 | 相关设计文档 | `.agents/docs/2026-09-14-636-build-database-and-the-latest-xlings.md`<br>`.agents/docs/2026-09-26-compile-database-and-issue-699-design.md` |
-| 相关 issue | #636, #648, #655, #699, #702 |
+| 相关 issue | #636, #648, #655, #699, #702, #707 |
 | 依据的外部规范 | S1「C++ Build Database: IDE Profile」profile 0.2.0 与 S2 0.2.0 §3.4,取自 https://github.com/Sunrisepeak/lsp-mcpp-private 提交 `b82859d`(schema 自提交 `28ecd6e` 起未变);S2 0.3.0 §3.4 的部分回答(S2-3.4-12、S2-3.4-13,Sunrisepeak/mcpp-language-server#25);JSON Compilation Database |
 
 ## 0. 适用范围
@@ -52,11 +52,13 @@ Database 定义,本规范不重复它们的字段定义,只规定 mcpp 作为生
 - **R2.4** 根包 `[build] generated_files` 中缺失或内容与声明不一致的文件不被写入,
   每个输出一条警告 `MCPP_GENERATED_FILE_NOT_MATERIALIZED`。**已实现**
 - **R2.5** 构建程序照常运行,工作目录为包根,与 `mcpp build` 相同;构建程序在
-  `MCPP_OUT_DIR` 之外写入的内容不在本保证之内。依赖提供的宿主工具照常构建到全局
-  工具库,它声明的 `check` 动作照常运行。构建失败的宿主工具在本命令下降级为
-  警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`,消息点名工具、其所属包与失败信息
-  的第一行;规划继续,请求该工具的构建程序收到的是该工具本应发布到的路径。
-  `mcpp build` 不受影响,宿主工具构建失败在其中仍使目标失败。**已实现**
+  `MCPP_OUT_DIR` 之外写入的内容不在本保证之内。命令不构建依赖提供的宿主工具
+  (R2.2):全局工具库中已有的工具照常使用;库中没有的工具被推迟,请求它的构建
+  程序收到该工具将被发布到的路径,命令输出说明 `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED`,
+  消息点名工具与其所属包。被推迟的工具的包不被规划,它声明的动作不运行。构建程序
+  若在配置期执行该路径,遇到的情形与工具构建失败时相同(SPEC-007 R5.3)。
+  `mcpp build` 不受影响:它构建宿主工具,构建失败仍使目标失败。**已实现**
+  (mcpp >= 2026.9.27.1)
 - **R2.6** `mcpp --protocol-version` 为这条命令声明 `init-mcpp-home`、`read-project`、
   `network`、`write-global-cache` 与 `exec-build-script`,不声明 `write-project`。
   **已实现**
@@ -200,3 +202,4 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 | 1.1 | 2026-09-16 | R5.2 增加离线诊断码 `MCPP_OFFLINE_DOWNLOAD_REQUIRED`;R5.3 的 `network` 按观测列出;新增 R5.4(子进程不继承调用方描述符,xlings 子进程有期限并随 mcpp 结束)(#648)。 |
 | 1.2 | 2026-09-17 | R3.7 陈述 `arguments` 的每一项是编译器收到的参数,单元 flag 按 SPEC-004 §8 的词列出(#655)。 |
 | 1.3 | 2026-09-26 | R2.5:`emit` 下构建失败的宿主工具是警告。R3.7:`work-directory` 是输出目录,模块接口单元的 `arguments` 带语言 flag。R3.8:标准库单元的 `provides` 指向 std 缓存中的 BMI,工具链带 `build-id`。R4.1:compile-commands 文档包含标准库单元(S1-12-1)。R5.2:成员各自规划,构建程序失败的包不带其指令地被描述(#699,#702)。 |
+| 1.4 | 2026-09-26 | R2.5:命令不构建宿主工具;工具库中没有的工具被推迟,输出说明 `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED`,取代 1.3 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`(#707)。 |

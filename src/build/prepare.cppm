@@ -791,6 +791,7 @@ inherit_as_workspace_member(mcpp::manifest::Manifest& member,
     mcpp::project::inherit_workspace_package(member, workspace);
     mcpp::project::merge_workspace_deps(member, workspace, workspaceRoot);
     mcpp::project::inherit_workspace_build(member, workspace, workspaceRoot);
+    mcpp::project::inherit_workspace_xlings(member, workspace);
     return mcpp::project::workspace_inheritance_error(member, memberDir);
 }
 
@@ -1187,6 +1188,9 @@ export struct BuildContext {
     // declared but not installed contributes nothing, and the lookup then
     // continues to PATH.
     std::vector<std::filesystem::path> xlingsDepBinDirs;
+    // The payload directory of every `[xlings]` address resolved above, for
+    // the fast path's presence check (#716). See BuildCacheEntry::xlingsPayloads.
+    std::vector<std::filesystem::path> xlingsPayloads;
     // True when the graph declared a `when = "run"` tool that THIS invocation
     // did not provision, because it was not going to execute anything. The
     // build cache records it so `mcpp run`'s fast path declines an entry a
@@ -1376,6 +1380,12 @@ export struct BuildOverrides {
     // outermost first. A request for one of them is the tool's own build asking
     // for itself, refused at its first repetition (#649 E6).
     std::vector<std::string> tool_chain_sources;
+    // The toolchain spec a host-tool sub-build uses, decided by the build that
+    // requested the tool and recorded in the tool's store key (#710). Beats
+    // every other source, `--toolchain` included, because the requesting build
+    // already took `--toolchain` into account when it decided. Empty for every
+    // user-facing invocation.
+    std::string toolchain;
     // Use THIS manifest instead of reading `<project_root>/mcpp.toml`.
     //
     // Required for a `compat`-style registry package (Form B), which ships no
@@ -1551,6 +1561,26 @@ sysroot_override(const mcpp::manifest::Manifest& m,
 {
     auto* e = find_target_entry(m, t);
     return (e && e->sysrootDeclared) ? &e->sysroot : nullptr;
+}
+
+// The toolchain a host tool's package chose for itself, read the way its own
+// build reads it (#710): the package's manifest with the root-position keys of
+// the workspace that lists it (`inherit_workspace_root_position`), then its
+// host row's `[target.<host>] toolchain`, then `[toolchain]`. nullopt when none
+// names one.
+std::optional<std::string>
+host_tool_declared_toolchain(const mcpp::manifest::Manifest& tool,
+                             const std::filesystem::path& toolRoot,
+                             std::string_view platform) {
+    auto effective = tool;
+    if (const auto wsRoot = mcpp::project::find_workspace_root(toolRoot); !wsRoot.empty())
+        if (auto ws = mcpp::manifest::load(wsRoot / "mcpp.toml");
+            ws && mcpp::project::is_workspace_member(*ws, wsRoot, toolRoot))
+            mcpp::project::inherit_workspace_root_position(effective, *ws, wsRoot);
+    if (auto* row = find_target_entry(effective, mcpp::toolchain::triple::host_triple());
+        row && !row->toolchain.empty())
+        return row->toolchain;
+    return effective.toolchain.for_platform(platform);
 }
 
 // THE MSVC TOOLSET A CLANG `*-windows-msvc` BUILD COMPILES AGAINST.
@@ -1959,10 +1989,15 @@ provision_xlings_addresses(const mcpp::config::GlobalConfig& cfg,
             // the project, because the installation is shared: two projects
             // declaring the same packages should pay for it once.
             //
-            // This still does not survive a user's `xlings remove`. No
-            // stamp does; the honest fix is a presence check, and it is
-            // blocked on `resolve_xpkg_path` requiring `<name>@<version>`
-            // while a manifest is entitled to name a package unpinned.
+            // A STAMP IS NOT A PRESENCE CHECK (#716). It records that the
+            // list was installed once; a payload removed since -- `xlings
+            // remove`, a pruned cache, a deleted directory -- left the stamp
+            // claiming it, the build skipped provisioning and succeeded with
+            // `xpkg_dir` answering "". So the stamp counts only while every
+            // address still resolves to a payload, answered by the same lookup
+            // `xpkg_dir` uses. That costs one record read or directory scan per
+            // address, and it was blocked until the lookup could answer an
+            // unpinned or two-segment address the way xlings resolved it.
             const auto stampDir = mcpp::home::root() / "provisioned";
             // `std::uint64_t`, not `std::size_t`: the offset basis below is
             // a 64-bit constant and a 32-bit host would truncate it, giving
@@ -2018,8 +2053,38 @@ provision_xlings_addresses(const mcpp::config::GlobalConfig& cfg,
                     legacy.assign(std::istreambuf_iterator<char>(in), {});
                 return legacy == want;
             };
-            bool needProvision = (have != want);
-            if (needProvision) {
+            const auto xlEnv = mcpp::config::make_xlings_env(cfg);
+            std::vector<std::string> missing;
+            if (have == want)
+                for (auto const& d : declaredDeps)
+                    if (!mcpp::xlings::paths::xpkg_payload(
+                            xlEnv, mcpp::xlings::paths::parse_xpkg_ref(d)))
+                        missing.push_back(d);
+            if (!missing.empty()) {
+                std::string list;
+                for (auto const& m : missing) list += (list.empty() ? "" : ", ") + m;
+                mcpp::log::verbose("xlings", std::format(
+                    "{}: recorded as provisioned in {}, but no payload is "
+                    "installed for: {}", label, stamp.string(), list));
+                if (mcpp::platform::env::offline_mode()
+                    || mcpp::platform::env::no_auto_install()) {
+                    std::string_view release =
+                        mcpp::platform::env::offline_mode()
+                        ? "drop --offline / unset MCPP_OFFLINE"
+                        : "unset MCPP_NO_AUTO_INSTALL";
+                    refusal::record(refusal::Code::OfflineDownloadRequired);
+                    return std::unexpected(std::format(
+                        "{} are recorded as provisioned, but these payloads "
+                        "are not installed: {}\n"
+                        "       record: {}\n"
+                        "       install them yourself with:\n"
+                        "         xlings install {}\n"
+                        "       or {} to let mcpp do it.",
+                        label, list, stamp.string(), join_deps(" "), release));
+                }
+            }
+            bool needProvision = (have != want) || !missing.empty();
+            if (needProvision && missing.empty()) {
                 // THE AUTO-INSTALL GATE, WHICH THIS PATH DID NOT HAVE.
                 //
                 // `[toolchain]` is the precedent this whole mechanism cites
@@ -2136,8 +2201,7 @@ provision_xlings_addresses(const mcpp::config::GlobalConfig& cfg,
 
                 mcpp::fetcher::InstallProgressHandler progress;
                 auto r = mcpp::xlings::call(
-                    mcpp::config::make_xlings_env(cfg), "install_packages",
-                    args.dump(), &progress);
+                    xlEnv, "install_packages", args.dump(), &progress);
                 // `if (!r)` IS NOT THE FAILURE TEST, AND TESTING ONLY
                 // IT MADE THIS PATH REPORT SUCCESS FOR EVERY FAILURE XLINGS
                 // CAN REPORT.
@@ -2190,6 +2254,14 @@ provision_xlings_addresses(const mcpp::config::GlobalConfig& cfg,
                         "         xlings install {}",
                         label, why, join_deps(" ")));
                 }
+                // What xlings resolved each address to, where it says so
+                // (protocol 1.1). Recorded per address so every later lookup
+                // -- the root's, a member's, a dependency's build program --
+                // gets xlings' answer rather than a re-derivation of it.
+                for (auto const& e : r->dataEvents)
+                    if (e.dataKind == "install_targets")
+                        mcpp::xlings::paths::record_resolutions(xlEnv,
+                            mcpp::xlings::paths::parse_install_targets(e.payloadJson));
                 // Written only on success, for the same reason the check
                 // above exists: a stamp is a record that the effect
                 // happened, and recording an effect that did not is worse
@@ -2529,7 +2601,10 @@ prepare_build(bool print_fingerprint,
                 targetMember = m->workspace.members.back();
             }
         }
-        // else: rooted workspace with [package] — build root normally.
+        // else: rooted workspace with [package] — build root normally. Its own
+        // `x.workspace = true` entries name its own [workspace.dependencies].
+        else if (m->workspace.present)
+            mcpp::project::merge_workspace_deps(*m, *m, *root);
 
         if (!targetMember.empty()) {
             auto memberDir = *root / targetMember;
@@ -2574,8 +2649,19 @@ prepare_build(bool print_fingerprint,
                     wsManifest = std::move(*wsm);
                 }
             }
+            // A preloaded manifest was inherited at its dependency load site,
+            // which gives a member everything but the root-position keys. This
+            // build IS rooted at it (a host-tool sub-build), so it takes those
+            // too, from the workspace that lists it (#710).
+            if (wsManifest
+                && mcpp::project::is_workspace_member(*wsManifest, runtimeWorkspaceRoot, *root))
+                mcpp::project::inherit_workspace_root_position(
+                    *m, *wsManifest, runtimeWorkspaceRoot);
         }
     }
+
+    if (auto bad = mcpp::project::unresolved_workspace_dependency_error(*m, *root))
+        return std::unexpected(*bad);
 
     mcpp::xlings::runtime::RuntimeSelection runtimeSelection;
     if (overrides.inherited_runtime_selection) {
@@ -3013,7 +3099,11 @@ prepare_build(bool print_fingerprint,
     // a value from the command line credited to a manifest key sends the
     // reader to a file that does not contain it.
     bool tcFromCommandLine = false;
+    bool tcFromConsumer    = false;
     auto tcSpecSource = [&]() -> std::string {
+        if (tcOrigin == TcOrigin::ManifestToolchain && tcFromConsumer)
+            return std::format("the toolchain chosen for this host tool by {}",
+                               overrides.tool_chain);
         if (tcOrigin == TcOrigin::ManifestToolchain && tcFromCommandLine)
             return "--toolchain";
         switch (tcOrigin) {
@@ -3043,6 +3133,11 @@ prepare_build(bool print_fingerprint,
         tcSpec   = std::string(tcEnv);
         tcOrigin = TcOrigin::ManifestToolchain;
         tcFromCommandLine = true;
+    }
+    if (!overrides.toolchain.empty()) {
+        tcSpec   = overrides.toolchain;
+        tcOrigin = TcOrigin::ManifestToolchain;
+        tcFromConsumer = true;
     }
     if (!tcSpec.has_value()) {
         auto cfg = get_cfg();
@@ -3113,6 +3208,23 @@ prepare_build(bool print_fingerprint,
             }
         }
     }
+
+    // `[target.<triple>]`'s build-shaping keys, applied the same way whichever
+    // path found the row (#704). The section's toolchain is a statement about
+    // this row the author wrote down, so it replaces `[toolchain]` and the
+    // global default; `--toolchain` and a consumer's decision for a host tool
+    // are statements about THIS invocation and keep precedence over it.
+    auto apply_target_section = [&](const mcpp::manifest::TargetEntry& e) {
+        if (!e.toolchain.empty() && !tcFromCommandLine && !tcFromConsumer) {
+            tcSpec   = e.toolchain;
+            tcOrigin = TcOrigin::TargetSection;
+        }
+        if (!e.linkage.empty()) m->buildConfig.linkage = e.linkage;
+        // #336: a per-target C++ runtime contract overrides the project
+        // default, so "self-contained everywhere except this triple" is
+        // expressible without touching the cfg() input channel.
+        if (!e.cxxRuntime.empty()) m->buildConfig.cxxRuntime = e.cxxRuntime;
+    };
 
     // ─── --target / --static overrides ──────────────────────────────────
     // Target-axis default resolution when no --target flag was passed:
@@ -3437,18 +3549,7 @@ prepare_build(bool print_fingerprint,
         // target/ output directory all see one spelling.
         if (parsed) overrides.target_triple = parsed->str();
 
-        if (hasExplicitSection) {
-            if (!it->second.toolchain.empty()) {
-                tcSpec   = it->second.toolchain;
-                tcOrigin = TcOrigin::TargetSection;
-            }
-            if (!it->second.linkage.empty())   m->buildConfig.linkage = it->second.linkage;
-            // #336: a per-target C++ runtime contract overrides the project
-            // default, so "self-contained everywhere except this triple" is
-            // expressible without touching the cfg() input channel.
-            if (!it->second.cxxRuntime.empty())
-                m->buildConfig.cxxRuntime = it->second.cxxRuntime;
-        }
+        if (hasExplicitSection) apply_target_section(it->second);
         // Convention from the vocabulary table (triple.cppm): the target's
         // pinned toolchain (host-awareness — native musl-gcc vs triple-named
         // cross, winlibs mingw vs Linux-hosted cross — lives in the payload
@@ -3608,6 +3709,17 @@ prepare_build(bool print_fingerprint,
         if (known && known->defaultStatic && m->buildConfig.linkage.empty())
             m->buildConfig.linkage = "static";
     }
+    // A HOST BUILD READS ITS OWN ROW (#704). `[target.<triple>]` is looked up
+    // by the triple the build produces, and a build without `--target`
+    // produces the host's. Before this the row applied only when a triple was
+    // named: `[target.x86_64-linux-gnu] cxx_runtime` shaped `--target
+    // x86_64-linux-gnu` and was ignored by `mcpp build` on that same machine,
+    // while the row's `.build` table and its `sysroot` already applied to both.
+    // The triple is not written into `overrides.target_triple`: that would make
+    // the host build a target build and turn the row's env segment into a
+    // requested C library.
+    else if (auto* hostRow = find_target_entry(*m, mcpp::toolchain::triple::host_triple()))
+        apply_target_section(*hostRow);
     if (overrides.force_static) m->buildConfig.linkage = "static";
 
     // #254: everything compiled INTO this build is resolved for the TARGET —
@@ -4827,6 +4939,20 @@ prepare_build(bool print_fingerprint,
     // the --target axis), lazily and only when a build.mcpp actually exists
     // (root or dependency).
     std::optional<std::pair<std::filesystem::path, mcpp::toolchain::Toolchain>> hostTcCache;
+    // The spec `host_tc_for_build_program` resolves, as text: the build's own
+    // spec on a native build; on a cross build the spec the target row's pin
+    // replaced, or the platform's native first-run default when it replaced
+    // nothing (#622, see the cross branch below). Also what a host-tool
+    // sub-build is handed when its package names no toolchain (#710), so the
+    // tool is built by the compiler the store key records.
+    auto host_spec_for_build_program = [&]() -> std::string {
+        if (!tcSpec) return {};
+        if (overrides.target_triple.empty()) return *tcSpec;
+        return (tcOrigin == TcOrigin::TargetPin && hostSpecBeforeRowPin.has_value()
+                && !hostSpecBeforeRowPin->empty() && *hostSpecBeforeRowPin != "system")
+            ? *hostSpecBeforeRowPin
+            : (tcOrigin == TcOrigin::TargetPin ? native_first_run_spec() : *tcSpec);
+    };
     auto host_tc_for_build_program = [&]() -> std::expected<
             std::pair<std::filesystem::path, mcpp::toolchain::Toolchain>, std::string> {
         // A HOST TOOLCHAIN'S C LIBRARY IS THE PAYLOAD'S, WHATEVER THE
@@ -4929,11 +5055,7 @@ prepare_build(bool print_fingerprint,
         // is that exact selection (declared once, above, and used by the
         // first-run installer itself), reused rather than re-derived so the
         // two cannot silently drift apart.
-        const std::string hostSpecText =
-            (tcOrigin == TcOrigin::TargetPin && hostSpecBeforeRowPin.has_value()
-             && !hostSpecBeforeRowPin->empty() && *hostSpecBeforeRowPin != "system")
-                ? *hostSpecBeforeRowPin
-                : (tcOrigin == TcOrigin::TargetPin ? native_first_run_spec() : *tcSpec);
+        const std::string hostSpecText = host_spec_for_build_program();
         auto spec = mcpp::toolchain::parse_toolchain_spec(hostSpecText);
         if (!spec || spec->version.empty()) {
             return std::unexpected(std::format(
@@ -6322,6 +6444,9 @@ prepare_build(bool print_fingerprint,
                     return std::unexpected(std::format(
                         "dependency '{}': {}", depName, *bad));
             }
+            if (auto bad = mcpp::project::unresolved_workspace_dependency_error(
+                    *dm, mcppToml.parent_path()))
+                return std::unexpected(std::format("dependency '{}': {}", depName, *bad));
             manifest = std::move(*dm);
             effRoot  = mcppToml.parent_path();
             return {};
@@ -8420,6 +8545,9 @@ prepare_build(bool print_fingerprint,
                         return std::unexpected(*bad);
                 }
             }
+            if (auto bad = mcpp::project::unresolved_workspace_dependency_error(
+                    *dep_manifest, dep_root))
+                return std::unexpected(std::format("dependency '{}': {}", name, *bad));
             // #229: path/git-dep half of the L1 cfg funnel — mirrors the
             // loadVersionDep call site above (loadFrom's L1 cfg merge, ~1740
             // lines up). Before this fix, path/git deps never ran this merge
@@ -9604,6 +9732,14 @@ prepare_build(bool print_fingerprint,
         // `.slang` to the built-in table required an mcpp release and a version
         // bump in the rule package's CI before its rule could route one file;
         // a language arriving this way needs neither.
+        // What each package's active rules claim, kept until its device
+        // sources are known (#715, the filter below).
+        struct RuleClaim {
+            std::string              module;
+            std::vector<std::string> extensions;
+            std::string              provider;   // "<ns>:<name>", for the report
+        };
+        std::vector<std::vector<RuleClaim>> ruleClaims(packages.size());
         for (std::size_t ci = 0; ci < packages.size(); ++ci) {
             std::vector<std::string> collected;
             std::vector<std::string> ruleModules;
@@ -9631,14 +9767,10 @@ prepare_build(bool print_fingerprint,
                         mit != dep.manifest.featureRuleModule.end()
                         && std::ranges::find(ruleModules, mit->second) == ruleModules.end()) {
                         ruleModules.push_back(mit->second);
-                        // Said out loud, for the same reason the resolved
-                        // toolchain is: the manifest states the intent and the
-                        // build states what that came to. Without this line a
-                        // reader of a terse manifest could not tell which rules
-                        // ran.
-                        mcpp::ui::info("Rules", std::format("{} ({}:{})", mit->second,
-                                                            dep.manifest.package.namespace_,
-                                                            dep.manifest.package.name));
+                        ruleClaims[ci].push_back(RuleClaim{
+                            mit->second, it->second,
+                            std::format("{}:{}", dep.manifest.package.namespace_,
+                                        dep.manifest.package.name)});
                     }
                 }
             }
@@ -9792,6 +9924,43 @@ prepare_build(bool print_fingerprint,
                 }
                 deviceSourcesByPackage[pkg.root.string()] = std::move(device);
             }
+        }
+
+        // ── A rule applies to a package through a source it claims (#715) ──
+        //
+        // A feature activates a rule for the consumer; whether the rule has
+        // anything to do there is answered by the consumer's sources. The
+        // synthesised build program used to be written for every active rule,
+        // so a package that only imports Qt -- no `.ui`, `.qrc` or `.ts`, no
+        // `build.mcpp` -- compiled and ran a program that could only report
+        // "nothing to do", on every configure. A rule now reaches the program
+        // only when one of the package's device sources has an extension the
+        // rule declared, classified by the same table the source scan uses. A
+        // device source no active rule claims is still the orphan refused
+        // below, and a package that wants a rule to run without claimed
+        // sources writes its own `build.mcpp`.
+        for (std::size_t ci = 0; ci < packages.size(); ++ci) {
+            if (ruleClaims[ci].empty()) continue;
+            auto& bc = packages[ci].manifest.buildConfig;
+            const auto dit = deviceSourcesByPackage.find(packages[ci].root.string());
+            std::vector<std::string> applies;
+            for (auto const& claim : ruleClaims[ci]) {
+                const auto table = mcpp::extension_table_for(bc.moduleExtensions,
+                                                             claim.extensions);
+                const bool claimed = dit != deviceSourcesByPackage.end()
+                    && std::ranges::any_of(dit->second, [&](const std::string& rel) {
+                           return mcpp::classify(std::filesystem::path(rel), table)
+                               == mcpp::SourceKind::Device;
+                       });
+                if (!claimed) continue;
+                applies.push_back(claim.module);
+                // Said out loud, for the same reason the resolved toolchain is:
+                // the manifest states the intent and the build states what that
+                // came to.
+                mcpp::ui::info("Rules", std::format("{} ({})", claim.module, claim.provider));
+            }
+            if (ci == 0) m->buildConfig.ruleModules = applies;
+            bc.ruleModules = std::move(applies);
         }
         activeFeaturesByPackage.resize(packages.size());
 
@@ -10335,8 +10504,35 @@ prepare_build(bool print_fingerprint,
                     std::vector<std::string> feats = tgt->requiredFeatures;
                     auto closure = feature_closure(depPkg.manifest, feats, true);
 
-                    auto hostTc = host_tc_for_build_program();
-                    if (!hostTc) return std::unexpected(hostTc.error());
+                    // WHICH COMPILER BUILDS THE TOOL IS DECIDED HERE, ONCE
+                    // (#710). The key used to record this build's host
+                    // toolchain while the sub-build chose its own -- the tool
+                    // package's `[toolchain]`, else the global default -- so an
+                    // entry could name gcc 15.1 over a binary gcc 16.1 had
+                    // produced, and a member tool built for a consumer used a
+                    // different compiler than `mcpp build -p <tool>`. The
+                    // choice is `--toolchain` when given, else the tool
+                    // package's own (its workspace's, for a member), else the
+                    // compiler this build compiles its build programs with. It
+                    // is handed to the sub-build as an override and recorded in
+                    // the key, so the two cannot disagree.
+                    std::string toolTcSpec;
+                    if (const char* e = std::getenv("MCPP_TOOLCHAIN"); e && *e)
+                        toolTcSpec = e;
+                    else if (auto own = host_tool_declared_toolchain(
+                                 depPkg.manifest, depPkg.root, kCurrentPlatform))
+                        toolTcSpec = *own;
+                    std::string compilerIdentity;
+                    if (toolTcSpec.empty()) {
+                        auto hostTc = host_tc_for_build_program();
+                        if (!hostTc) return std::unexpected(hostTc.error());
+                        toolTcSpec = host_spec_for_build_program();
+                        compilerIdentity = std::format("{}|{}|{}",
+                            hostTc->second.label(), hostTc->second.version,
+                            hostTc->first.string());
+                    } else {
+                        compilerIdentity = "spec|" + toolTcSpec;
+                    }
 
                     mcpp::build::tool_store::Key key;
                     key.indexName = depIdx >= 1 && depIdx - 1 < dep_cache_identities.size()
@@ -10367,9 +10563,7 @@ prepare_build(bool print_fingerprint,
                     key.version          = source_keyed_version(depIdx);
                     key.targetName       = toolName;
                     key.hostTriple       = mcpp::toolchain::triple::host_triple().str();
-                    key.compilerIdentity = std::format("{}|{}|{}",
-                        hostTc->second.label(), hostTc->second.version,
-                        hostTc->first.string());
+                    key.compilerIdentity = compilerIdentity;
                     key.profile          = "release";
                     key.features         = closure;
                     std::ranges::sort(key.features);
@@ -10397,25 +10591,31 @@ prepare_build(bool print_fingerprint,
                         continue;
                     }
 
-                    // #699 item 2 (E2): under `emit build-database`
-                    // (`plan_only`), a host tool that fails to build is a
-                    // warning, not a refusal that costs the whole plan — the
-                    // requesting member is still worth describing, and its
-                    // build program receives the path the tool would have
-                    // been published at (`binOut`, fixed above before any of
-                    // this runs). `mcpp build` is unchanged below: it still
-                    // returns `std::unexpected` and the target fails.
-                    auto host_tool_unbuilt = [&](std::string_view failure) {
-                        // The first line only: a nested build's message can
-                        // run to several, and the warning names the tool and
-                        // its package, not the whole log.
-                        const auto first = failure.substr(0, failure.find('\n'));
-                        planNotes.push_back({"MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT",
-                            std::format("host tool '{}' of package '{}' did not "
-                                        "build: {}", toolName, depName, first),
-                            mcpp::wire::Severity::Warning});
+                    // PLANNING BUILDS NO TOOL (SPEC-005 R2.5, v1.4; #707).
+                    // `emit build-database` describes a build; it does not
+                    // perform one (R2.2), and a tool sub-build is a whole
+                    // compile of another package, with its own prepare
+                    // actions -- measured on a fresh store, a single `emit`
+                    // compiled the tool and ran the tool package's `prepare`
+                    // action. A tool already in the store is used as above. One
+                    // that is not is deferred: the build program receives the
+                    // path the tool will be published at (`binOut`, fixed
+                    // before anything is built), which is the answer it gets
+                    // after a successful build, and a note names the tool. A
+                    // build program that must RUN the tool while configuring
+                    // meets the same missing file it meets when the tool fails
+                    // to build (SPEC-007 R5.3), so no new contract follows.
+                    if (overrides.plan_only) {
+                        planNotes.push_back({"MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED",
+                            std::format("host tool '{}' of package '{}' is not in "
+                                        "the tool store and is not built while "
+                                        "planning; the plan names the path it will "
+                                        "be published at: {}",
+                                        toolName, depName, binOut.string()),
+                            mcpp::wire::Severity::Note});
                         record(binOut);
-                    };
+                        continue;
+                    }
 
                     mcpp::ui::status("Building", std::format(
                         "host tool {}:{} from {} v{} (once per package source and "
@@ -10446,6 +10646,7 @@ prepare_build(bool print_fingerprint,
                     sub.work_dir     = mcpp::build::tool_store::scratch_dir(
                         cacheRoot, entry, workRoot);
                     sub.target_triple = "";            // HOST — the whole point
+                    sub.toolchain     = toolTcSpec;
                     sub.profile       = "release";
                     sub.cache_mode    = overrides.cache_mode;
                     sub.tool_depth    = overrides.tool_depth + 1;
@@ -10506,10 +10707,6 @@ prepare_build(bool print_fingerprint,
                                                 /*includeDevDeps=*/false,
                                                 /*extraTargets=*/{}, sub);
                     if (!subCtx) {
-                        if (overrides.plan_only) {
-                            host_tool_unbuilt(subCtx.error());
-                            continue;
-                        }
                         return std::unexpected(std::format(
                             "building host tool '{}:{}' failed: {}{}",
                             depName, toolName, subCtx.error(), subContext()));
@@ -10523,12 +10720,6 @@ prepare_build(bool print_fingerprint,
                         if (lu.targetName == toolName) { goal = lu.output; break; }
                     }
                     if (goal.empty()) {
-                        if (overrides.plan_only) {
-                            host_tool_unbuilt("produced no link unit — its "
-                                "required_features may not be satisfiable on "
-                                "this platform");
-                            continue;
-                        }
                         return std::unexpected(std::format(
                             "host tool '{}:{}' produced no link unit — its "
                             "required_features may not be satisfiable on this "
@@ -10547,10 +10738,6 @@ prepare_build(bool print_fingerprint,
                         bopt.verbose = true;
                     auto br = be->build(subCtx->plan, bopt);
                     if (!br) {
-                        if (overrides.plan_only) {
-                            host_tool_unbuilt(br.error().message);
-                            continue;
-                        }
                         auto diag = br.error().diagnosticOutput;
                         if (diag.empty())
                             diag = "(the inner build produced no diagnostic "
@@ -10561,11 +10748,6 @@ prepare_build(bool print_fingerprint,
                             subContext(), diag));
                     }
                     if (br->exitCode != 0) {
-                        if (overrides.plan_only) {
-                            host_tool_unbuilt(std::format(
-                                "build exited with {}", br->exitCode));
-                            continue;
-                        }
                         return std::unexpected(std::format(
                             "building host tool '{}:{}' failed (exit {}){}",
                             depName, toolName, br->exitCode, subContext()));
@@ -10577,11 +10759,6 @@ prepare_build(bool print_fingerprint,
                     std::error_code cpEc;
                     auto produced = subCtx->plan.outputDir / goal;
                     if (!std::filesystem::exists(produced, cpEc)) {
-                        if (overrides.plan_only) {
-                            host_tool_unbuilt(std::format(
-                                "built but '{}' is missing", produced.string()));
-                            continue;
-                        }
                         return std::unexpected(std::format(
                             "host tool '{}:{}' built but '{}' is missing",
                             depName, toolName, produced.string()));
@@ -10593,11 +10770,6 @@ prepare_build(bool print_fingerprint,
                     std::filesystem::copy_file(produced, tmp,
                         std::filesystem::copy_options::overwrite_existing, cpEc);
                     if (cpEc) {
-                        if (overrides.plan_only) {
-                            host_tool_unbuilt(std::format(
-                                "staging failed: {}", cpEc.message()));
-                            continue;
-                        }
                         return std::unexpected(std::format(
                             "staging host tool '{}:{}' failed: {}",
                             depName, toolName, cpEc.message()));
@@ -10609,11 +10781,6 @@ prepare_build(bool print_fingerprint,
                         std::filesystem::perm_options::add, cpEc);
                     std::filesystem::rename(tmp, binOut, cpEc);
                     if (cpEc) {
-                        if (overrides.plan_only) {
-                            host_tool_unbuilt(std::format(
-                                "publishing failed: {}", cpEc.message()));
-                            continue;
-                        }
                         return std::unexpected(std::format(
                             "publishing host tool '{}:{}' failed: {}",
                             depName, toolName, cpEc.message()));
@@ -13742,6 +13909,7 @@ prepare_build(bool print_fingerprint,
                 for (auto const& spec : xlingsSpecs) {
                     auto ref = mcpp::xlings::paths::parse_xpkg_ref(spec);
                     if (auto dir = mcpp::xlings::paths::xpkg_payload(xlEnv, ref)) {
+                        ctx.xlingsPayloads.push_back(*dir);
                         // `bin/`, then the payload root. The measurement that
                         // added the second entry is recorded with the rule, in
                         // runner_lookup::payload_search_dirs.
@@ -14363,6 +14531,11 @@ prepare_build(bool print_fingerprint,
                 // deliberately left a `${mcpp.` depfile untouched for
                 // exactly this phase to resolve.
                 if (!a.depfile.empty()) a.depfile = sub(a.depfile);
+                // The same vocabulary for the command's environment and
+                // directory (mcpp#708): `OUT=${mcpp.out_dir}/gen` is the value
+                // an environment-configured generator most often wants.
+                for (auto& x : a.env) x = sub(x);
+                if (!a.cwd.empty()) a.cwd = sub(a.cwd);
                 // THE DEPENDENCY IS IMPLIED BY THE USE, so a member author
                 // cannot forget it. Without this the edge is dirty only when a
                 // link output changes, and a staged set that grew a dependency's

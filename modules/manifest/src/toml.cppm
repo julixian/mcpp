@@ -4270,6 +4270,18 @@ void apply_defaults_and_infer(Manifest& m, const std::filesystem::path& root) {
             }
         }
         const bool hasModuleInterface = !moduleInterfaceExt.empty();
+        // `sources = []` states that the default build compiles nothing, so
+        // an interface under `src/` is not a library of that build (#714). It
+        // is the shape of a build-logic package: its module is reachable only
+        // through a feature that host-module consumers request. Inferring a
+        // library anyway made every build of the package -- a bare
+        // `mcpp build`, `emit build-database` -- link an archive with no
+        // inputs and refuse. A package whose features add a library's sources
+        // declares that target in `[targets]`. An accidentally empty glob
+        // (`sources = ["srcs/**"]`) is not this case and is still refused as an
+        // empty link (#533).
+        const bool declaredNothing =
+            m.buildConfig.sourcesDeclared && m.buildConfig.sources.empty();
 
         if (hasMain) {
             // #622 A3: inference stays `Binary`, deliberately. `app` is a
@@ -4286,7 +4298,7 @@ void apply_defaults_and_infer(Manifest& m, const std::filesystem::path& root) {
             m.targetsInferred = true;
             m.inferredNotes.push_back(
                 std::format("target {} (bin from src/main.cpp)", m.package.name));
-        } else if (hasModuleInterface) {
+        } else if (hasModuleInterface && !declaredNothing) {
             Target t;
             t.name = m.package.name;
             t.kind = Target::Library;

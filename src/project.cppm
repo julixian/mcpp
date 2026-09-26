@@ -199,17 +199,94 @@ export void inherit_workspace_package(mcpp::manifest::Manifest& member,
 // `wsRoot` anchors relative paths: an `[indices].path` or a
 // `[workspace.dependencies] path` was written against the WORKSPACE ROOT, and
 // re-anchoring it to the member directory is #224.
-export void inherit_workspace_config(mcpp::manifest::Manifest& member,
-                                     const mcpp::manifest::Manifest& workspace,
-                                     const std::filesystem::path& wsRoot) {
-    merge_workspace_deps(member, workspace, wsRoot);
+// The workspace root's `[xlings.workspace]`, for a member (#713).
+//
+// An xlings entry describes the environment a build runs in, the same class of
+// declaration as `[toolchain]` and `[target.*]`, so it is inherited implicitly
+// rather than through an explicit opt-in: only dependencies, which are graph
+// edges, need `.workspace = true` (`merge_workspace_deps`). Before this a member
+// saw none of the root's entries: they were installed for the workspace, and
+// `mcpp::xpkg_dir` in the member's build program still answered "" for them.
+//
+// The root's entries come first and a member's own declaration of the same
+// package wins, which is the "nearer the artifact" rule of SPEC-004 §4.5 --
+// identity is `(namespace, name)`, decided by `package_key`. Conditional
+// `[target.<sel>.xlings.workspace]` rows travel as conditional rows, so they are
+// still decided by the selector at merge time. Feature-gated entries do not
+// travel: a feature belongs to the package that declares it. Neither does the
+// emitter's per-platform view (`workspaceByPlatform`), so a published member's
+// descriptor states only what the member itself declared; the `subos` is the
+// root's choice already (`select_runtime`).
+export void inherit_workspace_xlings(mcpp::manifest::Manifest& member,
+                                     const mcpp::manifest::Manifest& workspace) {
+    // `(namespace, name)`, the identity `mcpp.xlings.address_set` defines,
+    // spelled here from the same parser rather than imported. Importing that
+    // module here makes GCC 16.1 fail with an internal compiler error
+    // (segmentation fault) at `import mcpp.cli;` in src/main.cpp. Measured.
+    auto package_key = [](std::string_view address) {
+        const auto e = mcpp::manifest::parse_address(address);
+        return (e.ns.empty() ? std::string("xim") : e.ns) + ":" + e.target;
+    };
+    std::set<std::string> own;
+    for (auto const& a : member.xlings.deps) own.insert(package_key(a));
+    for (auto const& cc : member.conditionalConfigs)
+        for (auto const& a : cc.xlings.deps) own.insert(package_key(a));
 
+    // Copies the entries of `from` whose package the member does not declare,
+    // with the pin and the tier each address carries.
+    auto take = [&](const mcpp::manifest::XlingsConfig& from,
+                    mcpp::manifest::XlingsConfig& to) {
+        std::vector<std::string> taken;
+        for (auto const& a : from.deps) {
+            if (own.contains(package_key(a))) continue;
+            taken.push_back(a);
+            const auto target = mcpp::manifest::parse_address(a).target;
+            if (auto pin = from.workspace.find(target); pin != from.workspace.end())
+                to.workspace.try_emplace(pin->first, pin->second);
+            if (auto w = from.depWhen.find(a); w != from.depWhen.end())
+                to.depWhen.try_emplace(a, w->second);
+        }
+        to.deps.insert(to.deps.begin(), taken.begin(), taken.end());
+    };
+    take(workspace.xlings, member.xlings);
+
+    std::vector<mcpp::manifest::ConditionalConfig> rows;
+    for (auto const& cc : workspace.conditionalConfigs) {
+        if (cc.xlings.deps.empty()) continue;
+        mcpp::manifest::ConditionalConfig row;
+        row.predicate = cc.predicate;
+        take(cc.xlings, row.xlings);
+        if (!row.xlings.deps.empty()) rows.push_back(std::move(row));
+    }
+    member.conditionalConfigs.insert(member.conditionalConfigs.begin(),
+                                     std::make_move_iterator(rows.begin()),
+                                     std::make_move_iterator(rows.end()));
+}
+
+// The keys a member inherits only where it is the ROOT of a build: `[toolchain]`,
+// `[target.<triple>]` and `[indices]`. They choose the compiler, the target
+// rows and the indices for the whole graph, so a member reached as somebody's
+// dependency takes them from that build's root instead. A member built as a
+// host tool is the root of its own sub-build, which is the second caller
+// (#710): without it, `mcpp build -p tool` used the workspace's compiler and
+// the same tool built for a consumer used the global default.
+export void inherit_workspace_root_position(mcpp::manifest::Manifest& member,
+                                            const mcpp::manifest::Manifest& workspace,
+                                            const std::filesystem::path& wsRoot) {
     if (member.toolchain.byPlatform.empty())
         member.toolchain = workspace.toolchain;
     for (auto& [triple, entry] : workspace.targetOverrides)
         if (!member.targetOverrides.contains(triple))
             member.targetOverrides[triple] = entry;
     inherit_workspace_indices(member, workspace, wsRoot);
+}
+
+export void inherit_workspace_config(mcpp::manifest::Manifest& member,
+                                     const mcpp::manifest::Manifest& workspace,
+                                     const std::filesystem::path& wsRoot) {
+    merge_workspace_deps(member, workspace, wsRoot);
+    inherit_workspace_root_position(member, workspace, wsRoot);
+    inherit_workspace_xlings(member, workspace);
 
     // The two halves, each with a second caller of its own: a member reached
     // as a sibling.s `path` dependency needs both, at two different points.
@@ -313,6 +390,39 @@ export std::optional<std::string> workspace_inheritance_error(
                            "a name.", (memberDir / "mcpp.toml").string());
     if (member.package.version.empty()) return missing("package.version", "version");
     return std::nullopt;
+}
+
+// A `x.workspace = true` entry that no workspace resolved (#714).
+//
+// Inheritance replaces the entry with the workspace's declaration; an entry
+// still marked afterwards names nothing. It used to fall through as a version
+// dependency with an empty version, refused far downstream as "SemVer
+// constraint '' ... run `mcpp index update`" -- an instruction about the index
+// for a mistake in the manifest. Asked once, after inheritance, at each place a
+// manifest enters a build: the root, a member built with `-p`, and every
+// dependency load site. The two ways out are the two ways inheritance happens.
+export std::optional<std::string>
+unresolved_workspace_dependency_error(const mcpp::manifest::Manifest& m,
+                                      const std::filesystem::path& manifestDir) {
+    auto first = [](const std::map<std::string, mcpp::manifest::DependencySpec>& deps)
+        -> std::optional<std::string> {
+        for (auto const& [name, spec] : deps)
+            if (spec.inheritWorkspace) return name;
+        return std::nullopt;
+    };
+    std::optional<std::string> name;
+    std::string_view table;
+    if ((name = first(m.dependencies)))           table = "dependencies";
+    else if ((name = first(m.devDependencies)))   table = "dev-dependencies";
+    else if ((name = first(m.buildDependencies))) table = "build-dependencies";
+    if (!name) return std::nullopt;
+    return std::format(
+        "{}: [{}] {} = {{ workspace = true }}, but no workspace declares '{}'.\n"
+        "       `workspace = true` is resolved against the [workspace.dependencies] "
+        "of the workspace whose `members` list this package.\n"
+        "       fix: list this package in that workspace's [workspace] members, "
+        "or state the dependency's version, path or git source here.",
+        (manifestDir / "mcpp.toml").string(), table, *name, *name);
 }
 
 // THE EFFECTIVE MANIFEST OF A PROJECT DIRECTORY, FOR EVERY READER OUTSIDE

@@ -852,6 +852,47 @@ TEST(BuildDirectives, DecodeActionRoundTripsOutputDir) {
     EXPECT_EQ(a->outputDir, "out/prefix");
 }
 
+// mcpp#708, protocol 13: `env` and `cwd` round-trip like `output_dir` --
+// present when the typed builder set them, absent otherwise, and an action
+// without them decodes exactly as it did under protocol 12.
+TEST(BuildDirectives, DecodeActionRoundTripsEnvAndCwd) {
+    auto d = parse(
+        "mcpp:action={\"id\":\"gen\",\"role\":\"source\","
+        "\"description\":\"\",\"blocking\":false,"
+        "\"env\":[\"GEN_MODE=fast\",\"EMPTY=\"],\"cwd\":\"third_party/gen\","
+        "\"inputs\":[],\"outputs\":[\"out/gen.cpp\"],"
+        "\"command\":[\"gen\"],\"provides\":[],\"imports\":[],\"targets\":[]}\n");
+    auto a = dirs::decode_action(d.at(dirs::Slot::Actions).front());
+    ASSERT_TRUE(a.has_value());
+    ASSERT_EQ(a->env.size(), 2u);
+    EXPECT_EQ(a->env[0], "GEN_MODE=fast");
+    EXPECT_EQ(a->env[1], "EMPTY=");      // an empty value is a value
+    EXPECT_EQ(a->cwd, "third_party/gen");
+
+    auto plain = parse(
+        "mcpp:action={\"id\":\"gen\",\"role\":\"source\","
+        "\"description\":\"\",\"blocking\":false,"
+        "\"inputs\":[],\"outputs\":[\"out/gen.cpp\"],"
+        "\"command\":[\"gen\"],\"provides\":[],\"imports\":[],\"targets\":[]}\n");
+    auto b = dirs::decode_action(plain.at(dirs::Slot::Actions).front());
+    ASSERT_TRUE(b.has_value());
+    EXPECT_TRUE(b->env.empty());
+    EXPECT_TRUE(b->cwd.empty());
+}
+
+// An `env` entry with no name is refused, and the refusal names the entry.
+TEST(BuildDirectives, AnEnvEntryWithoutANameIsRefused) {
+    auto d = parse(
+        "mcpp:action={\"id\":\"gen\",\"role\":\"source\","
+        "\"description\":\"\",\"blocking\":false,\"env\":[\"=oops\"],"
+        "\"inputs\":[],\"outputs\":[\"out/gen.cpp\"],"
+        "\"command\":[\"gen\"],\"provides\":[],\"imports\":[],\"targets\":[]}\n");
+    EXPECT_FALSE(dirs::decode_action(d.at(dirs::Slot::Actions).front()).has_value());
+    const auto why = dirs::action_error(d);
+    EXPECT_NE(why.find("=oops"), std::string::npos) << why;
+    EXPECT_NE(why.find("NAME=value"), std::string::npos) << why;
+}
+
 // A `prepare` action with no `output_dir` is refused: it would be a stamp
 // and nothing else, indistinguishable from a `check` that forgot
 // `blocking = true`.
@@ -1021,13 +1062,13 @@ TEST(BuildDirectives, DeployRowIsProtocolElevenWithLinkGlobalScopeAndATag) {
     EXPECT_EQ(def->scope, dirs::Scope::LinkGlobal);
     EXPECT_EQ(def->sinceProtocol, 11);
     EXPECT_FALSE(def->tag.empty());
-    EXPECT_EQ(dirs::kProtocolVersion, 12);
+    EXPECT_EQ(dirs::kProtocolVersion, 13);
 }
 
-TEST(BuildDirectives, ProtocolTwelveIsAcceptedAndThirteenIsNot) {
-    auto ok = parse("mcpp:protocol=12\n");
+TEST(BuildDirectives, ProtocolThirteenIsAcceptedAndFourteenIsNot) {
+    auto ok = parse("mcpp:protocol=13\n");
     EXPECT_FALSE(dirs::protocol_error(ok).has_value());
-    auto no = parse("mcpp:protocol=13\n");
+    auto no = parse("mcpp:protocol=14\n");
     EXPECT_TRUE(dirs::protocol_error(no).has_value());
 }
 

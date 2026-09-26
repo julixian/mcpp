@@ -589,6 +589,17 @@ struct BuildAction {
     // to still exist after a successful build and has itself just removed.
     std::string                        depfile;
     std::string                        description;
+    // Environment variables set for the COMMAND, each `NAME=value`, in the
+    // order declared (mcpp#708). Added to the environment the build already
+    // passes on, never replacing it: `PATH`, `MCPP_OFFLINE` and the rest reach
+    // the command as they reach every other edge (SPEC-007 R3.7). No name has
+    // a meaning of its own here, `PATH` included.
+    std::vector<std::string>           env;
+    // The directory the command runs in (mcpp#708). Empty means the build
+    // directory, which is where every action ran before this field. Absolute
+    // once `prepare_actions` has run; a relative spelling names a directory
+    // of the declaring package (SPEC-007 R2.2).
+    std::string                        cwd;
 };
 
 // `[resources]` — metadata and assets compiled INTO the produced artifact
