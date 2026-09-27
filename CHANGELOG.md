@@ -3,6 +3,24 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026.9.27.2] - 2026-09-27
+
+### 缺陷修复（#726）
+
+**Windows 上一次 xlings 调用只作用于 xlings 子进程。** 此前的 Windows 实现在两处与 POSIX 不一致：
+
+- **调用后留下 `PATH` 前缀与 `XLINGS_HOME`。** 每次调用都把 registry 的 `subos/default/bin` 加到 mcpp 进程 `PATH` 的最前面，并设置进程级的 `XLINGS_HOME`，调用后不恢复。
+  - 在同一次 `mcpp build` 中安装过工具链或载荷后，ninja 和每个动作都先找到这个目录。
+  - 目录中有 `xim:llvm` 在 Windows 上注册的 `cl`、`link`、`lib`、`rc` shim，它们遮住了 MSVC 的同名工具，vcpkg 对宿主三元组的编译器检测因此失败。
+  - 第二次构建不再调用 xlings，因而成功。
+- **xlings 在 mcpp 的工作目录中运行。** xlings 从工作目录向上查找 `.xlings.json` 来确定项目模式。项目根目录有 `.xlings.json` 时（例如项目在其中固定了 mcpp 的版本），registry 的 xlings 会进入该项目的模式，把 mcpp 工具链与载荷的 shim 写入该项目的 SubOS。
+
+现在的行为：
+
+- `ScopedInvocationEnv` 在调用期间应用 `XLINGS_HOME`、作用域变量和 `PATH` 前缀，调用结束后全部恢复。
+- 命令以 `cd /d "<home>" &&` 开头，与 POSIX 前缀中的 `cd` 相同。
+- 一次调用之后的进程环境与调用之前相同，所以安装过载荷的构建与未安装的构建看到同一个环境。
+
 ## [2026.9.27.1] - 2026-09-27
 
 ### 缺陷修复(#704、#705、#710、#712 至 #716)

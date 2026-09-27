@@ -304,6 +304,18 @@ std::string shq_meta(std::string_view s);
 //     XLINGS_HOME='<home>' '<binary>'
 std::string build_command_prefix(const Env& env);
 
+// The Windows spelling of that prefix, compiled on every host so that it is
+// tested from any: `cd /d "<home>" && "<binary>"`. The variables are applied
+// by ScopedInvocationEnv instead.
+//
+// THE WORKING DIRECTORY IS THE HOME ON BOTH PLATFORMS (#726). xlings enters
+// project mode by walking up from its working directory to a `.xlings.json`.
+// Started from a project that has one -- a project whose own mcpp is pinned
+// there -- the registry's xlings adopted that project and wrote the shims of
+// mcpp's toolchain and payloads (`cl`, `link`, `cmake`, ...) into the
+// project's SubOS, whose `bin` is on PATH wherever the project's shell is.
+std::string windows_command_prefix(const Env& env);
+
 // THE ENVIRONMENT OF ONE XLINGS INVOCATION (#614), decided once. Each entry is
 // a variable, its value, and whether it is present at all. Global mode is an
 // absent XLINGS_PROJECT_DIR, because xlings resolves its subos scope from that
@@ -325,13 +337,19 @@ struct InvocationVar {
 };
 std::vector<InvocationVar> invocation_env(const Env& env);
 
-// Applies the scope half of `invocation_env` to this process for the guard's
-// lifetime on Windows, and restores the prior value when the guard ends. On
-// POSIX the command prefix carries it and the guard does nothing. Every
-// function that runs a command built by `build_command_prefix` holds one while
-// the command runs, so a project directory set for one invocation does not
-// reach the processes mcpp starts afterwards. XLINGS_HOME and the PATH prefix
-// keep their process-wide lifetime.
+// Applies `invocation_env` and the sandbox's `bin` in front of PATH to this
+// process for the guard's lifetime on Windows, and restores every prior value
+// when the guard ends. On POSIX the command prefix carries them and the guard
+// does nothing. Every function that runs a command built by
+// `build_command_prefix` holds one while the command runs.
+//
+// NOTHING OUTLIVES THE INVOCATION (#726). The process environment after an
+// xlings invocation is the one before it, so a build that installed a payload
+// starts ninja with the environment a build that installed nothing does. The
+// PATH prefix used to stay: the sandbox's `bin` holds the shims `xim:llvm`
+// registers on Windows (`cl`, `link`, `lib`, `rc`), and every action of a
+// first build then met them in front of MSVC's tools -- vcpkg's compiler
+// detection failed there while the second build passed.
 class ScopedInvocationEnv {
 public:
     explicit ScopedInvocationEnv(const Env& env);
@@ -1293,38 +1311,45 @@ std::vector<InvocationVar> invocation_env(const Env& env) {
 
 ScopedInvocationEnv::ScopedInvocationEnv(const Env& env) {
     if constexpr (mcpp::platform::is_windows) {
-        // Every variable but XLINGS_HOME is scope: applied for the guard's
-        // lifetime and restored after it. XLINGS_HOME keeps the process-wide
-        // lifetime `build_command_prefix` gives it.
-        for (auto const& var : invocation_env(env)) {
-            if (var.name == "XLINGS_HOME") continue;
+        auto save = [this](const std::string& name) {
             Saved s;
-            s.name = var.name;
-            if (auto prior = mcpp::platform::env::get(var.name)) {
+            s.name = name;
+            if (auto prior = mcpp::platform::env::get(name)) {
                 s.hadPrevious = true;
                 s.previous = *prior;
             }
             saved_.push_back(s);
+        };
+        for (auto const& var : invocation_env(env)) {
+            save(var.name);
             if (var.present) mcpp::platform::env::set(var.name, var.value);
             else             mcpp::platform::env::unset(var.name);
         }
+        save("PATH");
+        mcpp::platform::windows::prepend_path(paths::sandbox_bin(env).string());
     }
 }
 
 ScopedInvocationEnv::~ScopedInvocationEnv() {
-    for (auto const& s : saved_) {
-        if (s.hadPrevious) mcpp::platform::env::set(s.name, s.previous);
-        else               mcpp::platform::env::unset(s.name);
+    // Newest first, so a variable saved twice ends at its oldest value.
+    for (auto it = saved_.rbegin(); it != saved_.rend(); ++it) {
+        if (it->hadPrevious) mcpp::platform::env::set(it->name, it->previous);
+        else                 mcpp::platform::env::unset(it->name);
     }
+}
+
+std::string windows_command_prefix(const Env& env) {
+    return std::format("cd /d {} && {}",
+        mcpp::platform::shell::quote_windows(env.home.string()),
+        mcpp::platform::shell::quote_windows(env.binary.string()));
 }
 
 std::string build_command_prefix(const Env& env) {
     auto xvmBin = paths::sandbox_bin(env).string();
     if constexpr (mcpp::platform::is_windows) {
-        // The scope variable is applied by the caller's ScopedInvocationEnv.
-        mcpp::platform::env::set("XLINGS_HOME", env.home.string());
-        mcpp::platform::windows::prepend_path(xvmBin);
-        return env.binary.string();
+        // The environment is applied by the caller's ScopedInvocationEnv and
+        // restored after the command; building a command changes nothing.
+        return windows_command_prefix(env);
     } else {
         // `env` takes its `-u` operands before its assignments.
         std::string unset, assign;
