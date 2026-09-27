@@ -152,3 +152,107 @@ TEST(MingwModel, TargetPredicate) {
     EXPECT_FALSE(is_mingw_target(make_tc(CompilerId::GCC, "x86_64-linux-gnu")));
     EXPECT_FALSE(is_mingw_target(make_tc(CompilerId::Clang, "x86_64-pc-windows-msvc")));
 }
+
+// ─── #718: the CRT model reaches every MSVC-ABI row, cl and clang++ alike ──
+
+// The property the whole design rests on: one helper, `msvc_abi_crt_word`,
+// spells the SAME two-state switch (static/dynamic CRT) for whichever driver
+// `tc` is, and says nothing for a row that is not the MSVC ABI at all.
+TEST(MsvcAbiCrtWord, SpelledForEachDriverAndEmptyOffTheAbi) {
+    auto cl = make_tc(CompilerId::MSVC, "x86_64-pc-windows-msvc");
+    EXPECT_EQ(msvc_abi_crt_word(cl, /*staticCrt=*/true),  "/MT");
+    EXPECT_EQ(msvc_abi_crt_word(cl, /*staticCrt=*/false), "/MD");
+
+    auto llvmRow = make_tc(CompilerId::Clang, "x86_64-pc-windows-msvc");
+    EXPECT_EQ(msvc_abi_crt_word(llvmRow, /*staticCrt=*/true),
+              "-fms-runtime-lib=static");
+    EXPECT_EQ(msvc_abi_crt_word(llvmRow, /*staticCrt=*/false),
+              "-fms-runtime-lib=dll");
+
+    // Neither the MSVC ABI: MinGW links the MSVC CRT to no row at all, and a
+    // plain Linux row has no CRT axis of this kind either.
+    EXPECT_TRUE(msvc_abi_crt_word(
+        make_tc(CompilerId::GCC, "x86_64-w64-mingw32"), true).empty());
+    EXPECT_TRUE(msvc_abi_crt_word(
+        make_tc(CompilerId::Clang, "x86_64-linux-gnu"), false).empty());
+    EXPECT_TRUE(msvc_abi_crt_word(
+        make_tc(CompilerId::GCC, "x86_64-linux-gnu"), true).empty());
+}
+
+// Every MSVC-ABI row x {undeclared, self-contained, toolchain-coupled,
+// host-coupled, linkage=static} yields exactly one CRT word, spelled for its
+// own driver — the property property test the design asks for at the level
+// this pure helper can state it at (§7.3's criterion). "undeclared" and
+// "toolchain-coupled" share a word (`/MD`/`-fms-runtime-lib=dll`) because the
+// undeclared default and an explicit `toolchain-coupled` both compile
+// against the dynamic CRT; they differ only in whether the redistributable
+// is staged, which is a distribution.cppm/flags.cppm concern this helper does
+// not carry.
+TEST(MsvcAbiCrtWord, EveryContractResolvesToExactlyOneWordPerRow) {
+    struct Row { Toolchain tc; std::string_view label; };
+    Row rows[] = {
+        {make_tc(CompilerId::MSVC, "x86_64-pc-windows-msvc"), "cl"},
+        {make_tc(CompilerId::Clang, "x86_64-pc-windows-msvc"), "llvm"},
+    };
+    struct Case {
+        std::string_view linkage, cxxRuntime;
+        bool wantsStatic;
+    };
+    Case cases[] = {
+        {"", "",                   false},  // undeclared
+        {"", "self-contained",     true},
+        {"", "toolchain-coupled",  false},
+        {"", "host-coupled",       false},
+        {"static", "",             true},
+    };
+    for (auto& row : rows) {
+        for (auto& c : cases) {
+            const bool staticCrt = msvc_wants_static_crt(c.linkage, c.cxxRuntime);
+            EXPECT_EQ(staticCrt, c.wantsStatic)
+                << row.label << " linkage='" << c.linkage
+                << "' cxx_runtime='" << c.cxxRuntime << "'";
+            auto word = msvc_abi_crt_word(row.tc, staticCrt);
+            EXPECT_FALSE(word.empty()) << row.label;
+            // Exactly one of the two spellings for this driver, and it is
+            // the SAME word `flags.cppm`'s compile line and `scan.cpp`'s std
+            // BMI mirror both call this helper for — one derivation, so a TU
+            // and its std BMI cannot disagree by construction.
+            if (row.tc.compiler == CompilerId::MSVC) {
+                EXPECT_EQ(word, staticCrt ? "/MT" : "/MD") << row.label;
+            } else {
+                EXPECT_EQ(word, staticCrt ? "-fms-runtime-lib=static"
+                                          : "-fms-runtime-lib=dll") << row.label;
+            }
+        }
+    }
+}
+
+// D3: a free-form CRT word is always a second statement once the model is
+// resolved for every MSVC-ABI row.
+TEST(CheckCrtWord, AgreeingWordIsRedundantContradictingWordIsRefused) {
+    // Recognised spellings, both dash conventions and both drivers.
+    for (auto* word : {"/MT", "-MT", "/MTd", "-MTd",
+                       "-fms-runtime-lib=static", "-fms-runtime-lib=static_dbg"}) {
+        auto agree = check_crt_word(word, /*staticCrt=*/true, "[build] cxxflags");
+        ASSERT_TRUE(agree.has_value()) << word;
+        EXPECT_FALSE(agree->contradicts) << word;
+        auto disagree = check_crt_word(word, /*staticCrt=*/false, "[build] cxxflags");
+        ASSERT_TRUE(disagree.has_value()) << word;
+        EXPECT_TRUE(disagree->contradicts) << word;
+        EXPECT_NE(disagree->message.find(word), std::string::npos) << disagree->message;
+        EXPECT_NE(disagree->message.find("[build] cxxflags"), std::string::npos)
+            << disagree->message;
+    }
+    for (auto* word : {"/MD", "-MD", "/MDd", "-MDd",
+                       "-fms-runtime-lib=dll", "-fms-runtime-lib=dll_dbg"}) {
+        auto agree = check_crt_word(word, /*staticCrt=*/false, "dialect_cxxflags");
+        ASSERT_TRUE(agree.has_value()) << word;
+        EXPECT_FALSE(agree->contradicts) << word;
+        auto disagree = check_crt_word(word, /*staticCrt=*/true, "dialect_cxxflags");
+        ASSERT_TRUE(disagree.has_value()) << word;
+        EXPECT_TRUE(disagree->contradicts) << word;
+    }
+    // A word this axis does not recognise says nothing about it.
+    EXPECT_FALSE(check_crt_word("-O2", true, "[build] cxxflags").has_value());
+    EXPECT_FALSE(check_crt_word("/EHsc", false, "[build] cxxflags").has_value());
+}

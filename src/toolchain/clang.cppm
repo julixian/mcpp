@@ -23,11 +23,17 @@ void enrich_toolchain(Toolchain& tc, const std::string& envPrefix);
 std::filesystem::path std_bmi_path(const std::filesystem::path& cacheDir);
 std::filesystem::path staged_std_bmi_path(const std::filesystem::path& outputDir);
 
+// `crtFlag` (#718): empty off the MSVC ABI; on it, `-fms-runtime-lib=static`
+// or `=dll` (`mcpp.toolchain.dialect::msvc_abi_crt_word`), applied to BOTH
+// commands below — the precompile step needs it as much as the codegen step
+// does, since the CRT choice also selects which `<vcruntime.h>` declarations
+// this compile sees.
 std::vector<std::string> std_module_build_commands(const Toolchain& tc,
                                                    const std::filesystem::path& cacheDir,
                                                    const std::filesystem::path& bmiPath,
                                                    std::string_view sysrootFlag,
-                                                   std::string_view cppStandardFlag);
+                                                   std::string_view cppStandardFlag,
+                                                   std::string_view crtFlag = {});
 
 std::optional<std::filesystem::path> find_libcxx_std_compat_source(
     const std::filesystem::path& cxx_binary,
@@ -41,7 +47,8 @@ std::vector<std::string> std_compat_build_commands(const Toolchain& tc,
                                                     const std::filesystem::path& bmiPath,
                                                     const std::filesystem::path& stdBmiPath,
                                                     std::string_view sysrootFlag,
-                                                    std::string_view cppStandardFlag);
+                                                    std::string_view cppStandardFlag,
+                                                    std::string_view crtFlag = {});
 
 
 // Locate clang-scan-deps in the same bin/ directory as clang++.
@@ -240,8 +247,14 @@ std::vector<std::string> std_module_build_commands(const Toolchain& tc,
                                                    const std::filesystem::path& cacheDir,
                                                    const std::filesystem::path& bmiPath,
                                                    std::string_view sysrootFlag,
-                                                   std::string_view cppStandardFlag) {
+                                                   std::string_view cppStandardFlag,
+                                                   std::string_view crtFlag) {
     auto relBmi = std::filesystem::relative(bmiPath, cacheDir).string();
+    // #718: rendered as its own token, with a leading space, so an empty
+    // `crtFlag` (every non-MSVC-ABI row) leaves both commands byte-identical
+    // to what they were before this parameter existed.
+    const std::string crtToken =
+        crtFlag.empty() ? std::string{} : std::format(" {}", crtFlag);
     // A PACKAGE-PROVIDED std MODULE REPLACES THE TOOLCHAIN'S SYSROOT FLAGS
     // RATHER THAN BEING APPENDED TO THEM.
     //
@@ -343,20 +356,22 @@ std::vector<std::string> std_module_build_commands(const Toolchain& tc,
     // the cause is a branch keyed on which machine is doing the building.
     return {
         std::format(
-            "{} {}{}{}{} "
+            "{} {}{}{}{}{} "
             "--precompile {} -o {}",
             tc.binaryPath.string(),
             cppStandardFlag,
+            crtToken,
             ixxFlags,
             sysrootFlag,
             precompileFlags,
             mcpp::xlings::shq(tc.stdModuleSource.string()),
             mcpp::xlings::shq(absBmi)),
         std::format(
-            "{} {}{}{} "
+            "{} {}{}{}{} "
             "{} -c -o {}",
             tc.binaryPath.string(),
             cppStandardFlag,
+            crtToken,
             sysrootFlag,
             codegenFlags,
             mcpp::xlings::shq(absBmi),
@@ -365,23 +380,25 @@ std::vector<std::string> std_module_build_commands(const Toolchain& tc,
 #else
     return {
         std::format(
-            "cd {} && {}{} {} -Wno-reserved-module-identifier{}{} "
+            "cd {} && {}{} {}{} -Wno-reserved-module-identifier{}{} "
             "--precompile {} -o {} 2>&1",
             mcpp::xlings::shq(cacheDir.string()),
             mcpp::toolchain::compiler_env_prefix(tc),
             mcpp::xlings::shq(tc.binaryPath.string()),
             cppStandardFlag,
+            crtToken,
             sysrootFlag,
             precompileFlags,
             mcpp::xlings::shq(tc.stdModuleSource.string()),
             mcpp::xlings::shq(relBmi)),
         std::format(
-            "cd {} && {}{} {} -Wno-reserved-module-identifier{}{} "
+            "cd {} && {}{} {}{} -Wno-reserved-module-identifier{}{} "
             "{} -c -o std.o 2>&1",
             mcpp::xlings::shq(cacheDir.string()),
             mcpp::toolchain::compiler_env_prefix(tc),
             mcpp::xlings::shq(tc.binaryPath.string()),
             cppStandardFlag,
+            crtToken,
             sysrootFlag,
             codegenFlags,
             mcpp::xlings::shq(relBmi))
@@ -487,10 +504,15 @@ std::vector<std::string> std_compat_build_commands(const Toolchain& tc,
                                                     const std::filesystem::path& bmiPath,
                                                     const std::filesystem::path& stdBmiPath,
                                                     std::string_view sysrootFlag,
-                                                    std::string_view cppStandardFlag)
+                                                    std::string_view cppStandardFlag,
+                                                    std::string_view crtFlag)
 {
     auto relBmi = std::filesystem::relative(bmiPath, cacheDir).string();
     auto relStdBmi = std::filesystem::relative(stdBmiPath, cacheDir).string();
+    // #718: see `std_module_build_commands` — empty keeps both commands
+    // byte-identical off the MSVC ABI.
+    const std::string crtToken =
+        crtFlag.empty() ? std::string{} : std::format(" {}", crtFlag);
     // THE SAME REPLACEMENT THE `std` BUILDER MAKES, FOR THE SAME REASON.
     //
     // `std.compat` is a second module over the SAME library, and it therefore
@@ -545,23 +567,25 @@ std::vector<std::string> std_compat_build_commands(const Toolchain& tc,
     auto absStdBmi = (cacheDir / relStdBmi).string();
     auto absObj    = (cacheDir / "std.compat.o").string();
     return {
-        std::format("{}{} {} -Wno-reserved-module-identifier{}{} "
+        std::format("{}{} {}{} -Wno-reserved-module-identifier{}{} "
                     "-fmodule-file=std={} "
                     "--precompile {} -o {} 2>&1",
                     mcpp::toolchain::compiler_env_prefix(tc),
                     mcpp::xlings::shq(tc.binaryPath.string()),
                     cppStandardFlag,
+                    crtToken,
                     sysrootFlag,
                     precompileFlags,
                     absStdBmi,
                     mcpp::xlings::shq(tc.stdCompatSource.string()),
                     mcpp::xlings::shq(absBmi)),
-        std::format("{}{} {} -Wno-reserved-module-identifier{}{} "
+        std::format("{}{} {}{} -Wno-reserved-module-identifier{}{} "
                     "-fmodule-file=std={} "
                     "{} -c -o {} 2>&1",
                     mcpp::toolchain::compiler_env_prefix(tc),
                     mcpp::xlings::shq(tc.binaryPath.string()),
                     cppStandardFlag,
+                    crtToken,
                     sysrootFlag,
                     codegenFlags,
                     absStdBmi,

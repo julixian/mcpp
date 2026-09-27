@@ -250,12 +250,38 @@ Contract default_contract(Role r, Format f) {
     return Contract::SelfContained;
 }
 
+// THE MSVC-ABI WHOLE-PROJECT DEFAULT (§7.2, §7.3, #718), used in place of
+// `default_contract` for EVERY role there. The CRT is a per-ABI switch, not a
+// per-role judgement about a format's hazard the way `default_contract`'s PE
+// cell is for MinGW: one contract answers for every role, because cl bakes
+// `_MSVC_MT`/`_MSVC_MD` into the one std module a whole project shares.
+//
+//   static CRT (`/MT`)          SelfContained — no DLL dependency to couple to.
+//   dynamic CRT, redist found   ToolchainCoupled — `/MD`, with the toolset's
+//                               own vcruntime140.dll/msvcp140.dll staged
+//                               beside the artifact (portable by default).
+//   dynamic CRT, no redist      HostCoupled — nothing to stage; the row is as
+//                               capable as it has ever been (#649 E10), and
+//                               this is RECORDED rather than degraded with a
+//                               warning (a property of the row, not of one
+//                               build).
+Contract msvc_abi_default_contract(bool staticCrt, bool hasRedist) {
+    if (staticCrt) return Contract::SelfContained;
+    return hasRedist ? Contract::ToolchainCoupled : Contract::HostCoupled;
+}
+
 // What a manifest states about the C++ runtime, read once for every role.
 struct ContractStatement {
     std::string_view cxxRuntime;        // `cxx_runtime = "..."` or its `default`
     std::string_view cxxRuntimeTests;   // `cxx_runtime = { tests = "..." }`
     std::string_view cxxRuntimeShared;  // `cxx_runtime = { shared = "..." }`
     bool             staticStdlib = true;
+    // The MSVC-ABI whole-project default (above), or nullopt off that ABI.
+    // When set, it replaces `default_contract` for every role — see
+    // `role_contracts`. Computed by the caller from `msvc_wants_static_crt`
+    // and the resolved toolset's redistributable directory, because those are
+    // toolchain facts this module does not otherwise see.
+    std::optional<Contract> msvcAbiDefault;
 };
 
 // Which images of a build load a C++ shared library the build itself makes:
@@ -309,16 +335,22 @@ std::optional<Contract> stated_shared_library_contract(std::string_view cxxRunti
 
 RoleContracts role_contracts(const ContractStatement& s, Format f, CxxSharedLoad load) {
     RoleContracts c;
+    // The MSVC-ABI default replaces `default_contract` for EVERY role passed
+    // through it below — the CRT model has no per-role judgement to make.
+    const Contract distributableDefault = s.msvcAbiDefault.value_or(
+        default_contract(Role::Distributable, f));
+    const Contract sharedDefault = s.msvcAbiDefault.value_or(
+        default_contract(Role::SharedLibrary, f));
     c.programStated = !s.cxxRuntime.empty() || !s.staticStdlib;
     c.program = parse_contract(s.cxxRuntime).value_or(
-        s.staticStdlib ? default_contract(Role::Distributable, f) : Contract::HostCoupled);
+        s.staticStdlib ? distributableDefault : Contract::HostCoupled);
     c.intermediate = c.program;
     c.testsStated = c.programStated || !s.cxxRuntimeTests.empty();
     c.tests = parse_contract(s.cxxRuntimeTests).value_or(c.program);
     c.sharedStated = c.programStated || !s.cxxRuntimeShared.empty();
     c.shared = stated_shared_library_contract(s.cxxRuntime, s.cxxRuntimeShared,
                                               s.staticStdlib, f)
-                   .value_or(default_contract(Role::SharedLibrary, f));
+                   .value_or(sharedDefault);
 
     // ONE PROCESS, ONE C++ RUNTIME (#646 F3a).
     //
@@ -383,13 +415,6 @@ struct MechanismInput {
     // decoration. Derived by `msvc_wants_static_crt`, which is also what
     // emits the flag.
     bool             msvcStaticCrt = false;
-    // MSVC STL only: does mcpp pass a CRT model (`/MT` or `/MD`) to this
-    // compiler? True for cl.exe. FALSE FOR CLANG ON THE MSVC ABI: that driver
-    // speaks the GNU dialect, mcpp emits no runtime flag for it, and clang
-    // then links the static CRT (`-defaultlib:libcmt`, measured with the
-    // 22.1.8 driver). The table must report the model the compiler was given,
-    // not the model `cl.exe` would have been given (#649 E10).
-    bool             msvcCrtModelEmitted = true;
     // Toolchain capability id: "libstdc++", "libc++", or an MSVC STL spelling.
     std::string_view stdlibId;
     Format           format = Format::Elf;
@@ -712,91 +737,69 @@ Mechanism resolve(const MechanismInput& in) {
     // ---------------------------------------------------------------- PE
     case Format::Pe: {
         if (!detail::is_libstdcxx(in.stdlibId)) {
-            // MSVC STL (cl.exe, or clang on the MSVC ABI). The CRT model is
-            // the mechanism here, and it is a whole-project switch: /MT is
-            // self-contained (no vcruntime DLL dependency), /MD is
-            // host-coupled. `msvcStaticCrt` is that switch, already derived
-            // by whoever emits the flag — so what this table reports and what
-            // cl was actually told cannot disagree.
+            // MSVC STL (cl.exe, or clang on the MSVC ABI). Every MSVC-ABI row
+            // now receives a CRT model — one helper (`msvc_abi_crt_word`)
+            // spells `/MT`/`/MD` for cl and `-fms-runtime-lib=static`/`=dll`
+            // for clang++ alike, reaching the TUs, the std/std.compat BMIs
+            // and the link command — so E10 is gone: there is no row left
+            // that the table must record as receiving none.
             //
-            // No unit flags: the model is a COMPILE flag on every TU, not
-            // something added to the link line.
+            // No unit flags: the model is a compile (and link) flag, not
+            // something added to this table's link-flag string.
             //
-            // CLANG ON THE MSVC ABI IS GIVEN NO MODEL, so the table records
-            // the one its driver chooses. The rows below were written for
-            // cl.exe, and for this row they recorded `host-coupled` beside an
-            // artifact that imports no vcruntime DLL at all (#649 E10). The
-            // artifact is left as it is; the record, and an explicit request
-            // the row does not deliver, now say what it is.
-            if (!in.msvcCrtModelEmitted) {
+            // `in.requested` already reflects the MSVC-ABI whole-project
+            // default (`msvc_abi_default_contract`, resolved before this
+            // table runs): an undeclared row without a redistributable
+            // directory arrives here as HostCoupled already, and an EXPLICIT
+            // `toolchain-coupled` a toolset cannot deliver is refused before
+            // compiling (`prepare/plan.cpp`), not silently degraded here —
+            // the same rule the pack mode contradiction follows.
+            if (in.msvcStaticCrt) {
                 m.effective = Contract::SelfContained;
                 if (in.requested != Contract::SelfContained && in.explicitRequest) {
+                    // A static CRT leaves NO DLL to couple to, whichever
+                    // coupled value was asked for — a genuine contradiction,
+                    // not a missing mechanism. Only reachable from a
+                    // per-role override or `linkage = "static"` beside an
+                    // explicit `cxx_runtime`: a project-level `cxx_runtime =
+                    // "self-contained"` would already have set this role's
+                    // `requested` to SelfContained too.
                     m.degraded   = true;
                     m.diagnostic = std::format(
-                        "cxx_runtime = \"{}\" is not delivered for clang on the "
-                        "MSVC ABI: mcpp passes this driver no CRT model, and clang "
-                        "links the static CRT (libcmt) by default. Use msvc@system "
-                        "for the dynamic CRT; using self-contained",
-                        to_string(in.requested));
+                        "cxx_runtime = \"{}\" cannot apply to a project "
+                        "compiled with the static CRT (/MT, or linkage = "
+                        "\"static\"): there is no vcruntime140.dll/"
+                        "msvcp140.dll dependency left to couple to; using "
+                        "self-contained", to_string(in.requested));
                 }
                 return m;
             }
-            m.effective = in.msvcStaticCrt ? Contract::SelfContained
-                                           : Contract::HostCoupled;
-            if (in.requested == Contract::SelfContained && !in.msvcStaticCrt) {
+            // Dynamic CRT (/MD). ToolchainCoupled is delivered exactly when
+            // requested — the row without a redistributable never reaches
+            // this table asking for it undeclared, and an explicit request it
+            // cannot meet is a planning-time refusal, not this table's to
+            // degrade.
+            if (in.requested == Contract::ToolchainCoupled) {
+                m.effective              = Contract::ToolchainCoupled;
+                m.deployToolchainRuntime = true;
+            } else {
+                m.effective = Contract::HostCoupled;
+            }
+            if (in.requested == Contract::SelfContained && in.explicitRequest) {
                 // Asked for, not delivered. Only reachable from a per-ROLE
                 // override, because a project-level one would have set
-                // msvcStaticCrt — so name that, instead of the old "not
-                // implemented", which stopped being true and had already
-                // been contradicted by flags.cppm emitting /MT for
-                // `linkage = "static"`.
-                m.degraded   = in.explicitRequest;
-                m.diagnostic = in.explicitRequest
-                    ? "on the MSVC runtime the CRT model is a whole-project "
-                      "property — one std module is built per project and cl "
-                      "bakes _MSVC_MT/_MSVC_MD into it, so a single role "
-                      "cannot differ. Move it to [build] cxx_runtime = "
-                      "\"self-contained\" (or linkage = \"static\") to apply "
-                      "it everywhere; using host-coupled here"
-                    : "";
-            } else if (in.requested == Contract::ToolchainCoupled) {
-                // THIS USED TO BE A FLAT REFUSAL, and the sentence it refused
-                // with was half true:
-                //
-                //   "…has no meaning for the MSVC runtime (it ships with the
-                //    OS/redistributable, not with the toolchain)"
-                //
-                // True of `ucrtbase.dll`, which IS an OS component since
-                // Win10. NOT true of `vcruntime140.dll` / `msvcp140.dll`,
-                // which are the toolset's own and sit inside every MSVC
-                // toolset ever shipped:
-                //
-                //   VC\Redist\MSVC\<ver>\<arch>\Microsoft.VC<N>.CRT\*.dll
-                //
-                // That is the same relationship gcc has to libstdc++.so, so it
-                // takes the same contract — and refusing it left a hole in the
-                // matrix that had a real cost: the default `/MD` artifact
-                // depends on DLLs a machine with only a managed toolset does
-                // not have, and there was no spelling that made them travel.
-                //
-                // `/MT` is the one case that stays a degradation, and it is a
-                // genuine contradiction rather than a missing mechanism: a
-                // static CRT leaves NO DLL to couple to. Say which one won.
-                if (in.msvcStaticCrt) {
-                    m.effective  = Contract::SelfContained;
-                    m.degraded   = true;
-                    m.diagnostic =
-                        "cxx_runtime = \"toolchain-coupled\" cannot apply to a "
-                        "project compiled with the static CRT (/MT): there is "
-                        "no vcruntime140.dll/msvcp140.dll dependency left to "
-                        "couple to. Drop linkage = \"static\" (or the "
-                        "project-wide self-contained contract) if the toolset's "
-                        "CRT should travel beside the artifact instead; using "
-                        "self-contained";
-                } else {
-                    m.effective              = Contract::ToolchainCoupled;
-                    m.deployToolchainRuntime = true;
-                }
+                // `msvcStaticCrt` — so name that: the CRT model is a
+                // whole-project property, one std module is built per
+                // project and cl bakes _MSVC_MT/_MSVC_MD into it, so a
+                // single role cannot differ.
+                m.degraded   = true;
+                m.diagnostic = std::format(
+                    "on the MSVC runtime the CRT model is a whole-project "
+                    "property — one std module is built per project and cl "
+                    "bakes _MSVC_MT/_MSVC_MD into it, so a single role "
+                    "cannot differ. Move it to [build] cxx_runtime = "
+                    "\"self-contained\" (or linkage = \"static\") to apply "
+                    "it everywhere; using {} here", to_string(m.effective));
             }
             return m;
         }

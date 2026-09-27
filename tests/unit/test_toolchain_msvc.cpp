@@ -479,6 +479,37 @@ TEST(MsvcRedist, AToolsetWithoutARedistIsNotAnError) {
     EXPECT_TRUE(msvc::vc_redist_dir(t.clPath, "x64").empty());
 }
 
+// #718: the LLVM row reaches the SAME redistributable from its sysroot's
+// tools directory, since it runs no cl.exe of its own to derive one from.
+TEST(MsvcRedist, TheSameDirectoryIsReachableFromTheToolsDirAlone) {
+    FakeRedist t{"14.44.35207", "14.44.35112"};
+    // <VC>/Tools/MSVC/<ver>/bin/Hostx64/x64/cl.exe -> up 4 reaches the tools
+    // dir `Toolchain::msvcToolsDir` carries (<VC>/Tools/MSVC/<ver>).
+    auto toolsDir = t.clPath.parent_path().parent_path().parent_path().parent_path();
+    auto fromCl    = msvc::vc_redist_dir(t.clPath, "x64");
+    auto fromTools = msvc::vc_redist_dir_for_tools_dir(toolsDir, "x86_64");
+    ASSERT_FALSE(fromCl.empty());
+    EXPECT_EQ(fromCl, fromTools);
+}
+
+TEST(MsvcRedist, ToolsDirArchMapping) {
+    // The GNU-spelled triple architecture (what a Toolchain carries) maps to
+    // the msvc spelling `vc_redist_dir` takes.
+    FakeRedist t{"14.44.35207", "14.44.35112"};
+    t.add("14.44.35112", "arm64", "Microsoft.VC143.CRT", "vcruntime140.dll");
+    t.add("14.44.35112", "x86", "Microsoft.VC143.CRT", "vcruntime140.dll");
+    auto toolsDir = t.clPath.parent_path().parent_path().parent_path().parent_path();
+    EXPECT_FALSE(msvc::vc_redist_dir_for_tools_dir(toolsDir, "aarch64").empty());
+    EXPECT_FALSE(msvc::vc_redist_dir_for_tools_dir(toolsDir, "i686").empty());
+    EXPECT_FALSE(msvc::vc_redist_dir_for_tools_dir(toolsDir, "x86_64").empty());
+    // An architecture this toolset was never given a redist for finds none —
+    // it does not fall back to a different one.
+    std::error_code ec;
+    auto vc = toolsDir.parent_path().parent_path().parent_path();   // <VC>
+    std::filesystem::remove_all(vc / "Redist" / "MSVC" / "14.44.35112" / "arm64", ec);
+    EXPECT_TRUE(msvc::vc_redist_dir_for_tools_dir(toolsDir, "aarch64").empty());
+}
+
 TEST(MsvcSdk, HeadersWithoutImportLibsIsNotAnAnswer) {
     // The half that used to pass. `Include/<v>/ucrt/corecrt.h` is there and
     // `Lib/` is not, which is exactly what a managed windows-sdk payload

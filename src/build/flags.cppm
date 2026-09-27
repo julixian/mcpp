@@ -95,6 +95,13 @@ struct CompileFlags {
     // The contract each role actually got (after any degradation).
     std::array<mcpp::build::dist::Contract,
                mcpp::build::dist::kRoleCount> contractByRole{};
+    // Was the Distributable role's contract WRITTEN, or is
+    // `contractByRole[Distributable]` a default `role_contracts` picked
+    // (`msvc_abi_default_contract` on the MSVC ABI)? `mcpp pack` reads this
+    // to tell "the manifest asked for toolchain-coupled" from "nobody asked
+    // and the row happened to default to it" — only the first survives an
+    // explicit `--mode system` (#718).
+    bool programCxxRuntimeStated = false;
     // macOS + self-contained: link units need the initializer-ordering shim
     // object prepended to their inputs (issue #336).
     bool needsStreamInitShim = false;
@@ -605,6 +612,18 @@ CompileFlags compute_flags(const BuildPlan& plan) {
 
     const bool isMsvcDialect = (d.id == "msvc");
 
+    // THE CRT MODEL WORD, for the driver `plan.toolchain` actually is (#718).
+    // Computed once so the compile line below, the link line
+    // (`LinkShape::PeLld`) and the mechanism table's record
+    // (`mi.msvcStaticCrt`) all read the SAME two facts: whether the project
+    // wants the static CRT (`msvc_wants_static_crt`, unchanged since #422),
+    // and how that driver spells it (`msvc_abi_crt_word`, new for #718 —
+    // empty off the MSVC ABI, where it is inert).
+    const bool msvcAbiWantsStaticCrt = mcpp::toolchain::msvc_wants_static_crt(
+        plan.manifest.buildConfig.linkage, plan.manifest.buildConfig.cxxRuntime);
+    const std::string msvcAbiCrtWord = mcpp::toolchain::msvc_abi_crt_word(
+        plan.toolchain, msvcAbiWantsStaticCrt);
+
     // PIC is a GNU concept and a property of the TARGET FORMAT: PE code is
     // position independent by design (base relocations), and clang rejects the
     // flag outright — `unsupported option '-fPIC' for target
@@ -1041,15 +1060,18 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // model — /MD by default, /MT when either knob asks for the static CRT
     // (portable-by-default is impossible on MSVC-ABI; /MT at least removes
     // the vcruntime DLL dep).
+    //
+    // CLANG ON THE MSVC ABI TAKES THE SAME WORD, spelled for its own driver
+    // (#718): `msvcAbiCrtWord` is empty for every non-MSVC-ABI row, so this
+    // `else if` adds nothing there. `d.alwaysFlags` is cl-only (`/nologo
+    // /EHsc /utf-8`) and stays out of the clang branch — nothing about those
+    // three flags is MSVC-ABI-specific.
     std::string msvc_base;
     if (isMsvcDialect) {
         msvc_base = std::format(" {}", d.alwaysFlags);
-        // ONE derivation, shared with the std module build — see
-        // `msvc_wants_static_crt` in mcpp.toolchain.dialect and #422.
-        msvc_base += std::format(" {}", mcpp::toolchain::msvc_crt_flag(
-            d, mcpp::toolchain::msvc_wants_static_crt(
-                   plan.manifest.buildConfig.linkage,
-                   plan.manifest.buildConfig.cxxRuntime)));
+        msvc_base += std::format(" {}", msvcAbiCrtWord);
+    } else if (mcpp::toolchain::is_msvc_target(plan.toolchain)) {
+        msvc_base = std::format(" {}", msvcAbiCrtWord);
     }
 
     // User link flags: `[build] ldflags`, the `link_flag` and `link_lib`
@@ -1133,11 +1155,15 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                         opt_flag, pic_flag, compile_toolchain_flags, b_flag);
     // MSVC compiles C with cl.exe too; /std: for C uses cN spellings — skip
     // the C standard flag there (cl defaults are fine for the C entry TUs).
+    //
+    // `msvc_base` rides the GNU branch too: on the LLVM row it holds the CRT
+    // word (`-fms-runtime-lib=*`) and nothing else, since `d.alwaysFlags` is
+    // only ever set for the msvc dialect. Empty everywhere else, as before.
     f.cc = isMsvcDialect
         ? std::format("{}{}{}{}", msvc_base, opt_flag, compile_toolchain_flags,
                       b_flag)
-        : std::format("{}{}{}{}{}{}", d.stdPrefix, c_std, opt_flag, pic_flag,
-                      compile_toolchain_flags, b_flag);
+        : std::format("{}{}{}{}{}{}{}", msvc_base, d.stdPrefix, c_std, opt_flag,
+                      pic_flag, compile_toolchain_flags, b_flag);
 
     // GAS assembly (.S/.s via the C driver): the asm-safe subset — no -std
     // (C-only) and no -O (meaningless), but PIC stays (.S sources gate on
@@ -1218,12 +1244,23 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             .program = mcpp::build::image_loads_cxx_shared_library(plan, LinkUnit::Binary),
             .tests   = mcpp::build::image_loads_cxx_shared_library(plan, LinkUnit::TestBinary),
         };
+        // The MSVC-ABI whole-project default (#718, §7.3): a row without a
+        // redistributable directory defaults to host-coupled rather than
+        // toolchain-coupled, silently — nothing to stage, and no per-build
+        // warning for a property of the row. Off that ABI, nullopt leaves
+        // every other format's own per-role defaults untouched.
+        const std::optional<dist::Contract> msvcAbiDefault =
+            mcpp::toolchain::is_msvc_target(plan.toolchain)
+                ? std::optional(dist::msvc_abi_default_contract(
+                      msvcAbiWantsStaticCrt, !plan.toolchain.msvcRedistDir.empty()))
+                : std::nullopt;
         const dist::RoleContracts contracts = dist::role_contracts(
             dist::ContractStatement{
                 .cxxRuntime       = bc.cxxRuntime,
                 .cxxRuntimeTests  = bc.cxxRuntimeTests,
                 .cxxRuntimeShared = bc.cxxRuntimeShared,
                 .staticStdlib     = bc.staticStdlib,
+                .msvcAbiDefault   = msvcAbiDefault,
             },
             format, cxxSharedLoad);
 
@@ -1279,11 +1316,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // other one fails inside the ucrt headers (#422). The mechanism table
         // needs to know so it can say that out loud rather than silently
         // ignoring a role override.
-        mi.msvcStaticCrt  = mcpp::toolchain::msvc_wants_static_crt(
-                                bc.linkage, bc.cxxRuntime);
-        // The model is emitted only for the `msvc` dialect (above); clang on
-        // the MSVC ABI receives none and links the static CRT (#649 E10).
-        mi.msvcCrtModelEmitted = isMsvcDialect;
+        mi.msvcStaticCrt  = msvcAbiWantsStaticCrt;
         mi.mingw          = isMingwTc;
         mi.macosFloor     = !macosDeploymentTarget.empty();
         // READ from the one value prepare resolved. The SDK being located for
@@ -1471,6 +1504,12 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         const bool explicitBase   = contracts.programStated;
         const bool explicitTests  = contracts.testsStated;
         const bool explicitShared = contracts.sharedStated;
+        // Read by `mcpp pack` (#718): an explicit `--mode system` outranks a
+        // DEFAULTED toolchain-coupled contract (resolved to host-coupled
+        // instead of a mode contradiction), but not a stated one — the same
+        // "explicit outranks a default" rule the pack mode / cxx_runtime
+        // refusal already follows for an explicit request no toolset can meet.
+        f.programCxxRuntimeStated = explicitBase;
 
         // Report a role's degradation only if this build HAS that role.
         //
@@ -1513,25 +1552,25 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                     "{} target: {}", dist::to_string(role), r.diagnostic));
         }
         if (wantsToolchainRuntime) {
-            // `linkRuntimeDirs` is the toolset's own redistributable CRT
-            // directory and nothing else on this toolchain — `enrich_toolchain
-            // _from_cl` puts exactly `vc_redist_dir()` there. Guarded on the
-            // compiler anyway: the field means "the toolchain's private
-            // runtime" for every provider, and on gcc it holds libstdc++'s
-            // directory, which has no business being copied into a PE tree.
-            if (plan.toolchain.compiler == mcpp::toolchain::CompilerId::MSVC) {
+            // THE GATE IS THE ABI AND A REDISTRIBUTABLE DIRECTORY, NOT THE
+            // COMPILER (#718). `msvcRedistDir` is its own field, set for cl
+            // AND for clang++ on the MSVC ABI alike (`enrich_toolchain_from_cl`
+            // / `bind_msvc_sysroot`) — unlike `linkRuntimeDirs`, which on the
+            // LLVM row holds the LLVM payload's OWN runtime directories and
+            // must not be searched here: copying those into a Windows
+            // program's `bin/` would stage the wrong files.
+            if (mcpp::toolchain::is_msvc_target(plan.toolchain)
+                && !plan.toolchain.msvcRedistDir.empty()) {
                 std::vector<std::filesystem::path> sources;
                 std::error_code ec;
-                for (auto const& dir : plan.toolchain.linkRuntimeDirs) {
-                    for (auto const& e :
-                         std::filesystem::directory_iterator(dir, ec)) {
-                        if (!e.is_regular_file(ec)) continue;
-                        auto ext = e.path().extension().string();
-                        std::ranges::transform(ext, ext.begin(),
-                            [](unsigned char c) { return std::tolower(c); });
-                        if (ext != ".dll") continue;
-                        sources.push_back(e.path());
-                    }
+                for (auto const& e : std::filesystem::directory_iterator(
+                         plan.toolchain.msvcRedistDir, ec)) {
+                    if (!e.is_regular_file(ec)) continue;
+                    auto ext = e.path().extension().string();
+                    std::ranges::transform(ext, ext.begin(),
+                        [](unsigned char c) { return std::tolower(c); });
+                    if (ext != ".dll") continue;
+                    sources.push_back(e.path());
                 }
                 // Directory order is not a stable input: this list reaches
                 // build.ninja, and a graph that differs between two runs of
@@ -1795,9 +1834,20 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // from these rather than from the machine; empty without a toolset.
         const auto msvcSysroot =
             mcpp::toolchain::render_tokens(lm.msvc_driver_tokens(ninjaEsc));
-        f.ld = std::format("{} -fuse-ld=lld{}{}{}{}", full_static, msvcSysroot,
-                           link_intent_ld, user_ldflags, link_extra);
-        f.ldC = f.ld;   // no C++ runtime token on this line
+        // THE CRT WORD REACHES THIS LINE TOO (#649 E10, #718). The clang
+        // driver chooses `-defaultlib:` at LINK time independently of what
+        // the objects were compiled with — measured with `-fms-runtime-
+        // lib=dll` at compile time only: the objects carried `--dependent-
+        // lib=msvcrt`, and the link step still passed `-defaultlib:libcmt`.
+        // `msvcAbiCrtWord` is the same word the compile line above carries,
+        // so a link run without recompiling (an incremental relink) cannot
+        // ask the driver for a different CRT than the objects already have.
+        const std::string msvcAbiCrtLd =
+            msvcAbiCrtWord.empty() ? std::string{} : (" " + msvcAbiCrtWord);
+        f.ld = std::format("{}{} -fuse-ld=lld{}{}{}{}", full_static,
+                           msvcAbiCrtLd, msvcSysroot, link_intent_ld,
+                           user_ldflags, link_extra);
+        f.ldC = f.ld;   // the CRT model applies to C TUs on this ABI too
     } else if (linkShape == LinkShape::AppleSdk) {
         // macOS. The C++ runtime itself is decided by the contract table above
         // (dist::Format::MachO) and rides unit_ldflags; what is left here is

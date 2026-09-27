@@ -1058,7 +1058,7 @@ libc++.a/libc++abi.a/libunwind.a。更低的 macOS 下限（11–13）需要一�
 |---|---|---|
 | ELF（Linux 等） | `toolchain-coupled` | ELF 只有一个全局符号命名空间，先加载的定义胜出。一个静态内嵌了 libstdc++ 的 `.so` 会把它**导出**，链接该库的可执行文件于是把自己的 `std::` 引用绑定到那里——它自己的 `self-contained` 契约会静默变成空操作，它的 C++ 运行时变成碰巧加载到的那一份该库。 |
 | Mach-O | `self-contained` | 那里的机制本来就是 `-load_hidden`，即隐藏可见性，dyld 因此从不归一这些符号；而且 macOS 上根本没有 toolchain-coupled 这一档（见下文注记）。 |
-| PE(Windows) | `self-contained` | PE 没有全局符号命名空间——导入按 DLL 逐个按名解析，一个 DLL 的私有运行时不可能被别的东西捡走。 |
+| PE，GNU ABI(MinGW) | `self-contained` | PE 没有全局符号命名空间——导入按 DLL 逐个按名解析，一个 DLL 的私有运行时不可能被别的东西捡走。MSVC ABI 自己的默认值是另一条规则——见下文[在 MSVC 运行时上](#在-msvc-运行时上)。 |
 
 在 ELF 上显式写 `shared = "self-contained"` 是支持的，而且就是字面意思：
 库会内嵌运行时。此时 mcpp 会额外为标准库归档传递
@@ -1134,27 +1134,66 @@ cxx_runtime = { shared = "self-contained" }
 
 ### 在 MSVC 运行时上
 
-这里的机制就是 CRT 模型，而它是一个**整个工程**级的开关：cl 会把
+CRT 模型是**目标 ABI** 的属性，不是编译器的属性：`cl` 与以
+`*-windows-msvc` 为目标的 clang++（`llvm` 行）接收**同一个**模型，各自以
+自己驱动的拼写发出。它同时是一个**整个工程**级的开关：`cl` 会把
 `_MSVC_MT`/`_MSVC_MD` 烘进一个工程唯一构建的那份 `std` 模块，所以一个与
 工程不一致的按角色契约无法被兑现，会被报出来，而不是被忽略。
 
-| 取值 | 在 MSVC 上的含义 |
-|---|---|
-| `self-contained` | `/MT`——静态 CRT。`linkage = "static"` 从 libc 那根轴选中的是同一件事。 |
-| `host-coupled`（`/MD` 下的默认值） | 由目标机器提供 `vcruntime140.dll` / `msvcp140.dll`——即那台机器装了 Visual Studio 或对应的 redistributable。 |
-| `toolchain-coupled` | toolset **自带**的那份 DLL 跟着产物一起走。 |
+| 取值 | 在 MSVC ABI 上的含义 | `cl` 的拼写 | clang++ 的拼写 |
+|---|---|---|---|
+| `self-contained`(或 `linkage = "static"`) | 静态 CRT | `/MT` | `-fms-runtime-lib=static` |
+| `toolchain-coupled`(**默认值**) | 动态 CRT，toolset 自带的 `vcruntime140.dll`/`msvcp140.dll` 会被放到产物旁边 | `/MD` | `-fms-runtime-lib=dll` |
+| `host-coupled` | 动态 CRT，不放置任何文件——由目标机器自己提供这些 DLL(Visual Studio,或 redistributable 安装程序) | `/MD` | `-fms-runtime-lib=dll` |
 
-`toolchain-coupled` 值得说清楚，因为直觉上的理解是错的。`ucrtbase.dll`
-**是**一个 Windows 组件（Windows 10 起），mcpp 从不分发它；而
-`vcruntime140.dll` 与 `msvcp140.dll` **不是**：每个 MSVC toolset 都在
+**`toolchain-coupled` 是默认值**，不论 `cxx_runtime` 写了什么，对每个角色
+皆然。这一点值得说清楚，因为「默认即可移植」这个直觉在这里是错的：
+`ucrtbase.dll` **是**一个 Windows 组件(Windows 10 起)，mcpp 从不分发它；
+而 `vcruntime140.dll` 与 `msvcp140.dll` **不是**：每个 MSVC toolset 都在
 `VC\Redist\MSVC\<version>\<arch>\` 下带着它们，和一个 gcc 载荷带着
-`libstdc++.so` 是同一件事。在这份契约下，mcpp 会把它们放到产物旁边——这
-正是让一次默认的 `/MD` 构建，能在一台只装了被钉住的 toolset、完全没有
+`libstdc++.so` 是同一件事。在这份契约下，mcpp 会把它们放到产物旁边(在
+`mcpp build` 的产出目录里)，并把同一个目录放上 `mcpp run`/`mcpp test`
+的搜索路径——这正是让默认构建，能在一台只装了被钉住的 toolset、完全没有
 Visual Studio 的机器上运行起来的原因。
 
-调试版 CRT（`debug_nonredist\` 下的 `vcruntime140d.dll` 等）永远不会被
-放进去：它不可再分发。
+一个不带 `VC\Redist\MSVC` 目录的 toolset(在某些 `msvc@system` 安装上实测
+存在)无法兑现 `toolchain-coupled`。此时未声明的默认值会静默解析为
+`host-coupled`——这是这一行的一个属性，在此说明一次，不是每次构建都打印
+的警告。在这样的行上**显式**写 `cxx_runtime = "toolchain-coupled"` 会被
+拒绝，并指出缺失的目录：一个 toolset 兑现不了的显式声明是一个错误，绝不
+是一次静默降级。
 
+调试版 CRT(`debug_nonredist\` 下的 `vcruntime140d.dll` 等)永远不会被
+放进去：它不可再分发，而且 mcpp 的 `dev` profile 不会选中它——那个
+profile 表达的是调试信息，不是另一个 CRT。这根轴留待有消费者需要时再设计。
+
+把 `toolchain-coupled` 或 `host-coupled` 和 `/MT`(`linkage = "static"`,
+或 `self-contained`)一起写是一处**矛盾**，而不是缺功能——一份静态 CRT
+根本没有 DLL 可以耦合——所以它会被报出来，并落回 `self-contained`。
+`mcpp pack` 兜底另一半:一个什么都不打包的模式(`--mode static`)配上一个
+**显式**的 `toolchain-coupled` 兑现不了，会直接拒绝；而 `--mode system`
+用在一个从未声明契约的工程上，会把默认值解析为 `host-coupled`——一个
+显式的 mode 胜过一个默认值。
+
+**自由拼写的 CRT 词永远是第二次声明。** 每个 MSVC ABI 构建现在都会声明
+自己的 CRT,所以 `[build] cxxflags` 或 `dialect_cxxflags` 里出现的字面
+`/MT`、`/MD`、`/MTd`、`/MDd` 或 `-fms-runtime-lib=*`(两种短横线拼写皆
+可)永远不能是唯一的声音。与已解析的模型**一致**的会被警告为冗余，并指
+出应当改写的键(`cxx_runtime` 或 `linkage`)；**不一致**的会被拒绝，消息
+指出该词、它所在的键，以及它对应的取值。引擎绝不让命令行上最后一个词
+静默胜出。
+
+> **升级到 2026.9.28.1?** `cl` 行的工程不受影响，只是程序旁多了被放置
+> 的 DLL。**LLVM 行的程序会从静态 CRT 换到动态 CRT**：这次发布之前，
+> MSVC ABI 上的 clang++ 收不到任何模型，总是链接 `libcmt`，与
+> `cxx_runtime` 无关；现在它收到与 `cl` 相同的模型，默认解析为
+> `toolchain-coupled`。一个在这一行链接 `/MT` 预构建库的工程，现在会链接
+> 失败(`LNK2038`,一处 CRT 不一致)，应当写
+> `cxx_runtime = "self-contained"` 以恢复它此前的静态 CRT。有两类
+> manifest 在这次发布前能构建、之后会被拒绝:一个与已解析模型矛盾的自由
+> 拼写 CRT 词，以及在一个 toolset 不带 redistributable 的行上显式写
+> `toolchain-coupled`——两者见上文。
+>
 > **从 2026.8.15 或更早版本升级时的变化。** 这个键在 MSVC ABI 上曾经是
 > **空操作**——它会报 `not implemented for the MSVC runtime yet`，写任何
 > 值都会退回 `/MD`。自 2026.8.16 起它真的会生效，于是一份从那个年代带着
@@ -1162,21 +1201,6 @@ Visual Studio 的机器上运行起来的原因。
 > 模型**：从 `/MD` 变成 `/MT`。它不是同一个模型的更严格版本，而且因为
 > 这个值一直是合法的，这次切换是**静默**的。如果一个工程是在这个键尚未
 > 生效时写下它的，应当重新确认所需的取值。
-
-把它和 `/MT` 一起写是一处**矛盾**，而不是缺功能——一份静态 CRT 根本没有
-DLL 可以耦合——所以它会被报出来，并落回 `self-contained`。另一半由
-`mcpp pack` 兜底：一个什么都不打包的模式（`--mode system`、
-`--mode static`）兑现不了 `toolchain-coupled`，会直接拒绝。
-
-**MSVC ABI 上的 clang**（`x86_64-windows-msvc` 的 `llvm` 行，记录自 mcpp
-2026.9.16.1 起）。上表描述的是 `cl.exe`，mcpp 只向它传递 CRT 模型。MSVC
-ABI 上的 clang 使用 GNU 方言，收不到任何模型，它的驱动链接静态 CRT
-(`-defaultlib:libcmt`)：这一行构建出的程序不会导入
-`vcruntime140.dll`、`msvcp140.dll` 或 `api-ms-win-crt-*`，每个 DLL 各自
-带着自己的 CRT。因此这一行无论 `cxx_runtime` 写什么都是
-`self-contained`，`resolution.json` 如实记录这一点，显式写
-`host-coupled` 或 `toolchain-coupled` 会打印这一行兑现不了它。需要在
-MSVC ABI 上使用动态 CRT 的工程，应当用 `msvc@system` 构建。
 
 **边界。** 该契约只管辖 C++ 运行时。静态 **libc** 是另一根轴
 (`linkage = "static"` / `--static`，例如一个 musl target)，部署下限是

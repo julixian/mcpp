@@ -282,6 +282,20 @@ struct Toolchain {
     std::string                         msvcOrigin;         // "system" | "managed"
     std::string                         msvcProduct;        // for the one printed line
     std::filesystem::path               windowsSdkRoot;     // <kits>/10 or the payload
+    // THE TOOLSET'S OWN REDISTRIBUTABLE CRT DIRECTORY
+    // (`VC\Redist\MSVC\<ver>\<arch>\Microsoft.VC*.CRT`), on an MSVC-ABI row of
+    // EITHER driver — cl.exe or clang++ targeting `*-windows-msvc`.
+    //
+    // Its own field rather than a reading of `linkRuntimeDirs`, because that
+    // field means something else on the two rows: for cl it happens to hold
+    // exactly this directory, but for clang it holds the LLVM payload's OWN
+    // runtime directories (`discover_link_runtime_dirs`, clang.cppm), and
+    // reading it for staging there would copy LLVM's files into a Windows
+    // program's `bin/`. Empty when the resolved toolset ships no
+    // redistributable (`msvc_abi_default_contract` then defaults to
+    // host-coupled rather than toolchain-coupled, and an explicit
+    // toolchain-coupled contract is refused, naming this field empty).
+    std::filesystem::path               msvcRedistDir;
     // Something about HOW this toolchain was resolved that the user has to be
     // told, but which is not a failure. Non-empty ⇒ the caller MUST surface it.
     //

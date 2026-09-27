@@ -22,6 +22,7 @@ import mcpp.toolchain.hostflags;   // the compile-token producer the package std
 import mcpp.toolchain.cppfly;
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
+import mcpp.toolchain.model;      // is_msvc_target — the MSVC-ABI default (#718)
 import mcpp.toolchain.fingerprint;
 import mcpp.toolchain.registry;
 import mcpp.toolchain.linkmodel;
@@ -526,14 +527,53 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             .tests   = mcpp::build::image_loads_cxx_shared_library(
                 ctx.plan, mcpp::build::LinkUnit::TestBinary),
         };
+        // The MSVC-ABI whole-project default (#718, §7.3) — read the same way
+        // flags.cppm does, so the record this check reads and the flags a
+        // build actually emits cannot disagree about which contract an
+        // undeclared row resolved to.
+        const std::optional<dist::Contract> msvcAbiDefault =
+            mcpp::toolchain::is_msvc_target(*state.tc)
+                ? std::optional(dist::msvc_abi_default_contract(
+                      mcpp::toolchain::msvc_wants_static_crt(
+                          bc.linkage, bc.cxxRuntime),
+                      !state.tc->msvcRedistDir.empty()))
+                : std::nullopt;
         const auto contracts = dist::role_contracts(
             dist::ContractStatement{
                 .cxxRuntime       = bc.cxxRuntime,
                 .cxxRuntimeTests  = bc.cxxRuntimeTests,
                 .cxxRuntimeShared = bc.cxxRuntimeShared,
                 .staticStdlib     = bc.staticStdlib,
+                .msvcAbiDefault   = msvcAbiDefault,
             },
             format, load);
+        // A ROW WITHOUT A REDISTRIBUTABLE DIRECTORY CANNOT DELIVER AN
+        // EXPLICIT `toolchain-coupled`, AND SAYS SO BEFORE COMPILING.
+        //
+        // The undeclared case is silent (`msvc_abi_default_contract` already
+        // resolved it to host-coupled above); an explicit statement that
+        // cannot be met is an error, never a downgrade with a warning — the
+        // same rule `mcpp pack`'s mode contradiction follows.
+        if (mcpp::toolchain::is_msvc_target(*state.tc)
+            && state.tc->msvcRedistDir.empty()) {
+            struct { dist::Contract c; bool stated; std::string_view role; } rows[] = {
+                {contracts.program, contracts.programStated, "distributable"},
+                {contracts.tests,   contracts.testsStated,   "test"},
+                {contracts.shared,  contracts.sharedStated,  "shared-library"},
+            };
+            for (auto const& r : rows) {
+                if (r.c != dist::Contract::ToolchainCoupled || !r.stated) continue;
+                refusal::record(refusal::Code::MsvcRedistUnavailable);
+                return std::unexpected(std::format(
+                    "cxx_runtime = \"toolchain-coupled\" cannot be delivered "
+                    "for the {} target: this MSVC toolset carries no "
+                    "VC\\Redist\\MSVC directory to stage vcruntime140.dll / "
+                    "msvcp140.dll from.\n"
+                    "       Use cxx_runtime = \"host-coupled\", or a toolset "
+                    "that ships its redistributable.",
+                    r.role));
+            }
+        }
         // F3a. A stated self-contained program over a coupled C++ shared
         // library of this build: the program would carry a static C++ runtime
         // and the library would load a shared one. The unstated case needs no

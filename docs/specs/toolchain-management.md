@@ -119,6 +119,23 @@ MSVC ABI 目标上:SDK 以 `ucrt@<版本>` 进入运行时身份;clang 行的 to
 描述产物的属性(最低系统版本、三元组中的版本段)**必须**按目标判定,与宿主无关;
 只有在宿主上执行的编译(build.mcpp)按宿主判定。macOS 的 deployment target 在任何宿主上都按目标解析与施加。
 
+### 3.7 MSVC ABI 目标的 CRT 模型 已实现
+
+在 `*-windows-msvc` 目标上,CRT 模型(静态或动态)是目标 ABI 的属性,而非某一个编译器的属性:
+`cl.exe` 与以该 ABI 为目标的 clang 行**必须**接收同一个模型,分别以各自驱动的拼写(`/MT`/`/MD`,
+`-fms-runtime-lib=static`/`=dll`)发给编译单元、`std`/`std.compat` BMI 与链接命令。
+
+- 未声明的契约在该 ABI 上,对每个角色都**必须**解析为 `toolchain-coupled`:动态 CRT,并将所选
+  toolset 自带的 `vcruntime140.dll`/`msvcp140.dll` 等文件置于产物旁。
+- `self-contained`,或 `linkage = "static"`,**必须**解析为静态 CRT。
+- `host-coupled` **必须**解析为动态 CRT,且不放置文件。
+- 所选 toolset 不带 `VC\Redist\MSVC\<版本>\<架构>\Microsoft.VC*.CRT` 目录时,未声明的契约**必须**
+  静默解析为 `host-coupled`;显式声明的 `toolchain-coupled` **必须**被拒绝,并指出缺失的目录——
+  这是行的一个属性,不因某一次构建而降级。
+- `[build] cxxflags` 或 `dialect_cxxflags` 中出现的自由拼写 CRT 词(`/MT`、`/MD`、`-fms-runtime-lib=*`
+  等)与已解析的模型一致时**应当**被警告为冗余;不一致时**必须**被拒绝,消息**必须**指出该词、
+  所在的键与该词对应的值。
+
 ---
 
 ## 4. 载荷契约
