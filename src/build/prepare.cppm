@@ -2396,6 +2396,10 @@ constexpr std::string_view kCurrentPlatform = mcpp::platform::name;
 namespace prov = mcpp::build::provisions;
 namespace dg = mcpp::build::dep_graph;
 
+// Sentinel for "the consumer is the main package" (no dep_manifests entry).
+// A pure constant; used by both halves of the P4 split (graph_load, graph).
+constexpr std::size_t kMainConsumer = static_cast<std::size_t>(-1);
+
     struct DepCacheIdentity {
         std::string indexName;
         std::string packageName;
@@ -10698,7 +10702,7 @@ static std::expected<void, std::string> phase3_xlings_before_graph(PrepareState&
     return {};
 }
 
-static std::expected<void, std::string> phase4_dependency_graph(PrepareState& state) {
+static std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
     // The features each package ends up built with, index-aligned with
     // `packages`. Recorded at activation because the passes that run after it
     // — `[feature-xlings]` provisioning among them — otherwise have no way to
@@ -10784,7 +10788,6 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
 
 
     // Sentinel for "the consumer is the main package" (no dep_manifests entry).
-    constexpr std::size_t kMainConsumer = static_cast<std::size_t>(-1);
 
     // #634, A2. A `path` or `git` dependency's identity is the one its manifest
     // declares (SPEC-001 §1.2), and the key a consumer wrote is one way of
@@ -11757,6 +11760,10 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
 
         return std::pair{effRoot, std::move(*manifest)};
     };
+    return {};
+}
+
+static std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
 
     // #634, X: every request that reached a package, as the requester wrote
     // it, for the `graph` section of resolution.json. Kept apart from
@@ -14001,6 +14008,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
 
     return {};
 }
+
 
 static std::expected<void, std::string> phase5_toolchain_after_graph(PrepareState& state) {
 
@@ -16360,7 +16368,8 @@ prepare_build(bool print_fingerprint,
     if (auto r = phase1_toolchain_spec_and_axes(state); !r) return std::unexpected(r.error());
     if (auto r = phase2_define_toolchain_resolver(state); !r) return std::unexpected(r.error());
     if (auto r = phase3_xlings_before_graph(state); !r) return std::unexpected(r.error());
-    if (auto r = phase4_dependency_graph(state); !r) return std::unexpected(r.error());
+    if (auto r = phase4a_graph_load(state); !r) return std::unexpected(r.error());
+    if (auto r = phase4b_graph_worklist(state); !r) return std::unexpected(r.error());
     if (auto r = phase5_toolchain_after_graph(state); !r) return std::unexpected(r.error());
     if (auto r = phase6_features_and_host_tools(state); !r) return std::unexpected(r.error());
     if (auto r = phase9_target_side_and_scan(state); !r) return std::unexpected(r.error());
