@@ -1357,3 +1357,38 @@ question in the round.
 | 6 | #727's own change moved `mcpp.toml` to 2026.9.27.2 but not `MCPP_VERSION`, which failed four CI jobs | The round moves both places together; the release is 2026.9.28.1 | §9.3 |
 | 7 | xlings's `update` CLI and `interface update_packages` are one function (`xim::cmd_update`) | Routing the refresh through the interface changes no behaviour of the refresh itself | §9.1 |
 | 8 | Windows CI's e2e default row is the LLVM row: e2e 703 asserts rather than skips | e2e 814's skip branch for other rows is a safety net, not the path CI takes | §7.3 |
+
+### 13.6 Global review and the first CI run (revision 5)
+
+Three read-only reviews covered the whole change from three angles
+(specification and architecture; stability and cross-platform; compatibility,
+user experience and simplicity). The first CI run of the integrated branch
+covered every platform. The table lists what each found and what changed.
+
+| # | Source | Finding | Change |
+|---|---|---|---|
+| 1 | CI, Windows | e2e 190 and 191 relinked `bin/<first file>`; on an MSVC-ABI row `bin/` also holds the staged redistributable DLLs (§7), so the first file was a DLL and no response file was written | the tests select the program by name |
+| 2 | CI, Windows | e2e 811: the plan-time scan of runtime search directories added the dependency's `libmathkit.dll` as a second source of the declared deploy, and `mcpp stage` refused the two different files | a DLL a search directory offers yields to a declared destination (SPEC-007 R4.3); the difference is warned at planning, because a successful build discards edge output; e2e 818 carries 811's case on Linux through the mingw cross toolchain |
+| 3 | CI, Linux (GCC) | e2e 807: a `build.mcpp` that imports only a build rule compiled in the project root and could not find the rule's BMI in `gcm.cache`. The defect predates the round; the fixture is the first to reach it on GCC | a build program that imports any module compiles in the build directory |
+| 4 | CI, Linux | e2e 205: W5 wrote the runtime-environment half of `.xlings.json` at `workRoot`, which for a workspace member is not the runtime's owner | two roots again; only `plan_only` redirects the owner's half to the planning directory |
+| 5 | Specification review | `ide.generated` file records went to the bare package set only, so a test set whose unit includes a generated header carried none | every set of the package names the outputs (R3.12 states it) |
+| 6 | Stability review | `check_crt_word` read the root's `cxxflags` only; a dependency's word reaches its own units after the graph's | every package's `cxxflags` is checked; a dependency's agreeing word is not warned, because the replacing key is the root's |
+| 7 | Compatibility review | `/MDd` and `/MTd` were bucketed with `/MD` and `/MT`, so an agreeing debug word was called redundant | a debug CRT word is refused: the model has no debug axis, and the std module and the link use the release CRT |
+| 8 | Compatibility review | the dependency cache key had no CRT axis; switching `cxx_runtime` within one release could be served objects of the other model | the key carries the CRT word from the helper the flag builder uses |
+| 9 | Stability review | deploy destinations compared case-sensitively on PE | `DeployFile::is_destination` folds case on a PE target, used by both deploy comparisons |
+| 10 | Stability review | an index refresh that failed mid-run drew its bar as done | the renderer finishes the open bar as not completed; an automatic refresh that exhausts its retries warns |
+| 11 | Compatibility review | the floor tip named neither the version nor the install-aware upgrade | the guard records each refreshed tree's `min_mcpp`; one helper gives the advice E0006 gives |
+| 12 | Stability and compatibility reviews | `-p` compared member paths as strings; the help omitted the qualified form; the newest redistributable was picked by string order; a missing deploy source read as a disagreement | each corrected, with a unit test |
+
+**Not changed, with the reason.** The second NDJSON `download_progress` parser
+predates the round (the round only extracted it into one helper for the two
+xlings-side readers); unifying it with the fetcher's is a refactor across a
+module boundary that the round does not need. A UNC `MCPP_HOME` fails loudly under
+`cd /d`, which is the correct shape for an unsupported home, not a silent one.
+
+**The method's blind spot.** The differential run of §13.5 item 3 compared the
+fresh binary with the released one in one environment. e2e 205 and 807 failed
+there on both binaries, for reasons of the environment (an unset `MCPP_HOME`;
+the machine's default toolchain), so the differential read them as unchanged.
+A test that fails on both sides measures nothing about the change; its reading
+has to come from an environment in which it passes, which here is CI.
