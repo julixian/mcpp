@@ -1341,3 +1341,19 @@ from beginning to end. The pass checked three things:
 - **Criteria.** Every step W1 to W6 and W8 to W12 now has a criterion that fails
   on 2026.9.27.1. W7's failing criterion is its parsed size gate.
 - **Routing.** No step moved between homes in this pass.
+
+### 13.5 Readings during implementation (revision 4)
+
+Each reading below corrected the design or the implementation; none left an open
+question in the round.
+
+| # | Reading | Consequence | Where |
+|---|---|---|---|
+| 1 | The stray `[1/7] awesome::xim.lua` text on xlings's NDJSON stream comes neither from xlings's code nor from libxpkg's. It comes from the `pkgindex-build.lua` script that ships inside an index repository, which libxpkg runs with the real `io` library | xlings captures fd 1 around every interface capability (`platform::StdoutCapture`) and turns a recognised `[i/n]` line into a `progress` event; the fix does not depend on the one script (openxlings/xlings#625) | §9.1 |
+| 2 | The refresh's `progress` events are per repository (`index_sync`) and per descriptor file (`index_rebuild`) | mcpp draws one bar per phase, and one per repository for a sync, so that output off a terminal is a few lines, not one per file | §9.1 |
+| 3 | A differential run of the Linux e2e suite, fresh binary against 2026.9.27.1 under the same environment, found one regression: e2e 797 re-ran the DLL placement on every build after the first | The plan's deploy set reads runtime search directories that a `prepare` action fills, so it differs between the first plan and the second. W6's first form wrote the deploy names into the `place-dlls` command, which then changed. `place-dlls` now reads the other writer's DLLs from the directory at run time, and its command is the one 2026.9.27.1 wrote | §5.2 |
+| 4 | SPEC-005 R5.2 allows a failed member exactly one error diagnostic | W4 folds the notes recorded before a phase failure into that one diagnostic's message instead of adding diagnostics | §4.2 |
+| 5 | Matching `[target.<selector>]` tables merge in the lexical order of the selector text, not in manifest order. The TOML table carries no key order, so SPEC-004's "manifest order" cannot be implemented by a conforming reader | Out of this round: SPEC-004 §3.1.1 is marked partially implemented and mcpp#728 tracks the rule | §6.2 |
+| 6 | #727's own change moved `mcpp.toml` to 2026.9.27.2 but not `MCPP_VERSION`, which failed four CI jobs | The round moves both places together; the release is 2026.9.28.1 | §9.3 |
+| 7 | xlings's `update` CLI and `interface update_packages` are one function (`xim::cmd_update`) | Routing the refresh through the interface changes no behaviour of the refresh itself | §9.1 |
+| 8 | Windows CI's e2e default row is the LLVM row: e2e 703 asserts rather than skips | e2e 814's skip branch for other rows is a safety net, not the path CI takes | §7.3 |
