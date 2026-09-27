@@ -538,4 +538,79 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state);
 std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state);
 std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& state);
 
+// ── Helpers the phases share, defined in the files named below ─────────────
+
+// config.cpp: manifest conditional merges, build flags and defines, workspace inheritance, feature requests, std-module detection
+void warn_unknown_xpkg_keys(const mcpp::manifest::Manifest& dm,
+                                   std::string_view depLabel);
+std::expected<void, std::string>
+materialize_generated_files(const std::filesystem::path& root,
+                            const mcpp::manifest::Manifest& manifest,
+                            std::vector<std::filesystem::path>* stale = nullptr);
+bool same_dependency_identity(const mcpp::manifest::DependencySpec& a,
+                              const mcpp::manifest::DependencySpec& b);
+void replace_dependencies(
+    std::map<std::string, mcpp::manifest::DependencySpec>& into,
+    const std::map<std::string, mcpp::manifest::DependencySpec>& from);
+std::vector<std::pair<std::string, std::string>>& pending_flag_words_notes();
+void report_flag_words_changes(const mcpp::manifest::Manifest& m);
+std::optional<std::string>
+inherit_as_workspace_member(mcpp::manifest::Manifest& member,
+                            const mcpp::manifest::Manifest& workspace,
+                            const std::filesystem::path& workspaceRoot,
+                            const std::filesystem::path& memberDir);
+std::optional<std::pair<mcpp::manifest::Manifest, std::filesystem::path>>
+workspace_listing(const std::filesystem::path& memberDir,
+                  const std::filesystem::path& bound);
+bool merge_layer_conditional_config(mcpp::manifest::Manifest& m,
+                                    const cfgpred::Ctx& ctx);
+std::vector<std::string> feature_closure(const mcpp::manifest::Manifest& pm,
+                                         const std::vector<std::string>& requested,
+                                         bool seedDefault = true);
+bool is_std_module(std::string_view name);
+bool graph_or_targets_import_std(const mcpp::modgraph::Graph& graph,
+                                 const mcpp::manifest::Manifest& manifest,
+                                 const std::filesystem::path& projectRoot);
+
+// toolchain_env.cpp: target rows, sysroots, the MSVC binding, build-program environments
+const mcpp::manifest::TargetEntry*
+find_target_entry(const mcpp::manifest::Manifest& m,
+                  const mcpp::toolchain::triple::Triple& t);
+const std::string*
+sysroot_override(const mcpp::manifest::Manifest& m,
+                 const mcpp::toolchain::triple::Triple& t);
+std::expected<void, std::string>
+bind_msvc_sysroot(mcpp::toolchain::Toolchain& tc,
+                  const mcpp::manifest::Manifest& m,
+                  const std::function<std::expected<mcpp::config::GlobalConfig*,
+                                                    std::string>()>& cfgOf);
+std::expected<void, std::string>
+check_cl_row_sysroot(const mcpp::toolchain::Toolchain& tc,
+                     const mcpp::manifest::Manifest& m);
+void fill_package_build_env(mcpp::build::BuildProgramEnv& e,
+                            const mcpp::manifest::Manifest& m);
+void fill_target_build_env(mcpp::build::BuildProgramEnv& e,
+                           const mcpp::manifest::Manifest& m,
+                           const mcpp::toolchain::Toolchain* tc,
+                           const mcpp::config::GlobalConfig* cfg);
+std::string min_platform_version(const mcpp::manifest::Manifest& m,
+                                 const mcpp::toolchain::triple::Triple& t,
+                                 const std::filesystem::path& compilerPath);
+
+// fetch.cpp: git remotes, network retries, xlings addresses and their provisioning
+std::string git_cache_head(const std::filesystem::path& gitRoot);
+mcpp::platform::process::RunResult run_with_network_retry(
+        std::string_view command,
+        const std::function<void()>& between = {});
+std::vector<std::string>
+applicable_xlings_addresses(const mcpp::manifest::Manifest& man,
+                            const std::vector<std::string>& activeFeatures,
+                            ToolPurpose purpose, bool isRoot);
+std::expected<void, std::string>
+provision_xlings_addresses(const mcpp::config::GlobalConfig& cfg,
+                           const std::vector<std::string>& declaredDeps,
+                           const std::filesystem::path& legacyStampRoot,
+                           std::string_view label);
+std::string with_index_cause(std::string msg);
+
 } // namespace mcpp::build
