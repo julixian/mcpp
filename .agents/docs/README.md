@@ -18,7 +18,7 @@ superseded_by: 2026-09-07-....md  # when status is superseded
 ---
 ```
 
-311 records.
+313 records.
 
 ## By subject
 
@@ -56,6 +56,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### plan
 
+- [Eight reports after 2026.9.27.1: implementation plan](2026-09-27-eight-reports-implementation-plan.md) — active
 - [#690: implementation plan](2026-09-25-issue-690-implementation-plan.md) — landed
 - [工具链选择与载荷可信度：实施计划](2026-09-24-toolchain-selection-implementation-plan.md) — landed
 - [openkal 生态：完整性收尾与验收方案](2026-09-21-openkal-ecosystem-completion-and-acceptance.md) — active
@@ -82,6 +83,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### triage
 
+- [Eight reports after 2026.9.27.1: what each one is, where it belongs, and one optimisation plan](2026-09-27-eight-reports-by-home-and-one-optimisation-plan.md) — active
 - [#685、#687 与 Windows clang 的 MSVC STL：三个问题的归属，以及工具链载荷的规范化](2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md) — landed
 - [运行时绑定方案 v3:让 mcpp 真正安装它所声明的运行时](2026-09-17-runtime-binding-multi-repo-plan.md) — landed
 - [#662:目标侧由依赖图提供时，编译器的隐式头文件搜索仍指向宿主](2026-09-17-issue-662-graph-target-header-isolation-plan.md) — active
@@ -102,6 +104,8 @@ Records that declare one. Everything else is listed by date below.
 
 ### 2026-09
 
+- [Eight reports after 2026.9.27.1: implementation plan](2026-09-27-eight-reports-implementation-plan.md) — active
+- [Eight reports after 2026.9.27.1: what each one is, where it belongs, and one optimisation plan](2026-09-27-eight-reports-by-home-and-one-optimisation-plan.md) — active
 - [The compile database, `emit build-database`, and #701/#702: triage against the specifications, and one design](2026-09-26-compile-database-and-issue-699-design.md) — landed
 - [Issues #693 to #696: triage against mcpp's contracts, and one repair plan](2026-09-25-issues-693-696-triage-and-repair-plan.md) — landed
 - [Workspace inheritance, flag scoping and the published form: a unified repair plan (#690)](2026-09-25-issue-690-workspace-build-inheritance-consistency.md) — landed
