@@ -11,7 +11,13 @@
 #   A. the command sees the variable, and runs in the package-relative
 #      directory `cwd` names;
 #   B. the declared output lands where it was declared, not under `cwd`;
-#   C. changing the variable's value re-runs the action.
+#   C. changing the variable's value re-runs the action;
+#   D. a directory the engine prepends to PATH (`--path-prepend`, which every
+#      action of an MSVC-ABI build receives since 2026.9.28.2, the 2026-09-28
+#      design D3) goes before the PATH the action declares with `env`, and
+#      before the inherited PATH when it declares none. The graph half, that
+#      the flag is emitted, is unit-tested (NinjaBackendPeRuntime); this is
+#      the wrapper's half, where it meets R3.8.
 set -e
 
 TMP=$(mktemp -d)
@@ -68,5 +74,23 @@ write_program goodbye
 [[ "$(sed -n 1p "$(probe)")" == "goodbye" ]] || {
     cat "$(probe)"; echo "FAIL: C: a changed value did not re-run the action"; exit 1; }
 echo "ok: C"
+
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        # The separator is ';' there, and an msys shell rewrites PATH on entry.
+        echo "ok: D not read on this host; the graph half is unit-tested" ;;
+    *)
+        "$MCPP" __action --env PATH=/declared/bin --path-prepend /first/bin \
+            -- /bin/sh -c 'printf "%s" "$PATH" > "$1"' sh "$TMP/d1.txt" \
+            || { echo "FAIL: D: the wrapper failed"; exit 1; }
+        [[ "$(cat "$TMP/d1.txt")" == "/first/bin:/declared/bin" ]] || {
+            echo "FAIL: D: with a declared PATH the command saw '$(cat "$TMP/d1.txt")'"; exit 1; }
+        "$MCPP" __action --path-prepend /first/bin \
+            -- /bin/sh -c 'printf "%s" "$PATH" > "$1"' sh "$TMP/d2.txt" \
+            || { echo "FAIL: D: the wrapper failed"; exit 1; }
+        [[ "$(cat "$TMP/d2.txt")" == "/first/bin:$PATH" ]] || {
+            echo "FAIL: D: without a declared PATH the command saw '$(cat "$TMP/d2.txt")'"; exit 1; }
+        echo "ok: D" ;;
+esac
 
 echo "PASS: 799_an_action_runs_with_its_env_and_cwd"
