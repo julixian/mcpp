@@ -2390,6 +2390,124 @@ namespace {
 // `tcSpecSource` included) can just name it.
 constexpr std::string_view kCurrentPlatform = mcpp::platform::name;
 
+// Namespace aliases used across several phases (P4's own declarations and
+// P7/P9's reuse of its helpers); hoisted here so every phase function sees
+// them under the short spelling instead of each repeating the full path.
+namespace prov = mcpp::build::provisions;
+namespace dg = mcpp::build::dep_graph;
+
+    struct DepCacheIdentity {
+        std::string indexName;
+        std::string packageName;
+        std::string version;
+        // "version" | "path" | "git". Only "version" is cacheable: an index
+        // package's payload lives in the immutable xpkgs store under a
+        // version-keyed directory, so name@version identifies its sources.
+        // Path and git checkouts can change under an unchanged identity.
+        std::string sourceKind;
+        // What identifies the SOURCES when the version does not: the resolved
+        // commit for `git`, the package root for `path`, empty for an index
+        // package. Read by the tool store, whose key must hold everything
+        // that can change a built tool's bytes (#630, item 6).
+        std::string sourceRef;
+    };
+
+    struct GitLockIdentity {
+        std::string source;
+        std::string hash;
+    };
+
+    struct DependencyEdge {
+        std::size_t consumerPackageIndex = 0;
+        std::size_t dependencyPackageIndex = 0;
+        mcpp::modgraph::DependencyVisibility visibility =
+            mcpp::modgraph::DependencyVisibility::Public;
+        // #242/#243: the per-edge feature request that THIS consumer made of
+        // THIS dependency. Feature activation must consume these off the edge
+        // graph (union over all incoming edges) rather than re-scanning only
+        // the root manifest's direct deps — otherwise a transitive dep's
+        // requested features and its consumer's `default-features = false` are
+        // silently dropped (resolution honors them per-edge; activation did not).
+        std::vector<std::string> requestedFeatures;
+        bool defaultFeatures = true;
+        // #355: HOST tools this consumer asked the dependency for. Aggregated
+        // off the edge graph exactly like requestedFeatures — a transitive
+        // consumer's request must not be silently dropped, which is the
+        // #242/#243 failure shape.
+        std::vector<std::string> requestedTools;
+        // mcpp#711: the dependency's programs this consumer ships, built in
+        // THIS plan for its target. A package asked for them is scanned and
+        // configured here even when every target it declares is a program.
+        std::vector<std::string> requestedArtifacts;
+        // #355 step 5 / #359: does this edge ask for the dependency's lib-root
+        // interface as a HOST module, and does it hand its build-time
+        // provisions on to this consumer's own consumers?
+        bool hostModule = false;
+        bool reexport = false;
+        // Did this edge come from `[build-dependencies]`? Such an edge serves
+        // the BUILD and never the target, and the property is inherited by
+        // everything reachable through it. It is a property of the edge and
+        // not of the package: the same package may be an ordinary dependency
+        // of someone else in the same build, and then it does reach the
+        // target.
+        bool buildOnly = false;
+    };
+
+    struct GraphRequest {
+        std::size_t consumerPackageIndex = 0;
+        std::size_t dependencyPackageIndex = 0;
+        std::string key;        // the dependency key as the requester wrote it
+        std::string table;      // `DependencySpec::declaredIn`
+    };
+
+    struct DependencyLinkForm {
+        mcpp::build::linkage_form::PackageFacts facts;
+        mcpp::build::linkage_form::Resolution   answer;
+        // The package has a library form to report: a package of programs or
+        // rules has none, and is neither recorded nor offered to a program.
+        bool recorded = false;
+    };
+
+    struct ResolvedKey {
+        std::string ns;
+        std::string shortName;
+        auto operator<=>(const ResolvedKey&) const = default;
+    };
+
+    struct ResolvedRecord {
+        std::string version;            // empty for path/git deps
+        std::string constraint;         // AND-combined original constraints (version src only)
+        std::string requestedBy;        // human-readable for error messages
+        std::string source;             // "version" | "path" | "git" — for type-clash check
+        // The declaration's identity beyond `source`, so a SECOND declaration
+        // of the same (ns, name) can be compared for "the same reference"
+        // rather than merely "the same kind". `git`: "<url>#<refKind>=<ref>",
+        // from the DECLARED ref (never the resolved commit — comparing two
+        // branch names must not need a network round trip to decide whether
+        // they conflict). `path`: the canonical absolute directory. `version`:
+        // the original constraint string ("*" for none). See the
+        // `dependency/source-override` decision at the resolve hit (2026-09-13
+        // #630 record, §2.2).
+        std::string sourceRef;
+        // True when this record's declaration came from the root manifest's
+        // own [dependencies]/[dev-dependencies]/[build-dependencies]
+        // (`item.consumerDepIndex == kMainConsumer` at the time the record
+        // was created). Bounds the root's privilege to override a
+        // conflicting declaration of the SAME identity the way
+        // `DependencySpec::linkage` is honoured only on the root's own
+        // edges — see dep_spec.cppm.
+        bool        fromRoot = false;
+        // Reached ONLY through [dev-dependencies]. mcpp.lock excludes these:
+        // dev-deps are resolved under `mcpp test` and not under `mcpp build`, so
+        // recording them makes a VCS-committed file depend on which command ran
+        // last and ping-pong between the two. The lock must be a function of the
+        // MANIFEST, not of the command. Cleared the moment a non-dev consumer
+        // asks for the same package.
+        bool        devOnly = false;
+        std::size_t depIndex = 0;       // index into dep_manifests/packages-1 (for in-place re-fetch)
+        std::vector<std::string> linkFlagsAdded;  // entries appended to m->buildConfig.ldflags by this dep
+    };
+
 struct PrepareState {
     PrepareState(bool print_fingerprint_, bool includeDevDeps_,
                  std::vector<mcpp::manifest::Target> extraTargets_,
@@ -2497,6 +2615,67 @@ struct PrepareState {
     // reference, not because ownership is in question -- it always aliases
     // either wsManifest or m, both of which outlive every phase.
     const mcpp::manifest::Manifest* runtimeOwnerManifest = nullptr;
+
+    // ── P4: the dependency graph ─────────────────────────────────────────────
+    // Escaping closures called again from P6/P7/P13 (fillXpkgDirs,
+    // fillDepDirs, adoptActionOutputs, markDirectiveTail, computeUsageRequirements,
+    // graph_xlings_split), plus the closures THEY call that are themselves
+    // referenced by reference from inside those (compilesHere,
+    // bareBindingsFor, isProgramOnlyPackage, isArtifactPackage,
+    // publishedNamesFor, appendUniqueFlags, appendUniquePaths,
+    // appendUniquePath): every one of the latter is a local lambda that would
+    // otherwise be captured by reference into one of the former and dangle
+    // the moment that former's phase returns, which the compiler cannot
+    // detect (nothing outside the escaping closure's own body names them).
+    std::vector<mcpp::modgraph::PackageRoot> packages;
+    std::vector<std::vector<std::string>> activeFeaturesByPackage;
+    std::map<std::string, std::string> xlingsWinner;
+    std::vector<std::unique_ptr<mcpp::manifest::Manifest>> dep_manifests;
+    std::vector<DepCacheIdentity> dep_cache_identities;
+    std::map<std::string, GitLockIdentity> root_git_lock_identities;
+    std::vector<DependencyEdge> dependencyEdges;
+    std::vector<GraphRequest> graphRequests;
+    std::map<std::size_t, DependencyLinkForm> dependencyLinkForms;
+    std::map<std::size_t, std::vector<std::size_t>> hostModuleProvidersByConsumer;
+    std::string runnerProvider;
+    std::map<std::string, std::string> namedRunnerProvider;
+    std::vector<std::string> rootReq;
+    mcpp::build::provisions::Propagation provisionGraph;
+
+    std::function<std::expected<
+        std::pair<std::vector<std::string>, std::vector<std::string>>,
+        std::string>()> graph_xlings_split;
+    std::function<void()> computeUsageRequirements;
+    std::function<void(mcpp::manifest::Manifest&, const std::filesystem::path&,
+                        std::size_t)> adoptActionOutputs;
+    std::function<void(mcpp::build::BuildProgramEnv&, const mcpp::manifest::Manifest&,
+                        std::size_t)> fillXpkgDirs;
+    std::function<void(mcpp::build::BuildProgramEnv&, std::size_t,
+                        const std::map<std::size_t, std::string>*)> fillDepDirs;
+    std::function<mcpp::build::directives::Mark(const mcpp::manifest::Manifest&)>
+        markDirectiveTail;
+    std::function<std::map<std::string, mcpp::build::provisions::BareBinding>(std::size_t)>
+        bareBindingsFor;
+    std::function<bool(std::size_t)> compilesHere;
+    std::function<bool(const mcpp::manifest::Manifest&)> isProgramOnlyPackage;
+    std::function<bool(std::vector<std::string>&, const std::vector<std::string>&)>
+        appendUniqueFlags;
+    std::function<bool(std::vector<std::filesystem::path>&,
+                        const std::vector<std::filesystem::path>&)> appendUniquePaths;
+    std::function<bool(std::vector<std::filesystem::path>&, const std::filesystem::path&)>
+        appendUniquePath;
+    std::function<bool(std::size_t)> isArtifactPackage;
+    std::function<std::vector<std::string>(std::size_t,
+        const std::map<std::string, mcpp::build::provisions::BareBinding>&)>
+        publishedNamesFor;
+    std::map<ResolvedKey, ResolvedRecord> resolved;
+    std::map<std::size_t, std::vector<std::pair<std::string, std::string>>>
+        toolEnvByConsumer;
+    std::map<std::size_t, std::vector<mcpp::build::BuildProgramEnv::HostModuleRef>>
+        hostModulesByConsumer;
+    std::function<void(mcpp::modgraph::PackageRoot&, const mcpp::manifest::Manifest&,
+                        const mcpp::build::directives::Mark&)>
+        foldDirectiveTailIntoPrivateBuild;
 };
 } // namespace
 
@@ -5055,491 +5234,12 @@ static std::expected<void, std::string> phase3_xlings_before_graph(PrepareState&
     return {};
 }
 
-export std::expected<BuildContext, std::string>
-
-prepare_build(bool print_fingerprint,
-              bool includeDevDeps = false,
-              std::vector<mcpp::manifest::Target> extraTargets = {},
-              BuildOverrides overrides = {}) {
-    PrepareState state(print_fingerprint, includeDevDeps,
-                        std::move(extraTargets), std::move(overrides));
-    pending_flag_words_notes().clear();
-
-    // A refusal decided early and released late. `host_can_serve` answers
-    // "does a payload on this machine produce this target", which is knowable
-    // before dependency resolution and is only half the question: a package in
-    // the graph can supply the target's system, and the graph is not known
-    // here. Held until it is, and released only if nothing supplies it.
-
-    // THE LOCATED APPLE SDK, RESOLVED ONCE AND READ ONCE.
-    //
-    // `xcrun` is a process. Calling it at the refusal below and again where
-    // the answer is stored would be two calls whose answers can differ -- the
-    // developer directory can be switched between them -- and this repository
-    // has a standing rule that a value crossing two sites is resolved at one.
-    // The iOS floor was not written and was taken from the located SDK. The
-    // refusal of a dependency's platform floor names where the value came
-    // from, and after the fill below the manifest no longer says.
-    state.iosFloorFromSdk = false;
-    // Non-empty when a target row's convention replaced a toolchain the user
-    // had set with `mcpp toolchain default`. Reported on the status line,
-    // because a substitution nobody is told about is a rule that can only be
-    // learned by experiment — writing the same value a second time in
-    // `[target.<triple>]` and observing that it works.
-    // THE HOST SPEC AS IT STOOD BEFORE A TARGET ROW'S CONVENTION REPLACED IT,
-    // whatever its origin. `build.mcpp` is compiled and run on this machine,
-    // so its compiler is a host fact; the row's pin is a target fact. Before
-    // this snapshot existed, `host_tc_for_build_program` read `tcSpec` after
-    // the row had overwritten it and resolved the row's payload "for the
-    // host" -- which works by accident for a payload whose compiler can also
-    // target the host (an NDK clang) and cannot work for one that cannot:
-    // `em++` produces WebAssembly under every invocation, and every project
-    // with a build program failed under `--target wasm32-emscripten` inside
-    // `emcc.py` (#622, measured by the dist-web member's first build).
-    //
-    // Empty when the row replaced nothing — no [toolchain], no global
-    // default, no [target.<row>] entry existed before the row's pin applied.
-    // THIS IS NOT "the row's pin remains the only spec there is": on a
-    // fresh $HOME whose first-ever invocation names a hosted `--target`
-    // (nothing to be "before"), that reading resolved the SAME payload the
-    // row just picked — `em++` again — as the host compiler, which is the
-    // exact defect this field exists to close, just with no prior value to
-    // restore. `host_tc_for_build_program` resolves the platform's own
-    // native default in that case instead (`native_first_run_spec()`), the
-    // same one a plain `mcpp build` would have installed.
-    // THE PACKAGE WHOSE `requires` CHOSE THE COMPILER, AND WHAT IT ASKED FOR.
-    //
-    // Non-empty only when the graph's requirement actually changed the answer.
-    // Reported on the status line for the same reason `pinReplacedDefault` is:
-    // a compiler the user did not name is a decision they did not make, and one
-    // reported without its reason is a rule learned by experiment.
-    // The C library the target triple asked for, taken before the triple is
-    // canonicalised. Empty when the project declined to name one.
-    // The target as the project spelled it, when that differs from the
-    // canonical identity. Report only; empty means they coincide.
-    // The target row's toolchain convention, held until the graph is known.
-    // Empty when the row names none or the project named its own.
-    // AND WHETHER THAT PIN IS A CONVENTION OR A CAPABILITY, RECORDED AT
-    // THE SAME READ.
-    //
-    // A hosted row's pin answers "which payload supplies this target's C
-    // library", so a graph that supplies one instead makes it inapplicable.
-    // A freestanding row's pin answers a different question — the table says
-    // so in its own words: "the pin is llvm on every host because clang/lld
-    // are cross-compilers by construction". A host g++ cannot emit
-    // riscv64-none-elf at all, and no dependency changes that.
-    //
-    // Taken here rather than re-derived at the decision point, because the row
-    // is read exactly once and both facts come out of that read.
-    state.targetPinIsCapability = false;
-    // THE ROW'S PIN, KEPT EVEN WHEN THE PROJECT NAMED ITS OWN COMPILER —
-    // which is exactly when `targetPinCandidate` above is left empty.
-    //
-    // The candidate answers "should mcpp apply its convention"; this answers
-    // "what does the convention SAY", and the two differ precisely in the case
-    // that needs a diagnosis: a project that overrode the convention and has
-    // nothing supplying what the convention was there to supply.
-    // Whether the resolved toolchain spec names the machine's own Visual
-    // Studio. Decided inside `resolve_target_toolchain`, read by
-    // `host_tc_for_build_program`, which is why it is declared out here.
-    state.tcSpecIsMsvc = false;
-
-    state.root = state.overrides.project_root.empty()
-        ? mcpp::project::find_manifest_root(std::filesystem::current_path())
-        : std::optional<std::filesystem::path>(state.overrides.project_root);
-    if (!state.root) {
-        return std::unexpected("no mcpp.toml found in current directory or any parent");
-    }
-    // THE PROJECT'S PATH IS PART OF EVERY DOCUMENT A BUILD WRITES, and those
-    // documents are UTF-8 text (build.ninja, compile_commands.json). A
-    // directory whose path has no UTF-8 spelling used to fail the first build
-    // with `internal: unhandled exception: [json.exception.type_error.316]`
-    // (#693, measured on Linux with a Latin-1 name and on a Windows code page
-    // 1252 host with a name that page can spell). It is refused here, by name.
-    if (!mcpp::modgraph::try_narrow(*state.root)) {
-        return std::unexpected(std::format(
-            "the project directory '{}' has no UTF-8 spelling.\n"
-            "       {}\n"
-            "       Every file a build writes names this directory in UTF-8; "
-            "rename or move it.",
-            mcpp::modgraph::escaped_spelling(*state.root),
-            mcpp::modgraph::no_utf8_spelling_reason()));
-    }
-    // NOTE: `workRoot` is deliberately NOT derived here. `root` is not final
-    // yet — the workspace block below reassigns it to the selected member
-    // (`root = memberDir`), and anchoring the write root to the pre-switch
-    // value puts a member's target/, mcpp.lock and .mcpp/ at the WORKSPACE
-    // root. See the derivation right after that block.
-
-    // A registry package in `compat` form (Form B) ships NO mcpp.toml — its
-    // manifest is synthesized from the `.lua` descriptor by the resolver. So a
-    // nested build of such a package cannot re-read one off disk, and the
-    // caller hands over the manifest it already synthesized instead.
-    //
-    // Passing it in rather than re-deriving it is also the more correct of the
-    // two: re-deriving could produce a DIFFERENT manifest than the one the
-    // parent resolved against (the L1 cfg merge and feature-activated deps
-    // have already been folded in by then).
-    // THE EFFECTIVE MANIFEST, FROM THE ONE LOADER EVERY COMMAND USES.
-    //
-    // A command issued inside a member directory receives the member's
-    // manifest after workspace inheritance, exactly as `publish`, `pack`,
-    // `emit xpkg` and `toolchain list` do (#690, W4). A command at the
-    // workspace root receives the root manifest as written; the `-p <member>`
-    // switch below loads and inherits the member it names.
-    //
-    // A PRELOADED manifest (a host-tool sub-build) is already effective: the
-    // resolver loaded it at the dependency's load site, where a member
-    // inherits (see `inherit_as_workspace_member`). It is not inherited a second time; the
-    // workspace it belongs to is still recorded below, so that its own sibling
-    // dependencies inherit as members.
-    state.m =
-        std::unexpected(std::string{});
-    if (state.overrides.preloaded_manifest) {
-        state.m = *state.overrides.preloaded_manifest;
-    } else {
-        auto loaded = mcpp::project::load_effective_manifest(*state.root);
-        if (!loaded) return std::unexpected(loaded.error());
-        state.m = loaded->manifest;
-        state.effective = std::move(*loaded);
-    }
-
-    // AND ONLY FOR THE ROOT. A layer name this engine does not know is a
-    // typo in the manifest the author is looking at, and a version gap in a
-    // dependency's. The reserved `mcpp:` prefix exists so the first is an error
-    // rather than a silently disabled behaviour; refusing the second as well
-    // meant the layer vocabulary could never be extended by a published package
-    // (`warn_unknown_xpkg_keys` carries that half).
-    if (!state.m->unknownCapabilities.empty()) {
-        auto const& cap = state.m->unknownCapabilities.front();
-        auto why = mcpp::targetside::parse_capability(cap);
-        return std::unexpected(std::format(
-            "{}: {}", (*state.root / "mcpp.toml").string(),
-            why ? std::format("`{}` names no capability mcpp knows.", cap)
-                : why.error()));
-    }
-
-    // A DISTRIBUTION package is not a source tree, and building "in" one is a
-    // failure that looks like a success: `interface/` holds declarations whose
-    // definitions are in the prebuilt archive, so the build compiles the
-    // declarations, produces a near-empty library, links nothing, and reports
-    // Finished. The archive it was supposed to carry never enters the picture.
-    //
-    // Only the ROOT is refused. As a dependency this is exactly what the
-    // package is for — the consumer compiles the interface and links the
-    // artifact, which is the whole design.
-    if (!state.overrides.preloaded_manifest && mcpp::pack::is_distribution_package(*state.m)) {
-        return std::unexpected(std::format(
-            "'{}' is a distribution package produced by `mcpp pack`, not a source tree.\n"
-            "  Its sources are interface declarations; the definitions are in the\n"
-            "  prebuilt artifacts beside them, so building here would produce an\n"
-            "  empty library and say it succeeded.\n"
-            "  Use it: add it to a project as a dependency —\n"
-            "      [dependencies]\n"
-            "      {} = {{ path = \"{}\" }}",
-            state.root->string(), state.m->package.name, state.root->string()));
-    }
-
-    // ─── Workspace handling ────────────────────────────────────────────
-    // If the manifest has [workspace] and is a virtual workspace (no [package]),
-    // or if -p filter is set, switch to the target member's manifest.
-    if (state.m->workspace.present) {
-        std::string targetMember;
-
-        if (!state.overrides.package_filter.empty()) {
-            // -p <name>: find matching member by directory basename or path
-            for (auto& mp : state.m->workspace.members) {
-                auto basename = std::filesystem::path(mp).filename().string();
-                if (basename == state.overrides.package_filter || mp == state.overrides.package_filter) {
-                    targetMember = mp;
-                    break;
-                }
-            }
-            if (targetMember.empty()) {
-                return std::unexpected(std::format(
-                    "workspace member '{}' not found in [workspace].members",
-                    state.overrides.package_filter));
-            }
-        } else if (state.m->package.name.empty()) {
-            // Virtual workspace: find a member with a program target ("is
-            // this the program", #622 A3's `is_program()`, so a member whose
-            // only target is `kind = "app"` is picked exactly as one whose
-            // target is `bin` is), or use last member.
-            for (auto& mp : state.m->workspace.members) {
-                auto memberDir = *state.root / mp;
-                auto mm = mcpp::manifest::load(memberDir / "mcpp.toml",
-                                               {.insideWorkspace = true});
-                if (!mm) continue;
-                for (auto& t : mm->targets) {
-                    if (t.is_program()) {
-                        targetMember = mp;
-                        break;
-                    }
-                }
-                if (!targetMember.empty()) break;
-            }
-            if (targetMember.empty() && !state.m->workspace.members.empty()) {
-                targetMember = state.m->workspace.members.back();
-            }
-        }
-        // else: rooted workspace with [package] — build root normally. Its own
-        // `x.workspace = true` entries name its own [workspace.dependencies].
-        else if (state.m->workspace.present)
-            mcpp::project::merge_workspace_deps(*state.m, *state.m, *state.root);
-
-        if (!targetMember.empty()) {
-            auto memberDir = *state.root / targetMember;
-            if (!std::filesystem::exists(memberDir / "mcpp.toml")) {
-                return std::unexpected(std::format(
-                    "workspace member '{}' has no mcpp.toml", targetMember));
-            }
-            state.runtimeWorkspaceRoot = *state.root;
-            state.wsManifest = std::move(*state.m);  // preserve workspace manifest
-            auto memberManifest = mcpp::manifest::load(memberDir / "mcpp.toml",
-                                                       {.insideWorkspace = true});
-            if (!memberManifest) return std::unexpected(std::format(
-                "workspace member '{}': {}", targetMember,
-                memberManifest.error().format()));
-            state.m = std::move(*memberManifest);
-
-            // ONE call, not a hand-copied list. `*root` is still the WORKSPACE
-            // root here (the `root = memberDir` reassignment below has not
-            // happened yet), which is what a relative `[indices].path` or
-            // `[workspace.dependencies] path` was written against (#224).
-            mcpp::project::inherit_workspace_config(*state.m, *state.wsManifest, *state.root);
-            if (auto bad = mcpp::project::workspace_inheritance_error(*state.m, memberDir))
-                return std::unexpected(*bad);
-
-            mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
-            state.root = memberDir;
-        }
-    } else {
-        // Not at workspace root: inside a member, the loader above has
-        // already inherited (#224 anchoring included). Only the workspace is
-        // recorded here, for the membership test of this member's own `path`
-        // dependencies.
-        if (state.effective && state.effective->member) {
-            state.runtimeWorkspaceRoot = state.effective->workspaceRoot;
-            state.wsManifest = std::move(*state.effective->workspace);
-        } else if (state.overrides.preloaded_manifest) {
-            auto wsRoot = mcpp::project::find_workspace_root(*state.root);
-            if (!wsRoot.empty()) {
-                if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
-                    wsm && wsm->workspace.present) {
-                    state.runtimeWorkspaceRoot = wsRoot;
-                    state.wsManifest = std::move(*wsm);
-                }
-            }
-            // A preloaded manifest was inherited at its dependency load site,
-            // which gives a member everything but the root-position keys. This
-            // build IS rooted at it (a host-tool sub-build), so it takes those
-            // too, from the workspace that lists it (#710).
-            if (state.wsManifest
-                && mcpp::project::is_workspace_member(*state.wsManifest, state.runtimeWorkspaceRoot, *state.root))
-                mcpp::project::inherit_workspace_root_position(
-                    *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
-        }
-    }
-
-    if (auto bad = mcpp::project::unresolved_workspace_dependency_error(*state.m, *state.root))
-        return std::unexpected(*bad);
-
-    if (state.overrides.inherited_runtime_selection) {
-        state.runtimeSelection = *state.overrides.inherited_runtime_selection;
-    } else {
-        std::optional<std::reference_wrapper<const mcpp::manifest::Manifest>> wsRef;
-        if (state.wsManifest) wsRef = std::cref(*state.wsManifest);
-        auto selected = mcpp::xlings::runtime::select_runtime(
-            *state.m, wsRef, *state.root, state.runtimeWorkspaceRoot);
-        if (!selected) return std::unexpected(selected.error());
-        state.runtimeSelection = std::move(*selected);
-    }
-
-    // Where mcpp WRITES — derived here because `root` is only final now: the
-    // workspace block above may have moved it to the selected member. Defaults
-    // to the project root, so every existing invocation is byte-for-byte
-    // unchanged; the tool-provisioning pass points it at the tool store
-    // instead (BuildOverrides::work_dir).
-    state.workRoot =
-        state.overrides.work_dir.empty() ? *state.root : state.overrides.work_dir;
-    {
-        std::error_code wdEc;
-        std::filesystem::create_directories(state.workRoot, wdEc);
-    }
-
-    if (state.m->package.sourceProvenance.empty()) {
-        state.m->package.sourceProvenance =
-            "path+" + state.root->lexically_normal().generic_string();
-    }
-
-    // A `compat`-form (Form B) package's sources live under a wrap directory
-    // inside the version dir, which is why its descriptor writes globs like
-    // `*/src/foo.cc` — the `*` stands for the tarball's top-level folder,
-    // whose name the descriptor cannot know. `[build] sources` has always
-    // expanded those; `targets.<x>.main` did NOT, so a bin target in such a
-    // package handed ninja a literal `*` and died with
-    // `missing and no known rule to make it`.
-    //
-    // Nothing could reach that path before #355 (a dependency's bin targets
-    // were never built), which is why it went unnoticed. Resolve it here, once
-    // the manifest is final and before anything reads `t.main`.
-    for (auto& t : state.m->targets) {
-        if (t.main.empty() || t.main.find('*') == std::string::npos) continue;
-        auto hits = mcpp::modgraph::expand_glob(*state.root, t.main);
-        if (hits.size() == 1) {
-            t.main = std::filesystem::relative(hits.front(), *state.root).generic_string();
-        } else {
-            return std::unexpected(std::format(
-                "target '{}': `main = \"{}\"` matched {} files; it must name "
-                "exactly one entry source",
-                t.name, t.main, hits.size()));
-        }
-    }
-
-    // Inject synthetic targets (e.g. test binaries from `mcpp test`).
-    for (auto& t : state.extraTargets) state.m->targets.push_back(t);
-
-    // #540: a cfg() predicate mcpp cannot evaluate must say so.
-    //
-    // A PREDICATE THAT ANSWERS FALSE AND A PREDICATE THAT WAS NEVER
-    // UNDERSTOOD USED TO READ THE SAME. `cfgpred` returns false for an unknown
-    // key and for an unknown bareword, and a `[target.<pred>.build]` section
-    // whose predicate is false is dropped without a word — so a typo, and every
-    // `cfg(c-abi = …)` section docs/14 documented before this release, produced
-    // a successful build configured as if the section had not been written.
-    //
-    // Reported here rather than in the manifest parser because the vocabulary
-    // lives with the evaluator, and a second copy of it in `toml.cppm` is the
-    // exact defect this release is fixing four other instances of.
-    //
-    // Scoped to the root manifest by where it sits, which matches the existing
-    // policy for every other schema warning: a dependency may adopt a predicate
-    // a consumer's older mcpp does not know, and its build stays quiet.
-    for (auto const& cc : state.m->conditionalConfigs) {
-        auto unknown = cfgpred::unknown_tokens(cc.predicate);
-        if (!unknown.empty()) {
-            std::string names;
-            for (auto const& u : unknown) {
-                if (!names.empty()) names += ", ";
-                names += '\'' + u + '\'';
-            }
-            state.m->schemaWarnings.push_back(std::format(
-                "[target.'{}'] names {} in its cfg() predicate, which mcpp does "
-                "not know, so the section never applies (ignored). {}",
-                cc.predicate, names, cfgpred::vocabulary_sentence()));
-        }
-        // A RESOLVED layer is answered AFTER dependency resolution, so a
-        // dependency selected by one would form a cycle with the resolution
-        // that produces the answer — docs/14 states this. The section's build
-        // inputs are honoured by the second pass; its dependencies cannot be,
-        // and saying so is the difference between a documented limit and a
-        // silent drop.
-        //
-        // `accelerator` is not one of these (see kCfgEarlyLayerKeys), so
-        // `[target.'cfg(accelerator = "cuda")'.dependencies]` is honoured and
-        // never reaches this warning: nothing about it is circular, because the
-        // accel is an input to the build rather than an answer from the graph.
-        if (cfgpred::uses_layer(cc.predicate)
-            && !(cc.dependencies.empty() && cc.devDependencies.empty()
-                 && cc.buildDependencies.empty() && cc.featureDeps.empty())) {
-            state.m->schemaWarnings.push_back(std::format(
-                "[target.'{}'] conditions dependencies on a target-side layer "
-                "(ignored). A layer is resolved from the dependency graph, so a "
-                "dependency chosen by one would decide the answer it is asking "
-                "for. Build inputs under this predicate DO apply; move the "
-                "dependency to an unconditional [dependencies] entry, or "
-                "condition it on the triple instead.",
-                cc.predicate));
-        }
-        // The same reason holds for a row's library form: whether a package
-        // is linked shared is decided while the graph is resolved, before a
-        // layer has an answer.
-        if (cfgpred::uses_layer(cc.predicate) && !cc.targetKinds.empty()) {
-            state.m->schemaWarnings.push_back(std::format(
-                "[target.'{}'] conditions a target's kind or linkage on a "
-                "target-side layer (ignored). A layer is resolved from the "
-                "dependency graph, and a library's form is decided while that "
-                "graph is resolved; condition the statement on the triple "
-                "instead.",
-                cc.predicate));
-        }
-    }
-
-    // Surface non-fatal manifest schema warnings (e.g. unsupported [targets.*]
-    // keys). Under --strict they become errors — same policy as the
-    // feature/platform schema checks below.
-    for (auto const& w : state.m->schemaWarnings) {
-        if (state.overrides.strict) return std::unexpected(w);
-        mcpp::diag::warning("manifest/schema", w);
-    }
-
-    // Load mcpp.lock once, up front: it is a resolution input for git deps
-    // (#329), which decide the commit to build long before anything is
-    // fetched. Keyed by package name — the same key the writer at the end of
-    // this function emits, both taken from the root manifest's [dependencies].
-    {
-        // Read where the project keeps it. A planning pass that writes
-        // elsewhere (plan_only) still resolves against the project's lock.
-        auto lockPath = (state.overrides.plan_only ? *state.root : state.workRoot) / "mcpp.lock";
-        if (std::filesystem::exists(lockPath)) {
-            if (auto lock = mcpp::pm::load(lockPath); lock) {
-                for (auto const& p : lock->packages) {
-                    if (!p.namespace_.empty())
-                        state.packageIdentityLockAnchors.emplace(
-                            p.name, p.namespace_);
-                    if (auto parsed = mcpp::pm::parse_git_source(p.source); parsed)
-                        state.gitLockAnchors.emplace(p.name, std::move(*parsed));
-                }
-            } else {
-                // Degraded, not a plain warning: the engine silently does less
-                // than asked — every git branch dep falls back to `ls-remote`
-                // and may advance past the commit the lock recorded.
-                mcpp::diag::degraded("lockfile",
-                    std::format("mcpp.lock could not be read: {}",
-                                lock.error().message),
-                    "git branch dependencies are re-resolved over the network "
-                    "and may move onto a newer commit than the one recorded",
-                    "delete mcpp.lock and rebuild to regenerate it");
-            }
-        }
-    }
-
-    // Global-cache mode: --cache > MCPP_BUILD_CACHE > [build] cache > global.
-    // An unparseable value is a warning (error under --strict) and falls
-    // through to the next source rather than silently meaning "global" — a typo
-    // that quietly re-enabled the cache would be the hardest kind of surprise
-    // to attribute.
-    // Selection lives in resolve_cache_mode (above) so the fast paths settle it
-    // identically. This block only adds the diagnostics, which the fast paths
-    // have no business emitting: an unparseable value must be reported once, by
-    // the invocation that actually resolves the build.
-    state.cacheMode = resolve_cache_mode(*state.m, state.overrides.cache_mode);
-    {
-        const char* envMode = std::getenv("MCPP_BUILD_CACHE");
-        for (auto [value, origin] : std::initializer_list<
-                 std::pair<std::string_view, std::string_view>>{
-                 {state.overrides.cache_mode,        "--cache"},
-                 {envMode ? envMode : "",      "MCPP_BUILD_CACHE"},
-                 {state.m->buildConfig.cacheMode,    "[build] cache"}}) {
-            if (value.empty() || parse_cache_mode(value)) continue;
-            auto msg = std::format(
-                "{} has unknown cache mode '{}' (expected: global | local | off)",
-                origin, value);
-            if (state.overrides.strict) return std::unexpected(msg);
-            mcpp::diag::warning("build/cache-mode", msg);
-        }
-    }
-
-    if (auto r = phase1_toolchain_spec_and_axes(state); !r) return std::unexpected(r.error());
-    if (auto r = phase2_define_toolchain_resolver(state); !r) return std::unexpected(r.error());
-    if (auto r = phase3_xlings_before_graph(state); !r) return std::unexpected(r.error());
-    std::vector<mcpp::modgraph::PackageRoot> packages;
+static std::expected<void, std::string> phase4_dependency_graph(PrepareState& state) {
     // The features each package ends up built with, index-aligned with
     // `packages`. Recorded at activation because the passes that run after it
     // — `[feature-xlings]` provisioning among them — otherwise have no way to
     // ask, and re-deriving it there would be a second copy of the aggregation
     // rule.
-    std::vector<std::vector<std::string>> activeFeaturesByPackage;
 
     // WHICH VERSION OF EACH TOOL PACKAGE THIS BUILD USES, decided once.
     //
@@ -5549,7 +5249,6 @@ prepare_build(bool print_fingerprint,
     // different ends: one decides what is installed, the other tells a build
     // program where it landed. They used to derive it separately, and the
     // failure that produced is the quiet one — installed A, answered B.
-    std::map<std::string, std::string> xlingsWinner;
 
     // The split is computed HERE and reused by the late pass, so the two
     // cannot disagree about what "the graph declared" means.
@@ -5560,19 +5259,19 @@ prepare_build(bool print_fingerprint,
     // and `xpkg_dir` answered one of them. The unification below adjudicates
     // (the declaration nearer the artifact wins) and validates (the winner must
     // satisfy every requirement that lost) — see mcpp.xlings.address_set.
-    auto graph_xlings_split = [&]() -> std::expected<
+    state.graph_xlings_split = [&]() -> std::expected<
             std::pair<std::vector<std::string>, std::vector<std::string>>,
             std::string> {
         namespace addrset = mcpp::xlings::addrset;
         auto describe = [&](std::size_t i) {
-            auto const& pkg = packages[i].manifest.package;
+            auto const& pkg = state.packages[i].manifest.package;
             return pkg.namespace_.empty() ? pkg.name
                                           : pkg.namespace_ + ":" + pkg.name;
         };
         std::vector<addrset::Claim> claims;
         for (auto const& spec : applicable_xlings_addresses(
-                 *state.runtimeOwnerManifest, activeFeaturesByPackage.empty()
-                     ? std::vector<std::string>{} : activeFeaturesByPackage[0],
+                 *state.runtimeOwnerManifest, state.activeFeaturesByPackage.empty()
+                     ? std::vector<std::string>{} : state.activeFeaturesByPackage[0],
                  state.toolPurpose, /*isRoot=*/true))
             claims.push_back({spec, "this project", 0});
         // THE BUCKET IS DECIDED BY WHERE THE WINNING CLAIM SITS IN THIS LIST,
@@ -5581,10 +5280,10 @@ prepare_build(bool print_fingerprint,
         // or nothing installs it. Those two lists are the same one whenever the
         // project is its own runtime owner, and differ under a workspace.
         const std::size_t rootClaims = claims.size();
-        for (std::size_t i = 0; i < packages.size(); ++i) {
-            const auto& man = packages[i].manifest;
-            const auto feats = i < activeFeaturesByPackage.size()
-                ? activeFeaturesByPackage[i] : std::vector<std::string>{};
+        for (std::size_t i = 0; i < state.packages.size(); ++i) {
+            const auto& man = state.packages[i].manifest;
+            const auto feats = i < state.activeFeaturesByPackage.size()
+                ? state.activeFeaturesByPackage[i] : std::vector<std::string>{};
             for (auto const& spec : applicable_xlings_addresses(
                      man, feats, state.toolPurpose, /*isRoot=*/i == 0))
                 claims.push_back({spec, describe(i), i == 0 ? 0 : 1});
@@ -5594,7 +5293,7 @@ prepare_build(bool print_fingerprint,
         std::vector<std::string> rootSpecs, fromGraph;
         for (auto const& w : unified->winners) {
             (w.claim < rootClaims ? rootSpecs : fromGraph).push_back(w.address);
-            xlingsWinner[addrset::package_key(w.address)] = w.address;
+            state.xlingsWinner[addrset::package_key(w.address)] = w.address;
         }
         // REPORTED, NOT INFERRED. An override that is only visible as "two
         // versions were declared and one directory exists" is a fact the reader
@@ -5608,78 +5307,17 @@ prepare_build(bool print_fingerprint,
             mcpp::diag::warning("xlings/version-override", note);
         return std::pair{std::move(rootSpecs), std::move(fromGraph)};
     };
-    packages.push_back({*state.root, *state.m});
+    state.packages.push_back({*state.root, *state.m});
 
     // dep_manifests is kept around purely so the build plan can move it
     // out at the end (PackageRoot stores a `Manifest` by value, so the
     // unique_ptr is not load-bearing for liveness — it's a leftover from
     // an earlier design and harmless).
-    std::vector<std::unique_ptr<mcpp::manifest::Manifest>> dep_manifests;
     auto cache_index_name = [](std::string_view ns) {
         if (ns.empty()) return std::string(mcpp::pm::kDefaultNamespace);
         return std::string(ns);
     };
-    struct DepCacheIdentity {
-        std::string indexName;
-        std::string packageName;
-        std::string version;
-        // "version" | "path" | "git". Only "version" is cacheable: an index
-        // package's payload lives in the immutable xpkgs store under a
-        // version-keyed directory, so name@version identifies its sources.
-        // Path and git checkouts can change under an unchanged identity.
-        std::string sourceKind;
-        // What identifies the SOURCES when the version does not: the resolved
-        // commit for `git`, the package root for `path`, empty for an index
-        // package. Read by the tool store, whose key must hold everything
-        // that can change a built tool's bytes (#630, item 6).
-        std::string sourceRef;
-    };
-    std::vector<DepCacheIdentity> dep_cache_identities;
-    struct GitLockIdentity {
-        std::string source;
-        std::string hash;
-    };
-    std::map<std::string, GitLockIdentity> root_git_lock_identities;
 
-    struct ResolvedKey {
-        std::string ns;
-        std::string shortName;
-        auto operator<=>(const ResolvedKey&) const = default;
-    };
-    struct ResolvedRecord {
-        std::string version;            // empty for path/git deps
-        std::string constraint;         // AND-combined original constraints (version src only)
-        std::string requestedBy;        // human-readable for error messages
-        std::string source;             // "version" | "path" | "git" — for type-clash check
-        // The declaration's identity beyond `source`, so a SECOND declaration
-        // of the same (ns, name) can be compared for "the same reference"
-        // rather than merely "the same kind". `git`: "<url>#<refKind>=<ref>",
-        // from the DECLARED ref (never the resolved commit — comparing two
-        // branch names must not need a network round trip to decide whether
-        // they conflict). `path`: the canonical absolute directory. `version`:
-        // the original constraint string ("*" for none). See the
-        // `dependency/source-override` decision at the resolve hit (2026-09-13
-        // #630 record, §2.2).
-        std::string sourceRef;
-        // True when this record's declaration came from the root manifest's
-        // own [dependencies]/[dev-dependencies]/[build-dependencies]
-        // (`item.consumerDepIndex == kMainConsumer` at the time the record
-        // was created). Bounds the root's privilege to override a
-        // conflicting declaration of the SAME identity the way
-        // `DependencySpec::linkage` is honoured only on the root's own
-        // edges — see dep_spec.cppm.
-        bool        fromRoot = false;
-        // Reached ONLY through [dev-dependencies]. mcpp.lock excludes these:
-        // dev-deps are resolved under `mcpp test` and not under `mcpp build`, so
-        // recording them makes a VCS-committed file depend on which command ran
-        // last and ping-pong between the two. The lock must be a function of the
-        // MANIFEST, not of the command. Cleared the moment a non-dev consumer
-        // asks for the same package.
-        bool        devOnly = false;
-        std::size_t depIndex = 0;       // index into dep_manifests/packages-1 (for in-place re-fetch)
-        std::vector<std::string> linkFlagsAdded;  // entries appended to m->buildConfig.ldflags by this dep
-    };
-    std::map<ResolvedKey, ResolvedRecord> resolved;
 
     // Sentinel for "the consumer is the main package" (no dep_manifests entry).
     constexpr std::size_t kMainConsumer = static_cast<std::size_t>(-1);
@@ -6696,80 +6334,23 @@ prepare_build(bool print_fingerprint,
         return std::pair{effRoot, std::move(*manifest)};
     };
 
-    struct DependencyEdge {
-        std::size_t consumerPackageIndex = 0;
-        std::size_t dependencyPackageIndex = 0;
-        mcpp::modgraph::DependencyVisibility visibility =
-            mcpp::modgraph::DependencyVisibility::Public;
-        // #242/#243: the per-edge feature request that THIS consumer made of
-        // THIS dependency. Feature activation must consume these off the edge
-        // graph (union over all incoming edges) rather than re-scanning only
-        // the root manifest's direct deps — otherwise a transitive dep's
-        // requested features and its consumer's `default-features = false` are
-        // silently dropped (resolution honors them per-edge; activation did not).
-        std::vector<std::string> requestedFeatures;
-        bool defaultFeatures = true;
-        // #355: HOST tools this consumer asked the dependency for. Aggregated
-        // off the edge graph exactly like requestedFeatures — a transitive
-        // consumer's request must not be silently dropped, which is the
-        // #242/#243 failure shape.
-        std::vector<std::string> requestedTools;
-        // mcpp#711: the dependency's programs this consumer ships, built in
-        // THIS plan for its target. A package asked for them is scanned and
-        // configured here even when every target it declares is a program.
-        std::vector<std::string> requestedArtifacts;
-        // #355 step 5 / #359: does this edge ask for the dependency's lib-root
-        // interface as a HOST module, and does it hand its build-time
-        // provisions on to this consumer's own consumers?
-        bool hostModule = false;
-        bool reexport = false;
-        // Did this edge come from `[build-dependencies]`? Such an edge serves
-        // the BUILD and never the target, and the property is inherited by
-        // everything reachable through it. It is a property of the edge and
-        // not of the package: the same package may be an ordinary dependency
-        // of someone else in the same build, and then it does reach the
-        // target.
-        bool buildOnly = false;
-    };
-    std::vector<DependencyEdge> dependencyEdges;
     // #634, X: every request that reached a package, as the requester wrote
     // it, for the `graph` section of resolution.json. Kept apart from
     // `dependencyEdges`, which merges two requests of one consumer for one
     // dependency into one edge; the record has to keep both keys, because two
     // keys over one identity (A2) and the table a declaration came from (A1)
     // are what it exists to show.
-    struct GraphRequest {
-        std::size_t consumerPackageIndex = 0;
-        std::size_t dependencyPackageIndex = 0;
-        std::string key;        // the dependency key as the requester wrote it
-        std::string table;      // `DependencySpec::declaredIn`
-    };
-    std::vector<GraphRequest> graphRequests;
     // The link form each dependency takes and the facts it was decided from,
     // by package index. COMPUTED ONCE, before the root build program runs, so
     // that program can read the answer (#642 E2); APPLIED after the scan, where
     // it always was. Every reader below reads this, never a second resolution.
-    struct DependencyLinkForm {
-        mcpp::build::linkage_form::PackageFacts facts;
-        mcpp::build::linkage_form::Resolution   answer;
-        // The package has a library form to report: a package of programs or
-        // rules has none, and is neither recorded nor offered to a program.
-        bool recorded = false;
-    };
-    std::map<std::size_t, DependencyLinkForm> dependencyLinkForms;
-    namespace dg = mcpp::build::dep_graph;
     // #355: consumer package index → (env var, absolute path) for each host
     // tool that consumer requested. Filled by the provisioning pass below;
     // read by BOTH build.mcpp call sites (the dependency loop and the root),
     // which is why it lives out here rather than inside the resolution block.
-    std::map<std::size_t, std::vector<std::pair<std::string, std::string>>>
-        toolEnvByConsumer;
     // #355 step 5: consumer package index → (logical module name, interface
     // path) for each dependency that offers HOST build rules. Same fan-out
     // shape as toolEnvByConsumer, and read by the same two call sites.
-    std::map<std::size_t,
-             std::vector<mcpp::build::BuildProgramEnv::HostModuleRef>>
-        hostModulesByConsumer;
     // The same providers by INDEX, and the reason they are needed twice.
     //
     // A rule's code runs inside its CONSUMER's build program, so
@@ -6787,26 +6368,23 @@ prepare_build(bool print_fingerprint,
     // The set is the host-module providers rather than every dependency: the
     // code that can call `xpkg_dir` in this build program is the consumer's
     // own `build.mcpp` plus exactly the rule modules compiled into it.
-    std::map<std::size_t, std::vector<std::size_t>> hostModuleProvidersByConsumer;
     // #359: who can see which build-time provision. Computed once by the
     // provisioning pass below (a fixpoint over `dependencyEdges`, the same
     // shape as computeUsageRequirements) and read by every consumer of the
     // three env channels above. Declared here because `fillDepDirs` closes
     // over it and is defined long before the pass runs; every call site is
     // after it.
-    namespace prov = mcpp::build::provisions;
-    prov::Propagation provisionGraph;
     // The spellings a given consumer may address a provider by. The qualified
     // name always works; the bare tail only when the namespace ladder binds it
     // to exactly this package FOR THIS CONSUMER. Scoped per consumer rather
     // than globally because two packages sharing a tail only collide inside an
     // environment that contains both.
-    auto bareBindingsFor = [&](std::size_t consumer) {
+    state.bareBindingsFor = [&](std::size_t consumer) {
         std::vector<std::string> fqns;
-        if (consumer < provisionGraph.visible.size())
-            for (auto const& pr : provisionGraph.visible[consumer]) {
-                if (pr.provider >= packages.size()) continue;
-                auto const& n = packages[pr.provider].manifest.package.name;
+        if (consumer < state.provisionGraph.visible.size())
+            for (auto const& pr : state.provisionGraph.visible[consumer]) {
+                if (pr.provider >= state.packages.size()) continue;
+                auto const& n = state.packages[pr.provider].manifest.package.name;
                 if (std::find(fqns.begin(), fqns.end(), n) == fqns.end())
                     fqns.push_back(n);
             }
@@ -6821,11 +6399,11 @@ prepare_build(bool print_fingerprint,
     // kept publishing `MCPP_DEP_INSTALLER_BIN_*` alone for a package written
     // `namespace = "spike"`, `name = "installer"`, so
     // `dep_bin("spike.installer", ...)` read nothing.
-    auto publishedNamesFor =
+    state.publishedNamesFor =
         [&](std::size_t provider,
             const std::map<std::string, prov::BareBinding>& bind) {
         std::vector<std::string> out;
-        auto const& manifest = packages[provider].manifest;
+        auto const& manifest = state.packages[provider].manifest;
         auto const& canon = manifest.package.name;
         out.push_back(canon);
         if (auto qualified = mcpp::build::qualified_package_name(manifest);
@@ -6841,7 +6419,7 @@ prepare_build(bool print_fingerprint,
 
     // A package whose DECLARED targets are all programs (#649 E6). See the
     // worklist, where such a package is not walked into a consumer's graph.
-    auto isProgramOnlyPackage = [](const mcpp::manifest::Manifest& pm) {
+    state.isProgramOnlyPackage = [](const mcpp::manifest::Manifest& pm) {
         if (pm.targetsInferred || pm.targets.empty()) return false;
         return std::ranges::none_of(pm.targets, [](const mcpp::manifest::Target& t) {
             return t.kind == mcpp::manifest::Target::Library
@@ -6851,15 +6429,15 @@ prepare_build(bool print_fingerprint,
     // A package some edge asked for programs to SHIP (mcpp#711). Its programs
     // are linked in this plan, so it is scanned and configured here like any
     // library dependency, even when every target it declares is a program.
-    auto isArtifactPackage = [&](std::size_t i) {
-        return std::ranges::any_of(dependencyEdges, [&](const DependencyEdge& e) {
+    state.isArtifactPackage = [&](std::size_t i) {
+        return std::ranges::any_of(state.dependencyEdges, [&](const DependencyEdge& e) {
             return e.dependencyPackageIndex == i && !e.requestedArtifacts.empty();
         });
     };
     // Compiled in this plan: not a package of programs, or one whose programs
     // this plan ships.
-    auto compilesHere = [&](std::size_t i) {
-        return i == 0 || !isProgramOnlyPackage(packages[i].manifest) || isArtifactPackage(i);
+    state.compilesHere = [&](std::size_t i) {
+        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest) || state.isArtifactPackage(i);
     };
     auto parseVisibility = [](std::string_view visibility) {
         if (visibility == "private")
@@ -6874,7 +6452,7 @@ prepare_build(bool print_fingerprint,
         return consumerDepIndex + 1;
     };
 
-    auto appendUniquePath =
+    state.appendUniquePath =
         [](std::vector<std::filesystem::path>& dirs,
            const std::filesystem::path& dir) -> bool
     {
@@ -6883,13 +6461,13 @@ prepare_build(bool print_fingerprint,
         return true;
     };
 
-    auto appendUniquePaths =
+    state.appendUniquePaths =
         [&](std::vector<std::filesystem::path>& dirs,
             const std::vector<std::filesystem::path>& additions) -> bool
     {
         bool changed = false;
         for (auto const& dir : additions) {
-            changed = appendUniquePath(dirs, dir) || changed;
+            changed = state.appendUniquePath(dirs, dir) || changed;
         }
         return changed;
     };
@@ -6906,11 +6484,11 @@ prepare_build(bool print_fingerprint,
     // publicUsage. The after-dirs ride the typed #249 channel, which owns the
     // per-dialect degradations (cl.exe /I, NASM -I).
     using DirectiveMark = mcpp::build::directives::Mark;
-    auto markDirectiveTail = [](const mcpp::manifest::Manifest& mm) {
+    state.markDirectiveTail = [](const mcpp::manifest::Manifest& mm) {
         return mcpp::build::directives::mark(mm);
     };
-    auto foldDirectiveTailIntoPrivateBuild =
-        [](auto& pkg, const mcpp::manifest::Manifest& ran,
+    state.foldDirectiveTailIntoPrivateBuild =
+        [](mcpp::modgraph::PackageRoot& pkg, const mcpp::manifest::Manifest& ran,
            const DirectiveMark& t)
     {
         mcpp::build::directives::fold_private_tail(pkg.privateBuild, ran, t);
@@ -6943,13 +6521,11 @@ prepare_build(bool print_fingerprint,
     // change. See mcpp::build::hostprogram::xpkg_dir.
     // Which dependency supplied the runner, for the exactly-one-provider
     // error below. A name rather than a bool: the message has to name both.
-    std::string runnerProvider;
     // ONE PROVIDER PER RUNNER NAME. `runner` has had this rule since #544;
     // a NAMED runner inherits it per name, because a board may legitimately
     // supply `flash` while a different package supplies `monitor`.
-    std::map<std::string, std::string> namedRunnerProvider;
 
-    auto fillXpkgDirs = [&](mcpp::build::BuildProgramEnv& e,
+    state.fillXpkgDirs = [&](mcpp::build::BuildProgramEnv& e,
                             const mcpp::manifest::Manifest& owner,
                             std::size_t consumer) {
         // `[feature-xlings.<f>]` is provisioned when `<f>` is active, so it has
@@ -6973,18 +6549,18 @@ prepare_build(bool print_fingerprint,
         // declared. Their own active features, not the consumer's: the
         // consumer asked for `features = ["rules-cuda"]` on the edge, and that
         // is what decides which of the rule's `[feature-xlings]` tables apply.
-        if (auto pit = hostModuleProvidersByConsumer.find(consumer);
-            pit != hostModuleProvidersByConsumer.end()) {
+        if (auto pit = state.hostModuleProvidersByConsumer.find(consumer);
+            pit != state.hostModuleProvidersByConsumer.end()) {
             for (auto q : pit->second) {
-                if (q >= packages.size()) continue;
-                auto const& pm = packages[q].manifest;
+                if (q >= state.packages.size()) continue;
+                auto const& pm = state.packages[q].manifest;
                 auto want = [&](const std::string& address) {
                     if (std::ranges::find(declared, address) == declared.end())
                         declared.push_back(address);
                 };
                 for (auto const& address : pm.xlings.deps) want(address);
-                const auto& pf = q < activeFeaturesByPackage.size()
-                    ? activeFeaturesByPackage[q] : std::vector<std::string>{};
+                const auto& pf = q < state.activeFeaturesByPackage.size()
+                    ? state.activeFeaturesByPackage[q] : std::vector<std::string>{};
                 for (auto const& f : pf)
                     if (auto it = pm.xlings.featureDeps.find(f);
                         it != pm.xlings.featureDeps.end())
@@ -7007,8 +6583,8 @@ prepare_build(bool print_fingerprint,
             // fact about ordering rather than a crash.
             const auto key = mcpp::xlings::addrset::package_key(raw);
             if (!answered.insert(key).second) continue;
-            auto wit = xlingsWinner.find(key);
-            const std::string spec = wit == xlingsWinner.end() ? raw : wit->second;
+            auto wit = state.xlingsWinner.find(key);
+            const std::string spec = wit == state.xlingsWinner.end() ? raw : wit->second;
             auto ref = mcpp::xlings::paths::parse_xpkg_ref(spec);
             auto dir = mcpp::xlings::paths::xpkg_payload(xlEnv, ref);
             if (!dir) continue;   // declared but not installed: "" is the answer
@@ -7026,18 +6602,18 @@ prepare_build(bool print_fingerprint,
     // library form is also offered under exactly the names its directory is,
     // so `dep_linkage(n)` answers for every `n` that `dep_dir(n)` answers for.
     // Only the root's program passes it; see the root call site for why.
-    auto fillDepDirs = [&](mcpp::build::BuildProgramEnv& e, std::size_t consumer,
+    state.fillDepDirs = [&](mcpp::build::BuildProgramEnv& e, std::size_t consumer,
                            const std::map<std::size_t, std::string>* linkForms = nullptr) {
-        if (consumer >= provisionGraph.visible.size()) return;
-        auto bind = bareBindingsFor(consumer);
+        if (consumer >= state.provisionGraph.visible.size()) return;
+        auto bind = state.bareBindingsFor(consumer);
         for (auto const& [tail, b] : bind) {
             if (auto note = prov::contest_note(tail, b); !note.empty())
                 mcpp::diag::warning("provisions/ambiguous", note);
         }
-        for (auto const& pr : provisionGraph.visible[consumer]) {
+        for (auto const& pr : state.provisionGraph.visible[consumer]) {
             if (pr.kind != prov::Kind::DepDir) continue;
-            if (pr.provider >= packages.size()) continue;
-            auto const& depPkg = packages[pr.provider];
+            if (pr.provider >= state.packages.size()) continue;
+            auto const& depPkg = state.packages[pr.provider];
             auto const& canon  = depPkg.manifest.package.name;
             const std::string* form = nullptr;
             if (linkForms)
@@ -7047,7 +6623,7 @@ prepare_build(bool print_fingerprint,
             // qualified name a manifest writing `namespace = "ns"` and
             // `name = "fw"` is addressed by (#642: the framework's rule asks
             // `dep_linkage("huxerui.huxerui")`), and the bound tail.
-            for (auto const& n : publishedNamesFor(pr.provider, bind)) {
+            for (auto const& n : state.publishedNamesFor(pr.provider, bind)) {
                 e.depDirs.emplace_back(n, depPkg.root);
                 if (form) e.depLinkages.emplace_back(n, *form);
             }
@@ -7060,7 +6636,7 @@ prepare_build(bool print_fingerprint,
     // (the scanner walks the legacy modules.sources mirror). ninja overwrites
     // the placeholder before the compile edge runs, because that compile
     // depends on the action's output.
-    auto adoptActionOutputs = [](mcpp::manifest::Manifest& mm,
+    state.adoptActionOutputs = [](mcpp::manifest::Manifest& mm,
                                  const std::filesystem::path& pkgRoot,
                                  std::size_t firstNewAction) {
         if (firstNewAction >= mm.buildConfig.actions.size()) return;
@@ -7095,7 +6671,7 @@ prepare_build(bool print_fingerprint,
     };
 
 
-    auto appendUniqueFlags =
+    state.appendUniqueFlags =
         [](std::vector<std::string>& flags,
            const std::vector<std::string>& additions) -> bool
     {
@@ -7121,12 +6697,12 @@ prepare_build(bool print_fingerprint,
                 // throw for names the ANSI codepage cannot spell (mcpp#230).
                 auto n = inc;
                 n.make_preferred();
-                appendUniquePath(dirs, std::move(n));
+                state.appendUniquePath(dirs, std::move(n));
                 continue;
             }
             for (auto& dir : mcpp::modgraph::expand_dir_glob(
                      packageRoot, inc.generic_string())) {
-                appendUniquePath(dirs, dir);
+                state.appendUniquePath(dirs, dir);
             }
         }
         return dirs;
@@ -7143,12 +6719,12 @@ prepare_build(bool print_fingerprint,
             if (inc.is_absolute()) {
                 auto n = inc;
                 n.make_preferred();
-                appendUniquePath(dirs, std::move(n));
+                state.appendUniquePath(dirs, std::move(n));
                 continue;
             }
             for (auto& dir : mcpp::modgraph::expand_dir_glob(
                      packageRoot, inc.generic_string())) {
-                appendUniquePath(dirs, dir);
+                state.appendUniquePath(dirs, dir);
             }
         }
         return dirs;
@@ -7165,12 +6741,12 @@ prepare_build(bool print_fingerprint,
             if (inc.is_absolute()) {
                 auto n = inc;
                 n.make_preferred();
-                appendUniquePath(dirs, std::move(n));
+                state.appendUniquePath(dirs, std::move(n));
                 continue;
             }
             for (auto& dir : mcpp::modgraph::expand_dir_glob(
                      packageRoot, inc.generic_string())) {
-                appendUniquePath(dirs, dir);
+                state.appendUniquePath(dirs, dir);
             }
         }
         return dirs;
@@ -7266,7 +6842,7 @@ prepare_build(bool print_fingerprint,
     {
         auto rootPackage = makePackageRoot(*state.root, *state.m);
         if (!rootPackage) return std::unexpected(rootPackage.error());
-        packages[0] = std::move(*rootPackage);
+        state.packages[0] = std::move(*rootPackage);
     }
 
     auto recordDependencyEdge =
@@ -7277,16 +6853,16 @@ prepare_build(bool print_fingerprint,
             const std::string& writtenKey)
     {
         const auto consumerPackageIndex = packageIndexForConsumer(consumerDepIndex);
-        if (consumerPackageIndex >= packages.size()
-            || dependencyPackageIndex >= packages.size()) {
+        if (consumerPackageIndex >= state.packages.size()
+            || dependencyPackageIndex >= state.packages.size()) {
             return;
         }
-        if (std::ranges::none_of(graphRequests, [&](const GraphRequest& r) {
+        if (std::ranges::none_of(state.graphRequests, [&](const GraphRequest& r) {
                 return r.consumerPackageIndex == consumerPackageIndex
                     && r.dependencyPackageIndex == dependencyPackageIndex
                     && r.key == writtenKey && r.table == spec.declaredIn;
             }))
-            graphRequests.push_back(GraphRequest{
+            state.graphRequests.push_back(GraphRequest{
                 .consumerPackageIndex = consumerPackageIndex,
                 .dependencyPackageIndex = dependencyPackageIndex,
                 .key = writtenKey,
@@ -7298,8 +6874,8 @@ prepare_build(bool print_fingerprint,
                 && edge.dependencyPackageIndex == dependencyPackageIndex
                 && edge.visibility == visibility;
         };
-        auto it = std::find_if(dependencyEdges.begin(), dependencyEdges.end(), same);
-        if (it != dependencyEdges.end()) {
+        auto it = std::find_if(state.dependencyEdges.begin(), state.dependencyEdges.end(), same);
+        if (it != state.dependencyEdges.end()) {
             // One consumer naming one dependency in BOTH tables. The ordinary
             // declaration wins, because the build-time path never subtracts
             // from what the project asked to link — stating the rule the other
@@ -7327,9 +6903,9 @@ prepare_build(bool print_fingerprint,
                     it->requestedFeatures.push_back(f);
             it->defaultFeatures = it->defaultFeatures || spec.defaultFeatures;
             if (spec.hostModule) it->hostModule = true;
-            else if (dependencyPackageIndex < packages.size())
+            else if (dependencyPackageIndex < state.packages.size())
                 for (auto const& f : spec.features)
-                    if (packages[dependencyPackageIndex].manifest.featureRuleModule.contains(f)) {
+                    if (state.packages[dependencyPackageIndex].manifest.featureRuleModule.contains(f)) {
                         it->hostModule = true;
                         break;
                     }
@@ -7345,12 +6921,12 @@ prepare_build(bool print_fingerprint,
         // when only the feature was written landed in the consumer's build as
         // an unresolved import rather than in the line that was incomplete.
         bool hostModule = spec.hostModule;
-        if (!hostModule && dependencyPackageIndex < packages.size()) {
-            auto const& depManifest = packages[dependencyPackageIndex].manifest;
+        if (!hostModule && dependencyPackageIndex < state.packages.size()) {
+            auto const& depManifest = state.packages[dependencyPackageIndex].manifest;
             for (auto const& f : spec.features)
                 if (depManifest.featureRuleModule.contains(f)) { hostModule = true; break; }
         }
-        dependencyEdges.push_back(DependencyEdge{
+        state.dependencyEdges.push_back(DependencyEdge{
             .consumerPackageIndex = consumerPackageIndex,
             .dependencyPackageIndex = dependencyPackageIndex,
             .visibility = visibility,
@@ -7364,56 +6940,56 @@ prepare_build(bool print_fingerprint,
         });
     };
 
-    auto computeUsageRequirements = [&] {
+    state.computeUsageRequirements = [&] {
         bool changed = true;
         while (changed) {
             changed = false;
-            for (auto const& edge : dependencyEdges) {
-                if (edge.consumerPackageIndex >= packages.size()
-                    || edge.dependencyPackageIndex >= packages.size()) {
+            for (auto const& edge : state.dependencyEdges) {
+                if (edge.consumerPackageIndex >= state.packages.size()
+                    || edge.dependencyPackageIndex >= state.packages.size()) {
                     continue;
                 }
-                auto& consumer = packages[edge.consumerPackageIndex];
-                auto const& dependency = packages[edge.dependencyPackageIndex];
+                auto& consumer = state.packages[edge.consumerPackageIndex];
+                auto const& dependency = state.packages[edge.dependencyPackageIndex];
                 // A package of programs publishes no usage requirements to its
                 // consumers (#649 E6): nothing of it is compiled or linked here.
                 if (edge.dependencyPackageIndex > 0
-                    && isProgramOnlyPackage(dependency.manifest)) continue;
+                    && state.isProgramOnlyPackage(dependency.manifest)) continue;
 
                 if (edge.visibility == mcpp::modgraph::DependencyVisibility::Private
                     || edge.visibility == mcpp::modgraph::DependencyVisibility::Public) {
-                    changed = appendUniquePaths(consumer.privateBuild.includeDirs,
+                    changed = state.appendUniquePaths(consumer.privateBuild.includeDirs,
                                                 dependency.publicUsage.includeDirs)
                               || changed;
                     // #249: after-dirs ride the same edges but keep their
                     // after-ness — consumers receive them as -idirafter,
                     // never upgraded to -I.
-                    changed = appendUniquePaths(consumer.privateBuild.includeDirsAfter,
+                    changed = state.appendUniquePaths(consumer.privateBuild.includeDirsAfter,
                                                 dependency.publicUsage.includeDirsAfter)
                               || changed;
                     // Interface defines (a dependency's active-feature `defines`)
                     // ride the same edges as include dirs: they must reach the
                     // consumer's own TUs so header-only switches like
                     // EIGEN_USE_BLAS take effect where the headers are used.
-                    changed = appendUniqueFlags(consumer.privateBuild.cflags,
+                    changed = state.appendUniqueFlags(consumer.privateBuild.cflags,
                                                 dependency.publicUsage.cflags)
                               || changed;
-                    changed = appendUniqueFlags(consumer.privateBuild.cxxflags,
+                    changed = state.appendUniqueFlags(consumer.privateBuild.cxxflags,
                                                 dependency.publicUsage.cxxflags)
                               || changed;
                 }
                 if (edge.visibility == mcpp::modgraph::DependencyVisibility::Public
                     || edge.visibility == mcpp::modgraph::DependencyVisibility::Interface) {
-                    changed = appendUniquePaths(consumer.publicUsage.includeDirs,
+                    changed = state.appendUniquePaths(consumer.publicUsage.includeDirs,
                                                 dependency.publicUsage.includeDirs)
                               || changed;
-                    changed = appendUniquePaths(consumer.publicUsage.includeDirsAfter,
+                    changed = state.appendUniquePaths(consumer.publicUsage.includeDirsAfter,
                                                 dependency.publicUsage.includeDirsAfter)
                               || changed;
-                    changed = appendUniqueFlags(consumer.publicUsage.cflags,
+                    changed = state.appendUniqueFlags(consumer.publicUsage.cflags,
                                                 dependency.publicUsage.cflags)
                               || changed;
-                    changed = appendUniqueFlags(consumer.publicUsage.cxxflags,
+                    changed = state.appendUniqueFlags(consumer.publicUsage.cxxflags,
                                                 dependency.publicUsage.cxxflags)
                               || changed;
                 }
@@ -7804,14 +7380,14 @@ prepare_build(bool print_fingerprint,
 
     // Pull the root package's active feature-deps into its dependency set before
     // seeding, so `mcpp build --features X` resolves X's optional deps.
-    std::vector<std::string> rootReq = parse_feature_request(state.overrides.features);
-    if (auto fm = mergeActiveFeatureDeps(*state.m, rootReq); !fm)
+    state.rootReq = parse_feature_request(state.overrides.features);
+    if (auto fm = mergeActiveFeatureDeps(*state.m, state.rootReq); !fm)
         return std::unexpected(fm.error());
     // #243: the root's active features may forward features to its direct deps.
-    std::vector<std::string> rootActive = feature_closure(*state.m, rootReq, true);
+    std::vector<std::string> rootActive = feature_closure(*state.m, state.rootReq, true);
     if (auto fe = validateForwards(*state.m, rootActive, state.m->package.name); !fe)
         return std::unexpected(fe.error());
-    activeFeaturesByPackage.assign(1, rootActive);
+    state.activeFeaturesByPackage.assign(1, rootActive);
 
     // `--features <dependency key>/<feature>` (#649 E8): a forward of the root,
     // applied to the edges exactly as a `[features]` forward is and checked
@@ -8001,7 +7577,7 @@ prepare_build(bool print_fingerprint,
             if (auto bySource = identityBySource.find(source);
                 !namesMember && bySource != identityBySource.end()
                 && !(bySource->second == key)) {
-                const auto& existing = resolved.at(bySource->second);
+                const auto& existing = state.resolved.at(bySource->second);
                 const auto& declaring = declaringManifest.at(bySource->second);
                 if (!declaring.namespaceDeclared) {
                     return std::unexpected(std::format(
@@ -8022,7 +7598,7 @@ prepare_build(bool print_fingerprint,
             }
         }
 
-        if (auto it = resolved.find(key); it != resolved.end()) {
+        if (auto it = state.resolved.find(key); it != state.resolved.end()) {
             // A package is dev-only until some non-dev consumer wants it. Order
             // of arrival must not decide, so this is an AND over every request.
             it->second.devOnly = it->second.devOnly && item.devOnly;
@@ -8081,8 +7657,8 @@ prepare_build(bool print_fingerprint,
                 if (sourceKind == "version") {
                     const std::string winnerVersion = it->second.source == "version"
                         ? it->second.version
-                        : (it->second.depIndex < dep_manifests.size()
-                               ? dep_manifests[it->second.depIndex]->package.version
+                        : (it->second.depIndex < state.dep_manifests.size()
+                               ? state.dep_manifests[it->second.depIndex]->package.version
                                : std::string{});
                     auto req = mcpp::version_req::parse_req(item.originalConstraint);
                     auto ver = mcpp::version_req::parse_version(winnerVersion);
@@ -8120,7 +7696,7 @@ prepare_build(bool print_fingerprint,
                     std::format("declare '{}{}{}' in the root to choose the other.",
                         key.ns, key.ns.empty() ? "" : ".", key.shortName));
 
-                if (it->second.depIndex + 1 < packages.size()) {
+                if (it->second.depIndex + 1 < state.packages.size()) {
                     recordDependencyEdge(item.consumerDepIndex,
                                          it->second.depIndex + 1,
                                          spec, item.buildOnly, name);
@@ -8234,8 +7810,8 @@ prepare_build(bool print_fingerprint,
                     // Stage layout:
                     //   <root>/target/.mangled/<consumerPkg>/<dep>__<version>/    ← rewritten secondary source
                     //   <root>/target/.mangled/<consumerPkg>/__self__/             ← rewritten consumer source
-                    auto& consumerManifest = *dep_manifests[item.consumerDepIndex];
-                    auto consumerRoot      = packages[item.consumerDepIndex + 1].root;
+                    auto& consumerManifest = *state.dep_manifests[item.consumerDepIndex];
+                    auto consumerRoot      = state.packages[item.consumerDepIndex + 1].root;
                     // Under the write root, not the source root: the stage
                     // is build output, and BuildOverrides::work_dir promises
                     // that everything the build writes moves with it.
@@ -8254,7 +7830,7 @@ prepare_build(bool print_fingerprint,
 
                     // Re-anchor the consumer's PackageRoot at its staged copy
                     // so the modgraph scanner picks up the rewritten imports.
-                    packages[item.consumerDepIndex + 1].root = consumerStage;
+                    state.packages[item.consumerDepIndex + 1].root = consumerStage;
 
                     // Record the staged secondary as a brand-new dep entry
                     // under its mangled name, so future encounters of this
@@ -8280,24 +7856,24 @@ prepare_build(bool print_fingerprint,
                         if (inc.is_relative()) inc = secondaryRoot / inc;
                     }
 
-                    dep_manifests.push_back(
+                    state.dep_manifests.push_back(
                         std::make_unique<mcpp::manifest::Manifest>(std::move(stagedManifest)));
-                    dep_cache_identities.push_back({
+                    state.dep_cache_identities.push_back({
                         .indexName   = cache_index_name(key.ns),
                         .packageName = mangledPackage,
                         .version     = spec.version,
                         .sourceKind  = "version",
                     });
-                    const auto depPackageIndex = packages.size();
-                    auto secPackage = makePackageRoot(secStage, *dep_manifests.back());
+                    const auto depPackageIndex = state.packages.size();
+                    auto secPackage = makePackageRoot(secStage, *state.dep_manifests.back());
                     if (!secPackage) return std::unexpected(secPackage.error());
-                    packages.push_back(std::move(*secPackage));
+                    state.packages.push_back(std::move(*secPackage));
                     recordDependencyEdge(item.consumerDepIndex, depPackageIndex,
                                          spec, item.buildOnly, name);
-                    auto linkFlagsAdded = propagateLinkFlags(secStage, *dep_manifests.back());
+                    auto linkFlagsAdded = propagateLinkFlags(secStage, *state.dep_manifests.back());
 
                     ResolvedKey mangledKey{key.ns, mangledPackage};
-                    resolved[mangledKey] = ResolvedRecord{
+                    state.resolved[mangledKey] = ResolvedRecord{
                         .version           = spec.version,
                         .constraint        = item.originalConstraint,
                         .requestedBy       = item.requestedBy,
@@ -8310,7 +7886,7 @@ prepare_build(bool print_fingerprint,
                         // dependency.
                         .fromRoot          = false,
                         .devOnly           = item.devOnly,
-                        .depIndex          = dep_manifests.size() - 1,
+                        .depIndex          = state.dep_manifests.size() - 1,
                         .linkFlagsAdded    = std::move(linkFlagsAdded),
                     };
 
@@ -8389,19 +7965,19 @@ prepare_build(bool print_fingerprint,
                 // Replace in dep_manifests + packages. depIndex is the slot
                 // in dep_manifests; packages = [main, dep_0, dep_1, …], so
                 // packages[depIndex+1] is the same dep.
-                *dep_manifests[it->second.depIndex] = std::move(newManifest);
+                *state.dep_manifests[it->second.depIndex] = std::move(newManifest);
                 auto mergedPackage =
-                    makePackageRoot(newRoot, *dep_manifests[it->second.depIndex]);
+                    makePackageRoot(newRoot, *state.dep_manifests[it->second.depIndex]);
                 if (!mergedPackage) return std::unexpected(mergedPackage.error());
-                packages[it->second.depIndex + 1] = std::move(*mergedPackage);
+                state.packages[it->second.depIndex + 1] = std::move(*mergedPackage);
                 recordDependencyEdge(item.consumerDepIndex,
                                      it->second.depIndex + 1,
                                      spec, item.buildOnly, name);
 
                 it->second.version            = *merged;
                 it->second.linkFlagsAdded     = std::move(linkFlagsAdded);
-                if (it->second.depIndex < dep_cache_identities.size())
-                    dep_cache_identities[it->second.depIndex].version = *merged;
+                if (it->second.depIndex < state.dep_cache_identities.size())
+                    state.dep_cache_identities[it->second.depIndex].version = *merged;
 
                 // Walk the *new* manifest's deps so their constraints feed
                 // future merges. Already-resolved children dedup via the
@@ -8410,7 +7986,7 @@ prepare_build(bool print_fingerprint,
                     key.ns, key.ns.empty() ? "" : ".",
                     key.shortName, *merged);
                 for (auto& [child_name, child_spec] :
-                        dep_manifests[it->second.depIndex]->dependencies) {
+                        state.dep_manifests[it->second.depIndex]->dependencies) {
                     worklist.push_back({child_name, child_spec, newLabel,
                                         child_spec.version,
                                         it->second.depIndex, {}, item.devOnly});
@@ -8472,7 +8048,7 @@ prepare_build(bool print_fingerprint,
             // Usage propagation is per edge, not per unique package: two
             // consumers can need the same dep's public surface even though
             // the dep itself is fetched/scanned once.
-            if (it->second.depIndex + 1 < packages.size()) {
+            if (it->second.depIndex + 1 < state.packages.size()) {
                 recordDependencyEdge(item.consumerDepIndex,
                                      it->second.depIndex + 1,
                                      spec, item.buildOnly, name);
@@ -8648,7 +8224,7 @@ prepare_build(bool print_fingerprint,
                 auto source = std::format("git+{}#{}={}",
                     spec.git, spec.gitRefKind, spec.gitRev);
                 if (spec.gitRefKind == "branch") source += "@" + resolvedGitRev;
-                root_git_lock_identities[name] = GitLockIdentity{
+                state.root_git_lock_identities[name] = GitLockIdentity{
                     .source = std::move(source),
                     .hash = "fnv1a:" + H(spec.git + "|"
                         + spec.gitRefKind + "|" + spec.gitRev + "|"
@@ -8790,7 +8366,7 @@ prepare_build(bool print_fingerprint,
             if (!(declared == key)) {
                 reportAdoption(item.requestedBy, name, key, declared, manifestPath);
                 stateAdoptedIdentity(item, declared);
-                if (resolved.contains(declared)) {
+                if (state.resolved.contains(declared)) {
                     // Another source already resolved the declared identity,
                     // and the rules for two declarations of one identity
                     // decide (the #630 decision table, at the resolved-record
@@ -8846,7 +8422,7 @@ prepare_build(bool print_fingerprint,
         // application `z.o`), compiled its sources in the consumer's build, and
         // made a tool that depends on the package declaring it a cycle of the
         // consumer's graph although the two builds never meet.
-        const bool depProgramOnly = isProgramOnlyPackage(*dep_manifest)
+        const bool depProgramOnly = state.isProgramOnlyPackage(*dep_manifest)
                                  && spec.artifacts.empty();
         auto linkFlagsAdded = depProgramOnly
             ? std::vector<std::string>{}
@@ -8854,23 +8430,23 @@ prepare_build(bool print_fingerprint,
 
         // Move the manifest into stable storage so we can later look it up
         // by depIndex (the SemVer merger needs to overwrite the slot).
-        dep_manifests.push_back(
+        state.dep_manifests.push_back(
             std::make_unique<mcpp::manifest::Manifest>(std::move(*dep_manifest)));
-        dep_cache_identities.push_back({
+        state.dep_cache_identities.push_back({
             .indexName   = cache_index_name(key.ns),
             .packageName = name,
             .version     = sourceKind == "version"
                 ? spec.version
-                : dep_manifests.back()->package.version,
+                : state.dep_manifests.back()->package.version,
             .sourceKind  = sourceKind,
             .sourceRef   = sourceKind == "git"  ? sourceCommit
                          : sourceKind == "path" ? dep_root.string()
                          : std::string{},
         });
-        const auto depPackageIndex = packages.size();
-        auto depPackage = makePackageRoot(dep_root, *dep_manifests.back());
+        const auto depPackageIndex = state.packages.size();
+        auto depPackage = makePackageRoot(dep_root, *state.dep_manifests.back());
         if (!depPackage) return std::unexpected(depPackage.error());
-        packages.push_back(std::move(*depPackage));
+        state.packages.push_back(std::move(*depPackage));
         recordDependencyEdge(item.consumerDepIndex, depPackageIndex, spec,
                              item.buildOnly, name);
 
@@ -8883,7 +8459,7 @@ prepare_build(bool print_fingerprint,
                 key);
             declaringManifest[key] = DeclaringManifest{ manifestPath, namespaceDeclared };
         }
-        resolved[key] = ResolvedRecord{
+        state.resolved[key] = ResolvedRecord{
             .version           = sourceKind == "version" ? spec.version : "",
             .constraint        = sourceKind == "version" ? item.originalConstraint : "",
             .requestedBy       = item.requestedBy,
@@ -8892,7 +8468,7 @@ prepare_build(bool print_fingerprint,
                                              item.originalConstraint),
             .fromRoot          = item.consumerDepIndex == kMainConsumer,
             .devOnly           = item.devOnly,
-            .depIndex          = dep_manifests.size() - 1,
+            .depIndex          = state.dep_manifests.size() - 1,
             .linkFlagsAdded    = std::move(linkFlagsAdded),
         };
 
@@ -8907,21 +8483,21 @@ prepare_build(bool print_fingerprint,
             key.ns.empty() ? "" : ".",
             key.shortName,
             sourceKind == "version" ? spec.version : sourceKind);
-        const std::size_t selfIdx = dep_manifests.size() - 1;
+        const std::size_t selfIdx = state.dep_manifests.size() - 1;
         // #243: forward this dep's active features to ITS children before they
         // are pushed (transitive dep->dep forwarding rides the BFS forward
         // edge). Uses the SAME closure inputs as mergeActiveFeatureDeps above
         // (this edge's spec.features, already carrying any forward injected by
         // this dep's own consumer, + defaultFeatures), so activation agrees
         // with resolution.
-        auto depActive = feature_closure(*dep_manifests.back(), spec.features,
+        auto depActive = feature_closure(*state.dep_manifests.back(), spec.features,
                                          spec.defaultFeatures);
-        if (auto fe = validateForwards(*dep_manifests.back(), depActive,
-                                       dep_manifests.back()->package.name); !fe)
+        if (auto fe = validateForwards(*state.dep_manifests.back(), depActive,
+                                       state.dep_manifests.back()->package.name); !fe)
             return std::unexpected(fe.error());
-        for (auto& [child_name, child_spec] : dep_manifests.back()->dependencies) {
+        for (auto& [child_name, child_spec] : state.dep_manifests.back()->dependencies) {
             auto childReq = child_spec;
-            injectForwards(*dep_manifests.back(), depActive, child_name, childReq);
+            injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
             worklist.push_back({child_name, childReq, thisDepLabel,
                                 childReq.version, selfIdx, dep_root,
                                 item.devOnly, item.buildOnly});
@@ -8937,9 +8513,9 @@ prepare_build(bool print_fingerprint,
         // library's build dependency has no business in its consumer's binary
         // either.
         for (auto& [child_name, child_spec] :
-                 dep_manifests.back()->buildDependencies) {
+                 state.dep_manifests.back()->buildDependencies) {
             auto childReq = child_spec;
-            injectForwards(*dep_manifests.back(), depActive, child_name, childReq);
+            injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
             worklist.push_back({child_name, childReq,
                                 thisDepLabel + " (build-dep)",
                                 childReq.version, selfIdx, dep_root,
@@ -8953,34 +8529,38 @@ prepare_build(bool print_fingerprint,
     // refused by default and built under `--cache=local`. Every edge counts,
     // build-only ones included, as the key walk counts them.
     {
-        std::vector<int> state(packages.size(), 0);   // 0 new / 1 on stack / 2 done
+        // Named visitState, not state: this block's own local shadows the
+        // PrepareState reference of the same name, which the rename pass that
+        // promoted `packages`/`dependencyEdges` to state members cannot see
+        // (a name introduced after that pass, not by it).
+        std::vector<int> visitState(state.packages.size(), 0);   // 0 new / 1 on stack / 2 done
         std::vector<std::size_t> stack, cycle;
         auto visit = [&](auto&& self, std::size_t u) -> bool {
-            state[u] = 1;
+            visitState[u] = 1;
             stack.push_back(u);
-            for (auto const& e : dependencyEdges) {
+            for (auto const& e : state.dependencyEdges) {
                 if (e.consumerPackageIndex != u) continue;
                 const auto v = e.dependencyPackageIndex;
-                if (v >= packages.size()) continue;
-                if (state[v] == 1) {
+                if (v >= state.packages.size()) continue;
+                if (visitState[v] == 1) {
                     cycle.assign(std::ranges::find(stack, v), stack.end());
                     cycle.push_back(v);
                     return true;
                 }
-                if (state[v] == 0 && self(self, v)) return true;
+                if (visitState[v] == 0 && self(self, v)) return true;
             }
             stack.pop_back();
-            state[u] = 2;
+            visitState[u] = 2;
             return false;
         };
-        for (std::size_t i = 0; i < packages.size() && cycle.empty(); ++i)
-            if (state[i] == 0) (void)visit(visit, i);
+        for (std::size_t i = 0; i < state.packages.size() && cycle.empty(); ++i)
+            if (visitState[i] == 0) (void)visit(visit, i);
         if (!cycle.empty()) {
             std::string path;
             for (auto p : cycle) {
                 if (!path.empty()) path += " -> ";
                 path += std::format("'{}'",
-                    mcpp::build::qualified_package_name(packages[p].manifest));
+                    mcpp::build::qualified_package_name(state.packages[p].manifest));
             }
             refusal::record(refusal::Code::PackageCycle);
             return std::unexpected(std::format(
@@ -8993,7 +8573,490 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    computeUsageRequirements();
+    state.computeUsageRequirements();
+
+    return {};
+}
+
+export std::expected<BuildContext, std::string>
+
+prepare_build(bool print_fingerprint,
+              bool includeDevDeps = false,
+              std::vector<mcpp::manifest::Target> extraTargets = {},
+              BuildOverrides overrides = {}) {
+    PrepareState state(print_fingerprint, includeDevDeps,
+                        std::move(extraTargets), std::move(overrides));
+    pending_flag_words_notes().clear();
+
+    // A refusal decided early and released late. `host_can_serve` answers
+    // "does a payload on this machine produce this target", which is knowable
+    // before dependency resolution and is only half the question: a package in
+    // the graph can supply the target's system, and the graph is not known
+    // here. Held until it is, and released only if nothing supplies it.
+
+    // THE LOCATED APPLE SDK, RESOLVED ONCE AND READ ONCE.
+    //
+    // `xcrun` is a process. Calling it at the refusal below and again where
+    // the answer is stored would be two calls whose answers can differ -- the
+    // developer directory can be switched between them -- and this repository
+    // has a standing rule that a value crossing two sites is resolved at one.
+    // The iOS floor was not written and was taken from the located SDK. The
+    // refusal of a dependency's platform floor names where the value came
+    // from, and after the fill below the manifest no longer says.
+    state.iosFloorFromSdk = false;
+    // Non-empty when a target row's convention replaced a toolchain the user
+    // had set with `mcpp toolchain default`. Reported on the status line,
+    // because a substitution nobody is told about is a rule that can only be
+    // learned by experiment — writing the same value a second time in
+    // `[target.<triple>]` and observing that it works.
+    // THE HOST SPEC AS IT STOOD BEFORE A TARGET ROW'S CONVENTION REPLACED IT,
+    // whatever its origin. `build.mcpp` is compiled and run on this machine,
+    // so its compiler is a host fact; the row's pin is a target fact. Before
+    // this snapshot existed, `host_tc_for_build_program` read `tcSpec` after
+    // the row had overwritten it and resolved the row's payload "for the
+    // host" -- which works by accident for a payload whose compiler can also
+    // target the host (an NDK clang) and cannot work for one that cannot:
+    // `em++` produces WebAssembly under every invocation, and every project
+    // with a build program failed under `--target wasm32-emscripten` inside
+    // `emcc.py` (#622, measured by the dist-web member's first build).
+    //
+    // Empty when the row replaced nothing — no [toolchain], no global
+    // default, no [target.<row>] entry existed before the row's pin applied.
+    // THIS IS NOT "the row's pin remains the only spec there is": on a
+    // fresh $HOME whose first-ever invocation names a hosted `--target`
+    // (nothing to be "before"), that reading resolved the SAME payload the
+    // row just picked — `em++` again — as the host compiler, which is the
+    // exact defect this field exists to close, just with no prior value to
+    // restore. `host_tc_for_build_program` resolves the platform's own
+    // native default in that case instead (`native_first_run_spec()`), the
+    // same one a plain `mcpp build` would have installed.
+    // THE PACKAGE WHOSE `requires` CHOSE THE COMPILER, AND WHAT IT ASKED FOR.
+    //
+    // Non-empty only when the graph's requirement actually changed the answer.
+    // Reported on the status line for the same reason `pinReplacedDefault` is:
+    // a compiler the user did not name is a decision they did not make, and one
+    // reported without its reason is a rule learned by experiment.
+    // The C library the target triple asked for, taken before the triple is
+    // canonicalised. Empty when the project declined to name one.
+    // The target as the project spelled it, when that differs from the
+    // canonical identity. Report only; empty means they coincide.
+    // The target row's toolchain convention, held until the graph is known.
+    // Empty when the row names none or the project named its own.
+    // AND WHETHER THAT PIN IS A CONVENTION OR A CAPABILITY, RECORDED AT
+    // THE SAME READ.
+    //
+    // A hosted row's pin answers "which payload supplies this target's C
+    // library", so a graph that supplies one instead makes it inapplicable.
+    // A freestanding row's pin answers a different question — the table says
+    // so in its own words: "the pin is llvm on every host because clang/lld
+    // are cross-compilers by construction". A host g++ cannot emit
+    // riscv64-none-elf at all, and no dependency changes that.
+    //
+    // Taken here rather than re-derived at the decision point, because the row
+    // is read exactly once and both facts come out of that read.
+    state.targetPinIsCapability = false;
+    // THE ROW'S PIN, KEPT EVEN WHEN THE PROJECT NAMED ITS OWN COMPILER —
+    // which is exactly when `targetPinCandidate` above is left empty.
+    //
+    // The candidate answers "should mcpp apply its convention"; this answers
+    // "what does the convention SAY", and the two differ precisely in the case
+    // that needs a diagnosis: a project that overrode the convention and has
+    // nothing supplying what the convention was there to supply.
+    // Whether the resolved toolchain spec names the machine's own Visual
+    // Studio. Decided inside `resolve_target_toolchain`, read by
+    // `host_tc_for_build_program`, which is why it is declared out here.
+    state.tcSpecIsMsvc = false;
+
+    state.root = state.overrides.project_root.empty()
+        ? mcpp::project::find_manifest_root(std::filesystem::current_path())
+        : std::optional<std::filesystem::path>(state.overrides.project_root);
+    if (!state.root) {
+        return std::unexpected("no mcpp.toml found in current directory or any parent");
+    }
+    // THE PROJECT'S PATH IS PART OF EVERY DOCUMENT A BUILD WRITES, and those
+    // documents are UTF-8 text (build.ninja, compile_commands.json). A
+    // directory whose path has no UTF-8 spelling used to fail the first build
+    // with `internal: unhandled exception: [json.exception.type_error.316]`
+    // (#693, measured on Linux with a Latin-1 name and on a Windows code page
+    // 1252 host with a name that page can spell). It is refused here, by name.
+    if (!mcpp::modgraph::try_narrow(*state.root)) {
+        return std::unexpected(std::format(
+            "the project directory '{}' has no UTF-8 spelling.\n"
+            "       {}\n"
+            "       Every file a build writes names this directory in UTF-8; "
+            "rename or move it.",
+            mcpp::modgraph::escaped_spelling(*state.root),
+            mcpp::modgraph::no_utf8_spelling_reason()));
+    }
+    // NOTE: `workRoot` is deliberately NOT derived here. `root` is not final
+    // yet — the workspace block below reassigns it to the selected member
+    // (`root = memberDir`), and anchoring the write root to the pre-switch
+    // value puts a member's target/, mcpp.lock and .mcpp/ at the WORKSPACE
+    // root. See the derivation right after that block.
+
+    // A registry package in `compat` form (Form B) ships NO mcpp.toml — its
+    // manifest is synthesized from the `.lua` descriptor by the resolver. So a
+    // nested build of such a package cannot re-read one off disk, and the
+    // caller hands over the manifest it already synthesized instead.
+    //
+    // Passing it in rather than re-deriving it is also the more correct of the
+    // two: re-deriving could produce a DIFFERENT manifest than the one the
+    // parent resolved against (the L1 cfg merge and feature-activated deps
+    // have already been folded in by then).
+    // THE EFFECTIVE MANIFEST, FROM THE ONE LOADER EVERY COMMAND USES.
+    //
+    // A command issued inside a member directory receives the member's
+    // manifest after workspace inheritance, exactly as `publish`, `pack`,
+    // `emit xpkg` and `toolchain list` do (#690, W4). A command at the
+    // workspace root receives the root manifest as written; the `-p <member>`
+    // switch below loads and inherits the member it names.
+    //
+    // A PRELOADED manifest (a host-tool sub-build) is already effective: the
+    // resolver loaded it at the dependency's load site, where a member
+    // inherits (see `inherit_as_workspace_member`). It is not inherited a second time; the
+    // workspace it belongs to is still recorded below, so that its own sibling
+    // dependencies inherit as members.
+    state.m =
+        std::unexpected(std::string{});
+    if (state.overrides.preloaded_manifest) {
+        state.m = *state.overrides.preloaded_manifest;
+    } else {
+        auto loaded = mcpp::project::load_effective_manifest(*state.root);
+        if (!loaded) return std::unexpected(loaded.error());
+        state.m = loaded->manifest;
+        state.effective = std::move(*loaded);
+    }
+
+    // AND ONLY FOR THE ROOT. A layer name this engine does not know is a
+    // typo in the manifest the author is looking at, and a version gap in a
+    // dependency's. The reserved `mcpp:` prefix exists so the first is an error
+    // rather than a silently disabled behaviour; refusing the second as well
+    // meant the layer vocabulary could never be extended by a published package
+    // (`warn_unknown_xpkg_keys` carries that half).
+    if (!state.m->unknownCapabilities.empty()) {
+        auto const& cap = state.m->unknownCapabilities.front();
+        auto why = mcpp::targetside::parse_capability(cap);
+        return std::unexpected(std::format(
+            "{}: {}", (*state.root / "mcpp.toml").string(),
+            why ? std::format("`{}` names no capability mcpp knows.", cap)
+                : why.error()));
+    }
+
+    // A DISTRIBUTION package is not a source tree, and building "in" one is a
+    // failure that looks like a success: `interface/` holds declarations whose
+    // definitions are in the prebuilt archive, so the build compiles the
+    // declarations, produces a near-empty library, links nothing, and reports
+    // Finished. The archive it was supposed to carry never enters the picture.
+    //
+    // Only the ROOT is refused. As a dependency this is exactly what the
+    // package is for — the consumer compiles the interface and links the
+    // artifact, which is the whole design.
+    if (!state.overrides.preloaded_manifest && mcpp::pack::is_distribution_package(*state.m)) {
+        return std::unexpected(std::format(
+            "'{}' is a distribution package produced by `mcpp pack`, not a source tree.\n"
+            "  Its sources are interface declarations; the definitions are in the\n"
+            "  prebuilt artifacts beside them, so building here would produce an\n"
+            "  empty library and say it succeeded.\n"
+            "  Use it: add it to a project as a dependency —\n"
+            "      [dependencies]\n"
+            "      {} = {{ path = \"{}\" }}",
+            state.root->string(), state.m->package.name, state.root->string()));
+    }
+
+    // ─── Workspace handling ────────────────────────────────────────────
+    // If the manifest has [workspace] and is a virtual workspace (no [package]),
+    // or if -p filter is set, switch to the target member's manifest.
+    if (state.m->workspace.present) {
+        std::string targetMember;
+
+        if (!state.overrides.package_filter.empty()) {
+            // -p <name>: find matching member by directory basename or path
+            for (auto& mp : state.m->workspace.members) {
+                auto basename = std::filesystem::path(mp).filename().string();
+                if (basename == state.overrides.package_filter || mp == state.overrides.package_filter) {
+                    targetMember = mp;
+                    break;
+                }
+            }
+            if (targetMember.empty()) {
+                return std::unexpected(std::format(
+                    "workspace member '{}' not found in [workspace].members",
+                    state.overrides.package_filter));
+            }
+        } else if (state.m->package.name.empty()) {
+            // Virtual workspace: find a member with a program target ("is
+            // this the program", #622 A3's `is_program()`, so a member whose
+            // only target is `kind = "app"` is picked exactly as one whose
+            // target is `bin` is), or use last member.
+            for (auto& mp : state.m->workspace.members) {
+                auto memberDir = *state.root / mp;
+                auto mm = mcpp::manifest::load(memberDir / "mcpp.toml",
+                                               {.insideWorkspace = true});
+                if (!mm) continue;
+                for (auto& t : mm->targets) {
+                    if (t.is_program()) {
+                        targetMember = mp;
+                        break;
+                    }
+                }
+                if (!targetMember.empty()) break;
+            }
+            if (targetMember.empty() && !state.m->workspace.members.empty()) {
+                targetMember = state.m->workspace.members.back();
+            }
+        }
+        // else: rooted workspace with [package] — build root normally. Its own
+        // `x.workspace = true` entries name its own [workspace.dependencies].
+        else if (state.m->workspace.present)
+            mcpp::project::merge_workspace_deps(*state.m, *state.m, *state.root);
+
+        if (!targetMember.empty()) {
+            auto memberDir = *state.root / targetMember;
+            if (!std::filesystem::exists(memberDir / "mcpp.toml")) {
+                return std::unexpected(std::format(
+                    "workspace member '{}' has no mcpp.toml", targetMember));
+            }
+            state.runtimeWorkspaceRoot = *state.root;
+            state.wsManifest = std::move(*state.m);  // preserve workspace manifest
+            auto memberManifest = mcpp::manifest::load(memberDir / "mcpp.toml",
+                                                       {.insideWorkspace = true});
+            if (!memberManifest) return std::unexpected(std::format(
+                "workspace member '{}': {}", targetMember,
+                memberManifest.error().format()));
+            state.m = std::move(*memberManifest);
+
+            // ONE call, not a hand-copied list. `*root` is still the WORKSPACE
+            // root here (the `root = memberDir` reassignment below has not
+            // happened yet), which is what a relative `[indices].path` or
+            // `[workspace.dependencies] path` was written against (#224).
+            mcpp::project::inherit_workspace_config(*state.m, *state.wsManifest, *state.root);
+            if (auto bad = mcpp::project::workspace_inheritance_error(*state.m, memberDir))
+                return std::unexpected(*bad);
+
+            mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
+            state.root = memberDir;
+        }
+    } else {
+        // Not at workspace root: inside a member, the loader above has
+        // already inherited (#224 anchoring included). Only the workspace is
+        // recorded here, for the membership test of this member's own `path`
+        // dependencies.
+        if (state.effective && state.effective->member) {
+            state.runtimeWorkspaceRoot = state.effective->workspaceRoot;
+            state.wsManifest = std::move(*state.effective->workspace);
+        } else if (state.overrides.preloaded_manifest) {
+            auto wsRoot = mcpp::project::find_workspace_root(*state.root);
+            if (!wsRoot.empty()) {
+                if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
+                    wsm && wsm->workspace.present) {
+                    state.runtimeWorkspaceRoot = wsRoot;
+                    state.wsManifest = std::move(*wsm);
+                }
+            }
+            // A preloaded manifest was inherited at its dependency load site,
+            // which gives a member everything but the root-position keys. This
+            // build IS rooted at it (a host-tool sub-build), so it takes those
+            // too, from the workspace that lists it (#710).
+            if (state.wsManifest
+                && mcpp::project::is_workspace_member(*state.wsManifest, state.runtimeWorkspaceRoot, *state.root))
+                mcpp::project::inherit_workspace_root_position(
+                    *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
+        }
+    }
+
+    if (auto bad = mcpp::project::unresolved_workspace_dependency_error(*state.m, *state.root))
+        return std::unexpected(*bad);
+
+    if (state.overrides.inherited_runtime_selection) {
+        state.runtimeSelection = *state.overrides.inherited_runtime_selection;
+    } else {
+        std::optional<std::reference_wrapper<const mcpp::manifest::Manifest>> wsRef;
+        if (state.wsManifest) wsRef = std::cref(*state.wsManifest);
+        auto selected = mcpp::xlings::runtime::select_runtime(
+            *state.m, wsRef, *state.root, state.runtimeWorkspaceRoot);
+        if (!selected) return std::unexpected(selected.error());
+        state.runtimeSelection = std::move(*selected);
+    }
+
+    // Where mcpp WRITES — derived here because `root` is only final now: the
+    // workspace block above may have moved it to the selected member. Defaults
+    // to the project root, so every existing invocation is byte-for-byte
+    // unchanged; the tool-provisioning pass points it at the tool store
+    // instead (BuildOverrides::work_dir).
+    state.workRoot =
+        state.overrides.work_dir.empty() ? *state.root : state.overrides.work_dir;
+    {
+        std::error_code wdEc;
+        std::filesystem::create_directories(state.workRoot, wdEc);
+    }
+
+    if (state.m->package.sourceProvenance.empty()) {
+        state.m->package.sourceProvenance =
+            "path+" + state.root->lexically_normal().generic_string();
+    }
+
+    // A `compat`-form (Form B) package's sources live under a wrap directory
+    // inside the version dir, which is why its descriptor writes globs like
+    // `*/src/foo.cc` — the `*` stands for the tarball's top-level folder,
+    // whose name the descriptor cannot know. `[build] sources` has always
+    // expanded those; `targets.<x>.main` did NOT, so a bin target in such a
+    // package handed ninja a literal `*` and died with
+    // `missing and no known rule to make it`.
+    //
+    // Nothing could reach that path before #355 (a dependency's bin targets
+    // were never built), which is why it went unnoticed. Resolve it here, once
+    // the manifest is final and before anything reads `t.main`.
+    for (auto& t : state.m->targets) {
+        if (t.main.empty() || t.main.find('*') == std::string::npos) continue;
+        auto hits = mcpp::modgraph::expand_glob(*state.root, t.main);
+        if (hits.size() == 1) {
+            t.main = std::filesystem::relative(hits.front(), *state.root).generic_string();
+        } else {
+            return std::unexpected(std::format(
+                "target '{}': `main = \"{}\"` matched {} files; it must name "
+                "exactly one entry source",
+                t.name, t.main, hits.size()));
+        }
+    }
+
+    // Inject synthetic targets (e.g. test binaries from `mcpp test`).
+    for (auto& t : state.extraTargets) state.m->targets.push_back(t);
+
+    // #540: a cfg() predicate mcpp cannot evaluate must say so.
+    //
+    // A PREDICATE THAT ANSWERS FALSE AND A PREDICATE THAT WAS NEVER
+    // UNDERSTOOD USED TO READ THE SAME. `cfgpred` returns false for an unknown
+    // key and for an unknown bareword, and a `[target.<pred>.build]` section
+    // whose predicate is false is dropped without a word — so a typo, and every
+    // `cfg(c-abi = …)` section docs/14 documented before this release, produced
+    // a successful build configured as if the section had not been written.
+    //
+    // Reported here rather than in the manifest parser because the vocabulary
+    // lives with the evaluator, and a second copy of it in `toml.cppm` is the
+    // exact defect this release is fixing four other instances of.
+    //
+    // Scoped to the root manifest by where it sits, which matches the existing
+    // policy for every other schema warning: a dependency may adopt a predicate
+    // a consumer's older mcpp does not know, and its build stays quiet.
+    for (auto const& cc : state.m->conditionalConfigs) {
+        auto unknown = cfgpred::unknown_tokens(cc.predicate);
+        if (!unknown.empty()) {
+            std::string names;
+            for (auto const& u : unknown) {
+                if (!names.empty()) names += ", ";
+                names += '\'' + u + '\'';
+            }
+            state.m->schemaWarnings.push_back(std::format(
+                "[target.'{}'] names {} in its cfg() predicate, which mcpp does "
+                "not know, so the section never applies (ignored). {}",
+                cc.predicate, names, cfgpred::vocabulary_sentence()));
+        }
+        // A RESOLVED layer is answered AFTER dependency resolution, so a
+        // dependency selected by one would form a cycle with the resolution
+        // that produces the answer — docs/14 states this. The section's build
+        // inputs are honoured by the second pass; its dependencies cannot be,
+        // and saying so is the difference between a documented limit and a
+        // silent drop.
+        //
+        // `accelerator` is not one of these (see kCfgEarlyLayerKeys), so
+        // `[target.'cfg(accelerator = "cuda")'.dependencies]` is honoured and
+        // never reaches this warning: nothing about it is circular, because the
+        // accel is an input to the build rather than an answer from the graph.
+        if (cfgpred::uses_layer(cc.predicate)
+            && !(cc.dependencies.empty() && cc.devDependencies.empty()
+                 && cc.buildDependencies.empty() && cc.featureDeps.empty())) {
+            state.m->schemaWarnings.push_back(std::format(
+                "[target.'{}'] conditions dependencies on a target-side layer "
+                "(ignored). A layer is resolved from the dependency graph, so a "
+                "dependency chosen by one would decide the answer it is asking "
+                "for. Build inputs under this predicate DO apply; move the "
+                "dependency to an unconditional [dependencies] entry, or "
+                "condition it on the triple instead.",
+                cc.predicate));
+        }
+        // The same reason holds for a row's library form: whether a package
+        // is linked shared is decided while the graph is resolved, before a
+        // layer has an answer.
+        if (cfgpred::uses_layer(cc.predicate) && !cc.targetKinds.empty()) {
+            state.m->schemaWarnings.push_back(std::format(
+                "[target.'{}'] conditions a target's kind or linkage on a "
+                "target-side layer (ignored). A layer is resolved from the "
+                "dependency graph, and a library's form is decided while that "
+                "graph is resolved; condition the statement on the triple "
+                "instead.",
+                cc.predicate));
+        }
+    }
+
+    // Surface non-fatal manifest schema warnings (e.g. unsupported [targets.*]
+    // keys). Under --strict they become errors — same policy as the
+    // feature/platform schema checks below.
+    for (auto const& w : state.m->schemaWarnings) {
+        if (state.overrides.strict) return std::unexpected(w);
+        mcpp::diag::warning("manifest/schema", w);
+    }
+
+    // Load mcpp.lock once, up front: it is a resolution input for git deps
+    // (#329), which decide the commit to build long before anything is
+    // fetched. Keyed by package name — the same key the writer at the end of
+    // this function emits, both taken from the root manifest's [dependencies].
+    {
+        // Read where the project keeps it. A planning pass that writes
+        // elsewhere (plan_only) still resolves against the project's lock.
+        auto lockPath = (state.overrides.plan_only ? *state.root : state.workRoot) / "mcpp.lock";
+        if (std::filesystem::exists(lockPath)) {
+            if (auto lock = mcpp::pm::load(lockPath); lock) {
+                for (auto const& p : lock->packages) {
+                    if (!p.namespace_.empty())
+                        state.packageIdentityLockAnchors.emplace(
+                            p.name, p.namespace_);
+                    if (auto parsed = mcpp::pm::parse_git_source(p.source); parsed)
+                        state.gitLockAnchors.emplace(p.name, std::move(*parsed));
+                }
+            } else {
+                // Degraded, not a plain warning: the engine silently does less
+                // than asked — every git branch dep falls back to `ls-remote`
+                // and may advance past the commit the lock recorded.
+                mcpp::diag::degraded("lockfile",
+                    std::format("mcpp.lock could not be read: {}",
+                                lock.error().message),
+                    "git branch dependencies are re-resolved over the network "
+                    "and may move onto a newer commit than the one recorded",
+                    "delete mcpp.lock and rebuild to regenerate it");
+            }
+        }
+    }
+
+    // Global-cache mode: --cache > MCPP_BUILD_CACHE > [build] cache > global.
+    // An unparseable value is a warning (error under --strict) and falls
+    // through to the next source rather than silently meaning "global" — a typo
+    // that quietly re-enabled the cache would be the hardest kind of surprise
+    // to attribute.
+    // Selection lives in resolve_cache_mode (above) so the fast paths settle it
+    // identically. This block only adds the diagnostics, which the fast paths
+    // have no business emitting: an unparseable value must be reported once, by
+    // the invocation that actually resolves the build.
+    state.cacheMode = resolve_cache_mode(*state.m, state.overrides.cache_mode);
+    {
+        const char* envMode = std::getenv("MCPP_BUILD_CACHE");
+        for (auto [value, origin] : std::initializer_list<
+                 std::pair<std::string_view, std::string_view>>{
+                 {state.overrides.cache_mode,        "--cache"},
+                 {envMode ? envMode : "",      "MCPP_BUILD_CACHE"},
+                 {state.m->buildConfig.cacheMode,    "[build] cache"}}) {
+            if (value.empty() || parse_cache_mode(value)) continue;
+            auto msg = std::format(
+                "{} has unknown cache mode '{}' (expected: global | local | off)",
+                origin, value);
+            if (state.overrides.strict) return std::unexpected(msg);
+            mcpp::diag::warning("build/cache-mode", msg);
+        }
+    }
+
+    if (auto r = phase1_toolchain_spec_and_axes(state); !r) return std::unexpected(r.error());
+    if (auto r = phase2_define_toolchain_resolver(state); !r) return std::unexpected(r.error());
+    if (auto r = phase3_xlings_before_graph(state); !r) return std::unexpected(r.error());
+    if (auto r = phase4_dependency_graph(state); !r) return std::unexpected(r.error());
 
     // ─── The toolchain, resolved now that the graph exists ──────────────────
     //
@@ -9117,7 +9180,7 @@ prepare_build(bool print_fingerprint,
                 reqCompilerBy, family, family, family));
         };
 
-        for (auto const& pkg : packages) {
+        for (auto const& pkg : state.packages) {
             for (auto const& entry : pkg.manifest.provides) {
                 auto cap = mcpp::targetside::parse_capability(entry);
                 if (!cap || !*cap) continue;
@@ -9461,20 +9524,20 @@ prepare_build(bool print_fingerprint,
                 }
             }
         }
-        for (std::size_t pi = 0; pi < packages.size(); ++pi) {
+        for (std::size_t pi = 0; pi < state.packages.size(); ++pi) {
             // The root's claims live in *m: its build program mutates
             // *m, and packages[0] is a snapshot taken before it ran.
-            const auto& mf  = pi == 0 ? *state.m : packages[pi].manifest;
+            const auto& mf  = pi == 0 ? *state.m : state.packages[pi].manifest;
             const auto who = mf.package.name;
             for (auto const& entry : mf.runtimeConfig.provides) {
                 auto fact = mcpp::build::parse_version_fact(entry);
                 if (fact.valid()) facts.emplace(fact.name, std::pair{fact.version, who});
             }
         }
-        for (std::size_t pi = 0; pi < packages.size(); ++pi) {
+        for (std::size_t pi = 0; pi < state.packages.size(); ++pi) {
             // The root's claims live in *m: its build program mutates
             // *m, and packages[0] is a snapshot taken before it ran.
-            const auto& mf  = pi == 0 ? *state.m : packages[pi].manifest;
+            const auto& mf  = pi == 0 ? *state.m : state.packages[pi].manifest;
             const auto who = mf.package.name;
             for (auto const& req : mf.runtimeConfig.requirements) {
                 if (req.kind != "version-floor") continue;
@@ -9818,7 +9881,7 @@ prepare_build(bool print_fingerprint,
                 mcpp::manifest::append(bc, contribution);
             }
         };
-        if (!packages.empty()) {
+        if (!state.packages.empty()) {
             auto rootReq = parse_feature_request(state.overrides.features);
             // Strict schema check: a requested feature must exist in the
             // target package's [features] table when one is declared (a
@@ -9832,13 +9895,13 @@ prepare_build(bool print_fingerprint,
                     if (!pm.featuresMap.contains(f)) return f;
                 return std::nullopt;
             };
-            if (auto bad = unknown_requested(packages[0].manifest, rootReq)) {
+            if (auto bad = unknown_requested(state.packages[0].manifest, rootReq)) {
                 auto msg = std::format(
                     "--features requests '{}' which [features] does not declare", *bad);
                 if (state.overrides.strict) return std::unexpected(msg);
                 mcpp::diag::warning("features/request", msg);
             }
-            apply(packages[0], rootReq);
+            apply(state.packages[0], rootReq);
             for (auto& f : activate(*state.m, rootReq)) activeRootFeatures.insert(f);
         }
         // #242/#243: the feature request for a dependency PACKAGE, aggregated
@@ -9854,7 +9917,7 @@ prepare_build(bool print_fingerprint,
             -> std::pair<std::vector<std::string>, bool> {
             std::vector<std::string> feats;
             bool anyEdge = false, anyDefault = false;
-            for (auto const& edge : dependencyEdges) {
+            for (auto const& edge : state.dependencyEdges) {
                 if (edge.dependencyPackageIndex != depPkgIndex) continue;
                 anyEdge = true;
                 if (edge.defaultFeatures) anyDefault = true;
@@ -9864,12 +9927,12 @@ prepare_build(bool print_fingerprint,
             }
             return { std::move(feats), anyEdge ? anyDefault : true };
         };
-        for (std::size_t i = 1; i < packages.size(); ++i) {
-            auto& pname = packages[i].manifest.package.name;
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {
+            auto& pname = state.packages[i].manifest.package.name;
             auto [req, depDefaultFeatures] = aggregatedRequest(i);
-            if (!req.empty() && !packages[i].manifest.featuresMap.empty()) {
+            if (!req.empty() && !state.packages[i].manifest.featuresMap.empty()) {
                 for (auto& f : req) {
-                    if (packages[i].manifest.featuresMap.contains(f)) continue;
+                    if (state.packages[i].manifest.featuresMap.contains(f)) continue;
                     auto msg = std::format(
                         "dependency '{}' does not declare requested feature '{}' "
                         "in its [features] table", pname, f);
@@ -9881,11 +9944,11 @@ prepare_build(bool print_fingerprint,
             // feature-gated sources must have those sources dropped by default.
             // depDefaultFeatures carries the consumer's `default-features = false`
             // (#242): when opted out, the dep's [features].default is not seeded.
-            apply(packages[i], req, depDefaultFeatures);
-            if (activeFeaturesByPackage.size() <= i)
-                activeFeaturesByPackage.resize(i + 1);
-            activeFeaturesByPackage[i] =
-                feature_closure(packages[i].manifest, req, depDefaultFeatures);
+            apply(state.packages[i], req, depDefaultFeatures);
+            if (state.activeFeaturesByPackage.size() <= i)
+                state.activeFeaturesByPackage.resize(i + 1);
+            state.activeFeaturesByPackage[i] =
+                feature_closure(state.packages[i].manifest, req, depDefaultFeatures);
         }
 
         // ─── Device extensions a rule dependency declared ──────────────────
@@ -9919,17 +9982,17 @@ prepare_build(bool print_fingerprint,
             std::vector<std::string> extensions;
             std::string              provider;   // "<ns>:<name>", for the report
         };
-        std::vector<std::vector<RuleClaim>> ruleClaims(packages.size());
-        for (std::size_t ci = 0; ci < packages.size(); ++ci) {
+        std::vector<std::vector<RuleClaim>> ruleClaims(state.packages.size());
+        for (std::size_t ci = 0; ci < state.packages.size(); ++ci) {
             std::vector<std::string> collected;
             std::vector<std::string> ruleModules;
-            for (auto const& edge : dependencyEdges) {
+            for (auto const& edge : state.dependencyEdges) {
                 if (edge.consumerPackageIndex != ci) continue;
-                if (edge.dependencyPackageIndex >= packages.size()) continue;
-                auto const& dep = packages[edge.dependencyPackageIndex];
+                if (edge.dependencyPackageIndex >= state.packages.size()) continue;
+                auto const& dep = state.packages[edge.dependencyPackageIndex];
                 const auto& depFeatures =
-                    edge.dependencyPackageIndex < activeFeaturesByPackage.size()
-                        ? activeFeaturesByPackage[edge.dependencyPackageIndex]
+                    edge.dependencyPackageIndex < state.activeFeaturesByPackage.size()
+                        ? state.activeFeaturesByPackage[edge.dependencyPackageIndex]
                         : edge.requestedFeatures;
                 for (auto const& f : depFeatures) {
                     auto it = dep.manifest.featureDeviceExtensions.find(f);
@@ -9956,7 +10019,7 @@ prepare_build(bool print_fingerprint,
             }
             if (!collected.empty()) {
                 if (ci == 0) state.m->buildConfig.deviceExtensions = collected;
-                packages[ci].manifest.buildConfig.deviceExtensions = std::move(collected);
+                state.packages[ci].manifest.buildConfig.deviceExtensions = std::move(collected);
             }
             if (!ruleModules.empty()) {
                 // THE ROOT'S MANIFEST IS TWO OBJECTS. `packages[0]` holds a COPY
@@ -9965,7 +10028,7 @@ prepare_build(bool print_fingerprint,
                 // an empty list and the shaders uncompiled, with a refusal that
                 // named the missing build program rather than the missing write.
                 if (ci == 0) state.m->buildConfig.ruleModules = ruleModules;
-                packages[ci].manifest.buildConfig.ruleModules = std::move(ruleModules);
+                state.packages[ci].manifest.buildConfig.ruleModules = std::move(ruleModules);
             }
         }
 
@@ -9992,8 +10055,8 @@ prepare_build(bool print_fingerprint,
         // no compile rule for them and never will.
         {
             const auto buildAccel = mcpp::pack::parse_accel(state.resolvedAccel());
-            for (std::size_t i = 0; i < packages.size(); ++i) {
-                auto& pkg = packages[i];
+            for (std::size_t i = 0; i < state.packages.size(); ++i) {
+                auto& pkg = state.packages[i];
                 auto& bc  = pkg.manifest.buildConfig;
                 std::set<std::string> excludedGlobs;
                 for (auto const& sc : bc.sourceConstraints) {
@@ -10119,10 +10182,10 @@ prepare_build(bool print_fingerprint,
         // device source no active rule claims is still the orphan refused
         // below, and a package that wants a rule to run without claimed
         // sources writes its own `build.mcpp`.
-        for (std::size_t ci = 0; ci < packages.size(); ++ci) {
+        for (std::size_t ci = 0; ci < state.packages.size(); ++ci) {
             if (ruleClaims[ci].empty()) continue;
-            auto& bc = packages[ci].manifest.buildConfig;
-            const auto dit = deviceSourcesByPackage.find(packages[ci].root.string());
+            auto& bc = state.packages[ci].manifest.buildConfig;
+            const auto dit = deviceSourcesByPackage.find(state.packages[ci].root.string());
             std::vector<std::string> applies;
             for (auto const& claim : ruleClaims[ci]) {
                 const auto table = mcpp::extension_table_for(bc.moduleExtensions,
@@ -10142,7 +10205,7 @@ prepare_build(bool print_fingerprint,
             if (ci == 0) state.m->buildConfig.ruleModules = applies;
             bc.ruleModules = std::move(applies);
         }
-        activeFeaturesByPackage.resize(packages.size());
+        state.activeFeaturesByPackage.resize(state.packages.size());
 
         // ── The GRAPH's `[xlings.workspace]`, provisioned BEFORE build.mcpp ──
         //
@@ -10177,10 +10240,10 @@ prepare_build(bool print_fingerprint,
             // fetched, so a refusal costs nothing that has to be undone.
             if (auto why = layer_predicated_xlings_refusal(*state.runtimeOwnerManifest))
                 return std::unexpected(*why);
-            for (auto const& pkg : packages)
+            for (auto const& pkg : state.packages)
                 if (auto why = layer_predicated_xlings_refusal(pkg.manifest))
                     return std::unexpected(*why);
-            auto split = graph_xlings_split();
+            auto split = state.graph_xlings_split();
             if (!split) {
                 refusal::record(refusal::Code::ToolVersionConflict);
                 return std::unexpected(split.error());
@@ -10223,12 +10286,12 @@ prepare_build(bool print_fingerprint,
             // same set `[feature-xlings]` is answered from. Added before the
             // aggregation below, so building, visibility (`dep_bin`) and the
             // store key are the edge-requested tool's in every respect.
-            for (auto& edge : dependencyEdges) {
+            for (auto& edge : state.dependencyEdges) {
                 const auto d = edge.dependencyPackageIndex;
-                if (d >= packages.size() || d >= activeFeaturesByPackage.size()) continue;
-                auto const& ft = packages[d].manifest.featureTools;
+                if (d >= state.packages.size() || d >= state.activeFeaturesByPackage.size()) continue;
+                auto const& ft = state.packages[d].manifest.featureTools;
                 if (ft.empty()) continue;
-                for (auto const& f : activeFeaturesByPackage[d])
+                for (auto const& f : state.activeFeaturesByPackage[d])
                     if (auto it = ft.find(f); it != ft.end())
                         for (auto const& t : it->second)
                             if (std::ranges::find(edge.requestedTools, t)
@@ -10236,7 +10299,7 @@ prepare_build(bool print_fingerprint,
                                 edge.requestedTools.push_back(t);
             }
             std::map<std::size_t, std::set<std::string>> toolRequests;
-            for (auto const& edge : dependencyEdges)
+            for (auto const& edge : state.dependencyEdges)
                 for (auto const& t : edge.requestedTools)
                     toolRequests[edge.dependencyPackageIndex].insert(t);
 
@@ -10245,7 +10308,7 @@ prepare_build(bool print_fingerprint,
             // and conflating them is what made a re-exported tool impossible:
             // the tool was built, but its path was recorded against the library
             // that asked for it rather than the project that needs it.
-            provisionGraph = prov::propagate(dependencyEdges, packages.size());
+            state.provisionGraph = prov::propagate(state.dependencyEdges, state.packages.size());
 
             // #355 step 5: dependencies offering HOST build rules. Nothing is
             // compiled here — the interface is handed to build_program.cppm,
@@ -10266,16 +10329,16 @@ prepare_build(bool print_fingerprint,
             // Providers of host modules that THIS package sees directly.
             auto directHostProviders = [&](std::size_t p) {
                 std::vector<std::size_t> out;
-                if (p >= provisionGraph.visible.size()) return out;
-                for (auto const& pr : provisionGraph.visible[p]) {
+                if (p >= state.provisionGraph.visible.size()) return out;
+                for (auto const& pr : state.provisionGraph.visible[p]) {
                     if (pr.kind != prov::Kind::HostModule) continue;
-                    if (pr.provider >= packages.size()) continue;
+                    if (pr.provider >= state.packages.size()) continue;
                     out.push_back(pr.provider);
                 }
                 return out;
             };
             auto identity = [&](std::size_t p) {
-                auto const& pkg = packages[p].manifest.package;
+                auto const& pkg = state.packages[p].manifest.package;
                 return pkg.namespace_.empty()
                      ? pkg.name : pkg.namespace_ + "." + pkg.name;
             };
@@ -10299,7 +10362,7 @@ prepare_build(bool print_fingerprint,
             // exposed then; widening that implicitly would compile units that
             // were written to be part of an ordinary library, alone.
             auto units = [&](std::size_t p) {
-                auto const& depPkg = packages[p];
+                auto const& depPkg = state.packages[p];
                 auto const& pkg    = depPkg.manifest.package;
                 std::vector<prov::HostModule> out;
                 auto push = [&](std::filesystem::path iface, std::string name) {
@@ -10416,7 +10479,7 @@ prepare_build(bool print_fingerprint,
                 for (auto i : order) push(pending[i].path, std::move(pending[i].name));
                 return out;
             };
-            for (std::size_t c = 0; c < provisionGraph.visible.size(); ++c) {
+            for (std::size_t c = 0; c < state.provisionGraph.visible.size(); ++c) {
                 const auto direct = directHostProviders(c);
                 if (direct.empty()) continue;
                 std::set<std::size_t> isDirect(direct.begin(), direct.end());
@@ -10469,7 +10532,7 @@ prepare_build(bool print_fingerprint,
                 // Every provider on this consumer's rule closure, transitive
                 // ones included -- `done` is exactly that set, and a rule
                 // imported by another rule declares payloads just as directly.
-                hostModuleProvidersByConsumer[c].assign(done.begin(), done.end());
+                state.hostModuleProvidersByConsumer[c].assign(done.begin(), done.end());
 
                 if (auto clash = prov::host_module_collision(ordered))
                     return std::unexpected(*clash);
@@ -10483,7 +10546,7 @@ prepare_build(bool print_fingerprint,
                         if (prefixWarned.insert(hm.package + "\x1e" + hm.module).second)
                             mcpp::diag::warning("build/rule-namespace", *w);
                     }
-                    hostModulesByConsumer[c].push_back(
+                    state.hostModulesByConsumer[c].push_back(
                         {hm.module, hm.interface, hm.importable});
                 }
             }
@@ -10532,14 +10595,14 @@ prepare_build(bool print_fingerprint,
             // one rule and no special case.
             {
                 auto reachable = [&](bool targetEdgesOnly) {
-                    std::vector<bool> seen(packages.size(), false);
-                    if (packages.empty()) return seen;
+                    std::vector<bool> seen(state.packages.size(), false);
+                    if (state.packages.empty()) return seen;
                     std::vector<std::size_t> stack{0};
                     seen[0] = true;
                     while (!stack.empty()) {
                         auto p = stack.back();
                         stack.pop_back();
-                        for (auto const& e : dependencyEdges) {
+                        for (auto const& e : state.dependencyEdges) {
                             if (e.consumerPackageIndex != p) continue;
                             if (targetEdgesOnly && (e.hostModule || e.buildOnly))
                                 continue;
@@ -10553,14 +10616,14 @@ prepare_build(bool print_fingerprint,
                 };
                 const auto viaTarget = reachable(/*targetEdgesOnly=*/true);
                 const auto viaAny    = reachable(/*targetEdgesOnly=*/false);
-                for (std::size_t d = 1; d < packages.size(); ++d) {
+                for (std::size_t d = 1; d < state.packages.size(); ++d) {
                     // `viaAny` is the guard that keeps this from acting on a
                     // package no edge ever mentioned. Such a package is a
                     // bookkeeping gap, not a build dependency, and clearing
                     // its sources would turn that gap into an undefined
                     // reference a long way from here.
                     if (viaTarget[d] || !viaAny[d]) continue;
-                    auto& dm = packages[d].manifest;
+                    auto& dm = state.packages[d].manifest;
                     dm.buildConfig.sources.clear();
                     dm.buildConfig.featureSources.clear();
                     dm.modules.sources.clear();
@@ -10576,7 +10639,7 @@ prepare_build(bool print_fingerprint,
             }
 
             for (auto const& [depIdx, wanted] : toolRequests) {
-                auto& depPkg = packages[depIdx];
+                auto& depPkg = state.packages[depIdx];
                 const auto& depName = depPkg.manifest.package.name;
                 std::string depShort = depName;
                 if (auto dot = depName.rfind('.');
@@ -10630,11 +10693,11 @@ prepare_build(bool print_fingerprint,
                     // addressed by exactly the names its directory is.
                     const prov::Provision want{ prov::Kind::Tool, depIdx, toolName };
                     auto record = [&](const std::filesystem::path& p) {
-                        for (std::size_t c = 0; c < provisionGraph.visible.size(); ++c) {
-                            if (!provisionGraph.visible[c].contains(want)) continue;
-                            auto& v = toolEnvByConsumer[c];
+                        for (std::size_t c = 0; c < state.provisionGraph.visible.size(); ++c) {
+                            if (!state.provisionGraph.visible[c].contains(want)) continue;
+                            auto& v = state.toolEnvByConsumer[c];
                             std::vector<std::string> vars;
-                            for (auto const& n : publishedNamesFor(depIdx, bareBindingsFor(c))) {
+                            for (auto const& n : state.publishedNamesFor(depIdx, state.bareBindingsFor(c))) {
                                 auto var = mcpp::build::tool_store::env_var_name(n, toolName);
                                 if (std::ranges::find(vars, var) != vars.end()) continue;
                                 vars.push_back(var);
@@ -10671,13 +10734,13 @@ prepare_build(bool print_fingerprint,
                     if (std::ranges::find(state.overrides.tool_chain_sources, toolSource)
                         != state.overrides.tool_chain_sources.end()) {
                         std::string askedBy;
-                        for (auto const& edge : dependencyEdges) {
+                        for (auto const& edge : state.dependencyEdges) {
                             if (edge.dependencyPackageIndex != depIdx) continue;
                             if (std::ranges::find(edge.requestedTools, toolName)
                                 == edge.requestedTools.end()) continue;
-                            if (edge.consumerPackageIndex < packages.size()) {
+                            if (edge.consumerPackageIndex < state.packages.size()) {
                                 askedBy = mcpp::build::qualified_package_name(
-                                    packages[edge.consumerPackageIndex].manifest);
+                                    state.packages[edge.consumerPackageIndex].manifest);
                                 break;
                             }
                         }
@@ -10735,8 +10798,8 @@ prepare_build(bool print_fingerprint,
                     }
 
                     mcpp::build::tool_store::Key key;
-                    key.indexName = depIdx >= 1 && depIdx - 1 < dep_cache_identities.size()
-                                  ? dep_cache_identities[depIdx - 1].indexName
+                    key.indexName = depIdx >= 1 && depIdx - 1 < state.dep_cache_identities.size()
+                                  ? state.dep_cache_identities[depIdx - 1].indexName
                                   : std::string(mcpp::pm::kDefaultNamespace);
                     key.packageName      = depName;
                     // THE VERSION IDENTIFIES THE SOURCES ONLY FOR AN INDEX
@@ -10747,15 +10810,15 @@ prepare_build(bool print_fingerprint,
                     // (#630, item 6; measured 2026-09-08 with examples/12).
                     // The same rule applies to every upstream below.
                     auto source_keyed_version = [&](std::size_t pkgIdx) {
-                        const auto& man = packages[pkgIdx].manifest.package;
+                        const auto& man = state.packages[pkgIdx].manifest.package;
                         std::string v = man.version;
-                        if (pkgIdx >= 1 && pkgIdx - 1 < dep_cache_identities.size()) {
-                            const auto& id = dep_cache_identities[pkgIdx - 1];
+                        if (pkgIdx >= 1 && pkgIdx - 1 < state.dep_cache_identities.size()) {
+                            const auto& id = state.dep_cache_identities[pkgIdx - 1];
                             if (id.sourceKind == "git" && !id.sourceRef.empty())
                                 v += "+git." + id.sourceRef;
                             else if (id.sourceKind == "path")
                                 v += "+path." + mcpp::build::tool_store::tree_stamp(
-                                    id.sourceRef.empty() ? packages[pkgIdx].root
+                                    id.sourceRef.empty() ? state.packages[pkgIdx].root
                                                          : std::filesystem::path(id.sourceRef));
                         }
                         return v;
@@ -10773,9 +10836,9 @@ prepare_build(bool print_fingerprint,
                     // but a path dependency can: bump something two levels down
                     // and the tool's direct list is unchanged, so a stale binary
                     // stays in the store — a silently wrong artifact.
-                    for (auto up : dg::transitive_dependencies(dependencyEdges, depIdx))
+                    for (auto up : dg::transitive_dependencies(state.dependencyEdges, depIdx))
                         key.upstreamKeys.push_back(std::format("{}@{}",
-                            packages[up].manifest.package.name,
+                            state.packages[up].manifest.package.name,
                             source_keyed_version(up)));
                     std::ranges::sort(key.upstreamKeys);
 
@@ -10864,9 +10927,9 @@ prepare_build(bool print_fingerprint,
                     // resolver merged this manifest's conditional sections for
                     // the consumer's target, and the sub-build merges them for
                     // its own (#690, F12).
-                    if (depIdx >= 1 && depIdx - 1 < dep_manifests.size()
-                        && dep_manifests[depIdx - 1]) {
-                        auto const& dep = *dep_manifests[depIdx - 1];
+                    if (depIdx >= 1 && depIdx - 1 < state.dep_manifests.size()
+                        && state.dep_manifests[depIdx - 1]) {
+                        auto const& dep = *state.dep_manifests[depIdx - 1];
                         sub.preloaded_manifest = dep.beforeConditionalMerge
                             ? dep.beforeConditionalMerge
                             : std::make_shared<const mcpp::manifest::Manifest>(dep);
@@ -11004,11 +11067,11 @@ prepare_build(bool print_fingerprint,
         // files live in the CONSUMING project's tree — a registry package
         // root is shared across projects and may be read-only; it is never
         // written to.
-        for (std::size_t i = 1; i < packages.size(); ++i) {
-            auto& pkg = packages[i];
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {
+            auto& pkg = state.packages[i];
             // A package of programs runs its build program in its own tool
             // sub-build, where its sources are compiled (#649 E6).
-            if (!compilesHere(i)) continue;
+            if (!state.compilesHere(i)) continue;
             std::error_code bpEc;
             if (!std::filesystem::exists(pkg.root / "build.mcpp", bpEc)
                 && pkg.manifest.buildConfig.ruleModules.empty()) continue;
@@ -11055,19 +11118,19 @@ prepare_build(bool print_fingerprint,
             // name-guessing); covers feature-activated deps too
             // (mergeActiveFeatureDeps folded them in before the edges were
             // recorded). Shared owner — see fillDepDirs.
-            fillDepDirs(bpEnv, i);
+            state.fillDepDirs(bpEnv, i, nullptr);
             // …and the xlings packages this package itself declared. Its own
             // manifest, not the root's: a dependency's `[xlings] deps` is what
             // its build.mcpp asks about.
-            fillXpkgDirs(bpEnv, packages[i].manifest, i);
+            state.fillXpkgDirs(bpEnv, state.packages[i].manifest, i);
             // #355: the host tools THIS package requested (resolved above).
-            if (auto tit = toolEnvByConsumer.find(i); tit != toolEnvByConsumer.end())
+            if (auto tit = state.toolEnvByConsumer.find(i); tit != state.toolEnvByConsumer.end())
                 bpEnv.toolPaths = tit->second;
-            bpEnv.hostModules = hostModulesByConsumer.count(i)
-                ? hostModulesByConsumer.at(i)
+            bpEnv.hostModules = state.hostModulesByConsumer.count(i)
+                ? state.hostModulesByConsumer.at(i)
                 : decltype(bpEnv.hostModules){};
             auto& bcDep = pkg.manifest.buildConfig;
-            const auto mark = markDirectiveTail(pkg.manifest);
+            const auto mark = state.markDirectiveTail(pkg.manifest);
             const auto ldN = bcDep.ldflags.size();
             const auto actN = bcDep.actions.size();
             const auto runnerN = bcDep.runner.size();
@@ -11107,8 +11170,8 @@ prepare_build(bool print_fingerprint,
             // flags — dep ldflags were propagated to the root during the
             // BFS walk, which ran before this pass — forward the new tail
             // (link-search paths are already absolute from parse_line).
-            foldDirectiveTailIntoPrivateBuild(pkg, pkg.manifest, mark);
-            adoptActionOutputs(pkg.manifest, pkg.root, actN);
+            state.foldDirectiveTailIntoPrivateBuild(pkg, pkg.manifest, mark);
+            state.adoptActionOutputs(pkg.manifest, pkg.root, actN);
 
             // Scope::RunGlobal — how the artifact is EXECUTED, forwarded to
             // the root like link flags but with the opposite merge rule.
@@ -11136,7 +11199,7 @@ prepare_build(bool print_fingerprint,
                 std::vector<std::string> supplied(
                     bcDep.runner.begin() + static_cast<std::ptrdiff_t>(runnerN),
                     bcDep.runner.end());
-                if (!state.m->buildConfig.runner.empty() && !runnerProvider.empty()) {
+                if (!state.m->buildConfig.runner.empty() && !state.runnerProvider.empty()) {
                     return std::unexpected(std::format(
                         "two dependencies both supply a runner for this target: "
                         "'{}' and '{}'.\n"
@@ -11144,10 +11207,10 @@ prepare_build(bool print_fingerprint,
                         "can only be one.\n"
                         "       Drop one of them, or override both with an "
                         "explicit [target.<triple>].runner.",
-                        runnerProvider, pkg.manifest.package.name));
+                        state.runnerProvider, pkg.manifest.package.name));
                 }
                 state.m->buildConfig.runner = std::move(supplied);
-                runnerProvider = pkg.manifest.package.name;
+                state.runnerProvider = pkg.manifest.package.name;
             }
             for (auto const& [name, nr] : bcDep.namedRunners) {
                 auto before = namedBefore.find(name);
@@ -11156,7 +11219,7 @@ prepare_build(bool print_fingerprint,
                                || (nr.longLived && !before->second.longLived);
                 if (!grew) continue;
                 auto& slot = state.m->buildConfig.namedRunners[name];
-                auto& who  = namedRunnerProvider[name];
+                auto& who  = state.namedRunnerProvider[name];
                 if (!slot.argv.empty() && !who.empty()) {
                     return std::unexpected(std::format(
                         "two dependencies both supply a runner named '{}' for "
@@ -11180,7 +11243,7 @@ prepare_build(bool print_fingerprint,
         // fixpoint so those flags flow into each consumer's privateBuild — the
         // first pass (above) ran before features were activated. Idempotent:
         // include-dir/flag propagation is unique-append.
-        computeUsageRequirements();
+        state.computeUsageRequirements();
 
         // ─── Capability binding (Stage 3) ──────────────────────────────────
         // For each required capability, bind exactly one provider from the
@@ -11404,8 +11467,8 @@ prepare_build(bool print_fingerprint,
             return false;
         };
 
-        for (std::size_t pkgIndex = 0; pkgIndex < packages.size(); ++pkgIndex) {
-            auto const& pkg = packages[pkgIndex];
+        for (std::size_t pkgIndex = 0; pkgIndex < state.packages.size(); ++pkgIndex) {
+            auto const& pkg = state.packages[pkgIndex];
             const auto pkgId = pkg.manifest.package.version.empty()
                 ? pkg.manifest.package.name
                 : std::format("{}@{}", pkg.manifest.package.name,
@@ -11418,7 +11481,7 @@ prepare_build(bool print_fingerprint,
             // this engine does not know went by in silence. This loop sees
             // every package in the graph.
             for (auto const& cap : pkg.manifest.unknownCapabilities) {
-                if (&pkg == &packages.front()) continue;   // root: already refused
+                if (&pkg == &state.packages.front()) continue;   // root: already refused
                 // The same text the root's refusal carries, including the list
                 // of layers that do exist. A warning that says less than the
                 // error it replaced would be a worse diagnostic wearing a
@@ -11944,15 +12007,15 @@ prepare_build(bool print_fingerprint,
             note_layer(tsd::CapLayer::CxxAbi,          resolvedTargetSide.cxx);
 
             for (auto idx : layerProviderIndices) {
-                if (idx >= packages.size()) continue;
-                auto const& provider = packages[idx];
-                appendUniquePaths(targetSideUsage.includeDirs,
+                if (idx >= state.packages.size()) continue;
+                auto const& provider = state.packages[idx];
+                state.appendUniquePaths(targetSideUsage.includeDirs,
                                   provider.publicUsage.includeDirs);
-                appendUniquePaths(targetSideUsage.includeDirsAfter,
+                state.appendUniquePaths(targetSideUsage.includeDirsAfter,
                                   provider.publicUsage.includeDirsAfter);
-                appendUniqueFlags(targetSideUsage.cflags,
+                state.appendUniqueFlags(targetSideUsage.cflags,
                                   provider.publicUsage.cflags);
-                appendUniqueFlags(targetSideUsage.cxxflags,
+                state.appendUniqueFlags(targetSideUsage.cxxflags,
                                   provider.publicUsage.cxxflags);
             }
 
@@ -11970,14 +12033,14 @@ prepare_build(bool print_fingerprint,
                 || !targetSideUsage.includeDirsAfter.empty()
                 || !targetSideUsage.cflags.empty()
                 || !targetSideUsage.cxxflags.empty()) {
-                for (auto& p : packages) {
-                    appendUniquePaths(p.privateBuild.includeDirs,
+                for (auto& p : state.packages) {
+                    state.appendUniquePaths(p.privateBuild.includeDirs,
                                       targetSideUsage.includeDirs);
-                    appendUniquePaths(p.privateBuild.includeDirsAfter,
+                    state.appendUniquePaths(p.privateBuild.includeDirsAfter,
                                       targetSideUsage.includeDirsAfter);
-                    appendUniqueFlags(p.privateBuild.cflags,
+                    state.appendUniqueFlags(p.privateBuild.cflags,
                                       targetSideUsage.cflags);
-                    appendUniqueFlags(p.privateBuild.cxxflags,
+                    state.appendUniqueFlags(p.privateBuild.cxxflags,
                                       targetSideUsage.cxxflags);
                 }
             }
@@ -12035,27 +12098,27 @@ prepare_build(bool print_fingerprint,
             // channel that builds an assembly unit's flags keeps the -D/-U/-I
             // words of those two (`compile_commands::unit_asm_flags`), so a
             // second copy here would put each one on a `.S` line twice.
-            for (auto& p : packages) {
-                appendUniqueFlags(p.privateBuild.cflags,   engineDefines);
-                appendUniqueFlags(p.privateBuild.cxxflags, engineDefines);
+            for (auto& p : state.packages) {
+                state.appendUniqueFlags(p.privateBuild.cflags,   engineDefines);
+                state.appendUniqueFlags(p.privateBuild.cxxflags, engineDefines);
             }
         }
 
         if (state.tc && (state.tc->kernelAbiIsOpenkal || !state.tc->cEnvTokens.empty()
                    || !state.tc->cEnvBuiltinsTokens.empty())) {
-            for (auto& p : packages) {
+            for (auto& p : state.packages) {
                 // `__OPENKAL__` is emitted above, with the rest of the
                 // engine's own defines; it is NOT subject to the
                 // `c-environment = "platform"` exception below, because that
                 // exception is about which C environment a package's headers
                 // see, not about whether its code may call `kal_*`.
                 if (p.manifest.cEnvironment == "platform") continue;
-                appendUniqueFlags(p.privateBuild.cflags, state.tc->cEnvTokens);
-                appendUniqueFlags(p.privateBuild.cxxflags, state.tc->cEnvTokens);
-                appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvTokens);
-                appendUniqueFlags(p.privateBuild.cflags, state.tc->cEnvBuiltinsTokens);
-                appendUniqueFlags(p.privateBuild.cxxflags, state.tc->cEnvBuiltinsTokens);
-                appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvBuiltinsTokens);
+                state.appendUniqueFlags(p.privateBuild.cflags, state.tc->cEnvTokens);
+                state.appendUniqueFlags(p.privateBuild.cxxflags, state.tc->cEnvTokens);
+                state.appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvTokens);
+                state.appendUniqueFlags(p.privateBuild.cflags, state.tc->cEnvBuiltinsTokens);
+                state.appendUniqueFlags(p.privateBuild.cxxflags, state.tc->cEnvBuiltinsTokens);
+                state.appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvBuiltinsTokens);
             }
         }
 
@@ -12092,7 +12155,7 @@ prepare_build(bool print_fingerprint,
             // rather than a missing one.
             std::vector<std::string> providedInterfaces;
             std::string providerId;
-            for (auto& pkg : packages) {
+            for (auto& pkg : state.packages) {
                 if (pkg.manifest.kernelAbiProvidesInterfaces.empty()) continue;
                 // `impl` is `name@version`; the name is what precedes the
                 // separator. A substring test would match `openkal` against
@@ -12122,7 +12185,7 @@ prepare_build(bool print_fingerprint,
             // cannot tell it from the first. One line closes that, and it
             // costs nothing to a graph where the provider does declare.
             std::size_t uncheckedRequirements = 0;
-            for (auto& pkg : packages) {
+            for (auto& pkg : state.packages) {
                 const auto& need = pkg.manifest.kernelAbiRequiresInterfaces;
                 if (need.empty()) continue;
                 if (providerId.empty()) {
@@ -12418,7 +12481,7 @@ prepare_build(bool print_fingerprint,
         // capability is deliberately UNPREFIXED, because it names no layer
         // this engine resolves, only a fact a package states about itself.
         std::vector<std::string> platformDeps;
-        for (auto& pkg : packages) {
+        for (auto& pkg : state.packages) {
             if (std::ranges::find(pkg.manifest.provides, "platform-sdk")
                 == pkg.manifest.provides.end())
                 continue;
@@ -12498,13 +12561,13 @@ prepare_build(bool print_fingerprint,
         // compile with flags the fingerprint does not describe, and the next
         // build would call that a cache hit.
         merge_layer_conditional_config(*state.m, layerCtx);
-        for (auto& pkg : packages) {
-            const auto mark  = markDirectiveTail(pkg.manifest);
+        for (auto& pkg : state.packages) {
+            const auto mark  = state.markDirectiveTail(pkg.manifest);
             const auto ldN   = pkg.manifest.buildConfig.ldflags.size();
             const auto privN = pkg.manifest.buildConfig.privateIncludeDirs.size();
             if (!merge_layer_conditional_config(pkg.manifest, layerCtx)) continue;
             // cflags / cxxflags / include_dirs / include_dirs_after.
-            foldDirectiveTailIntoPrivateBuild(pkg, pkg.manifest, mark);
+            state.foldDirectiveTailIntoPrivateBuild(pkg, pkg.manifest, mark);
             // ldflags: the link reads linkUsage.
             pkg.linkUsage.ldflags.insert(
                 pkg.linkUsage.ldflags.end(),
@@ -12585,8 +12648,8 @@ prepare_build(bool print_fingerprint,
             && mcpp::toolchain::target_supports_full_static(
                    state.tc->targetTriple, mcpp::platform::supports_full_static);
 
-        for (std::size_t i = 1; i < packages.size(); ++i) {
-            auto const& pkg = packages[i].manifest;
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {
+            auto const& pkg = state.packages[i].manifest;
             const std::string fq = pkg.package.namespace_.empty()
                 ? pkg.package.name
                 : std::format("{}.{}", pkg.package.namespace_, pkg.package.name);
@@ -12594,7 +12657,7 @@ prepare_build(bool print_fingerprint,
             lf::PackageFacts facts;
             facts.label = std::format("{}@{}", fq, pkg.package.version);
             facts.hasSources = !mcpp::modgraph::package_source_files(
-                packages[i].root, pkg).empty();
+                state.packages[i].root, pkg).empty();
             facts.carriesForeignLinkInputs =
                 lf::carries_foreign_link_inputs(
                     mcpp::manifest::flag_words(pkg.buildConfig.ldflags));
@@ -12644,7 +12707,7 @@ prepare_build(bool print_fingerprint,
             form.recorded = facts.isDistribution || facts.declaredShared
                          || hasLibraryTarget;
             form.facts    = std::move(facts);
-            dependencyLinkForms.emplace(i, std::move(form));
+            state.dependencyLinkForms.emplace(i, std::move(form));
         }
     }
 
@@ -12662,7 +12725,7 @@ prepare_build(bool print_fingerprint,
     // The link form is read from `dependencyLinkForms`, which is computed once,
     // before this point, for exactly this program (#642 E2).
     auto graph_package_entry = [&](std::size_t i, bool forBuildProgram) {
-        auto const& pm = packages[i].manifest;
+        auto const& pm = state.packages[i].manifest;
         const auto id = mcpp::manifest::package_id(pm.package);
         nlohmann::json entry = {
             {"package", {
@@ -12675,18 +12738,18 @@ prepare_build(bool print_fingerprint,
             {"root", i == 0},
         };
         nlohmann::json requests = nlohmann::json::array();
-        for (auto const& r : graphRequests) {
+        for (auto const& r : state.graphRequests) {
             if (r.dependencyPackageIndex != i) continue;
             requests.push_back({
                 {"requester", mcpp::manifest::package_id(
-                    packages[r.consumerPackageIndex].manifest.package).canonical()},
+                    state.packages[r.consumerPackageIndex].manifest.package).canonical()},
                 {"key", r.key},
                 {"table", r.table},
             });
         }
         entry["requested_by"] = std::move(requests);
-        if (auto form = dependencyLinkForms.find(i);
-            form != dependencyLinkForms.end() && form->second.recorded)
+        if (auto form = state.dependencyLinkForms.find(i);
+            form != state.dependencyLinkForms.end() && form->second.recorded)
             entry["link"] = {
                 {"form", std::string(mcpp::build::linkage_form::to_string(
                              form->second.answer.linkage))},
@@ -12695,11 +12758,11 @@ prepare_build(bool print_fingerprint,
         if (!forBuildProgram) return entry;
 
         std::error_code ec;
-        auto dir = std::filesystem::absolute(packages[i].root, ec).lexically_normal();
+        auto dir = std::filesystem::absolute(state.packages[i].root, ec).lexically_normal();
         entry["manifest_dir"] = dir.string();
         nlohmann::json feats = nlohmann::json::array();
-        if (i < activeFeaturesByPackage.size())
-            for (auto const& f : activeFeaturesByPackage[i]) feats.push_back(f);
+        if (i < state.activeFeaturesByPackage.size())
+            for (auto const& f : state.activeFeaturesByPackage[i]) feats.push_back(f);
         entry["features"] = std::move(feats);
         nlohmann::json targets = nlohmann::json::array();
         for (auto const& t : pm.targets) {
@@ -12790,18 +12853,18 @@ prepare_build(bool print_fingerprint,
         // package static-only), so the value it could be given would be a guess.
         {
             std::map<std::size_t, std::string> rootLinkForms;
-            for (auto const& [idx, form] : dependencyLinkForms)
+            for (auto const& [idx, form] : state.dependencyLinkForms)
                 if (form.recorded)
                     rootLinkForms.emplace(idx, std::string(
                         mcpp::build::linkage_form::to_string(form.answer.linkage)));
-            fillDepDirs(bpEnv, 0, &rootLinkForms);
+            state.fillDepDirs(bpEnv, 0, &rootLinkForms);
         }
-        fillXpkgDirs(bpEnv, *state.m, 0);
+        state.fillXpkgDirs(bpEnv, *state.m, 0);
         // #355: the host tools the ROOT package requested (consumer index 0).
-        if (auto tit = toolEnvByConsumer.find(0u); tit != toolEnvByConsumer.end())
+        if (auto tit = state.toolEnvByConsumer.find(0u); tit != state.toolEnvByConsumer.end())
             bpEnv.toolPaths = tit->second;
-        bpEnv.hostModules = hostModulesByConsumer.count(0u)
-            ? hostModulesByConsumer.at(0u)
+        bpEnv.hostModules = state.hostModulesByConsumer.count(0u)
+            ? state.hostModulesByConsumer.at(0u)
             : decltype(bpEnv.hostModules){};
         // #649 E5: the packaging pass's strip decision, beside its format.
         bpEnv.packStrip           = state.overrides.pack_strip;
@@ -12822,22 +12885,22 @@ prepare_build(bool print_fingerprint,
         // document does not change.
         {
             std::vector<std::size_t> order;
-            std::vector<bool> placed(packages.size(), false);
-            while (order.size() < packages.size()) {
-                std::size_t pick = packages.size();
-                for (std::size_t i = 0; i < packages.size() && pick == packages.size(); ++i) {
+            std::vector<bool> placed(state.packages.size(), false);
+            while (order.size() < state.packages.size()) {
+                std::size_t pick = state.packages.size();
+                for (std::size_t i = 0; i < state.packages.size() && pick == state.packages.size(); ++i) {
                     if (placed[i]) continue;
                     bool ready = true;
-                    for (auto const& r : graphRequests)
+                    for (auto const& r : state.graphRequests)
                         if (r.consumerPackageIndex == i && r.dependencyPackageIndex != i
-                            && r.dependencyPackageIndex < packages.size()
+                            && r.dependencyPackageIndex < state.packages.size()
                             && !placed[r.dependencyPackageIndex]) { ready = false; break; }
                     if (ready) pick = i;
                 }
                 // A cycle leaves nothing ready; its first member in discovery
                 // order is taken so the document is still complete.
-                if (pick == packages.size())
-                    for (std::size_t i = 0; i < packages.size(); ++i)
+                if (pick == state.packages.size())
+                    for (std::size_t i = 0; i < state.packages.size(); ++i)
                         if (!placed[i]) { pick = i; break; }
                 placed[pick] = true;
                 order.push_back(pick);
@@ -12866,7 +12929,7 @@ prepare_build(bool print_fingerprint,
             bpEnv.graphDigest = mcpp::toolchain::hash_string(text);
         }
         auto& bcRoot = state.m->buildConfig;
-        const auto mark = markDirectiveTail(*state.m);
+        const auto mark = state.markDirectiveTail(*state.m);
         const auto rldN = bcRoot.ldflags.size(), rsrcN = bcRoot.sources.size(),
                    rmodN = state.m->modules.sources.size();
         const auto ractN = bcRoot.actions.size();
@@ -12921,7 +12984,7 @@ prepare_build(bool print_fingerprint,
                     if (name.empty()) return !row->second.runner.empty();
                     return row->second.namedRunners.contains(std::string(name));
                 };
-                if (!runnerProvider.empty() && !runnerBeforeRoot.empty()
+                if (!state.runnerProvider.empty() && !runnerBeforeRoot.empty()
                     && bcRoot.runner.size() > runnerBeforeRoot.size()
                     && !manifestNames({})) {
                     return std::unexpected(std::format(
@@ -12930,13 +12993,13 @@ prepare_build(bool print_fingerprint,
                         "joined into one argv.\n"
                         "       Drop one of them, or state the runner in "
                         "[target.{}].runner.",
-                        runnerProvider, rowKey));
+                        state.runnerProvider, rowKey));
                 }
                 for (auto const& [name, nr] : bcRoot.namedRunners) {
                     auto before = namedBeforeRoot.find(name);
-                    auto who = namedRunnerProvider.find(name);
+                    auto who = state.namedRunnerProvider.find(name);
                     if (before == namedBeforeRoot.end() || before->second.argv.empty()
-                        || who == namedRunnerProvider.end() || who->second.empty())
+                        || who == state.namedRunnerProvider.end() || who->second.empty())
                         continue;
                     if (nr.argv.size() <= before->second.argv.size()) continue;
                     if (manifestNames(name)) continue;
@@ -12949,14 +13012,14 @@ prepare_build(bool print_fingerprint,
                         who->second, name, rowKey, name));
                 }
             }
-            auto& pkg0 = packages[0];
+            auto& pkg0 = state.packages[0];
             // Compile-visible tail → privateBuild: the shared fold (same owner
             // as the dep loop; the root's TUs read privateBuild).
-            foldDirectiveTailIntoPrivateBuild(pkg0, *state.m, mark);
+            state.foldDirectiveTailIntoPrivateBuild(pkg0, *state.m, mark);
             // Before the source residues are mirrored below: adopting an action's
             // outputs APPENDS to bcRoot.sources, and those appends must be inside
             // the tail that gets copied into the packages[0] snapshot the scan reads.
-            adoptActionOutputs(*state.m, *state.root, ractN);
+            state.adoptActionOutputs(*state.m, *state.root, ractN);
             // The root's build program has spoken; a floor it stated is checked
             // now, with the facts every package (it included) established.
             if (auto err = checkVersionFloors(); err) return std::unexpected(*err);
@@ -13044,8 +13107,8 @@ prepare_build(bool print_fingerprint,
     // condition an action needs anyway -- one that compiles a file it does not
     // declare as an input does not rerun when that file changes -- so a rule
     // that satisfies it is a rule that rebuilds correctly.
-    for (std::size_t i = 0; i < packages.size(); ++i) {
-        auto const& pkg = packages[i];
+    for (std::size_t i = 0; i < state.packages.size(); ++i) {
+        auto const& pkg = state.packages[i];
         auto dit = deviceSourcesByPackage.find(pkg.root.string());
         if (dit == deviceSourcesByPackage.end() || dit->second.empty()) continue;
         auto const& mm = (i == 0) ? *state.m : pkg.manifest;
@@ -13111,9 +13174,9 @@ prepare_build(bool print_fingerprint,
     {
         std::map<std::filesystem::path, std::string> ownerName;
         std::vector<std::pair<std::string, std::filesystem::path>> prepareDirs;
-        for (std::size_t i = 0; i < packages.size(); ++i) {
-            auto const& mm = (i == 0) ? *state.m : packages[i].manifest;
-            ownerName.emplace(packages[i].root.lexically_normal(), mm.package.name);
+        for (std::size_t i = 0; i < state.packages.size(); ++i) {
+            auto const& mm = (i == 0) ? *state.m : state.packages[i].manifest;
+            ownerName.emplace(state.packages[i].root.lexically_normal(), mm.package.name);
             for (auto const& a : mm.buildConfig.actions) {
                 if (a.role != mcpp::manifest::BuildAction::Role::Prepare) continue;
                 if (a.outputDir.empty()) continue;
@@ -13221,10 +13284,10 @@ prepare_build(bool print_fingerprint,
     // this build (#649 E6): its programs come from the tool sub-build, which
     // scans it as its own root. The root itself is always scanned.
     std::vector<mcpp::modgraph::PackageRoot> scannedPackages;
-    scannedPackages.reserve(packages.size());
-    for (std::size_t i = 0; i < packages.size(); ++i)
-        if (compilesHere(i))
-            scannedPackages.push_back(packages[i]);
+    scannedPackages.reserve(state.packages.size());
+    for (std::size_t i = 0; i < state.packages.size(); ++i)
+        if (state.compilesHere(i))
+            scannedPackages.push_back(state.packages[i]);
     auto scan = [&] {
         const char* sel = std::getenv("MCPP_SCANNER");
         if (sel && std::string_view(sel) == "p1689") {
@@ -13290,8 +13353,8 @@ prepare_build(bool print_fingerprint,
     // anyone who wrote the key aspirationally. `--strict` promotes it.
     {
         const auto graphLevel = state.m->cppStandard.level;
-        for (std::size_t i = 1; i < packages.size(); ++i) {
-            auto const& pkg = packages[i];
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {
+            auto const& pkg = state.packages[i];
             if (!pkg.manifest.package.standardDeclared) continue;
             // A C++-layer provider's declaration IS applied, to every unit of
             // it that neither provides nor imports a module (`make_plan`), so
@@ -13369,7 +13432,7 @@ prepare_build(bool print_fingerprint,
         // Extending it needs a per-package answer to "does this package import
         // std", which the scan graph holds and does not expose in that shape.
         // Recorded here so the next person meets the reason and not the gap.
-        for (auto const& pkg : std::span{packages}.first(1)) {
+        for (auto const& pkg : std::span{state.packages}.first(1)) {
             const auto words = mcpp::manifest::flag_words(pkg.manifest.buildConfig.cxxflags);
             auto missing = mcpp::manifest::dialect_flags_missing_from_prebuild(words, prebuilt);
             if (missing.empty()) continue;
@@ -13423,7 +13486,7 @@ prepare_build(bool print_fingerprint,
     // Both are read only from a package that ALSO provides the capability
     // below. A package that named a std module without supplying the
     // library would be describing something it does not have.
-    for (auto& pkg : packages) {
+    for (auto& pkg : state.packages) {
         if (pkg.manifest.stdModule.empty()) continue;
         // Either spelling of the C++ layer (see `provides_cxx_layer`). The
         // same predicate decides which package's implementation units keep
@@ -13768,7 +13831,7 @@ prepare_build(bool print_fingerprint,
         return fpTt && fpTt->os == "macos";
     }();
     fpi.compileFlags        = canonical_compile_flags(*state.m, fpTargetIsMacos)
-                              + canonical_package_build_metadata(packages, fpTargetIsMacos);
+                              + canonical_package_build_metadata(state.packages, fpTargetIsMacos);
     // [c-abi] REALISATION AND `__OPENKAL__` PARTICIPATE IN THE FINGERPRINT
     // (design 2026-09-18 §3.4, gap #4 of the design's own self-review). Two
     // builds whose C library declares `data-model = "lp64"` and `"llp64"`
@@ -13803,7 +13866,7 @@ prepare_build(bool print_fingerprint,
     // identical" guarantee the rest of this block already gives, which this
     // loop had broken on its own.
     if (!state.tc->cEnvTokens.empty() || !state.tc->cEnvBuiltinsTokens.empty()) {
-        for (auto& pkg : packages)
+        for (auto& pkg : state.packages)
             if (pkg.manifest.cEnvironment == "platform")
                 fpi.compileFlags += " cenv-platform:" + pkg.manifest.package.name;
     }
@@ -14011,8 +14074,8 @@ prepare_build(bool print_fingerprint,
                 ? pm.package.name
                 : pm.package.namespace_ + "." + pm.package.name;
         };
-        for (std::size_t i = 0; i < packages.size(); ++i) {
-            const auto& pkgRoot = packages[i].root;
+        for (std::size_t i = 0; i < state.packages.size(); ++i) {
+            const auto& pkgRoot = state.packages[i].root;
             if (pkgRoot.empty()) continue;
             if (i > 0 && mcpp::build::path_is_under_any(pkgRoot, owned)) continue;
             auto normalized = pkgRoot.lexically_normal();
@@ -14021,9 +14084,9 @@ prepare_build(bool print_fingerprint,
                     return sp.root.lexically_normal() == normalized;
                 });
             if (!known)
-                ctx.sourcePackages.push_back({qualified(packages[i].manifest),
+                ctx.sourcePackages.push_back({qualified(state.packages[i].manifest),
                                               normalized,
-                                              packages[i].manifest.modules.sources});
+                                              state.packages[i].manifest.modules.sources});
             if (i == 0 || normalized == state.root->lexically_normal()) continue;
             if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
                 roots.push_back(std::move(normalized));
@@ -14063,7 +14126,7 @@ prepare_build(bool print_fingerprint,
         // provisioning that has to happen before build.mcpp; this site reads it
         // for the records below. Two copies of "what did the graph declare"
         // would be two definitions of the same word.
-        auto split = graph_xlings_split();
+        auto split = state.graph_xlings_split();
         if (!split) {
             refusal::record(refusal::Code::ToolVersionConflict);
             return std::unexpected(split.error());
@@ -14093,10 +14156,10 @@ prepare_build(bool print_fingerprint,
         // installed: this verb is not running anything, and installing it
         // anyway is the behaviour the tier exists to remove.
         if (state.toolPurpose == ToolPurpose::Build) {
-            for (std::size_t i = 0; i < packages.size() && !ctx.runTierPending; ++i) {
-                const auto& man = packages[i].manifest;
-                const auto feats = i < activeFeaturesByPackage.size()
-                    ? activeFeaturesByPackage[i] : std::vector<std::string>{};
+            for (std::size_t i = 0; i < state.packages.size() && !ctx.runTierPending; ++i) {
+                const auto& man = state.packages[i].manifest;
+                const auto feats = i < state.activeFeaturesByPackage.size()
+                    ? state.activeFeaturesByPackage[i] : std::vector<std::string>{};
                 for (auto const& spec : applicable_xlings_addresses(
                          man, feats, ToolPurpose::Run, /*isRoot=*/i == 0))
                     if (std::ranges::find(xlingsSpecs, spec) == xlingsSpecs.end())
@@ -14148,8 +14211,8 @@ prepare_build(bool print_fingerprint,
         // which is correct, and is why a descriptor lists its CPU-only variant
         // first: the first accepted artifact wins.
         currentTag.accel = mcpp::pack::parse_accel(state.resolvedAccel());
-        for (std::size_t i = 1; i < packages.size(); ++i) {
-            auto const& pkg = packages[i];
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {
+            auto const& pkg = state.packages[i];
             if (!mcpp::pack::is_distribution_package(pkg.manifest)) continue;
             mcpp::pack::PrebuiltCheck chk{
                 .packageRoot  = pkg.root,
@@ -14177,15 +14240,15 @@ prepare_build(bool print_fingerprint,
 
         // A non-root edge that writes the key gets its request IGNORED, and
         // says so — a silently dropped knob is how a knob becomes decoration.
-        for (std::size_t i = 1; i < packages.size(); ++i)
-            for (auto const& [depName, spec] : packages[i].manifest.dependencies)
+        for (std::size_t i = 1; i < state.packages.size(); ++i)
+            for (auto const& [depName, spec] : state.packages[i].manifest.dependencies)
                 if (!spec.linkage.empty())
                     mcpp::diag::warning("build/dependency-linkage", std::format(
                         "'{}' asks for dependency '{}' to be linked as '{}'; only "
                         "the root project decides link forms, so this is ignored",
-                        packages[i].manifest.package.name, depName, spec.linkage));
+                        state.packages[i].manifest.package.name, depName, spec.linkage));
 
-        for (auto const& [i, form] : dependencyLinkForms) {
+        for (auto const& [i, form] : state.dependencyLinkForms) {
             auto const& answer = form.answer;
             auto const& facts  = form.facts;
 
@@ -14210,14 +14273,14 @@ prepare_build(bool print_fingerprint,
             // on Linux rather than joined by it — but "unreachable today" is
             // how the last few of these got in.)
             if (facts.declaredShared) continue;
-            for (auto& t : packages[i].manifest.targets)
+            for (auto& t : state.packages[i].manifest.targets)
                 if (t.kind == mcpp::manifest::Target::Library)
                     t.kind = mcpp::manifest::Target::SharedLibrary;
         }
     }
 
     auto planResult = mcpp::build::make_plan(*state.m, *state.tc, fp, scan.graph, report.topoOrder,
-                                             packages, *state.root, ctx.outputDir,
+                                             state.packages, *state.root, ctx.outputDir,
                                              stdBmiPath, stdObjectPath, state.storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
@@ -14289,9 +14352,9 @@ prepare_build(bool print_fingerprint,
     // payload's runtime), and every other case is refused here, before
     // anything compiles. Each build this refuses failed at link before.
     if (resolvedTargetSide.cxx.fromGraph() && cxxLayerProviderIndex
-        && *cxxLayerProviderIndex < packages.size()) {
+        && *cxxLayerProviderIndex < state.packages.size()) {
         namespace dist = mcpp::build::dist;
-        auto const& provider = packages[*cxxLayerProviderIndex].manifest;
+        auto const& provider = state.packages[*cxxLayerProviderIndex].manifest;
         const auto providerName = mcpp::build::qualified_package_name(provider);
         auto const& bc = ctx.plan.manifest.buildConfig;
         const auto format = dist::format_for(
@@ -14321,9 +14384,9 @@ prepare_build(bool print_fingerprint,
                 continue;
             }
             Refused r{ lu.targetName, {} };
-            for (auto const& [i, form] : dependencyLinkForms) {
-                if (!form.facts.declaredShared || i >= packages.size()) continue;
-                for (auto const& t : packages[i].manifest.targets)
+            for (auto const& [i, form] : state.dependencyLinkForms) {
+                if (!form.facts.declaredShared || i >= state.packages.size()) continue;
+                for (auto const& t : state.packages[i].manifest.targets)
                     if (t.name == lu.targetName)
                         r.statedBy = form.facts.declaredSharedBy.empty()
                             ? std::string("its manifest declares a shared library target")
@@ -14785,8 +14848,8 @@ prepare_build(bool print_fingerprint,
                 ctx.plan.providedPackFormats.push_back(f);
         };
         collect(*state.m);
-        for (std::size_t i = 1; i < packages.size(); ++i)
-            collect(packages[i].manifest);
+        for (std::size_t i = 1; i < state.packages.size(); ++i)
+            collect(state.packages[i].manifest);
         std::ranges::sort(ctx.plan.providedPackFormats);
         ctx.plan.providedPackFormats.erase(
             std::ranges::unique(ctx.plan.providedPackFormats).begin(),
@@ -15459,7 +15522,7 @@ prepare_build(bool print_fingerprint,
             ctx.plan.needsPic);
 
         // Sources belonging to each package, package-root-relative and sorted.
-        std::vector<std::vector<std::string>> pkgSources(packages.size());
+        std::vector<std::vector<std::string>> pkgSources(state.packages.size());
         for (auto& cu : ctx.plan.compileUnits) {
             // Longest matching root wins. Package roots can nest — a workspace
             // member lives under the workspace root — and taking the first match
@@ -15468,28 +15531,28 @@ prepare_build(bool print_fingerprint,
             // cannot be shadowed this way, so no cached entry is affected today;
             // resolving it by specificity rather than by iteration order is what
             // keeps that true if roots ever move.)
-            std::size_t best = packages.size();
+            std::size_t best = state.packages.size();
             std::size_t bestLen = 0;
             std::string bestRel;
-            for (std::size_t p = 0; p < packages.size(); ++p) {
+            for (std::size_t p = 0; p < state.packages.size(); ++p) {
                 std::error_code ec;
-                auto rel = std::filesystem::relative(cu.source, packages[p].root, ec);
+                auto rel = std::filesystem::relative(cu.source, state.packages[p].root, ec);
                 if (ec || rel.empty()) continue;
                 auto rels = rel.generic_string();
                 if (rels.starts_with("..")) continue;
-                auto len = packages[p].root.generic_string().size();
-                if (best == packages.size() || len > bestLen) {
+                auto len = state.packages[p].root.generic_string().size();
+                if (best == state.packages.size() || len > bestLen) {
                     best = p; bestLen = len; bestRel = std::move(rels);
                 }
             }
-            if (best != packages.size()) pkgSources[best].push_back(std::move(bestRel));
+            if (best != state.packages.size()) pkgSources[best].push_back(std::move(bestRel));
         }
         for (auto& v : pkgSources) std::ranges::sort(v);
 
-        std::vector<std::string>    pkgKeys(packages.size());
-        std::vector<nlohmann::json> pkgInputs(packages.size(),
+        std::vector<std::string>    pkgKeys(state.packages.size());
+        std::vector<nlohmann::json> pkgInputs(state.packages.size(),
                                               nlohmann::json::object());
-        std::vector<int>            keyState(packages.size(), 0); // 0 new/1 busy/2 done
+        std::vector<int>            keyState(state.packages.size(), 0); // 0 new/1 busy/2 done
         std::string                 keyCycleError;
         // Does this package's own transitive upstream contain anything that is
         // not an immutable index payload? If so it cannot be cached either, even
@@ -15503,7 +15566,7 @@ prepare_build(bool print_fingerprint,
         // dependency today, which makes this shape unreachable in practice; it is
         // enforced structurally anyway, because "unreachable today" is how the
         // transitive path-dep leak got in.
-        std::vector<char>           localTaint(packages.size(), 0);
+        std::vector<char>           localTaint(state.packages.size(), 0);
         auto compute_key = [&](auto&& self, std::size_t idx) -> const std::string& {
             static const std::string kEmpty;
             if (keyState[idx] == 2) return pkgKeys[idx];
@@ -15511,41 +15574,41 @@ prepare_build(bool print_fingerprint,
                 if (keyCycleError.empty()) {
                     keyCycleError = std::format(
                         "dependency cycle through package '{}' while computing "
-                        "its build-cache key", packages[idx].manifest.package.name);
+                        "its build-cache key", state.packages[idx].manifest.package.name);
                 }
                 return kEmpty;
             }
             keyState[idx] = 1;
 
             ck::PackageAxes pa;
-            if (idx > 0 && idx - 1 < dep_cache_identities.size()) {
-                pa.indexName   = dep_cache_identities[idx - 1].indexName;
-                pa.packageName = dep_cache_identities[idx - 1].packageName;
-                pa.version     = dep_cache_identities[idx - 1].version;
+            if (idx > 0 && idx - 1 < state.dep_cache_identities.size()) {
+                pa.indexName   = state.dep_cache_identities[idx - 1].indexName;
+                pa.packageName = state.dep_cache_identities[idx - 1].packageName;
+                pa.version     = state.dep_cache_identities[idx - 1].version;
             }
             if (pa.packageName.empty()) {
                 // The root package, or a package with no resolution identity.
                 // It is never cached, but its key still has to exist because
                 // downstream packages fold it in via axis F.
-                pa.packageName = packages[idx].manifest.package.namespace_.empty()
-                    ? packages[idx].manifest.package.name
-                    : std::format("{}.{}", packages[idx].manifest.package.namespace_,
-                                  packages[idx].manifest.package.name);
+                pa.packageName = state.packages[idx].manifest.package.namespace_.empty()
+                    ? state.packages[idx].manifest.package.name
+                    : std::format("{}.{}", state.packages[idx].manifest.package.namespace_,
+                                  state.packages[idx].manifest.package.name);
             }
-            if (pa.version.empty()) pa.version = packages[idx].manifest.package.version;
+            if (pa.version.empty()) pa.version = state.packages[idx].manifest.package.version;
             // The GLOBAL registry root — index 0 by construction above. Include
             // dirs are relativized against it so a key survives a different
             // MCPP_HOME; a project-local payload falls back to the `<pkg>`
             // prefix inside fill_package_config and is equally stable.
-            ck::fill_package_config(pa, packages[idx],
+            ck::fill_package_config(pa, state.packages[idx],
                                     state.storeRoots.empty() ? std::filesystem::path{}
                                                        : state.storeRoots.front());
             pa.sources = pkgSources[idx];
             const bool selfIsIndex = idx > 0
-                && idx - 1 < dep_cache_identities.size()
-                && dep_cache_identities[idx - 1].sourceKind == "version";
+                && idx - 1 < state.dep_cache_identities.size()
+                && state.dep_cache_identities[idx - 1].sourceKind == "version";
             if (!selfIsIndex) localTaint[idx] = 1;
-            for (auto& e : dependencyEdges) {
+            for (auto& e : state.dependencyEdges) {
                 if (e.consumerPackageIndex != idx) continue;
                 auto& up = self(self, e.dependencyPackageIndex);
                 if (!up.empty()) pa.upstreamKeys.push_back(up);
@@ -15565,14 +15628,14 @@ prepare_build(bool print_fingerprint,
             keyState[idx]    = 2;
             return pkgKeys[idx];
         };
-        for (std::size_t i = 0; i < packages.size(); ++i)
+        for (std::size_t i = 0; i < state.packages.size(); ++i)
             (void)compute_key(compute_key, i);
         if (!keyCycleError.empty()) return std::unexpected(keyCycleError);
 
-        for (std::size_t i = 1; i < packages.size(); ++i) {  // skip [0] = main
-            const auto& pkgRoot   = packages[i];
-            const auto* depIdent  = i - 1 < dep_cache_identities.size()
-                ? &dep_cache_identities[i - 1]
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {  // skip [0] = main
+            const auto& pkgRoot   = state.packages[i];
+            const auto* depIdent  = i - 1 < state.dep_cache_identities.size()
+                ? &state.dep_cache_identities[i - 1]
                 : nullptr;
             // Only index ("version") packages are cacheable, and the identity
             // recorded at resolution time is the ONLY admissible evidence.
@@ -15773,8 +15836,8 @@ prepare_build(bool print_fingerprint,
             mcpp::lockfile::LockedPackage lp;
             lp.name    = name;
             lp.version = spec.gitRev;
-            auto gitIt = root_git_lock_identities.find(name);
-            if (gitIt == root_git_lock_identities.end()) {
+            auto gitIt = state.root_git_lock_identities.find(name);
+            if (gitIt == state.root_git_lock_identities.end()) {
                 lp.source = std::format("git+{}#{}={}",
                     spec.git, spec.gitRefKind, spec.gitRev);
                 lp.hash = "fnv1a:" + mcpp::toolchain::hash_string(lp.source);
@@ -15787,7 +15850,7 @@ prepare_build(bool print_fingerprint,
 
         // Version deps: the whole resolved graph, at the versions actually
         // chosen. `resolved` is an ordered map, so the file is deterministic.
-        for (auto const& [key, rec] : resolved) {
+        for (auto const& [key, rec] : state.resolved) {
             if (rec.source != "version") continue;   // path / git handled elsewhere
             if (rec.version.empty()) continue;
             // See ResolvedRecord::devOnly: `mcpp test` resolves dev-deps and
@@ -15870,7 +15933,7 @@ prepare_build(bool print_fingerprint,
         // Same data, second consumer: the "Compiling <dep> v<version>" banner.
         // It reads this rather than re-deriving from the manifest, so the banner
         // and the lock cannot disagree about what was built.
-        for (auto const& [key, rec] : resolved) {
+        for (auto const& [key, rec] : state.resolved) {
             if (rec.source != "version" || rec.version.empty()) continue;
             ctx.resolvedVersions[lock_name_for(key)] = rec.version;
         }
@@ -16109,7 +16172,7 @@ prepare_build(bool print_fingerprint,
         // reads instead of a warning's wording.
         {
             nlohmann::json graphPackages = nlohmann::json::array();
-            for (std::size_t i = 0; i < packages.size(); ++i)
+            for (std::size_t i = 0; i < state.packages.size(); ++i)
                 graphPackages.push_back(graph_package_entry(i, /*forBuildProgram=*/false));
             j["graph"] = { {"packages", std::move(graphPackages)} };
         }
