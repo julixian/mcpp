@@ -1,0 +1,60 @@
+# Release canaries (the 2026-09-28 ecosystem design, WS10).
+#
+# Real projects built with the candidate mcpp before a release is tagged:
+# release.yml runs .github/workflows/release-canaries.yml first, and a canary
+# that fails blocks the tag. A regression that only a real project shows --
+# 2026.9.27.1's vcpkg compiler detection on GalTranslPP (#726) -- is then read
+# before the release instead of after it.
+#
+# The candidate is built from the commit being released. A project's own pin
+# of mcpp (`workspace.mcpp` in its `.xlings.json`) is removed in the project's
+# checkout, so nothing installs the released mcpp in its place; nothing is
+# committed to the project, and no override mechanism is added to xlings.
+#
+# Each entry: `repo` and `ref` to check out, the runner `os`, a `timeout` in
+# minutes, the `commands` run in the checkout with `$MCPP` naming the
+# candidate (each must exit 0; a command whose output must also say something
+# pairs it with `expect`), and `cache` paths kept between runs.
+
+[[canary]]
+name     = "xlings"
+repo     = "openxlings/xlings"
+ref      = "main"
+os       = "ubuntu-24.04"
+timeout  = 60
+commands = [
+  "$MCPP build",
+  "$MCPP test",
+]
+
+[[canary]]
+name     = "mcppls"
+repo     = "Sunrisepeak/mcpp-language-server"
+ref      = "main"
+os       = "ubuntu-24.04"
+timeout  = 60
+commands = [
+  "$MCPP build",
+  "$MCPP build -p devtools",
+  "$MCPP test",
+]
+
+[[canary]]
+name     = "GalTranslPP"
+repo     = "Sunrisepeak/GalTranslPP"
+ref      = "build/mcpp-zero-setup"
+os       = "windows-2025"
+timeout  = 300
+submodules = true
+commands = [
+  "$MCPP build --workspace --profile fast-release",
+  "$MCPP run -p GPPCLI --profile fast-release < /dev/null",
+  "cd GPPCLI && $MCPP pack --format release --profile fast-release",
+  "cd GPPGUI && $MCPP pack --format release --profile fast-release",
+]
+expect = { "$MCPP run -p GPPCLI --profile fast-release < /dev/null" = "GalTransl++ CLI v" }
+cache = [
+  "~/AppData/Local/vcpkg/archives",
+  "~/AppData/Local/vcpkg/downloads",
+  "~/AppData/Local/vcpkg/registries",
+]

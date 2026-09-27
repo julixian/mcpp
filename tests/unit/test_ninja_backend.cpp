@@ -109,12 +109,11 @@ TEST(NinjaBackend, ObjectiveCSourceUsesCObjectRuleAndCFlags) {
 // -MMD output that ninja's depfile loader rejects — see the long comment at
 // the definition site for the empirically-confirmed failure mode.
 TEST(NinjaBackend, CxxModuleAndCxxObjectRulesTrackHeaderDepsViaGccDepfile) {
-    // The filtered gcc depfile (#235) is POSIX-only: `posixDepfile =
-    // !msvcDeps && !is_windows` (awk isn't available on native Windows, and
-    // MSVC uses `deps = msvc` instead). This asserts the POSIX emission.
-    if constexpr (mcpp::platform::is_windows)
-        GTEST_SKIP() << "gcc depfile filter is POSIX-only (Windows uses deps=msvc)";
-
+    // Every host (the 2026-09-28 design, WS2): whether a unit emits a depfile
+    // is the compiler's property. What differs by host is how GCC's filtered
+    // form arrives: the awk program in the POSIX rule's shell command, and
+    // `mcpp depfile-filter` wrapping the compile on Windows, which has no
+    // shell to chain it in. Until 2026.9.28.2 Windows got neither.
     auto plan = minimal_plan();
 
     auto ninja = emit_ninja_string(plan);
@@ -135,6 +134,14 @@ TEST(NinjaBackend, CxxModuleAndCxxObjectRulesTrackHeaderDepsViaGccDepfile) {
         // The raw compiler depfile (with GCC's module-specific reversed
         // rules) must never be bound directly as ninja's depfile.
         EXPECT_EQ(rule.find("depfile = $out.d.raw"), std::string::npos) << ninja;
+        if constexpr (mcpp::platform::is_windows) {
+            EXPECT_NE(rule.find("$mcpp depfile-filter --raw $out.d.raw --out $out.d -- "),
+                      std::string::npos) << ninja;
+            EXPECT_EQ(rule.find("awk"), std::string::npos) << ninja;
+        } else {
+            EXPECT_NE(rule.find("awk"), std::string::npos) << ninja;
+            EXPECT_EQ(rule.find("depfile-filter"), std::string::npos) << ninja;
+        }
     }
 }
 
@@ -907,9 +914,8 @@ TEST(NinjaBackend, CompileRulesStayInlineOnPosixDrivers) {
 // so it takes the depfile WITHOUT the awk filter, writing -MF straight to
 // $out.d.
 TEST(NinjaBackend, ClangGetsDepfileWithoutTheGccModuleRuleFilter) {
-    if constexpr (mcpp::platform::is_windows)
-        GTEST_SKIP() << "POSIX depfile shape only";
-
+    // Every host: the clang++ row on Windows (the default Windows row since
+    // #718) had no depfile until 2026.9.28.2 (WS2).
     auto plan = minimal_plan();
     plan.toolchain.compiler = mcpp::toolchain::CompilerId::Clang;
     plan.toolchain.binaryPath = "/usr/bin/clang++";
@@ -929,14 +935,12 @@ TEST(NinjaBackend, ClangGetsDepfileWithoutTheGccModuleRuleFilter) {
     // No scratch file and no filter: there is nothing to strip.
     EXPECT_EQ(module_rule.find("$out.d.raw"), std::string::npos) << ninja;
     EXPECT_EQ(module_rule.find("awk"), std::string::npos) << ninja;
+    EXPECT_EQ(module_rule.find("depfile-filter"), std::string::npos) << ninja;
 }
 
 // The other half of the same asymmetry: C and GAS edges include headers too
 // and had no depfile on ANY toolchain.
 TEST(NinjaBackend, CAndAsmRulesAlsoTrackHeaderDeps) {
-    if constexpr (mcpp::platform::is_windows)
-        GTEST_SKIP() << "POSIX depfile shape only";
-
     auto plan = minimal_plan();
     plan.compileUnits.push_back({
         .source = "src/a.c",
@@ -1540,6 +1544,15 @@ BuildPlan msvc_plan_with_redist(const FakeRedistDir& redist,
     return plan;
 }
 
+// The entries of the runtime placement resolver's answer that come from the
+// toolset's C++ runtime.
+std::vector<BuildPlan::DeployFile> toolset_entries(const mcpp::build::CompileFlags& f) {
+    std::vector<BuildPlan::DeployFile> out;
+    for (auto const& d : f.runtimeDeploy)
+        if (d.origin == BuildPlan::DeployFile::Origin::Toolchain) out.push_back(d);
+    return out;
+}
+
 }  // namespace
 
 TEST(NinjaBackendPeRuntime, ToolchainCoupledStagesTheToolsetCrtBesideTheExe) {
@@ -1547,9 +1560,10 @@ TEST(NinjaBackendPeRuntime, ToolchainCoupledStagesTheToolsetCrtBesideTheExe) {
     auto plan = msvc_plan_with_redist(redist, "toolchain-coupled");
 
     auto flags = compute_flags(plan);
-    ASSERT_EQ(flags.toolchainRuntimeDeploy.size(), 3u)
+    auto toolset = toolset_entries(flags);
+    ASSERT_EQ(toolset.size(), 3u)
         << "expected the three .dll and not the .manifest beside them";
-    for (auto const& d : flags.toolchainRuntimeDeploy) {
+    for (auto const& d : toolset) {
         EXPECT_EQ(d.dest.parent_path(), std::filesystem::path("bin"))
             << "a DLL must land in the same directory as the .exe: "
             << d.dest.string();
@@ -1586,7 +1600,7 @@ TEST(NinjaBackendPeRuntime, HostCoupledStagesNothing) {
     // the DLLs, and keeping a copy beside the artifact would contradict it.
     FakeRedistDir redist;
     auto plan = msvc_plan_with_redist(redist, "host-coupled");
-    EXPECT_TRUE(compute_flags(plan).toolchainRuntimeDeploy.empty());
+    EXPECT_TRUE(compute_flags(plan).runtimeDeploy.empty());
 
     // The BARE default (#718): `toolchain-coupled` is now the MSVC-ABI
     // default for every role, so a project that never mentioned
@@ -1594,7 +1608,7 @@ TEST(NinjaBackendPeRuntime, HostCoupledStagesNothing) {
     // explicit `toolchain-coupled` would — see
     // `ToolchainCoupledStagesTheToolsetCrtBesideTheExe`.
     auto bare = msvc_plan_with_redist(redist, "");
-    EXPECT_EQ(compute_flags(bare).toolchainRuntimeDeploy.size(), 3u)
+    EXPECT_EQ(toolset_entries(compute_flags(bare)).size(), 3u)
         << "the undeclared MSVC-ABI default no longer stages the redistributable";
 }
 
@@ -1602,20 +1616,58 @@ TEST(NinjaBackendPeRuntime, AProjectsOwnDeployFileOutranksTheToolsets) {
     // A vendored redist named in `[runtime] deploy_files` is a human's
     // statement about which build of msvcp140.dll this program ships. Silently
     // replacing it with the toolset's copy produces a different program than
-    // the manifest describes, so the explicit one wins — out loud.
+    // the manifest describes, so the explicit one wins -- and is compared with
+    // the toolset's version (D2). The fake files carry no VERSIONINFO, so the
+    // comparison cannot be made, and that is what is said.
     FakeRedistDir redist;
     auto plan = msvc_plan_with_redist(redist, "toolchain-coupled");
     plan.runtimeDeployFiles.push_back(
         {{"/vendor/msvcp140.dll"}, std::filesystem::path("bin") / "msvcp140.dll"});
 
     auto flags = compute_flags(plan);
-    for (auto const& d : flags.toolchainRuntimeDeploy)
+    for (auto const& d : toolset_entries(flags))
         EXPECT_NE(d.dest.filename(), std::filesystem::path("msvcp140.dll"))
             << "overwrote the project's own deploy file";
-    EXPECT_EQ(flags.toolchainRuntimeDeploy.size(), 2u);
-    EXPECT_TRUE(std::ranges::any_of(flags.diagnostics, [](auto const& d) {
+    EXPECT_EQ(toolset_entries(flags).size(), 2u);
+    EXPECT_TRUE(std::ranges::any_of(flags.runtimeDeploy, [](auto const& d) {
+        return d.origin == BuildPlan::DeployFile::Origin::Declared
+            && d.sources.front() == std::filesystem::path("/vendor/msvcp140.dll");
+    })) << "the declared file is not placed";
+    EXPECT_TRUE(std::ranges::any_of(flags.runtimeNotes, [](auto const& d) {
         return d.find("msvcp140.dll") != std::string::npos;
-    })) << "the collision was resolved silently";
+    })) << "the declared runtime file was placed without a word about its version";
+}
+
+// The 2026-09-28 design, §2.9: a build for a Windows target has one C++
+// runtime, the toolset's, for the program and for the tools that build it.
+// Every action runs with the toolset's runtime directory first on its PATH,
+// through the named wrapper, whatever its role. A target without the MSVC ABI
+// keeps its commands as they were.
+TEST(NinjaBackendPeRuntime, EveryActionOfAWindowsTargetHasTheToolsetRuntimeOnPath) {
+    FakeRedistDir redist;
+    auto plan = msvc_plan_with_redist(redist, "");
+    mcpp::manifest::BuildAction a;
+    a.id = "gen:moc";
+    a.packageName = "app";
+    a.role = mcpp::manifest::BuildAction::Role::Source;
+    a.command = {"moc.exe", "widget.h", "-o", "gen/moc_widget.cpp"};
+    a.outputs = {"gen/moc_widget.cpp"};
+    plan.actions.push_back(a);
+
+    auto ninja = emit_ninja_string(plan);
+    auto ruleAt = ninja.find("rule mcpp_action_0");
+    ASSERT_NE(ruleAt, std::string::npos) << ninja;
+    auto rule = ninja.substr(ruleAt, ninja.find("\n\n", ruleAt) - ruleAt);
+    EXPECT_NE(rule.find(" __action"), std::string::npos) << rule;
+    EXPECT_NE(rule.find("--path-prepend"), std::string::npos) << rule;
+    EXPECT_NE(rule.find(redist.path.filename().string()), std::string::npos)
+        << "the prepended directory is not the toolset's runtime directory\n" << rule;
+
+    auto elf = minimal_plan();
+    elf.actions.push_back(a);
+    auto elfNinja = emit_ninja_string(elf);
+    EXPECT_EQ(elfNinja.find("--path-prepend"), std::string::npos)
+        << "a target without the MSVC ABI received the Windows runtime on PATH\n" << elfNinja;
 }
 
 TEST(NinjaBackendPeRuntime, AnElfToolchainNeverStagesItsRuntimeDirs) {
@@ -1628,7 +1680,7 @@ TEST(NinjaBackendPeRuntime, AnElfToolchainNeverStagesItsRuntimeDirs) {
     plan.toolchain.compiler     = mcpp::toolchain::CompilerId::GCC;
     plan.toolchain.binaryPath   = "/usr/bin/g++";
     plan.toolchain.targetTriple = "x86_64-linux-gnu";
-    EXPECT_TRUE(compute_flags(plan).toolchainRuntimeDeploy.empty());
+    EXPECT_TRUE(toolset_entries(compute_flags(plan)).empty());
 }
 
 // #718: every MSVC-ABI row x {undeclared, self-contained, toolchain-coupled,

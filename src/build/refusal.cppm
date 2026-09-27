@@ -155,6 +155,13 @@ enum class Code {
     // downgraded here, because an explicit statement a toolset cannot meet is
     // an error, not a default to fall back from.
     MsvcRedistUnavailable,
+    // A file of the MSVC C++ runtime is declared beside the program while the
+    // program's contract is host-coupled, under which the system's runtime
+    // serves it and no copy is placed from any source (SPEC-006 §3.7, WS1 of
+    // the 2026-09-28 design). Distinct from MsvcRedistUnavailable, which is
+    // about a toolset that cannot deliver a copy: here a copy is asked for
+    // where the contract says there is none.
+    CrtDeclaredUnderHostCoupled,
     Other,                 // a refusal that has not been given a code yet
 };
 
@@ -201,6 +208,8 @@ constexpr std::string_view name(Code c) {
         case Code::PlatformDependency:   return "platform-dependency";
         case Code::MsvcRedistUnavailable:
             return "msvc-redist-unavailable";
+        case Code::CrtDeclaredUnderHostCoupled:
+            return "crt-declared-under-host-coupled";
         case Code::Other:                return "other";
     }
     return "other";

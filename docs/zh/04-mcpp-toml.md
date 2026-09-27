@@ -164,7 +164,8 @@ dialect_cxxflags = ["-D_HAS_EXCEPTIONS=0"]
 与普通的构建输入不同，`dialect_cxxflags` 是图级联的（SPEC-004 §9 第 10 条），
 所以只有这次构建的根贡献它：命令直接构建的那个包，或 `-p` 选中的成员。条目
 按这个顺序追加——`[workspace.build]`、根自己的 `[build]`、再到每个命中的
-`[target.<selector>.build]`（按清单顺序）——解出的列表到达 std BMI 的预构建、
+`[target.<selector>.build]`（按选择器的具体程度：三元组在操作系统之后，操作系统在族之后；
+SPEC-004 §3.1.1）——解出的列表到达 std BMI 的预构建、
 模块扫描与每一个翻译单元，对根和对每个依赖一视同仁。依赖包自己声明的
 `dialect_cxxflags`，无论是否带条件，都不到达任何命令：一个包为自己将来作为
 根的构建合法地声明它，这也是它不被诊断的原因。

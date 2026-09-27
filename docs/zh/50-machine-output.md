@@ -246,7 +246,8 @@ mcpp self env --format json
   "xlingsBinary":"/home/u/.mcpp/registry/bin/xlings",
   "config":      "/home/u/.mcpp/config.toml",
   "buildCache":  "/home/u/.mcpp/build-cache/v1",
-  "mcppVersion": "2026.8.8.3"
+  "mcppVersion": "2026.8.8.3",
+  "defaultToolchain": "gcc@16.1.0"   // 2026.9.28.2+
 }
 ```
 
@@ -259,6 +260,10 @@ mcpp self env --format json
 这也是这个 kind 存在的理由：没有它，客户端就得自己重新实现一遍 mcpp 的 home
 解析逻辑 —— 包括「PATH 上的 `mcpp` 可能是一个 xlings shim 而不是真正的
 二进制」这一部分。
+
+`defaultToolchain` 是在这台宿主上、什么都没有配置时一次构建所解析的工具链：首次运行
+安装的正是它，各 CI 宿主也以它核对 docs/01 与 docs/20 的表格。在 Windows 上，它取决于
+是否存在可用的 MSVC（来自 Visual Studio 或受管的工具集）。
 
 ### `mcpp.xpkg` —— 一份被解析的描述符
 
@@ -394,6 +399,7 @@ replaced}` —— `origin` 与构建的状态行使用的是同一句话
 | `host-tool-toolchain` | 一个交叉 `--target` 下的 `build.mcpp` 需要一个可解析的**宿主**工具链，而一个都没有配置 |
 | `std-module-precompile` | 标准库的模块在这个配置下无法被预编译 |
 | `msvc-redist-unavailable` | 在 MSVC ABI 的行上显式写了 `cxx_runtime = "toolchain-coupled"`，而该行的工具集没有可放置的 redistributable 目录 *(2026.9.28.1+)* |
+| `crt-declared-under-host-coupled` | 程序的契约是 host-coupled（由系统的运行时服务、不放置任何副本），而程序旁声明了 MSVC C++ 运行时的文件 *(2026.9.28.2+)* |
 | `other` | 一个尚未被赋予记号的拒绝分支 |
 
 **其中一个记号也由 `mcpp build` 自己打印。** `interface-not-provided` 会

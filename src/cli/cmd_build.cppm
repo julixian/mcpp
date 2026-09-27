@@ -22,6 +22,7 @@ import mcpp.build.test_targets;
 import mcpp.build.build_database;
 import mcpp.build.build_program;
 import mcpp.build.refusal;          // offline-download-required (#648 A1)
+import mcpp.diag;                   // a member's own diagnostics, in the envelope (WS3)
 import mcpp.dyndep;
 import mcpp.home;
 import mcpp.hooks;
@@ -378,6 +379,22 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
     // member's do (render(), below), so an edit that might fix the failure is
     // what wakes a consumer to ask again.
     std::vector<std::filesystem::path>     failedMemberRoots;
+    // Each member's own diagnostics, as that member's (WS3 of the 2026-09-28
+    // design): the terminal prints a fact once per process, and the envelope
+    // keeps every occurrence with the member it belongs to. A record's domain
+    // is its code: `build/msvc-crt-word` is `MCPP_BUILD_MSVC_CRT_WORD`.
+    auto take_member_diagnostics = [&](const std::string& memberPath) {
+        for (auto& r : mcpp::diag::take()) {
+            std::string code = "MCPP_";
+            for (char c : r.domain)
+                code += (c == '/' || c == '-') ? '_'
+                      : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            diagnostics.push_back({std::move(code),
+                                   r.severity == mcpp::diag::Severity::Note
+                                       ? Severity::Note : Severity::Warning,
+                                   r.format(), memberPath});
+        }
+    };
     {
         // Planning narrates on stdout and may start programs that inherit it;
         // the document is printed after this scope, alone.
@@ -406,6 +423,7 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
             auto ctx = mcpp::build::prepare_build(/*print_fingerprint=*/false,
                                                   includeDevDeps,
                                                   std::move(discovered->targets), mo);
+            take_member_diagnostics(memberPath);
             if (!ctx) {
                 // A wholly-failed member contributes exactly one `error`
                 // diagnostic, `path` its `mcpp.toml` (SPEC-005 R5.2) — that

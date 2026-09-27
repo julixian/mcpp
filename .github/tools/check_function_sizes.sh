@@ -33,13 +33,11 @@
 # the caller runs that build first. check_file_lengths.sh needs no such
 # division because it reads the tree.
 #
-# NOT IN CI YET. The only CI job that builds mcpp with clang (ci-linux.yml,
-# "toolchain: musl + llvm", llvm@20.1.7) does not produce a complete build:
-# libc++ 20's `std` module does not make directory_iterator's comparison
-# visible, and that step reads the resolution line rather than the build's
-# exit status. Over the partial database clang-tidy crashes. The gate is wired
-# in once a CI job builds mcpp with clang (mcpp-community/mcpp#729); until
-# then it is run by hand after `mcpp build --toolchain llvm@22.1.8`.
+# IN CI SINCE 2026.9.28.2 (#729). ci-linux.yml's "toolchain: musl + llvm" job
+# builds mcpp with llvm@22.1.8 -- failing on the build's own status, which it
+# did not do while it built with llvm@20.1.7 and read only the resolution line
+# -- and runs this script after it, over the compile database that build
+# writes. By hand: `mcpp build --toolchain llvm@22.1.8`, then this script.
 #
 # clang-tidy itself is not part of the plain xim:llvm payload mcpp resolves
 # for `--toolchain llvm@...` (measured: xim-x-llvm/22.1.8/bin has clang,

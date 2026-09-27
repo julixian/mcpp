@@ -181,6 +181,9 @@ jobs:
       # fetch 'imgui@0.0.6' exit 1 on hosts without a sha256sum binary).
       - name: "Template: exact mcpplibs.imgui selector (fetch path)"
         run: |
+          # The template fetch's own status is the first assertion; without
+          # pipefail `tee` would report success for it (WS7, #729).
+          set -o pipefail
           cd "$(mktemp -d)"
           mcpp new abc1 --template mcpplibs.imgui 2>&1 | tee template.log
           test -f abc1/mcpp.toml
@@ -357,7 +360,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   macos-fresh:
     needs: [wait-index]
-    name: macOS fresh install (${{ matrix.image }})
+    name: macOS fresh install (${{ matrix.image }}${{ matrix.known_red != '' && format(', known red {0}', matrix.known_red) || '' }})
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     # Two images, the two ends of the supported range.
     #
@@ -374,8 +377,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [macos-14, xcode-27]
+        include:
+          - image: macos-14
+            known_red: ''
+          - image: xcode-27
+            known_red: '#669'
     runs-on: ${{ matrix.image }}
+    # KNOWN RED, MACHINE-READABLY (the 2026-09-28 design, WS7). A leg whose
+    # failure has a tracked external cause carries that issue in `known_red`:
+    # the leg may fail without failing the workflow, its own result and log
+    # stay visible, and .github/tools/check_workflow_assertions.py requires
+    # the issue to be open. The leg leaves the list when #669 closes.
+    continue-on-error: ${{ matrix.known_red != '' }}
     timeout-minutes: 30
     env:
       # The one derived value (see the header comment): every install job names
@@ -433,6 +446,9 @@ jobs:
       # in-process.
       - name: "Template: exact mcpplibs.imgui selector (fetch path)"
         run: |
+          # The template fetch's own status is the first assertion; without
+          # pipefail `tee` would report success for it (WS7, #729).
+          set -o pipefail
           cd "$(mktemp -d)"
           mcpp new abc1 --template mcpplibs.imgui 2>&1 | tee template.log
           test -f abc1/mcpp.toml
@@ -472,7 +488,7 @@ jobs:
   #   channel healthy the entire time. So the trust gate itself is asserted
   #   from BOTH sides: refused before `brew trust`, accepted after.
   macos-brew-fresh:
-    name: macOS fresh install (Homebrew, ${{ matrix.image }})
+    name: macOS fresh install (Homebrew, ${{ matrix.image }}${{ matrix.known_red != '' && format(', known red {0}', matrix.known_red) || '' }})
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     # Same two images as macos-fresh: the formula declares `depends_on macos:
     # :sonoma` + arm64, macos-14 is the oldest image satisfying it, and
@@ -480,8 +496,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [macos-14, xcode-27]
+        include:
+          - image: macos-14
+            known_red: ''
+          - image: xcode-27
+            known_red: '#669'
     runs-on: ${{ matrix.image }}
+    # KNOWN RED, MACHINE-READABLY (the 2026-09-28 design, WS7). A leg whose
+    # failure has a tracked external cause carries that issue in `known_red`:
+    # the leg may fail without failing the workflow, its own result and log
+    # stay visible, and .github/tools/check_workflow_assertions.py requires
+    # the issue to be open. The leg leaves the list when #669 closes.
+    continue-on-error: ${{ matrix.known_red != '' }}
     timeout-minutes: 30
     steps:
       - name: Environment

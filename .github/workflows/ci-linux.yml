@@ -94,6 +94,19 @@ jobs:
       - name: Where the CI assertions live
         run: bash tools/lint-ci-assertions.sh
 
+      # A GATE, unlike the warnings above: a step asserts what its name says
+      # (the 2026-09-28 design, WS7, #729). A build piped into `tee` without
+      # pipefail, a build step whose status is discarded before a grep, and a
+      # job allowed to fail without an open issue are refused. The fixture
+      # tests run first, so a lint that stopped reading files fails here
+      # rather than passing every workflow.
+      - name: Steps assert what their names say
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 tests/scripts/test_check_workflow_assertions.py
+          python3 .github/tools/check_workflow_assertions.py --check-open
+
       # Text-only, like the two steps around it, and it belongs here rather
       # than in the target-matrix workflow: that workflow runs the matrix, and
       # this asserts a property of the TABLE, which is readable without a
@@ -165,6 +178,15 @@ jobs:
       # Every member is run, and the loop is derived from the manifest rather
       # than written out: a list maintained by hand is a list that stops
       # matching, and `check_modules_wiring.sh` cannot see this file.
+      # WS8: docs/01 and docs/20 state, per host, the toolchain a first run
+      # installs; this host's row is checked against the one answer the
+      # resolver gives (`self env --format json` -> defaultToolchain). Each
+      # host's CI row checks its own row of the tables.
+      - name: The documented default toolchain is this host's answer
+        run: |
+          python3 tests/scripts/test_check_default_toolchain_docs.py
+          python3 .github/tools/check_default_toolchain_docs.py --mcpp "$MCPP_FRESH"
+
       - name: Per-subsystem tests (`mcpp test -p <member>`)
         run: |
           set -euo pipefail
@@ -214,6 +236,9 @@ jobs:
 
       - name: "Toolchain: GCC — cold rebuild with the PR binary"
         run: |
+          # The build's exit status is the assertion; the grep names the
+          # toolchain that produced it (WS7, #729).
+          set -o pipefail
           "$MCPP" clean
           "$MCPP" build 2>&1 | tee build.log; grep -q "Resolved gcc@16.1.0" build.log
 
@@ -240,18 +265,33 @@ jobs:
       # Auto-installs gcc@16.1.0-musl on demand (cached across runs).
       - name: "Toolchain: musl-gcc — build mcpp (--target)"
         run: |
+          set -o pipefail
           "$MCPP" clean
           "$MCPP" build --target x86_64-linux-musl 2>&1 | tee build.log; grep -q "Resolved gcc@16.1.0 → x86_64-linux-musl" build.log
 
-      - name: "Toolchain: LLVM — build mcpp"
+      # #729. This step reported success for a year while the build failed:
+      # the build was piped into `tee` with no pipefail, and the only
+      # assertion was a grep for the resolution line. It now fails on the
+      # build's own status. It builds with llvm@22.1.8, the LLVM row mcpp
+      # develops with (`[toolchain] macos`) and that Windows CI resolves;
+      # libc++ 20's `std` module does not expose directory_iterator's
+      # comparison, so llvm@20.1.7 cannot build mcpp's own sources.
+      - name: "Toolchain: LLVM 22.1.8 — build mcpp"
         run: |
-          "$MCPP" toolchain install llvm 20.1.7
-          # Override project toolchain to use LLVM for this build
-          sed -i 's/^default = "gcc@16.1.0"/default = "llvm@20.1.7"/' mcpp.toml
+          set -o pipefail
+          "$MCPP" toolchain install llvm 22.1.8
           "$MCPP" clean
-          "$MCPP" build 2>&1 | tee build.log; grep -q "Resolved llvm@20.1.7" build.log
-          # Restore
-          sed -i 's/^default = "llvm@20.1.7"/default = "gcc@16.1.0"/' mcpp.toml
+          "$MCPP" build --toolchain llvm@22.1.8 2>&1 | tee build.log
+          grep -q "Resolved llvm@22.1.8" build.log
+
+      # #722's function-size gate, which needs the compile database a
+      # successful clang build writes at the project root, and clang-tidy from
+      # xim:llvm-tools at the same version. It ran by hand until this job built
+      # mcpp with clang (#729).
+      - name: "Function sizes of the prepare decomposition (#722)"
+        run: |
+          "$XLINGS_BIN" install xim:llvm-tools@22.1.8 -y
+          bash .github/tools/check_function_sizes.sh
 
   # Integration: the mcpp built from THIS PR's source builds & runs a real
   # external C++ project — xlings (openxlings/xlings ships its own mcpp.toml).
@@ -328,7 +368,7 @@ jobs:
       - name: "examples: the feature criterion and the device language"
         run: |
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          set -e
+          set -eo pipefail
 
           # 11-features. NOT "the default build works" -- that passes while the
           # optional package is resolved and merely unused. The criterion is
@@ -453,6 +493,7 @@ jobs:
 
       - name: "Graphics example: render offscreen on lavapipe and assert the pixels"
         run: |
+          set -o pipefail
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
           cd examples/10-graphics/offscreen
           "$MCPP" build

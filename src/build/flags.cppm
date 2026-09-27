@@ -14,6 +14,8 @@ export module mcpp.build.flags;
 import std;
 import mcpp.build.distribution;
 import mcpp.build.plan;
+import mcpp.build.runtime_placement;
+import mcpp.pack.binfmt;
 import mcpp.build.refusal;
 import mcpp.diag;
 import mcpp.freestanding.target;
@@ -105,28 +107,41 @@ struct CompileFlags {
     // macOS + self-contained: link units need the initializer-ordering shim
     // object prepended to their inputs (issue #336).
     bool needsStreamInitShim = false;
-    // PE + `toolchain-coupled`: the toolset's own CRT DLLs, to be staged
-    // beside the artifact. Resolved HERE rather than in the emitter because
-    // "which files does this contract imply" is a contract question; the
-    // backend only knows how to spell a copy edge.
+    // EVERY FILE BESIDE THE PROGRAM, DECIDED ONCE (SPEC-006 §3.7, SPEC-007
+    // R4.3). The plan lists the candidates -- declared deploys and the DLLs of
+    // the runtime search directories -- and this is
+    // mcpp.build.runtime_placement's answer over them together with the
+    // selected toolset's C++ runtime, under the contract this function
+    // resolves. The backend's stage edges, `mcpp run`/`mcpp test`'s carried
+    // files and `mcpp pack` all read this list; none of them decides again.
+    //
+    // Resolved HERE because the contract is resolved here, per role, and the
+    // contract governs which kind of file may be placed: under host-coupled no
+    // copy of the C++ runtime is placed from any source.
     //
     // A whole-BUILD list, not a per-role one, and that is a property of the
     // format rather than a simplification: a PE artifact resolves a DLL from
-    // its own directory, so one directory holds one answer and two roles in
-    // one output tree cannot disagree about it. Any built role asking for the
-    // contract is enough to populate it.
+    // its own directory, so one directory holds one answer.
     //
-    // The DIRECTORY comes from `msvc::vc_redist_dir()` via
-    // `Toolchain::linkRuntimeDirs`, which is what keeps `debug_nonredist\`
-    // (vcruntime140d.dll & friends — NOT redistributable) out of the list. The
-    // criterion lives in exactly one place on purpose: a second name-shaped
-    // rule here could disagree with it, and a copy step that disagrees about
-    // what may be redistributed is a licensing defect, not a bug.
-    //
-    // Already deduped against the plan's own deploy files, so the emitter can
-    // append without deciding anything: a name the manifest already claims
-    // stays the manifest's and the conflict is reported through `diagnostics`.
-    std::vector<BuildPlan::DeployFile> toolchainRuntimeDeploy;
+    // The toolset's runtime DIRECTORY is `Toolchain::msvcRedistDir`, which is
+    // what keeps `debug_nonredist\` (vcruntime140d.dll & friends, NOT
+    // redistributable) out of the list.
+    std::vector<BuildPlan::DeployFile> runtimeDeploy;
+    // What the resolver has to say, once: a dependency that ships the C++
+    // runtime (a packaging fault), a newer set chosen over the toolset's, an
+    // unreadable version (notes); a declared runtime file older than the
+    // toolset's (warnings, D2); a declared runtime file under host-coupled
+    // (errors, refused at planning by `prepare/plan.cpp`).
+    std::vector<std::string> runtimeNotes;
+    std::vector<std::string> runtimeWarnings;
+    std::vector<std::string> runtimeErrors;
+    // The rule the contract gave the C++ runtime's names, as the resolver read
+    // it: "not-applicable", "carry", "system" or "static". `mcpp place-dlls`
+    // and `mcpp pack` apply the same rule to the names they see later.
+    std::string runtimeCrtPolicy = "not-applicable";
+    // The C++ runtime set placed beside the program, for resolution.json.
+    std::string runtimeCrtVersion;
+    std::string runtimeCrtKind;
     // Non-empty when a requested contract could not be honored. The caller
     // MUST surface these — a silent downgrade is the failure mode this whole
     // model exists to prevent. Emitted once by the backend, not here, because
@@ -1551,57 +1566,79 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                 f.diagnostics.push_back(std::format(
                     "{} target: {}", dist::to_string(role), r.diagnostic));
         }
-        if (wantsToolchainRuntime) {
-            // THE GATE IS THE ABI AND A REDISTRIBUTABLE DIRECTORY, NOT THE
-            // COMPILER (#718). `msvcRedistDir` is its own field, set for cl
-            // AND for clang++ on the MSVC ABI alike (`enrich_toolchain_from_cl`
-            // / `bind_msvc_sysroot`) — unlike `linkRuntimeDirs`, which on the
-            // LLVM row holds the LLVM payload's OWN runtime directories and
-            // must not be searched here: copying those into a Windows
-            // program's `bin/` would stage the wrong files.
-            if (mcpp::toolchain::is_msvc_target(plan.toolchain)
-                && !plan.toolchain.msvcRedistDir.empty()) {
-                std::vector<std::filesystem::path> sources;
-                std::error_code ec;
-                for (auto const& e : std::filesystem::directory_iterator(
-                         plan.toolchain.msvcRedistDir, ec)) {
-                    if (!e.is_regular_file(ec)) continue;
-                    auto ext = e.path().extension().string();
-                    std::ranges::transform(ext, ext.begin(),
-                        [](unsigned char c) { return std::tolower(c); });
-                    if (ext != ".dll") continue;
-                    sources.push_back(e.path());
-                }
-                // Directory order is not a stable input: this list reaches
-                // build.ninja, and a graph that differs between two runs of
-                // the same build re-runs edges for no reason.
-                std::ranges::sort(sources);
-                for (auto const& src : sources) {
-                    auto dest = std::filesystem::path("bin") / src.filename();
-                    // An explicit `[runtime] deploy_files` naming the same DLL
-                    // WINS, and says so. A human wrote that one down; this list
-                    // is derived. Silently overwriting a vendored redist with
-                    // the toolset's copy is a different program than the one
-                    // the manifest describes.
-                    auto clash = std::ranges::find_if(plan.runtimeDeployFiles,
-                        [&](auto const& d) { return d.is_destination(dest, /*peTarget=*/true); });
-                    if (clash != plan.runtimeDeployFiles.end()) {
-                        if (std::ranges::none_of(clash->sources,
-                                [&](auto const& s) {
-                                    return s.lexically_normal()
-                                        == src.lexically_normal();
-                                }))
-                            f.diagnostics.push_back(std::format(
-                                "toolchain-coupled would stage '{}' beside the "
-                                "artifact, but this project already deploys "
-                                "'{}' there; keeping the project's file",
-                                src.string(), clash->sources.front().string()));
-                        continue;
-                    }
-                    f.toolchainRuntimeDeploy.push_back({{src}, dest});
-                }
-            }
+        // ── What sits beside the program (mcpp.build.runtime_placement) ──
+        //
+        // THE GATE IS THE ABI AND A REDISTRIBUTABLE DIRECTORY, NOT THE
+        // COMPILER (#718). `msvcRedistDir` is its own field, set for cl AND
+        // for clang++ on the MSVC ABI alike (`enrich_toolchain_from_cl` /
+        // `bind_msvc_sysroot`) -- unlike `linkRuntimeDirs`, which on the LLVM
+        // row holds the LLVM payload's OWN runtime directories and must not be
+        // searched here: copying those beside a Windows program would stage
+        // the wrong files.
+        //
+        // The contract governs the kind: any built role that is
+        // toolchain-coupled carries the chosen set; otherwise the program's
+        // own contract decides, host-coupled placing no copy of the runtime
+        // and self-contained placing one only for a dependency that brings a
+        // runtime name.
+        namespace rp = mcpp::build::runtime_placement;
+        const bool msvcAbi = mcpp::toolchain::is_msvc_target(plan.toolchain);
+        rp::CrtPolicy policy = rp::CrtPolicy::NotApplicable;
+        if (msvcAbi) {
+            const auto program =
+                f.contractByRole[static_cast<std::size_t>(dist::Role::Distributable)];
+            if (wantsToolchainRuntime)                          policy = rp::CrtPolicy::Carry;
+            else if (program == dist::Contract::HostCoupled)    policy = rp::CrtPolicy::System;
+            else                                                policy = rp::CrtPolicy::Static;
         }
+        rp::Input in;
+        in.crt = policy;
+        in.versionOf = [](const std::filesystem::path& p) {
+            return mcpp::pack::binfmt::pe_file_version(p);
+        };
+        using Origin = BuildPlan::DeployFile::Origin;
+        for (auto const& d : plan.runtimeDeployFiles)
+            in.candidates.push_back({d.sources, d.dest,
+                                     d.origin == Origin::Derived ? rp::Kind::Derived
+                                                                 : rp::Kind::Declared});
+        if (msvcAbi && policy != rp::CrtPolicy::System
+            && !plan.toolchain.msvcRedistDir.empty()) {
+            std::vector<std::filesystem::path> sources;
+            std::error_code ec;
+            for (auto const& e : std::filesystem::directory_iterator(
+                     plan.toolchain.msvcRedistDir, ec)) {
+                if (!e.is_regular_file(ec)) continue;
+                auto ext = e.path().extension().string();
+                std::ranges::transform(ext, ext.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
+                if (ext != ".dll") continue;
+                sources.push_back(e.path());
+            }
+            // Directory order is not a stable input: this list reaches
+            // build.ninja, and a graph that differs between two runs of the
+            // same build re-runs edges for no reason.
+            std::ranges::sort(sources);
+            for (auto const& src : sources)
+                in.candidates.push_back({{src}, std::filesystem::path("bin") / src.filename(),
+                                         rp::Kind::Toolchain});
+        }
+        auto decision = rp::resolve(in);
+        for (auto& p : decision.placed)
+            f.runtimeDeploy.push_back({std::move(p.sources), std::move(p.dest),
+                                       p.kind == rp::Kind::Derived   ? Origin::Derived
+                                       : p.kind == rp::Kind::Toolchain ? Origin::Toolchain
+                                                                       : Origin::Declared});
+        f.runtimeNotes    = std::move(decision.notes);
+        f.runtimeWarnings = std::move(decision.warnings);
+        f.runtimeErrors   = std::move(decision.errors);
+        switch (policy) {
+            case rp::CrtPolicy::NotApplicable: f.runtimeCrtPolicy = "not-applicable"; break;
+            case rp::CrtPolicy::Carry:         f.runtimeCrtPolicy = "carry"; break;
+            case rp::CrtPolicy::System:        f.runtimeCrtPolicy = "system"; break;
+            case rp::CrtPolicy::Static:        f.runtimeCrtPolicy = "static"; break;
+        }
+        if (decision.crtVersion) f.runtimeCrtVersion = decision.crtVersion->str();
+        if (decision.crtKind)    f.runtimeCrtKind = std::string(rp::to_string(*decision.crtKind));
         // Two roles usually share a contract, so they usually share a
         // complaint; report each distinct one once.
         std::ranges::sort(f.diagnostics);

@@ -20,6 +20,15 @@
 // Records are deduplicated and rendered once, at flush(). `--strict` promotes
 // degradations to errors in ONE place, replacing the per-site copies of that
 // policy that had accumulated across prepare.cppm.
+//
+// ONE STATEMENT PER FACT PER RUN, ATTRIBUTED TO ITS SOURCE (P4 of the
+// 2026-09-28 design, WS3). A `--workspace` build plans every member as a root
+// and flushes after each, so a fact that holds for all of them -- a redundant
+// word the workspace states, a directory that ships the C++ runtime -- was
+// printed once per member: five times for five members. The terminal now
+// prints each (domain, text) once per PROCESS; the per-run record, which
+// `--strict` counts and `take()` hands to a machine-readable envelope, still
+// holds every occurrence, so a machine reader sees each member's.
 
 export module mcpp.diag;
 
@@ -28,7 +37,7 @@ import mcpp.ui;
 
 export namespace mcpp::diag {
 
-enum class Severity { Warning, Degraded };
+enum class Severity { Warning, Degraded, Note };
 
 struct Record {
     Severity    severity = Severity::Warning;
@@ -50,6 +59,17 @@ void degraded(std::string_view domain, std::string_view what,
 void warning(std::string_view domain, std::string_view what,
              std::string_view hint = {});
 
+// A statement that changes nothing the build does and that a reader may want
+// to act on: a dependency that ships the compiler's runtime, a newer runtime
+// set chosen over the toolset's. Printed as `note:`, never promoted by
+// `--strict`.
+void note(std::string_view domain, std::string_view what);
+
+// The records of this run, cleared: what a command that writes an envelope
+// reports for one member before planning the next. What was printed stays
+// printed -- the once-per-process rule is about the terminal.
+std::vector<Record> take();
+
 // Records render as they are reported (see the implementation note), so this
 // only settles the --strict policy and clears the run's state. Returns false
 // when `strict` is set and at least one Degraded was recorded, meaning the
@@ -69,6 +89,10 @@ namespace mcpp::diag {
 namespace {
 
 std::vector<Record> g_records;
+// Every (domain, text) printed by this process. Not cleared by flush(): a
+// workspace build flushes once per member, and the terminal owes the reader
+// one statement per fact, not one per member (WS3).
+std::set<std::string> g_printed;
 
 // Identity for deduplication: the whole payload. Two sites reporting the
 // same degradation for the same reason are one record; the same domain with
@@ -87,7 +111,10 @@ void push(Record r) {
     auto key = dedup_key(r);
     for (auto const& existing : g_records)
         if (dedup_key(existing) == key) return;
-    mcpp::ui::warning(r.format());
+    if (g_printed.insert(key).second) {
+        if (r.severity == Severity::Note) mcpp::ui::note(r.format());
+        else                              mcpp::ui::warning(r.format());
+    }
     g_records.push_back(std::move(r));
 }
 
@@ -115,6 +142,17 @@ void warning(std::string_view domain, std::string_view what,
                 std::string{}, std::string(hint)});
 }
 
+void note(std::string_view domain, std::string_view what) {
+    push(Record{Severity::Note, std::string(domain), std::string(what),
+                std::string{}, std::string{}});
+}
+
+std::vector<Record> take() {
+    auto out = std::move(g_records);
+    g_records.clear();
+    return out;
+}
+
 bool flush(bool strict) {
     const bool ok = !(strict && count(Severity::Degraded) > 0);
     if (!ok) {
@@ -133,6 +171,6 @@ std::size_t count(Severity severity) {
 
 std::vector<Record> records() { return g_records; }
 
-void reset() { g_records.clear(); }
+void reset() { g_records.clear(); g_printed.clear(); }
 
 } // namespace mcpp::diag

@@ -39,6 +39,7 @@ export module mcpp.pack;
 import std;
 import mcpp.build.loader_contract;
 import mcpp.build.stage;      // place_runtime_dlls publishes through the staging primitive
+import mcpp.build.runtime_placement;   // and decides the C++ runtime's names by the plan's rule
 import mcpp.config;
 import mcpp.pack.binfmt;
 import mcpp.pack.host_requirements;
@@ -146,6 +147,13 @@ struct Options {
     // caller resolves the contract; this is the one bit of it that packaging
     // acts on.
     bool                            carryToolchainRuntime = false;
+    // Names the host provides under the contract, whatever directory offers a
+    // copy: the MSVC C++ runtime when it is not carried (host-coupled, or an
+    // explicit `--mode system` over a defaulted contract). The closure states
+    // them as the target's and never stages them. Compared without case, as
+    // the PE loader compares them: an MSVC-linked image imports
+    // `VCRUNTIME140.dll`.
+    std::vector<std::string>        hostProvidedLibs;
 
     // ── how the shipped artifact is BUILT and what travels inside it ──
     //
@@ -215,6 +223,7 @@ struct Plan {
     std::vector<std::string>             includeGlobs;
     std::vector<std::string>             excludeGlobs;
     std::vector<std::string>             alsoSkipLibs;
+    std::vector<std::string>             hostProvidedLibs;   // Options::hostProvidedLibs
     std::vector<std::string>             forceBundleLibs;
     // What the TARGET machine must provide. Derived once, in make_plan, from
     // the same predicate `mcpp publish` uses — see mcpp.pack.host_requirements.
@@ -402,11 +411,25 @@ struct RuntimeDllPlacement {
 // never written here. When the resolved import differs from what is already
 // there, the difference is reported in `warnings` rather than silently kept
 // or silently overwritten.
+//
+// THE MSVC C++ RUNTIME'S NAMES FOLLOW THE CONTRACT, NOT THE SEARCH ORDER
+// (mcpp.build.runtime_placement). `crtRule` is the rule the plan's resolver
+// applied: under "system" (host-coupled) no copy of the runtime is placed;
+// under "carry" the plan already placed the chosen set, and a dependency's
+// different copy is the plan's packaging-fault note, not a warning per link;
+// a runtime name the plan did not see -- a directory a `prepare` action filled
+// -- is decided by the same resolver between `toolsetCrtDir`'s set and that
+// directory's.
+struct RuntimeCrtRule {
+    std::string           policy = "not-applicable";   // carry | system | static | not-applicable
+    std::filesystem::path toolsetCrtDir;
+};
 std::expected<RuntimeDllPlacement, Error>
 place_runtime_dlls(const std::filesystem::path& program,
                    const std::vector<std::filesystem::path>& searchDirs,
                    const std::vector<std::string>& placedBefore = {},
-                   const std::vector<std::string>& placedByOthers = {});
+                   const std::vector<std::string>& placedByOthers = {},
+                   const RuntimeCrtRule& crtRule = {});
 
 // Build a Plan from already-resolved inputs. Caller is expected to have
 // already run `mcpp build` (or equivalent) and pass the resulting
@@ -686,6 +709,7 @@ make_plan(const mcpp::manifest::Manifest& manifest,
     p.includeGlobs    = manifest.packConfig.include;
     p.excludeGlobs    = manifest.packConfig.exclude;
     p.alsoSkipLibs    = manifest.packConfig.alsoSkip;
+    p.hostProvidedLibs = opts.hostProvidedLibs;
     p.forceBundleLibs = manifest.packConfig.forceBundle;
 
     return p;
@@ -1310,7 +1334,11 @@ stage_closure(const Plan& plan, const ClosureRead& read,
 {
     auto skipped = [&](const std::string& name) {
         const auto leaf = std::filesystem::path(name).filename().string();
-        const bool skip = soname_matches(name, plan.alsoSkipLibs)
+        const auto folded = mcpp::build::runtime_placement::fold(leaf);
+        const bool hostProvided = std::ranges::any_of(plan.hostProvidedLibs,
+            [&](const std::string& h) { return mcpp::build::runtime_placement::fold(h) == folded; });
+        const bool skip = hostProvided
+                       || soname_matches(name, plan.alsoSkipLibs)
                        || soname_matches(leaf, plan.alsoSkipLibs);
         const bool force = soname_matches(name, plan.forceBundleLibs)
                         || soname_matches(leaf, plan.forceBundleLibs);
@@ -1388,8 +1416,13 @@ std::expected<RuntimeDllPlacement, Error>
 place_runtime_dlls(const std::filesystem::path& program,
                    const std::vector<std::filesystem::path>& searchDirs,
                    const std::vector<std::string>& placedBefore,
-                   const std::vector<std::string>& placedByOthers)
+                   const std::vector<std::string>& placedByOthers,
+                   const RuntimeCrtRule& crtRule)
 {
+    namespace rp = mcpp::build::runtime_placement;
+    const bool crtRuleApplies = crtRule.policy == "carry" || crtRule.policy == "system"
+                             || crtRule.policy == "static";
+    std::vector<std::filesystem::path> lateCrt;   // runtime names the plan did not see
     const auto programDir = program.parent_path();
     auto same_dir = [](const std::filesystem::path& a, const std::filesystem::path& b) {
         std::error_code ec;
@@ -1438,6 +1471,16 @@ place_runtime_dlls(const std::filesystem::path& program,
     for (auto const& m : read.members) {
         if (same_dir(m.source.parent_path(), in.searchDirs.front())) continue;
 
+        if (crtRuleApplies && rp::is_msvc_crt_name(m.name)) {
+            // host-coupled: the system's runtime serves the program.
+            if (crtRule.policy == "system") continue;
+            // Placed by the plan as part of the chosen set; a dependency's
+            // different copy was stated there once, as a packaging fault.
+            if (deployedNames.contains(lower(m.name))) continue;
+            lateCrt.push_back(m.source);
+            continue;
+        }
+
         // SPEC-007 R4.2/R4.3: one destination, one writer. A name the merged
         // deploy list already places beside this program is that list's
         // file, not this mechanism's — `add_deploy`'s content check (`mcpp
@@ -1479,6 +1522,46 @@ place_runtime_dlls(const std::filesystem::path& program,
             out.notes.push_back(std::format(
                 "'{}' is offered by {} and by {}; the program receives the first, in "
                 "runtime search order", m.name, offering.front().string(), others));
+        }
+    }
+
+    // A runtime name no plan saw: the same resolver the plan used, over the
+    // toolset's set and every runtime file of the directories that brought
+    // one (a set is judged whole, so the directory's other runtime files take
+    // part in the comparison).
+    if (!lateCrt.empty()) {
+        rp::Input rin;
+        rin.crt = crtRule.policy == "carry" ? rp::CrtPolicy::Carry : rp::CrtPolicy::Static;
+        rin.versionOf = [](const std::filesystem::path& p) {
+            return mcpp::pack::binfmt::pe_file_version(p);
+        };
+        auto add_dir = [&](const std::filesystem::path& dir, rp::Kind kind) {
+            std::vector<std::filesystem::path> files;
+            std::error_code ec;
+            for (auto const& e : std::filesystem::directory_iterator(dir, ec))
+                if (e.is_regular_file(ec) && rp::is_msvc_crt_name(e.path().filename().string()))
+                    files.push_back(e.path());
+            std::ranges::sort(files);
+            for (auto const& f : files)
+                rin.candidates.push_back({{f}, std::filesystem::path("bin") / f.filename(), kind});
+        };
+        if (!crtRule.toolsetCrtDir.empty()) add_dir(crtRule.toolsetCrtDir, rp::Kind::Toolchain);
+        std::set<std::filesystem::path> dirs;
+        for (auto const& src : lateCrt) dirs.insert(src.parent_path());
+        for (auto const& d : dirs) add_dir(d, rp::Kind::Derived);
+        auto decision = rp::resolve(rin);
+        for (auto const& n : decision.notes) out.notes.push_back(n);
+        for (auto const& p : decision.placed) {
+            const auto name = p.dest.filename().string();
+            if (deployedNames.contains(lower(name))) continue;
+            const auto& src = p.sources.front();
+            auto staged = mcpp::build::stage::stage_file(src, programDir / name);
+            if (!staged)
+                return std::unexpected(Error{std::format(
+                    "cannot place '{}' beside '{}': {}", src.string(),
+                    program.filename().string(), staged.error().message)});
+            out.sources.push_back(src);
+            out.names.push_back(name);
         }
     }
     return out;

@@ -846,7 +846,9 @@ cxxflags = ["-march=x86-64-v2"]
   ```
 
   同一规则适用于 `dev-dependencies`、`build-dependencies` 与
-  `feature-deps.<feature>`；多个命中的段按清单顺序生效，最后一个为准。
+  `feature-deps.<feature>`；多个命中的段按选择器的具体程度生效，最具体的最后生效、因此为准：
+  三元组在操作系统之后，操作系统在族之后，具体程度相同时按选择器文本（SPEC-004 §3.1.1，
+  2026.9.28.2 起；此前的版本按选择器文本的顺序生效）。
   `mcpp why deps` 给出每条请求来自哪张表（[09 —— 按场景的命令](09-commands-by-scenario.md)）。
   只写选项、不写来源的表 `huxerui.huxerui = { linkage = "shared" }`
   声明的是名为 `huxerui.huxerui.linkage` 的包：mcpp 报出这一行并给出补全
@@ -900,8 +902,9 @@ cxxflags = ["-march=x86-64-v2"]
   的 `build` 输入照常生效。`accelerator` 不在此列（mcpp 2026.9.6.5）：它是
   构建的输入而不是图给出的答案，所以
   `[target.'cfg(accelerator = "cuda")'.dependencies]` 生效。
-- **优先级**：精确三元组表胜过 `cfg`/别名表；多个命中的谓词表，其 flag
-  按顺序拼接，其依赖声明按清单顺序生效。条件项追加在无条件 `[build]`
+- **优先级**：更具体的表后生效，因此胜出：精确三元组表胜过操作系统表，操作系统表
+  胜过族表（SPEC-004 §3.1.1）。多个命中的表，其 flag 按这一次序拼接，其依赖声明
+  按这一次序生效。条件项追加在无条件 `[build]`
   项**之后**，因此在 GNU「最后一个 flag 生效」的规则下，条件规则会覆盖
   更宽的无条件规则。这正是让按 OS **移除**成为可表达的原因：
 

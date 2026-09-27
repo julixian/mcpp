@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   macos-xlings-llvm:
-    name: macOS ARM64 — xlings LLVM end-to-end (${{ matrix.image }})
+    name: macOS ARM64 — xlings LLVM end-to-end (${{ matrix.image }}${{ matrix.known_red != '' && format(', known red {0}', matrix.known_red) || '' }})
     # Two images: macos-15, the image every other macOS job uses, and macOS 27,
     # the newest macOS release. The newest release is where a change of the SDK,
     # the system libc++ headers or the loader first shows; the packaged binaries
@@ -32,8 +32,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [macos-15, xcode-27]
+        include:
+          - image: macos-15
+            known_red: ''
+          - image: xcode-27
+            known_red: '#669'
     runs-on: ${{ matrix.image }}
+    # KNOWN RED, MACHINE-READABLY (the 2026-09-28 design, WS7). A leg whose
+    # failure has a tracked external cause carries that issue in `known_red`:
+    # the leg may fail without failing the workflow, its own result and log
+    # stay visible, and .github/tools/check_workflow_assertions.py requires
+    # the issue to be open. The leg leaves the list when #669 closes.
+    continue-on-error: ${{ matrix.known_red != '' }}
     timeout-minutes: 45
     # NOTE: no MCPP_VERBOSE here — keep this job's output shape identical to
     # ci-macos-e2e.yml, which asserts mcpp's default quiet output (48/53).
@@ -294,6 +304,13 @@ jobs:
           MCPP=$(cd "$(dirname "$MCPP")" && pwd)/$(basename "$MCPP")
           "$MCPP" self config --mirror GLOBAL
           "$MCPP" test
+
+      # WS8: this host's row of docs/01 and docs/20 is checked against the
+      # one answer the resolver gives (`self env --format json`).
+      - name: The documented default toolchain is this host's answer
+        run: |
+          MCPP=$(find target -path "*/bin/mcpp" | head -1)
+          python3 .github/tools/check_default_toolchain_docs.py --mcpp "$MCPP"
 
       - name: Forensics — test-binary link + load state (on failure)
         if: failure()

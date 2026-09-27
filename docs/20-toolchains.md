@@ -1242,6 +1242,26 @@ default" is wrong here: `ucrtbase.dll` *is* a Windows component (since Windows
 runnable on a machine that has only the pinned toolset and no Visual Studio
 at all.
 
+**Which copy is placed is decided by one rule, not by search order**
+(SPEC-006 §3.7.1). The MSVC C++ runtime is one versioned set, and the files
+beside a program are the toolset's set unless a runtime search directory
+offers the complete set at a strictly newer version, in which case that set is
+placed and a note says so. A dependency that ships a copy of the runtime which
+is not placed is stated once, as a packaging fault: a library package does not
+carry the compiler's runtime. A runtime file the project declares itself
+(`[runtime] deploy`) is placed as declared, with a warning when it is older
+than the toolset's runtime the program was compiled against; a version that
+cannot be read decides nothing. Under `host-coupled` no copy is placed, and a
+declared one is refused. `mcpp pack` carries the files the build placed.
+
+**Every action runs with the toolset's runtime first on `PATH`.** A build for
+the MSVC ABI puts the toolset's redistributable directory first on the `PATH`
+of each action it runs, as it already does for `mcpp run` and `mcpp test`, so a
+host tool that a dependency ships without a runtime (Qt's `moc.exe`) starts.
+The Windows loader searches the system directory before `PATH`, so a machine
+with the VC++ redistributable installed still uses that copy; `PATH` supplies
+the runtime where the system has none.
+
 A resolved toolset that carries no `VC\Redist\MSVC` directory (measured on
 some `msvc@system` installs) cannot deliver `toolchain-coupled`. The
 undeclared default then resolves to `host-coupled` instead, silently — this is
@@ -1278,6 +1298,12 @@ not warned, because `cxx_runtime` is the root's key. A debug word (`/MTd`,
 axis, and the standard library module and the link use the release CRT. The
 engine never lets the last word on the command line decide silently.
 
+> **Upgrading to 2026.9.28.2?** A program whose runtime search directories
+> hold an older copy of the MSVC C++ runtime now receives the toolset's copy,
+> where it received the directory's; the difference is stated once as a note
+> instead of warned on every link. A manifest that declares a runtime file
+> under `host-coupled` is refused.
+>
 > **Upgrading to 2026.9.28.1?** `cl`-row projects are unchanged apart from
 > gaining the staged DLLs beside their programs. **LLVM-row programs move
 > from the static to the dynamic CRT**: before this release clang++ on the

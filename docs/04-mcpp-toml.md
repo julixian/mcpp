@@ -152,7 +152,8 @@ dialect_cxxflags = ["-D_HAS_EXCEPTIONS=0"]
 Unlike an ordinary build input, `dialect_cxxflags` is graph-wide (SPEC-004 §9 item 10), so only
 the root of the build contributes it: the command's own package, or the member `-p` selects.
 Entries are appended in this order — `[workspace.build]`, the root's own `[build]`, then each
-matching `[target.<selector>.build]` in manifest order — and the resolved list is what reaches
+matching `[target.<selector>.build]` in order of selector specificity (a triple after an OS,
+an OS after a family; SPEC-004 §3.1.1) — and the resolved list is what reaches
 the std BMI prebuild, the module scan and every translation unit, on the root and on every
 dependency alike. A dependency's own `dialect_cxxflags`, conditional or not, reaches no command:
 a package legitimately declares it for the build it does when it is the root of one, which is why

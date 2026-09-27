@@ -13,6 +13,8 @@ import mcpp.doctor;
 import mcpp.toolchain.fingerprint;   // MCPP_VERSION
 import mcpp.home;
 import mcpp.platform;
+import mcpp.toolchain.triple;          // pins::host_default_toolchain (WS8)
+import mcpp.toolchain.msvc;            // msvc_available_here
 import mcpp.wire;
 import mcpp.libs.json;
 
@@ -57,6 +59,11 @@ nlohmann::json env_data_readonly() {
         {"config",       s(config)},
         {"buildCache",   s(mcpp::home::cache_root())},
         {"mcppVersion",  std::string(mcpp::toolchain::MCPP_VERSION)},
+        // What a build with nothing configured resolves on this host (WS8):
+        // the one function the first run uses. Probing for a usable MSVC is
+        // read-only, as the rest of this path is.
+        {"defaultToolchain", std::string(mcpp::toolchain::triple::pins::host_default_toolchain(
+            mcpp::toolchain::msvc::msvc_available_here(registry / "data" / "xpkgs")))},
     };
 }
 

@@ -9,6 +9,7 @@ module;
 export module mcpp.pack.pipeline;
 
 import std;
+import mcpp.build.runtime_placement;
 import mcpp.build.prepare;
 import mcpp.build.backend;
 import mcpp.build.distribution;
@@ -479,10 +480,28 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
         opts.depSearchDirs = ctx->plan.runtimeLibraryDirs;
         for (auto const& d : ctx->plan.linkIntent.runtimeSearchDirs)
             opts.depSearchDirs.push_back(d);
-        // What the build placed relative to the executable (#615). The plan's
-        // destinations are `bin/<to>/<file>`, and the executable is in `bin/`.
-        for (auto const& d : ctx->plan.runtimeDeployFiles)
+        // What the build placed relative to the executable (#615): the
+        // runtime placement resolver's answer (`CompileFlags::runtimeDeploy`),
+        // not the plan's candidates, so the package carries the files the
+        // build placed and no other. The destinations are `bin/<to>/<file>`,
+        // and the executable is in `bin/`.
+        //
+        // The MSVC C++ runtime's names are left to the closure below: in a
+        // mode that carries the toolchain's runtime it resolves them beside
+        // the program, where the build placed the chosen set; otherwise they
+        // are the host's (`hostProvidedLibs`), whichever directory offers a
+        // copy. A copy found in a dependency's directory never enters a
+        // package that the contract says the host serves.
+        namespace rp = mcpp::build::runtime_placement;
+        const bool msvcAbi = mcpp::toolchain::is_msvc_target(ctx->plan.toolchain);
+        for (auto const& d : flags.runtimeDeploy) {
+            if (msvcAbi && d.dest.parent_path() == "bin"
+                && rp::is_msvc_crt_name(d.dest.filename().string()))
+                continue;
             opts.runtimeFiles.push_back(d.dest.lexically_relative("bin"));
+        }
+        if (msvcAbi && !opts.carryToolchainRuntime && flags.runtimeCrtPolicy != "static")
+            for (auto n : rp::kMsvcCrtNames) opts.hostProvidedLibs.emplace_back(n);
         // A dependency's program the manifest ships with this one (mcpp#711,
         // `artifacts = [...]`) is linked into `bin/` beside the executable, so
         // it is staged the way a deployed file is.

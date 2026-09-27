@@ -6672,3 +6672,76 @@ package = {
     ASSERT_TRUE(m.has_value()) << m.error().format();
     EXPECT_EQ(m->cEnvironment, "platform");
 }
+
+// ── #728, D7: matching conditional tables apply in order of specificity ──────
+//
+// A more specific selector applies later, so it replaces a broader one's scalar
+// and its list values come after; lexical order of the selector text only
+// breaks a tie. The triple below sorts BEFORE `linux` and `cfg(unix)`, so under
+// the lexical order these tables used to apply in, the family table was the
+// last word on an aarch64 Linux target.
+TEST(ConditionalOrder, SpecificityRanksATripleOverAnOsOverAFamily) {
+    using mcpp::manifest::cfg::specificity;
+    EXPECT_EQ(specificity("x86_64-unknown-linux-gnu"), mcpp::manifest::cfg::kTripleRank);
+    EXPECT_EQ(specificity("linux"), 2);
+    EXPECT_EQ(specificity("cfg(os = \"linux\")"), 2);
+    EXPECT_EQ(specificity("unix"), 1);
+    EXPECT_EQ(specificity("cfg(family = \"unix\")"), 1);
+    EXPECT_EQ(specificity("cfg(arch = \"x86_64\")"), 1);
+    EXPECT_EQ(specificity("cfg(all(os = \"linux\", arch = \"aarch64\"))"), 3);
+    EXPECT_EQ(specificity("cfg(any(linux, windows))"), 0);
+    EXPECT_EQ(specificity("cfg(not(windows))"), 0);
+    EXPECT_EQ(specificity("cfg(c-abi = \"musl\")"), 0);
+    EXPECT_GT(specificity("aarch64-unknown-linux-gnu"), specificity("cfg(all(os = \"linux\", arch = \"aarch64\"))"));
+}
+
+TEST(ConditionalOrder, AMoreSpecificTableAppliesLater) {
+    constexpr auto src = R"(
+[package]
+name = "x"
+version = "0.1.0"
+[build]
+cxxflags = ["-DBASE"]
+[target.aarch64-unknown-linux-gnu.build]
+cxxflags = ["-DTRIPLE"]
+[target.aarch64-unknown-linux-gnu.abi]
+threads = true
+[target.linux.build]
+cxxflags = ["-DOS"]
+[target.'cfg(unix)'.build]
+cxxflags = ["-DFAMILY"]
+[target.'cfg(unix)'.abi]
+threads = false
+)";
+    auto parsed = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().format();
+    std::vector<std::string> order;
+    for (auto const& cc : parsed->conditionalConfigs) order.push_back(cc.predicate);
+    // The two `cfg(unix)` rows (build, abi) are one table; ties keep text order.
+    ASSERT_GE(order.size(), 3u);
+    EXPECT_EQ(order.front(), "cfg(unix)");
+    EXPECT_EQ(order.back(), "aarch64-unknown-linux-gnu");
+
+    auto m = manifest_dialect::merged_for(src, "aarch64-unknown-linux-gnu");
+    const auto& f = m.buildConfig.cxxflags;
+    ASSERT_EQ(f.size(), 4u);
+    EXPECT_EQ(f[0], "-DBASE");
+    EXPECT_EQ(f[1], "-DFAMILY");
+    EXPECT_EQ(f[2], "-DOS");
+    EXPECT_EQ(f[3], "-DTRIPLE");
+    // The scalar: the triple states it last, so the triple's value stands.
+    EXPECT_TRUE(m.buildConfig.abiThreads);
+}
+
+// A tie is broken by the selector text, so the order is the same on every
+// reader and every run.
+TEST(ConditionalOrder, EqualSpecificityKeepsTheSelectorTextOrder) {
+    std::vector<mcpp::manifest::ConditionalConfig> tables(3);
+    tables[0].predicate = "cfg(unix)";
+    tables[1].predicate = "cfg(arch = \"x86_64\")";
+    tables[2].predicate = "cfg(env = \"gnu\")";
+    mcpp::manifest::cfg::order_by_specificity(tables);
+    EXPECT_EQ(tables[0].predicate, "cfg(arch = \"x86_64\")");
+    EXPECT_EQ(tables[1].predicate, "cfg(env = \"gnu\")");
+    EXPECT_EQ(tables[2].predicate, "cfg(unix)");
+}

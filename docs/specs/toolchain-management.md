@@ -4,10 +4,10 @@
 |---|---|
 | 规范编号 | SPEC-006 |
 | 标题 | 工具链管理:身份、来源、选择与载荷契约 |
-| 状态 | 草案 v0.3 |
+| 状态 | 草案 v0.4 |
 | 最后修改 | 2026-09-28 |
 | 对应实现 | 逐条标注;标为「已实现」的条款对应 mcpp >= 2026.9.24.1。标为「未实现」的条款计划与下一批 LLVM 工具链一同落地,届时按实测修订本规范 |
-| 相关设计文档 | `.agents/docs/2026-09-24-toolchain-selection-and-payload-trust-design.md`、`.agents/docs/2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md` |
+| 相关设计文档 | `.agents/docs/2026-09-24-toolchain-selection-and-payload-trust-design.md`、`.agents/docs/2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md`、`.agents/docs/2026-09-28-ecosystem-design-and-optimisation-plan.md` |
 | 相关 issue | mcpp#685、mcpp#687、mcpp#718 |
 | 使用文档 | [docs/20 - 工具链](../zh/20-toolchains.md)、[docs/32 - 编写载荷](../zh/32-authoring-a-payload.md)、[docs/91 - 工具链内部](../zh/91-toolchain-internals.md) |
 
@@ -139,6 +139,43 @@ MSVC ABI 目标上:SDK 以 `ucrt@<版本>` 进入运行时身份;clang 行的 to
   调试 CRT 词(`/MTd`、`/MDd`、`-fms-runtime-lib=*_dbg`)**必须**被拒绝:模型不表达调试 CRT,
   标准库模块与链接使用发布版 CRT。
 
+#### 3.7.1 程序旁的文件由一个解析器决定 已实现
+
+PE 程序旁的每个名字,其字节来自哪里,**必须**由一个解析器回答(`mcpp.build.runtime_placement`)。
+构建的放置边、链接后的 `place-dlls` 边、`mcpp run`/`mcpp test` 携带的文件与 `mcpp pack` 都读取
+这一个答案,**禁止**各自再决定。
+
+- **候选分三类。** 声明:`[runtime] deploy_files` 与插件的 `deploy`(SPEC-007 R4.2)。工具链:
+  所选 toolset 的 `Microsoft.VC*.CRT` 目录中的文件。推导:在运行时搜索目录中找到的 DLL。
+  声明优先于工具链,工具链优先于推导。
+- **MSVC C++ 运行时是一个带版本的集合。** 同一集合的文件**禁止**跨版本混用,集合整体选择:
+  默认取 toolset 的集合;某个推导目录中的集合完整(含 toolset 集合的每一个名字)且其
+  `VERSIONINFO` 文件版本严格更新时,取该集合,并说明一次。集合的版本取其成员中最旧的一个。
+- **契约决定种类,而不只是次序。** host-coupled 下,**禁止**从任何来源放置运行时文件:声明的
+  运行时文件**必须**在编译前被拒绝(`crt-declared-under-host-coupled`),推导目录中的运行时文件
+  被丢弃并说明一次。self-contained 下程序不导入运行时;依赖带来运行时的名字时,按上一条的集合
+  规则放置。
+- **声明的运行时文件优先于集合选择,并与 toolset 的运行时版本比较。** 更旧时**必须**给出警告,
+  点名两个版本。在这一下限的读数被证实可靠之前,它是警告而不是拒绝:可执行映像的
+  `MajorLinkerVersion.MinorLinkerVersion` 由 lld-link 写为 14.0,不能回答「哪个 toolset 构建了
+  这个映像」。
+- **读不出的版本不作决定。** 某个候选的 `VERSIONINFO` 读不出时,按种类次序决定,并说明一次;
+  **禁止**把缺失的版本当作更旧或更新比较。
+- **依赖目录携带运行时文件是打包缺陷。** 它**必须**被说明一次,**禁止**成为静默的来源
+  (xim-pkgindex 的配方规则见其文档)。
+- **规划之后才出现的名字用同一规则。** `prepare` 在构建中填充的目录里的运行时名字,由链接后
+  的放置以同一个解析器决定;`place-dlls` 以 `--crt <规则>` 与 `--toolset-crt <目录>` 接收规划
+  采用的规则。`mcpp pack` 在不携带运行时的模式下把运行时的名字当作宿主提供,不论哪个目录提供
+  了副本。
+- **构建期的工具与程序使用同一个运行时。** 为 MSVC ABI 目标运行的每个 action,`PATH` 的首位
+  **必须**是 toolset 的运行时目录。系统目录在加载器的搜索中先于 `PATH`,所以装有 VC++
+  redistributable 的机器使用系统的运行时;`PATH` 在系统没有时提供它。
+- **决定被记录。** `resolution.json` 的 `runtime.placement`(每个目的地、来源与种类)、
+  `runtime.crt_set`(规则、来源种类与版本)与 `runtime.placement_notes`。
+
+MinGW 的运行时(`libstdc++-6.dll`、`libgcc_s_seh-1.dll`、`libwinpthread-1.dll`)按种类次序决定,
+没有版本规则:这些 DLL 不携带可靠的 `VERSIONINFO`,也没有工具链候选为它们放置。
+
 ---
 
 ## 4. 载荷契约
@@ -249,3 +286,4 @@ xim-pkgindex 的准入脚本 `verify-toolchain.sh` 对一个载荷归档做一�
 | v0.1 | 2026-09-24 | 初版草案:身份与写法、来源与选择(含 MSVC ABI 目标的 sysroot)、载荷契约、构建、验收、发布顺序 |
 | v0.2 | 2026-09-24 | 随 mcpp 2026.9.24.1 更新实现状态:§2.3、§2.4、§3.1 至 §3.6 已实现;§4.2、§6.4 部分实现;§2.2 更正:不带族的 `system` 被拒绝 |
 | v0.3 | 2026-09-28 | 随 mcpp 2026.9.28.1:新增 §3.7,MSVC ABI 的 CRT 模型是目标 ABI 的性质,cl 与 clang++ 同样收到,默认 `toolchain-coupled`(mcpp#718)。 |
+| v0.4 | 2026-09-28 | 随 mcpp 2026.9.28.2:新增 §3.7.1,程序旁的文件由一个解析器决定;MSVC C++ 运行时是一个带版本的集合;契约决定种类;声明的运行时文件与 toolset 的版本比较;读不出的版本不作决定;action 的 `PATH` 首位是 toolset 的运行时目录(2026-09-28 设计 WS1)。 |

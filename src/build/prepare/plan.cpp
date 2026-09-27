@@ -369,24 +369,12 @@ static std::expected<void, std::string> step13_make_plan(PrepareState& state, Bu
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
     // SPEC-007 R4.3: a declared deploy outranks a search directory's file of
-    // the same name, and a difference between the two is said here, where
-    // the user sees it (the post-link placement edge says it only under -v).
-    // A declared source that an action writes is left to that edge: at
-    // planning it may still hold the previous build's bytes.
-    std::set<std::filesystem::path> actionOutputs;
-    for (auto const& a : ctx.plan.actions)
-        for (auto const& o : a.outputs)
-            actionOutputs.insert(std::filesystem::path(o).lexically_normal());
-    for (auto const& s : ctx.plan.shadowedSearchDirDlls) {
-        if (actionOutputs.contains(s.declared.lexically_normal())) continue;
-        std::error_code ec;
-        if (std::filesystem::is_regular_file(s.declared, ec)
-            && !mcpp::build::stage::same_content(s.declared, s.offered))
-            mcpp::diag::warning("build/deploy-shadows-search-dir", std::format(
-                "'{}' is placed by this project's deploy list; the runtime "
-                "search directories also offer a different '{}', which is "
-                "not used", s.declared.string(), s.offered.string()));
-    }
+    // the same name, and a difference between the two is stated ONCE, by the
+    // post-link placement edge, through the edge-advice channel
+    // (mcpp.build.advice) that mcpp reports after a successful build. The
+    // planning-time statement that stood here (#727) was a second statement
+    // of the same fact, and could not see a directory a `prepare` action
+    // fills (WS3 of the 2026-09-28 design).
     // Resolved far above, where the dependency graph first exists. It is
     // attached here rather than threaded through `make_plan` because nothing
     // that function does depends on it: the flag assembly that does reads the
@@ -606,6 +594,21 @@ static std::expected<void, std::string> step13_cxx_process_runtime(PrepareState&
                     "       Use cxx_runtime = \"host-coupled\", or a toolset "
                     "that ships its redistributable.",
                     r.role));
+            }
+        }
+        // A FILE OF THE C++ RUNTIME DECLARED WHERE THE CONTRACT SAYS THERE IS
+        // NONE. Under host-coupled the system's runtime serves the program, and
+        // the runtime placement resolver places no copy from any source; a
+        // declared copy is the one statement it cannot honour, so the build
+        // stops here, before compiling, with both statements named.
+        if (mcpp::toolchain::is_msvc_target(*state.tc)) {
+            const auto flags = mcpp::build::compute_flags(ctx.plan);
+            if (!flags.runtimeErrors.empty()) {
+                refusal::record(refusal::Code::CrtDeclaredUnderHostCoupled);
+                std::string lines;
+                for (auto const& e : flags.runtimeErrors)
+                    lines += (lines.empty() ? "" : "\n       ") + e;
+                return std::unexpected(lines);
             }
         }
         // F3a. A stated self-contained program over a coupled C++ shared

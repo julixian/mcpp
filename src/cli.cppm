@@ -17,6 +17,7 @@ module;
 export module mcpp.cli;
 
 import std;
+import mcpp.build.depfile;
 import mcpplibs.cmdline;
 import mcpp.cli.cmd_build;
 import mcpp.cli.cmd_cache;
@@ -30,6 +31,7 @@ import mcpp.pm.commands;
 import mcpp.toolchain.fingerprint;   // MCPP_VERSION
 import mcpp.wire;
 import mcpp.cli.cmd_sbom;
+import mcpp.platform;                // is_windows — the PATH separator of `__action --path-prepend`
 import mcpp.platform.env;            // --offline → MCPP_OFFLINE
 import mcpp.platform.process;        // __action-stamp runs the checked command
 import mcpp.platform.fs;             // __action-stamp writes its stamps
@@ -933,6 +935,10 @@ int run(int argc, char** argv) {
             .description("(internal: invoked by ninja) Place beside a Windows program the DLLs it imports from its runtime search directories")
             .option(cl::Option("output").takes_value().value_name("PATH").help("the stamp to write"))
             .option(cl::Option("depfile").takes_value().value_name("PATH").help("the depfile naming every DLL placed"))
+            .option(cl::Option("crt").takes_value().value_name("RULE")
+                .help("how the contract governs the MSVC C++ runtime's names: carry | system | static | not-applicable"))
+            .option(cl::Option("toolset-crt").takes_value().value_name("DIR")
+                .help("the selected toolset's C++ runtime directory"))
             .action(wrap_rc(cmd_place_dlls)))
         .subcommand(cl::App("coff-def")
             .description("(internal: invoked by ninja) Write a .def of every exportable symbol in the given COFF objects")
@@ -1014,12 +1020,70 @@ int run(int argc, char** argv) {
     // `mcpp-deps` -- re-ran on every build after its first input change,
     // because its output stayed older than that input forever.
     // `mcpp __action [--env NAME=VALUE]... [--cwd <dir>] [--require-dir <dir>]
-    // [--stamp <stamp>]... -- <argv>...` is the same wrapper with every part
-    // named (mcpp#708): an action that declares `env` or `cwd` is run through
-    // it whatever its role. An action that declares neither keeps the
+    // [--path-prepend <dir>]... [--stamp <stamp>]... -- <argv>...` is the same
+    // wrapper with every part named (mcpp#708): an action that declares `env`
+    // or `cwd` is run through it whatever its role, and so is every action of
+    // a build for a Windows target whose toolset has a C++ runtime directory:
+    // `--path-prepend` puts that directory first on the command's PATH, so a
+    // tool the action runs (Qt's moc.exe, a vcpkg port's generator) starts
+    // with the toolset's runtime and not with whatever copy a library package
+    // happened to ship beside it (the 2026-09-28 design, §2.9). An action that declares neither keeps the
     // positional `__action-stamp` spelling above, so its command line -- and
     // ninja's command hash for its edge -- is the one an earlier engine wrote,
     // and upgrading re-runs no check and no `prepare`.
+    // `mcpp depfile-filter --raw <file> --out <file> -- <compiler argv>...`
+    // (internal: written into build.ninja for GCC on a Windows host, WS2 of
+    // the 2026-09-28 design). Runs the compile with inherited stdio and no
+    // shell, and on success writes the first record of the raw depfile to
+    // `--out` and removes the raw file (mcpp.build.depfile). POSIX chains the
+    // equivalent awk program in the rule's shell command instead. Handled
+    // before the command-line parser, as `__action` is: everything after `--`
+    // is the compiler's argv, and a flag there is not this command's.
+    if (std::string_view(argv[1]) == "depfile-filter") {
+        std::string raw, out;
+        int i = 2;
+        for (; i < argc && std::string_view(argv[i]) != "--"; ++i) {
+            const std::string_view a = argv[i];
+            if ((a == "--raw" || a == "--out") && i + 1 < argc) {
+                (a == "--raw" ? raw : out) = argv[++i];
+                continue;
+            }
+            std::println(stderr, "error: depfile-filter: unknown option '{}'", a);
+            return 2;
+        }
+        if (raw.empty() || out.empty() || i + 1 >= argc) {
+            std::println(stderr,
+                "error: depfile-filter requires --raw <file> --out <file> -- <command>...");
+            return 2;
+        }
+        std::vector<std::string> cmd;
+        for (++i; i < argc; ++i) cmd.emplace_back(argv[i]);
+        bool timedOut = false;
+        const int r = mcpp::platform::process::run_exec_deadline(
+            cmd, {}, std::chrono::milliseconds(0), &timedOut);
+        if (r != 0) return r;
+        std::string text;
+        {
+            std::ifstream in(std::filesystem::path{raw}, std::ios::binary);
+            if (!in) {
+                std::println(stderr, "error: depfile-filter: the compile wrote no '{}'", raw);
+                return 1;
+            }
+            text.assign(std::istreambuf_iterator<char>(in), {});
+        }
+        {
+            std::ofstream o(std::filesystem::path{out}, std::ios::binary | std::ios::trunc);
+            o << mcpp::build::depfile::first_record(text);
+            if (!o) {
+                std::println(stderr, "error: depfile-filter: cannot write '{}'", out);
+                return 1;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::remove(std::filesystem::path{raw}, ec);
+        return 0;
+    }
+
     if (std::string_view(argv[1]) == "__action-stamp"
         || std::string_view(argv[1]) == "__action") {
         const bool named = std::string_view(argv[1]) == "__action";
@@ -1031,10 +1095,12 @@ int run(int argc, char** argv) {
         std::string cwd;
         std::vector<std::pair<std::string, std::string>> env;
         std::vector<std::string> stamps;
+        std::vector<std::string> pathPrepend;
         for (; i < argc && std::string_view(argv[i]) != "--"; ++i) {
             const std::string_view a = argv[i];
             const bool takesValue = a == "--require-dir"
-                || (named && (a == "--env" || a == "--cwd" || a == "--stamp"));
+                || (named && (a == "--env" || a == "--cwd" || a == "--stamp"
+                              || a == "--path-prepend"));
             if (!takesValue) {
                 if (named) {
                     std::println(stderr, "error: __action: unknown option '{}'", a);
@@ -1051,6 +1117,7 @@ int run(int argc, char** argv) {
             if (a == "--require-dir") requireDir = v;
             else if (a == "--cwd")    cwd = v;
             else if (a == "--stamp")  stamps.push_back(v);
+            else if (a == "--path-prepend") pathPrepend.push_back(v);
             else {
                 const auto eq = v.find('=');
                 if (eq == std::string::npos || eq == 0) {
@@ -1070,6 +1137,28 @@ int run(int argc, char** argv) {
         if (cmd.empty()) {
             std::println(stderr, "error: {} has no command to run", argv[1]);
             return 2;
+        }
+        // The prepended directories go before the PATH the command would
+        // otherwise see: the action's own `env` PATH when it declares one,
+        // the inherited one when it does not. On Windows the name is compared
+        // without case, as the environment compares it.
+        if (!pathPrepend.empty()) {
+            constexpr char sep = mcpp::platform::is_windows ? ';' : ':';
+            auto is_path = [](std::string_view k) {
+                if (!mcpp::platform::is_windows) return k == "PATH";
+                return k.size() == 4
+                    && std::ranges::equal(k, std::string_view("path"), [](char x, char y) {
+                           return std::tolower(static_cast<unsigned char>(x)) == y; });
+            };
+            std::string current;
+            auto declared = std::ranges::find_if(env, [&](auto const& kv) { return is_path(kv.first); });
+            if (declared != env.end()) current = declared->second;
+            else if (const char* p = std::getenv("PATH")) current = p;
+            std::string joined;
+            for (auto const& d : pathPrepend) joined += d + sep;
+            joined += current;
+            if (declared != env.end()) declared->second = std::move(joined);
+            else env.emplace_back("PATH", std::move(joined));
         }
         // Stamps and the required directory are named relative to the build
         // directory, where ninja started this process. Anchored before the

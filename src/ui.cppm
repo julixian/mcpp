@@ -40,6 +40,9 @@ void finished(std::string_view profile, std::chrono::milliseconds elapsed,
 // "warning:" / "error:" prefix lines (yellow / red).
 void warning(std::string_view message);
 void error(std::string_view message);
+// "note:" prefix line (cyan), on stderr like the two above: a statement that
+// changes nothing the build does and that a reader may want to act on.
+void note(std::string_view message);
 
 // Closing notices: advisories that concern the run as a whole rather than the
 // step that noticed them, such as a refreshed package index that requires a
@@ -373,6 +376,15 @@ void error(std::string_view message) {
         std::println(stderr, "{}{}error:{} {}", kBold, kBrightRed, kReset, message);
     } else {
         std::println(stderr, "error: {}", message);
+    }
+}
+
+void note(std::string_view message) {
+    init();
+    if (g_color) {
+        std::println(stderr, "{}{}note:{} {}", kBold, kCyan, kReset, message);
+    } else {
+        std::println(stderr, "note: {}", message);
     }
 }
 
