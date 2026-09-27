@@ -150,6 +150,25 @@ error: `-fno-exceptions` changes the language dialect, but the `import std` BMI 
 没有任何单元 import `std` 时不会触发，此时该标志只是一个正常生效的按
 单元选项。
 
+`dialect_cxxflags` 也接受条件形式 `[target.<selector>.build] dialect_cxxflags`
+*(mcpp 2026.9.28.1+)*，用来表达一个只在部分目标上存在的方言开关：
+
+```toml
+[build]
+dialect_cxxflags = ["-fno-exceptions"]
+
+[target.windows.build]
+dialect_cxxflags = ["-D_HAS_EXCEPTIONS=0"]
+```
+
+与普通的构建输入不同，`dialect_cxxflags` 是图级联的（SPEC-004 §9 第 10 条），
+所以只有这次构建的根贡献它：命令直接构建的那个包，或 `-p` 选中的成员。条目
+按这个顺序追加——`[workspace.build]`、根自己的 `[build]`、再到每个命中的
+`[target.<selector>.build]`（按清单顺序）——解出的列表到达 std BMI 的预构建、
+模块扫描与每一个翻译单元，对根和对每个依赖一视同仁。依赖包自己声明的
+`dialect_cxxflags`，无论是否带条件，都不到达任何命令：一个包为自己将来作为
+根的构建合法地声明它，这也是它不被诊断的原因。
+
 ### 2.2 `[targets.<name>]` —— 构建目标
 
 ```toml

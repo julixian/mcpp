@@ -335,6 +335,22 @@ void merge_conditional_config(mcpp::manifest::Manifest& m,
             m.buildConfig.abiExceptions = cc.abiExceptions;
             m.buildConfig.abiExceptionsDeclared = true;
         }
+        // `[target.<sel>.build] dialect_cxxflags` (#717): recorded for every
+        // package, like the abi switches above, but APPENDED rather than
+        // replaced -- there is no "last matching section wins" here, because
+        // the key is additive by design (design 2026-09-27 §6: "entries are
+        // appended, as cxxflags are"). This is the SAME iteration this loop
+        // already performs in manifest order, so a package's matching rows
+        // land after its own unconditional `[build] dialect_cxxflags`
+        // (already in `m.buildConfig.dialectCxxflags` from the initial parse)
+        // in exactly the declared order. Only the root's resulting list is
+        // ever read downstream; a dependency's is inert on that dependency's
+        // own manifest and excluded from its fingerprint contribution
+        // (prepare_inputs.cppm).
+        if (!cc.dialectCxxflags.empty())
+            m.buildConfig.dialectCxxflags.insert(m.buildConfig.dialectCxxflags.end(),
+                                                 cc.dialectCxxflags.begin(),
+                                                 cc.dialectCxxflags.end());
         // `[target.<sel>] requires_abi` / `.feature-requires-abi` (A6): a
         // requirement on the TARGET axis, unioned in -- not overwritten --
         // because more than one matching selector may ask for the same
