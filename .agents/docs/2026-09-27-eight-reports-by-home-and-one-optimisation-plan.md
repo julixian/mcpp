@@ -1392,3 +1392,19 @@ there on both binaries, for reasons of the environment (an unset `MCPP_HOME`;
 the machine's default toolchain), so the differential read them as unchanged.
 A test that fails on both sides measures nothing about the change; its reading
 has to come from an environment in which it passes, which here is CI.
+
+**#722, completed after the first CI run.** The first pass split the seven named
+functions and three more the gate found (10 findings at the base, 6 after it).
+The second pass split the six that remained (`step6_provision_host_tools`,
+`loadVersionDep`, `phase11_scan`, `step1_target_and_static_overrides`,
+`phase2_define_toolchain_resolver`, `step9_kernel_abi_interfaces_and_requirements`),
+each with a phase-local context struct where several of its steps share locals.
+Readings on the final tree: the gate reports no function over 400 lines; the
+seven fixtures are byte-identical to the pre-split binary; AddressSanitizer
+reports nothing over the fixtures and a 20-script e2e subset; the unit suite
+passes. The gate runs in `ci-linux.yml`'s LLVM toolchain job after mcpp builds
+itself with llvm@20.1.7, with clang-tidy from `xim:llvm-tools` at the version
+that wrote the compile database, because it reads that clang's BMIs. The merge
+of the first pass took `plan.cpp` to 2,505 lines, over the file gate; the
+records half of P13 (`mcpp.lock`, `resolution.json`) moved to `records.cpp`,
+byte-identical on the same fixtures.
