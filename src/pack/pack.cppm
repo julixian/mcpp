@@ -388,26 +388,25 @@ ClosureRead read_closure(const ClosureReadInput& in);
 // directory rather than taken for a file of the program's own; `notes` names
 // each DLL that more than one directory offers, with the one the search order
 // chose; `warnings` names a DLL this function did NOT place because
-// `placedByDeploy` already claims that name, together with the difference
-// found (SPEC-007 R4.2/R4.3: one destination, one writer — #723 self-review).
+// `placedByOthers` already claims that name, together with the difference
+// found (SPEC-007 R4.2/R4.3: one destination, one writer, #723).
 struct RuntimeDllPlacement {
     std::vector<std::filesystem::path> sources;
     std::vector<std::string>           names;
     std::vector<std::string>           notes;
     std::vector<std::string>           warnings;
 };
-// `placedByDeploy` names the DLLs the merged deploy list (declared deploys
-// plus the toolchain's own runtime staging) already places directly beside
-// `program`: that list is the single authority for those destinations
-// (`add_deploy`, mcpp.build.plan), so a name in it is never written here.
-// When the resolved import differs from what is already there, the
-// difference is reported in `warnings` rather than silently kept or
-// silently overwritten.
+// `placedByOthers` names the DLLs another writer already put directly beside
+// `program` (a declared deploy, or the toolchain's staged runtime; the caller
+// determines them from the directory, see cmd_place_dlls): a name in it is
+// never written here. When the resolved import differs from what is already
+// there, the difference is reported in `warnings` rather than silently kept
+// or silently overwritten.
 std::expected<RuntimeDllPlacement, Error>
 place_runtime_dlls(const std::filesystem::path& program,
                    const std::vector<std::filesystem::path>& searchDirs,
                    const std::vector<std::string>& placedBefore = {},
-                   const std::vector<std::string>& placedByDeploy = {});
+                   const std::vector<std::string>& placedByOthers = {});
 
 // Build a Plan from already-resolved inputs. Caller is expected to have
 // already run `mcpp build` (or equivalent) and pass the resulting
@@ -1389,7 +1388,7 @@ std::expected<RuntimeDllPlacement, Error>
 place_runtime_dlls(const std::filesystem::path& program,
                    const std::vector<std::filesystem::path>& searchDirs,
                    const std::vector<std::string>& placedBefore,
-                   const std::vector<std::string>& placedByDeploy)
+                   const std::vector<std::string>& placedByOthers)
 {
     const auto programDir = program.parent_path();
     auto same_dir = [](const std::filesystem::path& a, const std::filesystem::path& b) {
@@ -1405,7 +1404,7 @@ place_runtime_dlls(const std::filesystem::path& program,
         return l;
     };
     std::set<std::string> deployedNames;
-    for (auto const& n : placedByDeploy) deployedNames.insert(lower(n));
+    for (auto const& n : placedByOthers) deployedNames.insert(lower(n));
 
     ClosureReadInput in;
     in.object = program;
@@ -1419,12 +1418,12 @@ place_runtime_dlls(const std::filesystem::path& program,
     // resolution below would find that very copy in `searchDirs.front()` and
     // treat the name as already resolved, so the runtime search directories'
     // copy — the one to compare against — would never be looked at. Folding
-    // `placedByDeploy` into `notInFirstDir` forces resolution from the OTHER
+    // `placedByOthers` into `notInFirstDir` forces resolution from the OTHER
     // search directories instead, exactly as it already does for a name THIS
     // function placed on a previous run.
     in.notInFirstDir = placedBefore;
     in.notInFirstDir.insert(in.notInFirstDir.end(),
-                           placedByDeploy.begin(), placedByDeploy.end());
+                           placedByOthers.begin(), placedByOthers.end());
     const auto read = read_closure(in);
 
     // The program itself is the one object the caller chose, so a program that

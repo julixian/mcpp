@@ -57,19 +57,14 @@ export int cmd_publish(const mcpplibs::cmdline::ParsedArgs& parsed) {
 export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
     const std::filesystem::path stamp{parsed.option_or_empty("output").value()};
     const std::filesystem::path depfile{parsed.option_or_empty("depfile").value()};
-    if (stamp.empty() || depfile.empty() || parsed.positional_count() < 2) {
+    if (stamp.empty() || depfile.empty() || parsed.positional_count() < 1) {
         std::println(stderr,
-            "error: place-dlls requires --output, --depfile, a program and a placed-names word");
+            "error: place-dlls requires --output, --depfile and a program");
         return 2;
     }
     const std::filesystem::path program{parsed.positional(0)};
-    std::vector<std::string> placedByDeploy;
-    for (auto piece : std::views::split(parsed.positional(1), ',')) {
-        std::string_view name(piece.begin(), piece.end());
-        if (!name.empty()) placedByDeploy.emplace_back(name);
-    }
     std::vector<std::filesystem::path> dirs;
-    for (std::size_t i = 2; i < parsed.positional_count(); ++i)
+    for (std::size_t i = 1; i < parsed.positional_count(); ++i)
         dirs.emplace_back(parsed.positional(i));
 
     // What the previous run placed, recorded in the stamp itself: those copies
@@ -81,7 +76,37 @@ export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
         for (std::string line; std::getline(prev, line);)
             if (!line.empty()) placedBefore.push_back(line);
     }
-    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore, placedByDeploy);
+    // ONE DESTINATION, ONE WRITER (SPEC-007 R4.3, #723). A DLL already beside
+    // the program that this edge did not place, and that a runtime search
+    // directory also offers, is another writer's: a declared deploy or the
+    // toolchain's staged runtime, both completed before the link this edge
+    // follows. It is never overwritten; `place_runtime_dlls` compares it with
+    // the directory's copy and warns on a difference. A DLL only the
+    // program's directory holds (a library the project built there) is not
+    // one this edge could write, and stays an ordinary member of the closure.
+    // Decided here, from the directories, so the edge's command does not
+    // change when the plan's deploy set does.
+    std::vector<std::string> placedByOthers;
+    {
+        std::error_code dirEc;
+        const auto here = program.has_parent_path() ? program.parent_path()
+                                                    : std::filesystem::path(".");
+        for (auto const& e : std::filesystem::directory_iterator(here, dirEc)) {
+            if (!e.is_regular_file(dirEc)) continue;
+            auto ext = e.path().extension().string();
+            std::ranges::transform(ext, ext.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext != ".dll") continue;
+            const auto name = e.path().filename().string();
+            if (std::ranges::find(placedBefore, name) != placedBefore.end()) continue;
+            const bool offered = std::ranges::any_of(dirs, [&](auto const& d) {
+                std::error_code fe;
+                return std::filesystem::is_regular_file(d / name, fe);
+            });
+            if (offered) placedByOthers.push_back(name);
+        }
+    }
+    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore, placedByOthers);
     if (!placed) {
         std::println(stderr, "error: {}", placed.error().message);
         return 1;

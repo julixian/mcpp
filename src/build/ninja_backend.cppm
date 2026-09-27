@@ -1935,16 +1935,14 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         for (auto const& d : plan.linkIntent.runtimeSearchDirs)
             dirs += " " + ninja_command_word(d.string());
         append("rule place_dlls\n");
-        // `$placed` (SPEC-007 R4.2/R4.3, #723 self-review: one destination,
-        // one writer) names, per edge, the DLLs the merged deploy list
-        // already places directly beside THIS program. `place-dlls` skips
-        // them — that list is the authority for its own destinations, and
-        // this mechanism only compares and warns instead of racing it. It is
-        // always exactly one shell word, comma-joining the names (never
-        // empty in the ninja_command_word sense: `''`/`""` when there is
-        // nothing to say) so it can never absorb `$in` or the directories
-        // that follow it, whatever it lists.
-        append("  command = $mcpp place-dlls --output $out --depfile $out.d $in $placed" + dirs + "\n");
+        // One destination, one writer (SPEC-007 R4.2/R4.3, #723): `place-dlls`
+        // decides for itself which DLLs beside the program are another
+        // writer's (see cmd_place_dlls), so the command line carries no list.
+        // A list here changed whenever the plan's deploy set did -- and that
+        // set reads runtime search directories a `prepare` action fills, so it
+        // differs between the first plan and the second, and every build after
+        // the first re-ran the placement (e2e 797).
+        append("  command = $mcpp place-dlls --output $out --depfile $out.d $in" + dirs + "\n");
         append("  depfile = $out.d\n");
         append("  deps = gcc\n");
         append("  description = DLLS $in\n\n");
@@ -2967,18 +2965,6 @@ std::string emit_ninja_string(const BuildPlan& plan) {
             append("build " + exe + ".dlls: place_dlls " + exe
                    + (prepareStamps.empty() ? std::string{} : " |" + prepareStamps)
                    + "\n");
-            // One destination, one writer (SPEC-007 R4.2/R4.3, #723 self-
-            // review): the names the merged deploy list already places in
-            // THIS program's own directory. `place-dlls` must not place a
-            // second, competing copy of one of these — see the `$placed`
-            // comment above, and `place_runtime_dlls` in mcpp.pack.
-            std::string placedHere;
-            for (auto const& d : deployFiles) {
-                if (d.dest.parent_path() != lu.output.parent_path()) continue;
-                if (!placedHere.empty()) placedHere += ',';
-                placedHere += d.dest.filename().string();
-            }
-            append("  placed = " + ninja_command_word(placedHere) + "\n");
             append("default " + exe + ".dlls\n\n");
         }
 
