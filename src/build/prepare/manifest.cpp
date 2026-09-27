@@ -1,3 +1,6 @@
+// manifest.cpp -- P0: the effective manifest and the workspace it belongs to,
+// from the one loader every command uses.
+
 module mcpp.build.prepare;
 import :state;
 

@@ -6,11 +6,12 @@
 #
 # prepare.cppm was 16,105 lines: one exported function, prepare_build, ~85%
 # of the file, ~180 top-level locals sharing a stack frame. It was split into
-# a primary interface (src/build/prepare.cppm), an implementation partition
-# (src/build/prepare/state.cppm) and twelve implementation units, each phase
-# a function taking PrepareState& instead of closing over the old locals
-# directly — see the layout comment at the top of prepare.cppm and
-# .agents/docs/2026-09-27-mcpp-2026.9.27.1-ecosystem-plan.md §4.
+# a primary interface (src/build/prepare.cppm) holding declarations, an
+# implementation partition (src/build/prepare/state.cppm) and implementation
+# units, each phase a function taking PrepareState& instead of closing over
+# the old locals directly -- see the layout comment at the top of
+# prepare.cppm, and mcpp-community/mcpp#721 for the GCC 16.1 constraint that
+# shapes it.
 #
 # A size cap with no gate is a target nobody re-checks. The decomposition's
 # whole point was to keep any one file's compile from blocking on the rest —

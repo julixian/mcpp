@@ -526,17 +526,17 @@ struct PrepareState {
 // prepare_build(). Ordinary (non-static) module-linkage declarations --
 // static would give each definition internal linkage, invisible outside
 // its own file.
-std::expected<void, std::string> phase9_target_side(PrepareState& state);
-std::expected<void, std::string> phase11_scan(PrepareState& state);
-std::expected<BuildContext, std::string> phase13_finish(PrepareState& state);
 std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& state);
 std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state);
 std::expected<void, std::string> phase2_define_toolchain_resolver(PrepareState& state);
-std::expected<void, std::string> phase5_toolchain_after_graph(PrepareState& state);
 std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state);
 std::expected<void, std::string> phase4a_graph_load(PrepareState& state);
 std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state);
+std::expected<void, std::string> phase5_toolchain_after_graph(PrepareState& state);
 std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& state);
+std::expected<void, std::string> phase9_target_side(PrepareState& state);
+std::expected<void, std::string> phase11_scan(PrepareState& state);
+std::expected<BuildContext, std::string> phase13_finish(PrepareState& state);
 
 // ── Helpers the phases share, defined in the files named below ─────────────
 

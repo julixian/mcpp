@@ -1,3 +1,6 @@
+// scan.cpp -- P11 and P12: the module scan and its validation, the
+// standard-module gate, and the fingerprint.
+
 module mcpp.build.prepare;
 import :state;
 

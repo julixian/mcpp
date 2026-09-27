@@ -1,3 +1,6 @@
+// graph.cpp -- P4b: the dependency worklist, the resolved graph and the
+// package-cycle check.
+
 module mcpp.build.prepare;
 import :state;
 

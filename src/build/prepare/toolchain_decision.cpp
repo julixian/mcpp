@@ -1,3 +1,6 @@
+// toolchain_decision.cpp -- P5: the toolchain decided once the graph exists,
+// through the resolver P2 defined.
+
 module mcpp.build.prepare;
 import :state;
 

@@ -2,35 +2,40 @@
 // core (workspace -> toolchain -> dependency resolution -> features ->
 // modgraph -> fingerprint -> plan -> lockfile).
 //
-// LAYOUT. This file is the primary interface: exported types, and
-// prepare_build's own exported declaration (default arguments included —
-// they belong on the declaration, not the definition). Nothing else. The
-// implementation lives under src/build/prepare/:
-//   state.cppm       implementation partition `:state` — PrepareState (the
-//                     working state every phase reads and writes, by
-//                     reference, in place of prepare_build's former ~180
-//                     locals) and the phase functions' declarations.
-//   driver.cpp        prepare_build's definition: construct PrepareState,
-//                     call each phase in order, return the last one's result.
-//   manifest.cpp      P0 — manifest and workspace resolution.
-//   toolchain.cpp     P1, P2, P5 — toolchain spec, the toolchain resolver
-//                     closure (P2 defines it, P5 calls it), the toolchain
-//                     decision once the graph exists.
-//   xlings.cpp        P3 — xlings payload before the graph.
-//   graph_load.cpp    P4a — the git/path/version dependency loader
-//                     (loadVersionDep), called from graph.cpp.
-//   graph.cpp         P4b — the worklist engine and cycle detection that
-//                     call it.
-//   features.cpp      P6-P8 — feature activation, capability/ABI
-//                     accumulation, target side, host-tool provisioning.
-//   target_side.cpp   P9 — the target side, resolved once against the graph.
-//   scan.cpp          P11 — the modgraph scan, validation, fingerprint.
-//   plan.cpp          P13 — BuildContext: plan, assembly, Windows resources,
-//                     the global cache, mcpp.lock, resolution.json.
+// LAYOUT. This file is the primary interface: the exported types, the exported
+// inline functions, and the declarations of every other exported function,
+// default arguments included (they belong on the declaration, not the
+// definition). Nothing else is defined here. The implementation lives under
+// src/build/prepare/:
+//   state.cppm         implementation partition `:state`: PrepareState (the
+//                      working state every phase reads and writes, by
+//                      reference, in place of prepare_build's former ~180
+//                      locals), the phase functions' declarations, and the
+//                      declarations of the helpers the phases share.
+//   driver.cpp         prepare_build: construct PrepareState, run the phases
+//                      in order, return what the last one builds.
+//   manifest.cpp       P0 -- the manifest and its workspace.
+//   toolchain.cpp      P1, P2 -- the toolchain specification and target axis;
+//                      the toolchain resolver's definition.
+//   xlings.cpp         P3 -- xlings payloads before the graph.
+//   graph_load.cpp     P4a -- loading one git, path or version dependency.
+//   graph.cpp          P4b -- the worklist, the graph, the cycle check.
+//   toolchain_decision.cpp  P5 -- the toolchain, decided once the graph exists.
+//   features.cpp       P6-P8 -- features, capabilities, host tools, and the
+//                      dependencies' build programs.
+//   target_side.cpp    P9, P10 -- the target side and each dependency's link form.
+//   scan.cpp           P11, P12 -- the module scan, validation, fingerprint.
+//   plan.cpp           P13 -- the BuildContext, mcpp.lock, resolution.json.
+//   config.cpp, options.cpp, toolchain_env.cpp, fetch.cpp
+//                      the helpers the phases share: manifest merges and
+//                      feature requests; invocation options; target rows,
+//                      sysroots and build-program environments; git remotes
+//                      and xlings provisioning.
+// Every file stays at or below 2,500 lines (.github/tools/check_file_lengths.sh).
 //
-// A GCC 16.1 CONSTRAINT SHAPES ALL OF THIS. Verified locally (archived on
-// branch wip/prepare-split; see the mcpp repository's `upstream`-labelled GCC
-// issue for the minimal reproduction): inserting a new INTERFACE unit into
+// A GCC 16.1 CONSTRAINT SHAPES ALL OF THIS. Measured locally and recorded in
+// mcpp-community/mcpp#721 (the archived attempt is branch wip/prepare-split):
+// inserting a new INTERFACE unit into
 // mcpp.build.prepare's import chain — a separately named module, or an
 // interface partition (`export module mcpp.build.prepare:x;`) — makes GCC
 // 16.1 segfault in add_imported_namespace while reading `import mcpp.cli;`

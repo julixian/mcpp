@@ -1,3 +1,7 @@
+// driver.cpp -- prepare_build itself: construct the PrepareState, run the
+// phases in order, and return what the last one builds. An early error of any
+// phase ends the call with that phase's message.
+
 module mcpp.build.prepare;
 import :state;
 

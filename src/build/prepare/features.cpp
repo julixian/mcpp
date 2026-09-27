@@ -1,3 +1,6 @@
+// features.cpp -- P6 to P8: feature activation, capability and ABI
+// requirements, host-tool provisioning, and the dependencies' build programs.
+
 module mcpp.build.prepare;
 import :state;
 

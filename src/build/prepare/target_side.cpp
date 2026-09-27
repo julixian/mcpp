@@ -1,3 +1,6 @@
+// target_side.cpp -- P9 and P10: the target side resolved against the
+// graph, and the form each dependency is linked in.
+
 module mcpp.build.prepare;
 import :state;
 

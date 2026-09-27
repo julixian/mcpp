@@ -1,3 +1,6 @@
+// graph_load.cpp -- P4a: loading one dependency (git, path or index
+// version) into the graph; the worklist in graph.cpp calls it.
+
 module mcpp.build.prepare;
 import :state;
 

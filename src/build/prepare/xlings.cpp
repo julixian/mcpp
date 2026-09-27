@@ -1,3 +1,6 @@
+// xlings.cpp -- P3: the xlings payloads the root declares, provisioned
+// before the dependency graph is built.
+
 module mcpp.build.prepare;
 import :state;
 

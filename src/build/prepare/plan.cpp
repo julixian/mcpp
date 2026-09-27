@@ -1,3 +1,7 @@
+// plan.cpp -- P13: the BuildContext: the plan, prebuilt dependencies,
+// assembly units, Windows resources, the global cache, mcpp.lock and
+// resolution.json.
+
 module mcpp.build.prepare;
 import :state;
 

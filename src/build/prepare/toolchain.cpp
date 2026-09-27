@@ -1,3 +1,7 @@
+// toolchain.cpp -- P1 and P2: the toolchain specification and the target
+// axis, and the definition of the toolchain resolver that P5 calls once the
+// dependency graph exists.
+
 module mcpp.build.prepare;
 import :state;
 
