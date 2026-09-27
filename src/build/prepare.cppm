@@ -2383,6 +2383,13 @@ host_tool_declared_toolchain(const mcpp::manifest::Manifest& tool,
 // PrepareState inside its body, never in its own signature, so this does not
 // narrow prepare_build's own interface.
 namespace {
+
+// The platform key used to read `[toolchain].<platform>` — a pure constant,
+// so it lives at file scope rather than in PrepareState: nothing about it
+// depends on any phase's state, and every phase that reads it (P1's
+// `tcSpecSource` included) can just name it.
+constexpr std::string_view kCurrentPlatform = mcpp::platform::name;
+
 struct PrepareState {
     PrepareState(bool print_fingerprint_, bool includeDevDeps_,
                  std::vector<mcpp::manifest::Target> extraTargets_,
@@ -2434,8 +2441,1076 @@ struct PrepareState {
     std::map<std::string, mcpp::pm::LockedGitSource> gitLockAnchors;
     std::map<std::string, std::string> packageIdentityLockAnchors;
     CacheMode cacheMode{};
+
+    // ── P1: toolchain spec resolution, target axis, L1 cfg merge ────────────
+    // `get_cfg`, `provide_runtime_payload`, `report_fixup`,
+    // `msvc_usable_either_origin`, `native_first_run_spec`, `tcSpecSource`,
+    // `resolvedAccel`, `cfgCtx` and `add_once` are closures that outlive P1
+    // (later phases call them by name): each captures `state` itself, not the
+    // individual fields below, so it stays valid regardless of which phase's
+    // stack frame created it (see the PrepareState comment above).
+    std::filesystem::path explicit_compiler;
+    std::optional<mcpp::config::GlobalConfig> cfg_opt;
+    bool bootstrap_checked = false;
+    std::function<std::expected<mcpp::config::GlobalConfig*, std::string>(bool)> get_cfg;
+    mcpp::platform::runtime::RuntimeBinding runtimeBindingSnapshot;
+    std::string projectSubosBin;
+    std::string runtimePayload;
+    std::filesystem::path runtimeLibDir;
+    bool runtimePayloadProvided = false;
+    std::function<void(const mcpp::toolchain::XimToolchainPackage&)> provide_runtime_payload;
+    std::function<void(const mcpp::toolchain::FixupOutcome&,
+                        const std::filesystem::path&)> report_fixup;
+    std::string effectiveProfile;
+    std::vector<std::filesystem::path> storeRoots;
+    std::optional<std::string> tcSpec;
+    TcOrigin tcOrigin{};
+    bool tcFromCommandLine = false;
+    bool tcFromConsumer = false;
+    std::function<std::string()> tcSpecSource;
+    std::function<bool()> msvc_usable_either_origin;
+    std::function<std::string()> native_first_run_spec;
+    bool windowsGnuFirstRun = false;
+    std::function<std::string()> resolvedAccel;
+    std::function<cfgpred::Ctx()> cfgCtx;
+    std::optional<mcpp::platform::TargetPlatform> targetPlatform;
+    bool abiThreadsRendered = false;
+    std::function<void(std::vector<std::string>&, std::string_view)> add_once;
+    std::optional<mcpp::toolchain::Toolchain> tc;
+    bool firstRunNeedsTargetPass = false;
+    bool targetPassDone = false;
 };
 } // namespace
+
+static std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state) {
+    // ─── Toolchain resolution (docs/21) ────────────────────────────────
+    //
+    // THE WHOLE CHAIN, in the order it is applied. It was documented twice, as
+    // "3 steps" here and "4 steps" further down, and neither list had been
+    // true for a long time — between them they named five of the nine inputs
+    // below and disagreed about two. A comment that undercounts the inputs to
+    // a decision is worse than none: it tells the next reader they have seen
+    // the whole thing.
+    //
+    // The WHAT (which spec) is settled first, then the HOW (which binary).
+    // Anything that WRITES `tcSpec` also writes `tcOrigin`, and that is the
+    // invariant this table rests on — the enumerator names below are real, so
+    // this comment cannot quietly stop matching the code.
+    //
+    //   WHICH SPEC                                       tcOrigin
+    //   1. mcpp.toml [toolchain].<platform> / .default   ManifestToolchain
+    //   2. global config.toml [toolchain] default        GlobalDefault
+    //   3. mcpp.toml [target.<triple>].toolchain         TargetSection
+    //      (--target / [build] target / config default
+    //       select the section; 3 outranks 1 and 2)
+    //   4. the target vocabulary's pin (triple.cppm)     TargetPin
+    //      — a convention, and it stands down when a
+    //        REMEMBERED target would overrule a spec the
+    //        user wrote down
+    //   5. the platform's first-run default, installed   FirstRun
+    //      and persisted by this very invocation
+    //
+    //   WHICH BINARY, from the spec settled above
+    //   6. `msvc@system`  → probe the machine (no xim package exists)
+    //   7. `<family>@<v>` → xim payload; msvc resolves through
+    //                       resolve_managed_msvc, everything else through
+    //                       the bin/-shaped frontend lookup
+    //   8. bare `system`  → the PATH compiler. A deliberate escape hatch, and
+    //                       the ONLY host-compiler route: there is no
+    //                       `gcc@system` (see parse_toolchain_spec)
+    //   9. offline / MCPP_NO_AUTO_INSTALL → hard error rather than a silent
+    //                       ~800 MB download
+    //
+    // AND ONE REVISION, after 1-9 have produced a toolchain: a spec targeting
+    // the MSVC ABI on a machine with no usable MSVC is switched to MinGW-w64
+    // — but only when `tc_origin_is_user_explicit` says mcpp chose it itself.
+    state.bootstrap_checked = false;
+    state.get_cfg = [&](bool requireBootstrap = true) -> std::expected<mcpp::config::GlobalConfig*, std::string> {
+        if (!state.cfg_opt) {
+            auto c = mcpp::config::load_or_init(/*quiet=*/false,
+                mcpp::fetcher::make_bootstrap_progress_callback());
+            if (!c) return std::unexpected(c.error().message);
+            state.cfg_opt = std::move(*c);
+        }
+        // Commands that need bootstrap tools (build, run, toolchain install)
+        // pass requireBootstrap=true to get an early, clear error.
+        if (requireBootstrap && !state.bootstrap_checked) {
+            state.bootstrap_checked = true;
+            auto problem = mcpp::config::check_base_init(*state.cfg_opt);
+            if (!problem.empty()) {
+                return std::unexpected(std::format(
+                    "{}\n  hint: run `mcpp self init --force` to reset and re-initialize",
+                    problem));
+            }
+        }
+        return &*state.cfg_opt;
+    };
+
+    // Resolve one exact runtime contract before resolving/fixing a toolchain.
+    // The fixup is itself a consumer of RuntimeBinding: doing it first would
+    // recreate #392 by letting directory order choose a libc and only later
+    // discovering what the project selected.
+    if (state.overrides.inherited_runtime_binding) {
+        state.runtimeBindingSnapshot = *state.overrides.inherited_runtime_binding;
+    } else {
+        auto cfgRuntime = state.get_cfg(true);
+        if (!cfgRuntime) return std::unexpected(cfgRuntime.error());
+        auto resolved = mcpp::platform::runtime::resolve_runtime_binding(
+            state.runtimeSelection, {}, (**cfgRuntime).xlingsHome());
+        if (!resolved) return std::unexpected(resolved.error());
+        state.runtimeBindingSnapshot = std::move(*resolved);
+        // A degradation that nobody prints is indistinguishable from no
+        // degradation, which is the failure this whole area keeps paying for.
+        // A note is not a warning: nothing is wrong with the build, some facts
+        // are simply unavailable — so it is reported once, at info level.
+        if (!state.runtimeBindingSnapshot.note.empty())
+            mcpp::ui::info("Runtime", state.runtimeBindingSnapshot.note);
+    }
+    // THE `bin` THIS PROJECT'S BUILD PROGRAMS SEE FIRST — derived ONCE,
+    // here, from the selection that has just been resolved.
+    //
+    // Empty unless the manifest declared `[xlings].subos`. That is deliberate:
+    // prepending the SHARED `subos/default/bin` would make what a build sees
+    // depend on what else has been installed on this machine, so a project
+    // that has not asked for an environment of its own gets the `PATH` mcpp
+    // was started with, byte for byte.
+    //
+    // NOT RE-DERIVED AT THE TWO DELIVERY SITES BELOW, AND NOT FROM
+    // `[xlings] deps`. `mcpp::xlings::runtime` is the sole runtime-selection
+    // policy and `RuntimeBinding::subosDir` is its resolved answer; a second
+    // derivation is how a build ends up with two subos and no way to say which
+    // one it used. The per-package payload paths a program may also need are
+    // already answered, separately, by `MCPP_XPKG_*_DIR`.
+    state.projectSubosBin = [&]() -> std::string {
+        using Mode = mcpp::xlings::runtime::RuntimeSelection::Mode;
+        if (state.runtimeBindingSnapshot.selection.mode != Mode::NamedSubos)
+            return {};
+        auto bin = state.runtimeBindingSnapshot.subosDir / "bin";
+        std::error_code ec;
+        if (!std::filesystem::is_directory(bin, ec)) return {};
+        return bin.string();
+    }();
+
+    state.runtimePayload = state.runtimeBindingSnapshot.libc;
+    state.runtimeLibDir = state.runtimeBindingSnapshot.libraryDirs.empty()
+        ? std::filesystem::path{} : state.runtimeBindingSnapshot.libraryDirs.front();
+
+    // THE DECLARED RUNTIME PAYLOAD IS PROVIDED BEFORE THE FIRST FIXUP THAT
+    // CONSUMES IT (mcpp#660), and not earlier: a build whose toolchain needs
+    // no C runtime payload must not download one. At most once per build. An
+    // inherited binding is not exempt, because the parent build may have used
+    // a toolchain that needed no payload. The two values derived above are
+    // refreshed with the binding, because detection and the fingerprint read
+    // them after the fixups.
+    state.runtimePayloadProvided = false;
+    state.provide_runtime_payload = [&](const mcpp::toolchain::XimToolchainPackage& pkg) {
+        if (state.runtimePayloadProvided) return;
+        if (mcpp::toolchain::post_install_fixup_kind(pkg).empty()) return;
+        state.runtimePayloadProvided = true;
+        auto cfgP = state.get_cfg(true);
+        if (!cfgP) return;
+        if (!mcpp::toolchain::ensure_declared_runtime(**cfgP, state.runtimeBindingSnapshot))
+            return;
+        state.runtimePayload = state.runtimeBindingSnapshot.libc;
+        state.runtimeLibDir = state.runtimeBindingSnapshot.libraryDirs.empty()
+            ? std::filesystem::path{} : state.runtimeBindingSnapshot.libraryDirs.front();
+    };
+
+    // mcpp#427: a toolchain fixup that could not run is a DEGRADATION, not a
+    // failure — the build continues without it. But it has to be said, or the
+    // eventual `stdlib.h: No such file or directory` arrives with no way to
+    // connect it to its cause.
+    //
+    // Deduplicated by payload: `ensure_post_install_fixup` is called from up
+    // to four seams in one build (manifest toolchain, default toolchain,
+    // MinGW first-run, build.mcpp host toolchain) and they routinely resolve
+    // the SAME payload. Saying it once is the rule mcpp#417 already paid for.
+    auto fixupNoticed = std::make_shared<std::set<std::string>>();
+    state.report_fixup = [fixupNoticed](
+            const mcpp::toolchain::FixupOutcome& outcome,
+            const std::filesystem::path& payloadRoot) {
+        if (outcome.skippedReason.empty()) return;
+        if (!fixupNoticed->insert(payloadRoot.generic_string()).second) return;
+        // Only the fact this line ADDS. The `Runtime` note above already gave
+        // the cause and the remedy for the same absence; repeating them here
+        // would be the second copy of one message, which is the habit mcpp#417
+        // exists to break.
+        mcpp::ui::info("Toolchain", std::format(
+            "used as installed — not patched against a C runtime ({})",
+            outcome.skippedReason));
+    };
+
+
+    // Toolchain resolution priority: see the table at the top of this
+    // function. Stated once, where `tcOrigin` is introduced — this used to be
+    // a second, shorter and differently-wrong list of the same thing.
+    //
+    // Resolve the build profile, overlaid by any [profile.<name>] from the
+    // manifest → buildConfig. `effectiveProfile` outlives the block: the
+    // build.mcpp env contract exposes it as MCPP_PROFILE.
+    {
+        auto& pname = state.effectiveProfile;
+        // Precedence lives in resolve_profile_name (above) so execute.cppm's
+        // fast paths settle it identically without running prepare_build.
+        // Release is opt-in via --release / --profile release; a project that
+        // wants its plain `mcpp build` optimized sets
+        // [build].default-profile = "release" (mcpp's own mcpp.toml does this,
+        // so the released binary stays -O2).
+        pname = resolve_profile_name(*state.m, state.overrides.profile, state.overrides.profile_fallback);
+        mcpp::manifest::Profile pr;
+        if (pname == "dev" || pname == "debug") { pr.optLevel = "0"; pr.debug = true; }
+        else if (pname == "dist")               { pr.optLevel = "3"; pr.strip = true; }
+        // (built-in dist intentionally leaves lto off: several packaged gcc
+        //  payloads ship without the LTO plugin; enable via [profile.dist].)
+        else                                    { pr.optLevel = "2"; } // release
+        if (auto it = state.m->profiles.find(pname); it != state.m->profiles.end()) pr = it->second;
+        // #519 — a profile may override the whole-graph form. OPTIONAL, so a
+        // profile that does not mention it leaves `[build]` standing; a plain
+        // value would reset it, because the block above REPLACES `pr` wholesale
+        // with the declared profile.
+        if (pr.dependencyLinkageDeclared)
+            state.m->buildConfig.dependencyLinkage = pr.dependencyLinkage;
+        state.m->buildConfig.optLevel = pr.optLevel;
+        state.m->buildConfig.debug    = pr.debug;
+        state.m->buildConfig.lto      = pr.lto;
+        state.m->buildConfig.strip    = pr.strip;
+        state.m->buildConfig.cflags.insert(state.m->buildConfig.cflags.end(),
+                                     pr.cflags.begin(), pr.cflags.end());
+        state.m->buildConfig.cxxflags.insert(state.m->buildConfig.cxxflags.end(),
+                                       pr.cxxflags.begin(), pr.cxxflags.end());
+        state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
+                                      pr.ldflags.begin(), pr.ldflags.end());
+    }
+
+    // Every directory a package payload may legitimately have been INSTALLED
+    // into: the global registry, plus the two project-local data roots a custom
+    // git index installs into. Defined HERE, above its first use, because three
+    // separate questions now depend on the same answer — where a dependency's
+    // cache address is anchored, whether its sources came from a store at all,
+    // and whether a `standard` declaration in its manifest was written by an
+    // author or by a descriptor generator. One definition, three uses; deriving
+    // the same fact twice is how two of them start disagreeing.
+    state.storeRoots = [&]() -> std::vector<std::filesystem::path> {
+        std::vector<std::filesystem::path> roots;
+        if (auto c = state.get_cfg(true)) roots.push_back((*c)->xlingsHome() / "data" / "xpkgs");
+        for (auto& d : mcpp::config::project_xlings_data_roots(state.workRoot))
+            roots.push_back(d / "xpkgs");
+        return roots;
+    }();
+
+    // [package] platforms — fixed vocabulary owned by mcpp (it owns the
+    // target/triple system): the platform name of every row it has
+    // (`platform_name`, beside `artifact_naming`). Unknown values: warning, or
+    // error under --strict.
+    for (auto& pf : state.m->package.platforms) {
+        if (!mcpp::toolchain::triple::is_platform_name(pf)) {
+            auto msg = std::format(
+                "[package] platforms contains unknown platform '{}' "
+                "(expected: {})", pf,
+                mcpp::toolchain::triple::platform_names_joined());
+            if (state.overrides.strict) return std::unexpected(msg);
+            mcpp::diag::warning("manifest/platforms", msg);
+        }
+    }
+
+    state.tcSpec = state.m->toolchain.for_platform(kCurrentPlatform);
+    // Where the spec came from decides whether mcpp may later revise it.
+    // See TcOrigin: mcpp can rewrite a default it chose itself, but must not
+    // silently overrule one the user wrote down.
+    state.tcOrigin = state.tcSpec.has_value() ? TcOrigin::ManifestToolchain
+                                       : TcOrigin::None;
+    // `--toolchain` shares `ManifestToolchain`'s precedence and not its
+    // spelling: the messages that refuse a spec name where it was written, and
+    // a value from the command line credited to a manifest key sends the
+    // reader to a file that does not contain it.
+    state.tcFromCommandLine = false;
+    state.tcFromConsumer    = false;
+    state.tcSpecSource = [&]() -> std::string {
+        if (state.tcOrigin == TcOrigin::ManifestToolchain && state.tcFromConsumer)
+            return std::format("the toolchain chosen for this host tool by {}",
+                               state.overrides.tool_chain);
+        if (state.tcOrigin == TcOrigin::ManifestToolchain && state.tcFromCommandLine)
+            return "--toolchain";
+        switch (state.tcOrigin) {
+            case TcOrigin::ManifestToolchain:
+                return std::format("[toolchain].{}", kCurrentPlatform);
+            case TcOrigin::TargetSection:
+                return std::format("[target.{}].toolchain", state.overrides.target_triple);
+            case TcOrigin::GlobalDefault:
+                return "the default toolchain (`mcpp toolchain default`)";
+            default:
+                return std::format("the toolchain mcpp chose ({})",
+                                   tc_origin_name(state.tcOrigin));
+        }
+    };
+    // `--toolchain` (arriving as MCPP_TOOLCHAIN, the same side channel
+    // `--offline` and `--jobs` use) beats everything, including the manifest.
+    //
+    // This is the usable form of "which compiler". On this repository the
+    // choice is worth 2.48x — gcc@16.1.0 builds mcpp in 79.9s, llvm@22.1.8 in
+    // 32.2s — but CHANGING THE DEFAULT is an ecosystem decision, not a
+    // performance one: it invalidates every published package's fingerprint and
+    // the three platforms do not yet ship the same llvm. Selecting per build
+    // costs nobody anything and needs no coordination.
+    //
+    // It counts as user-explicit, so mcpp will not quietly revise it.
+    if (const char* tcEnv = std::getenv("MCPP_TOOLCHAIN"); tcEnv && *tcEnv) {
+        state.tcSpec   = std::string(tcEnv);
+        state.tcOrigin = TcOrigin::ManifestToolchain;
+        state.tcFromCommandLine = true;
+    }
+    if (!state.overrides.toolchain.empty()) {
+        state.tcSpec   = state.overrides.toolchain;
+        state.tcOrigin = TcOrigin::ManifestToolchain;
+        state.tcFromConsumer = true;
+    }
+    if (!state.tcSpec.has_value()) {
+        auto cfg = state.get_cfg(true);
+        if (cfg && !(*cfg)->defaultToolchain.empty()) {
+            state.tcSpec   = (*cfg)->defaultToolchain;
+            state.tcOrigin = TcOrigin::GlobalDefault;
+        }
+    }
+
+    // ─── Windows first run without Visual Studio ────────────────────────
+    // The host triple on Windows is MSVC-ABI, so the historical default
+    // (llvm) resolves to clang targeting MSVC — which uses the MSVC STL and
+    // the Windows SDK. Neither ships with Windows; both arrive only with
+    // Visual Studio's "Desktop development with C++" workload. On a bare box
+    // that default installs fine and then fails at compile time with no
+    // actionable message.
+    //
+    // Seed only the TARGET axis and let the block right below derive the
+    // rest: the vocabulary table already maps x86_64-windows-gnu to its pin
+    // (winlibs GCC) and to static linkage, so the toolchain answer stays a
+    // single derivation instead of being spelled out a second time here.
+    // "Is MSVC usable here" — either origin. Asking `has_usable_msvc()` (which
+    // probes the machine) would answer "no" on a box that has a pinned
+    // msvc@<toolset> payload and no Visual Studio, and every decision below
+    // would then divert a perfectly good toolchain to mingw.
+    state.msvc_usable_either_origin = [&]() -> bool {
+        auto c = state.get_cfg(true);
+        if (!c) return mcpp::toolchain::msvc::has_usable_msvc();
+        return mcpp::toolchain::msvc::msvc_available_here(
+            (*c)->xlingsHome() / "data" / "xpkgs");
+    };
+
+    // THE PLATFORM'S CANONICAL NATIVE DEFAULT — a spec string only; no
+    // install, no persistence. Two places need "what would a native
+    // `mcpp build` pick here, with no --target": the first-run installer
+    // further below (which goes on to install and persist it), and
+    // `host_tc_for_build_program`'s cross branch (which needs a genuine HOST
+    // compiler when nothing was ever recorded as one — see its own comment
+    // for why #622 happened). One derivation, called from both, so they
+    // cannot drift the way a hand-copied second copy would.
+    state.native_first_run_spec = [&]() -> std::string {
+        namespace pins = mcpp::toolchain::triple::pins;
+        if constexpr (mcpp::platform::is_macos) {
+            return std::string(pins::kFirstRunMac);
+        } else if constexpr (mcpp::platform::is_windows) {
+            // A machine with no usable MSVC gets the GNU pin, not an
+            // MSVC-ABI clang it cannot use — mirrors the windows-gnu seed
+            // below, which this function's other caller runs after.
+            return std::string(state.msvc_usable_either_origin()
+                ? pins::kFirstRunWinMsvc : pins::kFirstRunWinGnu);
+        } else if (mcpp::platform::host_arch == std::string_view("x86_64")) {
+            return std::string(pins::kFirstRunLinuxX86_64);
+        } else {
+            return std::string(pins::kFirstRunLinuxOther);
+        }
+    };
+
+    state.windowsGnuFirstRun = false;
+    if constexpr (mcpp::platform::is_windows) {
+        if (!state.tcSpec.has_value() && state.overrides.target_triple.empty()
+            && state.m->buildConfig.target.empty()
+            && !state.msvc_usable_either_origin()) {
+            auto cfgW = state.get_cfg(true);
+            if (!cfgW || (*cfgW)->defaultTarget.empty()) {
+                state.overrides.target_triple =
+                    std::string(mcpp::toolchain::triple::pins::kFirstRunWinGnuTarget);
+                state.windowsGnuFirstRun = true;
+            }
+        }
+    }
+
+    // `[target.<triple>]`'s build-shaping keys, applied the same way whichever
+    // path found the row (#704). The section's toolchain is a statement about
+    // this row the author wrote down, so it replaces `[toolchain]` and the
+    // global default; `--toolchain` and a consumer's decision for a host tool
+    // are statements about THIS invocation and keep precedence over it.
+    auto apply_target_section = [&](const mcpp::manifest::TargetEntry& e) {
+        if (!e.toolchain.empty() && !state.tcFromCommandLine && !state.tcFromConsumer) {
+            state.tcSpec   = e.toolchain;
+            state.tcOrigin = TcOrigin::TargetSection;
+        }
+        if (!e.linkage.empty()) state.m->buildConfig.linkage = e.linkage;
+        // #336: a per-target C++ runtime contract state.overrides the project
+        // default, so "self-contained everywhere except this triple" is
+        // expressible without touching the cfg() input channel.
+        if (!e.cxxRuntime.empty()) state.m->buildConfig.cxxRuntime = e.cxxRuntime;
+    };
+
+    // ─── --target / --static state.overrides ──────────────────────────────────
+    // Target-axis default resolution when no --target flag was passed:
+    // [build] target (project default, ≙ cargo build.target) >
+    // [toolchain] default_target (global config) > host.
+    if (state.overrides.target_triple.empty() && !state.m->buildConfig.target.empty())
+        state.overrides.target_triple = state.m->buildConfig.target;
+    // Remembered, not requested: this one came out of the global config, so
+    // it must not outrank anything the user wrote down (see the pin below).
+    bool targetFromGlobalDefault = false;
+    if (state.overrides.target_triple.empty()) {
+        if (auto cfg = state.get_cfg(true); cfg && !(*cfg)->defaultTarget.empty()) {
+            state.overrides.target_triple = (*cfg)->defaultTarget;
+            targetFromGlobalDefault = true;
+        }
+    }
+    // Normalize the triple (alias spellings → canonical), validate against
+    // the known-target vocabulary, then apply the manifest [target.<triple>]
+    // override and the vocabulary-table convention (pin + default linkage).
+    if (!state.overrides.target_triple.empty()) {
+        namespace triple = mcpp::toolchain::triple;
+        // THE SPELLING THE PROJECT WROTE, KEPT FOR EVERY DIAGNOSTIC BELOW.
+        // `state.overrides.target_triple` is canonicalised further down, and until
+        // this variable existed the refusals quoted the canonical form:
+        // `--target aarch64-linux` produced "target 'aarch64-linux-gnu' is
+        // registered but not yet supported", a string the reader never typed
+        // and cannot find in their own command.
+        const std::string requestedSpelling = state.overrides.target_triple;
+        auto parsed = triple::parse(state.overrides.target_triple);
+
+        // THE REQUEST IS COMPLETED FROM THE VOCABULARY BEFORE ANYTHING
+        // READS IT, AND THE ORDER RELATIVE TO THE `[target.X]` LOOKUP IS PART
+        // OF THE CONTRACT.
+        //
+        // `parse` fills a missing env segment lexically so the identity stays
+        // total — `x86_64-linux` IS `x86_64-linux-gnu`, and a unit test says so.
+        // Every gate below then asked about the filled value instead of about
+        // the request. See `triple::resolve_request` for the two measurements.
+        //
+        // The lookup that follows keys on `parsed->str()`, so completing after
+        // it would match sections against a triple this build is not going to
+        // use. A project wanting the `planned` row keeps its escape hatch by
+        // WRITING the segment: `--target aarch64-linux-gnu` skips completion
+        // entirely, because a written segment is a request rather than a gap.
+        triple::RequestResolution req;
+        if (parsed) {
+            req    = triple::resolve_request(*parsed);
+            parsed = req.triple;
+        }
+
+        // [target.X] lookup is spelling-independent: a section keyed
+        // `x86_64-w64-mingw32` matches `--target x86_64-windows-gnu` and
+        // vice versa. Unparseable keys/inputs compare exactly (escape hatch).
+        auto it = state.m->targetOverrides.find(state.overrides.target_triple);
+        if (it == state.m->targetOverrides.end() && parsed) {
+            for (auto o = state.m->targetOverrides.begin();
+                 o != state.m->targetOverrides.end(); ++o) {
+                if (auto k = triple::parse(o->first);
+                    k && k->str() == parsed->str()) { it = o; break; }
+            }
+        }
+        bool hasExplicitSection   = it != state.m->targetOverrides.end();
+        bool hasToolchainOverride = hasExplicitSection
+                                 && !it->second.toolchain.empty();
+
+        const triple::TargetInfo* known =
+            parsed ? triple::find_known_target(*parsed) : nullptr;
+
+        // Validation: a typo must never silently fall through to the host
+        // toolchain (the worst failure mode — you think you cross-compiled).
+        // An explicit [target.X] section is the escape hatch for custom
+        // triples outside the vocabulary.
+        // Several rows serve this (arch, os) and the lexical default names none
+        // of them, so there is nothing to complete the request WITH. Refusing
+        // and listing them is the only honest answer; picking one would be an
+        // invented convention. No group has this shape today — the rule is here
+        // so the first one that does gets a diagnosis rather than a guess.
+        if (parsed && req.ambiguous && !hasExplicitSection) {
+            std::string opts;
+            for (auto s : req.supported) {
+                if (!opts.empty()) opts += ", ";
+                opts += std::string(s);
+            }
+            refusal::record(refusal::Code::AmbiguousRequest);
+            return std::unexpected(std::format(
+                "target '{}' does not say which C library, and several are "
+                "supported here.\n"
+                "       candidates: {}\n"
+                "       Name one of them.",
+                requestedSpelling, opts));
+        }
+        if (!known && !hasExplicitSection) {
+            // "UNKNOWN" IS A CLAIM ABOUT THE VOCABULARY, AND IT WAS FALSE FOR
+            // A WHOLE arch+os FAMILY.
+            //
+            // Measured on 2026.8.26.1: `--target riscv64-linux` reported
+            // `unknown target 'riscv64-linux'` while `riscv64-linux-musl` was
+            // sitting in `kKnownTargets` as `planned`. The lexical fill had
+            // produced `riscv64-linux-gnu` — a row that genuinely does not
+            // exist — and the gate reported on the fill.
+            //
+            // A non-empty sibling group means the family IS registered, so this
+            // is the planned refusal wearing the wrong word. It names the row
+            // that exists, which is also the one the reader would have to write
+            // to opt in.
+            if (!req.siblings.empty()) {
+                std::string rows;
+                for (auto s : req.siblings) {
+                    if (!rows.empty()) rows += ", ";
+                    rows += std::string(s);
+                }
+                refusal::record(refusal::Code::TierPlanned);
+                return std::unexpected(std::format(
+                    "target '{}' is registered but not yet supported (planned) — "
+                    "no toolchain is published for it yet.\n"
+                    "       registered rows for this system: {}\n"
+                    "       An explicit [target.<triple>] toolchain override can "
+                    "opt in early.",
+                    requestedSpelling, rows));
+            }
+            auto sug = triple::did_you_mean(requestedSpelling);
+            refusal::record(refusal::Code::UnknownTarget);
+            return std::unexpected(std::format(
+                "unknown target '{}'{}\n"
+                "       known targets: `mcpp toolchain list`; a custom triple needs an\n"
+                "       explicit [target.{}] section in mcpp.toml",
+                requestedSpelling,
+                sug ? std::format(" — did you mean '{}'?", *sug) : "",
+                requestedSpelling));
+        }
+        if (known && known->tier == "planned" && !hasToolchainOverride) {
+            refusal::record(refusal::Code::TierPlanned);
+            // The subject is what the user wrote. When completion filled a
+            // segment, both are shown — otherwise the sentence is about a
+            // string that appears nowhere in their command.
+            const std::string subject =
+                requestedSpelling == parsed->str()
+                    ? std::format("'{}'", requestedSpelling)
+                    : std::format("'{}' (which resolves to '{}')",
+                                  requestedSpelling, parsed->str());
+            return std::unexpected(std::format(
+                "target {} is registered but not yet supported (planned) — "
+                "no toolchain is published for it yet.\n"
+                "       An explicit [target.{}] toolchain override can opt in early.",
+                subject, parsed->str()));
+        }
+        // AN APPLE SDK IS LOCATED, SO ITS ABSENCE IS KNOWN NOW.
+        //
+        // REFUSED HERE AND NOT WITH THE TOOLCHAIN, which is a decision about
+        // WHEN rather than about the message. The iOS rows need the machine's
+        // iPhoneOS or iPhoneSimulator SDK, and that is knowable before any
+        // payload is resolved -- so a machine without Xcode used to download
+        // a 700 MB compiler and then be told the thing it was missing was not
+        // the compiler.
+        //
+        // AND UNLIKE `host_can_serve` BELOW, THIS IS NOT DEFERRED. That
+        // refusal waits for the dependency graph because a package can supply
+        // a target's C library and platform interface. An Apple SDK is not
+        // redistributable, so no package supplies it: there is nothing a later
+        // line could learn that would change this answer.
+        //
+        // The escape hatch that opens the tier gate does NOT open this one.
+        // Declaring a toolchain says which compiler; it says nothing about
+        // where the headers and stub libraries are, and every compiler needs
+        // them.
+        if (parsed && parsed->is_ios()) {
+            const auto which = parsed->is_ios_simulator()
+                ? mcpp::platform::macos::sdk_iphonesim
+                : mcpp::platform::macos::sdk_iphoneos;
+            state.appleSdkLocated = mcpp::platform::macos::sdk_path(which);
+            // AN UNSET FLOOR IS THE LOCATED SDK'S VERSION, READ RATHER THAN
+            // LEFT TO THE DRIVER. `docs/20` promised that an unversioned
+            // triple meant the SDK's own default; measured on macos-15 with
+            // Xcode 16.4, clang given `arm64-apple-ios` with no version
+            // refused thread-local storage for the target, which libc++abi
+            // uses, so the default it chose was older than any SDK on the
+            // machine. The version `xcrun` reports for the located SDK is the
+            // one the SDK was made for, and it enters the manifest here so
+            // that the fingerprint slot, the effective triple and every
+            // report read one value.
+            if (state.appleSdkLocated && state.m->buildConfig.iosDeploymentTarget.empty()) {
+                if (auto v = mcpp::platform::macos::sdk_version(which)) {
+                    state.m->buildConfig.iosDeploymentTarget = *v;
+                    state.iosFloorFromSdk = true;
+                }
+            }
+            if (!state.appleSdkLocated) {
+                // A CODE, BECAUSE THE MATRIX COMPARES REASONS AND NOT ONLY
+                // OUTCOMES. A refusal with no code is recorded as `other`,
+                // which `check_matrix_reasons.sh` refuses on the ground that
+                // it freezes an unnamed branch into the expected table.
+                refusal::record(refusal::Code::AppleSdkAbsent);
+                return std::unexpected(std::format(
+                    "target {} needs the {} SDK, which this machine does not "
+                    "provide.\n"
+                    "       It is not redistributable, so mcpp LOCATES it "
+                    "rather than installing it: `xcrun --sdk {} "
+                    "--show-sdk-path` must answer, which needs Xcode on macOS "
+                    "(not the Command Line Tools alone -- those ship the "
+                    "macOS SDK only).\n"
+                    "       Check `xcode-select -p`, and note that the "
+                    "compiler is not what is missing: these rows pin "
+                    "`xim:llvm`, which every other Apple row also uses.",
+                    parsed->str(), which, which));
+            }
+        }
+        // A `shared` TARGET NAMES A LINK CONTRACT THIS ENGINE DOES NOT RENDER.
+        //
+        // `-sSIDE_MODULE` is a different Emscripten link mode from the
+        // ordinary one (one static image, `artifact_naming`'s `.js`+`.wasm`
+        // pair) and mcpp emits no flag for it. Falling through to the
+        // ordinary link would still WRITE a `.so`-shaped file — the fallback
+        // naming's `sharedLibExt` is empty, so the linker would be asked for
+        // an empty-named output — so this is caught here, by NAME, rather
+        // than reached as an obscure link failure.
+        //
+        // REFUSED HERE AND NOT AT PLAN TIME, same reasoning as the Apple SDK
+        // check above: `parsed` and the manifest's own target list are both
+        // already known, resolving neither an emsdk payload nor any other
+        // toolchain, so an offline build (no emsdk installed) gets this
+        // sentence instead of downloading the SDK first.
+        if (parsed && parsed->object_format()
+                          == triple::ObjectFormat::Wasm) {
+            for (auto const& t : state.m->targets) {
+                if (t.kind != mcpp::manifest::Target::SharedLibrary) continue;
+                return std::unexpected(std::format(
+                    "[targets.{}] kind = \"shared\" is not supported on "
+                    "wasm32-emscripten: a side module needs -sSIDE_MODULE, "
+                    "which mcpp does not render",
+                    t.name));
+            }
+        }
+        // Known, supported — and IMPOSSIBLE ON THIS HOST.
+        //
+        // Without this the target falls through to the host toolchain and the
+        // build SUCCEEDS, which is the failure the check above calls the worst
+        // one, arriving through a different door. Measured on Linux:
+        //
+        //   $ mcpp build --target x86_64-windows-msvc
+        //       Resolved gcc@16.1.0 → x86_64-windows-msvc → …/xim-x-gcc/bin/g++
+        //       Finished dev [unoptimized + debuginfo] in 0.07s
+        //   $ ls target/
+        //       x86_64-linux-gnu/          ← an ELF, reported as a Windows build
+        //
+        // The vocabulary tier says "mcpp supports this target"; it never said
+        // "this machine can produce it". `host_can_serve` is the answer to the
+        // second question and lives beside the payload resolution it has to
+        // agree with.
+        //
+        // The escape hatch stays open on purpose: an explicit `[target.X]`
+        // toolchain override means the author is supplying the cross toolchain
+        // themselves, and mcpp's payload matrix has no standing to refuse it.
+        // DIAGNOSED HERE, REPORTED LATER, AND THE DIFFERENCE IS THE POINT.
+        //
+        // Whether a payload on this machine produces this target is knowable
+        // now. Whether anything ELSE produces it is not: a dependency can
+        // supply the target's platform interface and C library, and the
+        // dependency graph does not exist yet at this line. Refusing here
+        // therefore answered a narrower question than the one it claimed —
+        // measured, a project that only had to add a dependency was told its
+        // machine could not build the target at all.
+        //
+        // The refusal is kept in full, because it is right whenever nothing
+        // supplies the target side, which remains the ordinary case. It is
+        // carried to where the graph is known and released there. Nothing
+        // between here and there consumes the answer: what follows is toolchain
+        // and dependency resolution, and a target no payload serves resolves to
+        // a driver that simply will not be asked to emit anything.
+        //
+        // The escape hatch stays open on purpose: an explicit `[target.X]`
+        // toolchain override means the author is supplying the cross toolchain
+        // themselves, and mcpp's payload matrix has no standing to refuse it.
+        if (known && known->tier != "planned" && !hasToolchainOverride
+            && parsed
+            && !mcpp::toolchain::host_can_serve(*parsed)) {
+            std::string servable;
+            for (auto const& info : triple::known_targets()) {
+                auto t = triple::parse(info.canonical);
+                if (!t || info.tier == "planned") continue;
+                if (!mcpp::toolchain::host_can_serve(*t)) continue;
+                if (!servable.empty()) servable += ", ";
+                servable += t->str();
+            }
+            state.unservedTargetDiagnosis = std::format(
+                "target '{}' cannot be built on this host.\n"
+                "       No toolchain payload here produces it, and nothing in "
+                "the dependency graph\n"
+                "       supplies its system side.\n"
+                "       this host can build with the payload alone: {}\n"
+                "       To build it anyway, depend on a package that implements "
+                "the target's system\n"
+                "       (its kernel interface and C library), or supply your own "
+                "cross toolchain with\n"
+                "       an explicit [target.{}] toolchain = \"…\" section.",
+                parsed->str(),
+                servable.empty() ? "(nothing — `mcpp toolchain list`)" : servable,
+                parsed->str());
+        }
+        // CAPTURED BEFORE CANONICALISATION, BECAUSE CANONICALISATION IS
+        // EXACTLY WHAT DESTROYS IT.
+        //
+        // `str()` renders the filled-in identity, so `x86_64-linux` becomes
+        // `x86_64-linux-gnu` here and every later `parse` of that string reports
+        // an env segment the project never wrote. The request has to be taken
+        // from the ONLY triple that still knows the difference: this one.
+        if (parsed && parsed->envExplicit) state.requestedCAbi = parsed->env;
+        // AND THE SPELLING THE PROJECT USED, FOR THE REPORT ONLY.
+        //
+        // The canonical form is the identity — the output directory, the cache
+        // key, the subject of a `cfg()` — and it must stay filled. The REPORT is
+        // a different thing: it says what was asked for and what resolved, and
+        // heading it `x86_64-linux-gnu` above a line reading `c-abi musl` states
+        // a contradiction the build does not actually contain. A project that
+        // declined to name a C library is shown as having declined.
+        if (parsed && !parsed->envExplicit && !parsed->env.empty()) {
+            auto asWritten = *parsed;
+            asWritten.env.clear();
+            state.targetDisplayName = asWritten.str();
+        }
+
+        // Canonical from here on: cfg evaluation, spec attachment and the
+        // target/ output directory all see one spelling.
+        if (parsed) state.overrides.target_triple = parsed->str();
+
+        if (hasExplicitSection) apply_target_section(it->second);
+        // Convention from the vocabulary table (triple.cppm): the target's
+        // pinned toolchain (host-awareness — native musl-gcc vs triple-named
+        // cross, winlibs mingw vs Linux-hosted cross — lives in the payload
+        // mapping, not here) and its default linkage. GCC 16 pin rationale:
+        // GCC 15 drops module template instantiations at link (remediation
+        // doc A2; packages shipped 2026-07-08/09, GitHub+GitCode).
+        // A convention, not an instruction: on the Windows-GNU first-run path
+        // this is what turns the seeded target into `gcc@16.1.0`.
+        //
+        // It must not fire when it would overrule a toolchain the user wrote
+        // down. The pin is mcpp's own default for a target row — `gcc@16.1.0`
+        // for Windows-GNU, because the mingw payload is what supplies that
+        // target's headers and C library — and an explicit `[toolchain]` line
+        // is not a default. This is the promise the no-Visual-Studio fallback
+        // is built on: mcpp revises its own defaults, never yours.
+        //
+        // HOW THE TARGET WAS NAMED IS NOT PART OF THE QUESTION, and it used to
+        // be. The guard read `targetFromGlobalDefault && user_explicit`, so a
+        // target given on the command line disabled it — and then the row's pin
+        // replaced a toolchain the project had stated. Measured 2026-08-23:
+        // `--target x86_64-windows-gnu` with an explicit `llvm@22.1.8` resolved
+        // `x86_64-w64-mingw32-g++`, and gcc cannot compile libc++'s std module.
+        //
+        // A project that means to use a different compiler for a pinned target
+        // is stating something about its own build, and a project whose target
+        // side comes from its dependency graph is the ordinary reason to do so:
+        // the payload the row names supplies headers and a C library that such
+        // a project does not use. The narrower reading of this guard was
+        // patched with an openkal-specific exception; stating the rule
+        // correctly removes the need for one.
+        // RECORDED, NOT APPLIED. The convention answers "which payload
+        // supplies this target's C library", and whether it is needed depends on
+        // whether the dependency graph supplies one instead. That is knowable
+        // only after resolution, so the decision waits for
+        // `resolve_target_toolchain` and only the candidate is kept here.
+        if (known && !known->pin.empty() && parsed
+            && !parsed->pin_is_capability()) {
+            state.targetRowPin  = std::string(known->pin);
+            state.targetRowName = parsed->str();
+        }
+        if (known && !hasToolchainOverride && !known->pin.empty()
+            && !tc_origin_is_user_explicit(state.tcOrigin)) {
+            state.targetPinCandidate = std::string(known->pin);
+            state.targetPinIsCapability = parsed && parsed->pin_is_capability();
+        }
+        // A USER'S EXPLICIT TOOLCHAIN OVERRIDES A CONVENTION, NOT A
+        // CAPABILITY — AND UNTIL THIS LINE IT OVERRODE BOTH.
+        //
+        // The block above deliberately steps aside for an explicit
+        // `[toolchain] default`: a hosted row's pin says "this payload supplies
+        // the target's C library", and an author who names their own compiler
+        // has said they will supply it instead. A bare-metal row's pin says
+        // something the author cannot override — the table's own words: "the
+        // pin is llvm on every host because clang/lld are cross-compilers by
+        // construction". A host g++ does not emit riscv64 whatever anyone
+        // declares.
+        //
+        // Measured 2026-08-26:
+        //
+        //     [toolchain] default = "gcc@16.1.0"
+        //     $ mcpp build --target riscv64-none-elf
+        //       g++: error: unrecognized argument in option '-mabi=lp64d'
+        //       g++: note: valid arguments to '-mabi=' are: ms sysv
+        //
+        // — a message about an option, for a decision made here. Refusing at
+        // the decision costs one line; the alternative is a compiler complaining
+        // about flags the reader never wrote.
+        if (known && parsed && parsed->pin_is_capability()
+            && tc_origin_is_user_explicit(state.tcOrigin) && state.tcSpec.has_value()) {
+            auto declared = mcpp::toolchain::parse_toolchain_spec(*state.tcSpec);
+            // WHICH DECLARATIONS THE ROW ACCEPTS IS THE ROW'S PIN, NOT A FIXED
+            // FAMILY.
+            //
+            // This asked `family != Llvm`, which was right while every
+            // capability-pinned row pinned llvm. `wasm32-emscripten` pins
+            // `emsdk@6.0.9`, and emsdk NORMALISES to the llvm family -- `em++`
+            // is clang -- so a declared `llvm@22.1.8` passed this gate, was
+            // never refused, and resolved the generic llvm payload for a target
+            // it cannot emit. The condition is now the pin's own family, which
+            // is the question the row was always answering.
+            const auto pinFamily = [&]() -> std::optional<mcpp::toolchain::Family> {
+                if (known->pin.empty()) return mcpp::toolchain::Family::Llvm;
+                if (auto ps = mcpp::toolchain::parse_toolchain_spec(
+                        std::string(known->pin)))
+                    return ps->family;
+                return std::nullopt;
+            }();
+            const bool declaredMatchesPin =
+                declared && pinFamily && declared->family == *pinFamily
+                // An emsdk row is llvm-family, so the family alone cannot
+                // separate `emsdk@6.0.9` from `llvm@22.1.8`. The pin's own
+                // spelling is what does.
+                && (known->pin.empty()
+                    || state.tcSpec->find(known->pin.substr(0, known->pin.find('@')))
+                       != std::string::npos);
+            if (declared && !declaredMatchesPin) {
+                // THE REASON TRAVELS WITH THE ROW. The rows refuse for the
+                // same rule and NOT for the same reason, and one sentence
+                // covering all of them would be wrong about the others: a
+                // PE+musl target is not bare metal, a wasm target is neither,
+                // and a reader told the wrong one stops reading.
+                //
+                // Measured before the third arm existed: `--target
+                // wasm32-emscripten` with a declared gcc was refused correctly
+                // and explained with "No gcc payload emits a PE with a musl C
+                // library", which is a true sentence about a different row.
+                //
+                // IT HAPPENED AGAIN, AND ADDING AN ARM IS ONLY HALF THE FIX.
+                // Android became a capability row and this chain still had
+                // three arms, so a declared `llvm@22.1.8` against
+                // `aarch64-linux-android` was refused correctly and explained
+                // with the PE+musl sentence -- the identical wrong answer the
+                // paragraph above records for wasm, reached the same way: by a
+                // fourth case falling into a final `else` that was written as
+                // the third case's answer.
+                //
+                // So the last arm now NAMES ITS OWN ROW and the fallthrough is
+                // generic. A capability added later gets a sentence that is
+                // merely unspecific instead of one that is false, and the
+                // refusal still names the pin either way.
+                std::string_view why = parsed->is_freestanding()
+                    ? "A freestanding target has no per-host cross payload: "
+                      "clang and lld are\n"
+                      "       cross-compilers by construction and gcc is not."
+                    : parsed->is_wasm()
+                    ? "Nothing but Emscripten emits WebAssembly: `em++` is a "
+                      "clang whose target,\n"
+                      "       sysroot and JavaScript glue all come from its own "
+                      "payload."
+                    : parsed->is_android()
+                    ? "An Android target needs bionic, not just an aarch64 or "
+                      "x86_64 back end:\n"
+                      "       its headers, its per-API-level stubs and its "
+                      "loader path are inside the\n"
+                      "       NDK, and no package adds them to another compiler."
+                    : (parsed->is_pe() && parsed->is_musl())
+                    ? "No gcc payload emits a PE with a musl C library — the "
+                      "mingw payload emits\n"
+                      "       PE with the MinGW CRT, which is the separate "
+                      "`-gnu` row."
+                    : "This row's toolchain is the only one that can emit the "
+                      "target at all.";
+                refusal::record(refusal::Code::CapabilityPin);
+                return std::unexpected(std::format(
+                    "target '{}' cannot be emitted by '{}'.\n"
+                    "       {}\n"
+                    "       The row names `{}` as a capability rather than as a "
+                    "preference, so\n"
+                    "       this one line is not a convention you can override.\n"
+                    "       remove the `[toolchain]` line for this target, or set "
+                    "it to `{}`.",
+                    parsed->str(), *state.tcSpec, why,
+                    known->pin.empty() ? std::string_view("llvm") : known->pin,
+                    known->pin.empty() ? std::string_view("llvm") : known->pin));
+            }
+        }
+        if (known && known->defaultStatic && state.m->buildConfig.linkage.empty())
+            state.m->buildConfig.linkage = "static";
+    }
+    // A HOST BUILD READS ITS OWN ROW (#704). `[target.<triple>]` is looked up
+    // by the triple the build produces, and a build without `--target`
+    // produces the host's. Before this the row applied only when a triple was
+    // named: `[target.x86_64-linux-gnu] cxx_runtime` shaped `--target
+    // x86_64-linux-gnu` and was ignored by `mcpp build` on that same machine,
+    // while the row's `.build` table and its `sysroot` already applied to both.
+    // The triple is not written into `state.overrides.target_triple`: that would make
+    // the host build a target build and turn the row's env segment into a
+    // requested C library.
+    else if (auto* hostRow = find_target_entry(*state.m, mcpp::toolchain::triple::host_triple()))
+        apply_target_section(*hostRow);
+    if (state.overrides.force_static) state.m->buildConfig.linkage = "static";
+
+    // #254: everything compiled INTO this build is resolved for the TARGET —
+    // an xpkg descriptor's per-OS sections (sources, flags, deps) and its xpm
+    // asset/version table all describe code that will run on the target, not
+    // on the machine building it. Previously a compile-time host constant,
+    // which is invisible natively (host == target) and picks the wrong leg
+    // under --target.
+    //
+    // Computed HERE, not earlier: `state.overrides.target_triple` is only complete
+    // above — it is filled from `[build] target` and the config default, then
+    // canonicalized. Reading it before that point would silently fall back to
+    // the host for any project that sets its target in the manifest rather
+    // than on the command line.
+    // ── The device axis, resolved ONCE ────────────────────────────────────
+    //
+    // `--accel` / `--no-accel` over `[build] accel`. `--no-accel` arrives as the
+    // sentinel "(none)", which parse_accel reads as nothing, and printing the
+    // parsed form back normalises the spelling -- so every reader below sees
+    // one string, and a build program sees the same one in MCPP_ACCEL. Read
+    // at call time rather than captured: a `[target.'cfg(...)'.build]` section
+    // may set `accel`, and the merge that applies it runs a few lines down.
+    //
+    // "NO ACCELERATOR" IS THE EMPTY STRING HERE, NOT `accel_str`'s "(none)".
+    //
+    // `accel_str` is a DISPLAY function: it prints `(none)` for an empty set so
+    // an ABI tag reads as a sentence. Handing that spelling on as a value made
+    // two readers wrong at once. A build program saw `MCPP_ACCEL=(none)` while
+    // the manual promised an empty string, so a rule package asking "is there
+    // an accelerator" got a yes and a backend named `(none)`; and the
+    // fingerprint's own guard, `if (!accel.empty())`, was true for every
+    // project on earth, appending `#accel=(none)` to builds that had asked for
+    // nothing. Measured 2026-09-05 with a build program that wrote the value to
+    // a file, which is the only way to see it -- a program's stdout is shown
+    // only when it fails.
+    state.resolvedAccel = [&]() -> std::string {
+        const auto sets = mcpp::pack::parse_accel(
+            state.overrides.accel.empty() ? state.m->buildConfig.accel : state.overrides.accel);
+        return sets.empty() ? std::string{} : mcpp::pack::accel_str(sets);
+    };
+    // The cfg context, with the accelerator layer filled from the resolved
+    // accel's backend names. `cfg(accelerator = "cuda")` is a membership test
+    // over these (prepare_inputs::Ctx::layer_matches); before this the field
+    // was declared, documented, and never written, so the key matched nothing.
+    state.cfgCtx = [&]() {
+        auto c = cfgpred::context_for(state.overrides.target_triple);
+        for (auto const& set : mcpp::pack::parse_accel(state.resolvedAccel()))
+            c.accelerators.push_back(set.backend);
+        return c;
+    };
+    state.targetPlatform = mcpp::platform::TargetPlatform::for_os(state.cfgCtx().os);
+
+    // ── L1: merge conditional [target.'cfg(...)'] sections ───────────────────
+    // Evaluated now (target resolved) against the resolved target — the
+    // --target triple for a cross build, else the host.
+    //
+    // #229: merge_conditional_config MUST run here — before
+    // `packages[0] = makePackageRoot(*root, *m)` snapshots `m->buildConfig`
+    // into `packages[0].privateBuild`/`.manifest` — because that snapshot,
+    // not `*m`, is what the modgraph scan and per-TU compile-flag assembly
+    // actually read afterward. Every dependency (path/git/version alike) gets
+    // the SAME treatment, at the mirror-image point in its own load path
+    // (right before ITS `makePackageRoot`/`propagateLinkFlags`) — see the
+    // dependency-manifest-acquisition block below. That makes this the root
+    // package's half of the one funnel, not a special case: every package is
+    // merged exactly once, immediately before it is captured into `packages[]`.
+    if (!state.m->conditionalConfigs.empty()) {
+        merge_conditional_config(*state.m, state.cfgCtx());
+    }
+    // `[target.<selector>.abi] threads` -- the ROOT's statement, rendered once,
+    // into channels that already reach the whole artefact: the graph-global
+    // dialect flag set (every C++ translation unit, the std module's own
+    // commands, the scan, every dependency's cache key), the C flags of every
+    // package (the root here, each dependency where it is loaded), and the link.
+    //
+    // For hosted targets that are not PE. On PE the MSVC runtime is always
+    // multithreaded and mingw-w64's threading model belongs to its payload; a
+    // freestanding target has no thread library to select.
+    state.abiThreadsRendered = [&] {
+        if (!state.m->buildConfig.abiThreads) return false;
+        const auto abiTriple = mcpp::toolchain::triple::parse(
+            state.overrides.target_triple.empty()
+                ? mcpp::toolchain::triple::host_triple().str()
+                : state.overrides.target_triple);
+        return abiTriple && !abiTriple->is_pe() && !abiTriple->is_freestanding();
+    }();
+    state.add_once = [](std::vector<std::string>& v, std::string_view flag) {
+        if (std::ranges::find(v, flag) == v.end()) v.emplace_back(flag);
+    };
+    if (state.abiThreadsRendered) {
+        state.add_once(state.m->buildConfig.dialectCxxflags, "-pthread");
+        state.add_once(state.m->buildConfig.cflags, "-pthread");
+        state.add_once(state.m->buildConfig.ldflags, "-pthread");
+    }
+    // `[target.<selector>.abi] exceptions` -- design 2026-09-12 (the UI
+    // framework record), section 2.1, A1: the second `abi` member, the
+    // ROOT's statement, rendered once. Reaches the dialect flag set (every
+    // C++ translation unit, the std module's own commands, the scan, every
+    // dependency's cache key) and the link -- NOT the C flags, unlike
+    // `threads`: `-fexceptions` has no C-language meaning worth carrying to
+    // a `.c` translation unit.
+    //
+    // Rendered only where the target's default is OFF: Emscripten's native
+    // toolchain builds without exceptions unless asked. gcc, clang and MSVC
+    // already link with exceptions on, so a host build with the member
+    // declared is byte-identical to one without -- the same property
+    // `threads` has on PE.
+    const bool abiExceptionsRendered = state.m->buildConfig.abiExceptions
+                                     && state.cfgCtx().os == "emscripten";
+    if (abiExceptionsRendered) {
+        state.add_once(state.m->buildConfig.dialectCxxflags, "-fexceptions");
+        state.add_once(state.m->buildConfig.ldflags, "-fexceptions");
+    }
+    // `[build].defines` must reach the scanner (P1689) and the compile edge,
+    // and must participate in the fingerprint. Fold before dependency
+    // resolution / fingerprinting.
+    report_flag_words_changes(*state.m);
+    fold_build_defines_into_flags(state.m->buildConfig);
+
+    // ORIGIN, RESOLVED ONCE.
+    //
+    // The spec used to be parsed TWICE from the same string a dozen lines
+    // apart — once to ask "is this msvc@system", once to get the package —
+    // and each call site drew its own conclusions from the result. Two parses
+    // of one string is two places for the answer to differ, which is the shape
+    // §1 of the three-axes design is about: a platform special case whose cost
+    // is paid at every site that has to know about it.
+    //
+    // `Origin::SystemMsvc` is located on the machine and never resolved
+    // through an xim package — mcpp does not install the machine's Visual
+    // Studio. `Origin::Managed` is everything else, including a VERSIONED
+    // msvc spec, and that is the point: what the manifest says is what gets
+    // used, on every machine, instead of whatever this one happens to have.
+    // RESOLVED HERE, RUN AFTER THE DEPENDENCY GRAPH — AND THE SPLIT IS THE
+    // WHOLE POINT.
+    //
+    // A target row's convention does not name a preferred compiler. It names
+    // the payload that supplies THAT TARGET'S C library. Whether the user's own
+    // toolchain can serve the target instead depends on whether something ELSE
+    // supplies the target side — and that is knowable only once the graph is
+    // resolved, which is after this point in the function.
+    //
+    // Deciding early was measured to be wrong in both directions. Applying the
+    // convention unconditionally replaced a toolchain the user had set with
+    // `mcpp toolchain default`, for a payload their project never used. NOT
+    // applying it turned a working zero-dependency cross build into a failing
+    // one, because clang alone carries no C runtime for `x86_64-windows-gnu`
+    // while the payload the row names does.
+    //
+    // The body does not MOVE; only its execution does. Everything between
+    // here and the call site was measured to read `tc` exactly once, and that
+    // one read wanted the target triple rather than the compiler.
+    // `std::function` AND NOT `auto`, BECAUSE THE FIRST-RUN BRANCH INSIDE
+    // CALLS BACK INTO IT. That branch installs a host default and then has to
+    // resolve THAT default for the requested target — which is what the top of
+    // this same function does. Recursing reuses it; writing it a second time
+    // there would be a second answer to one question. Depth is one: the second
+    // pass takes the `tcSpec.has_value()` branch that the first-run path just
+    // made true.
+    state.firstRunNeedsTargetPass = false;
+    // Guards the one recursive call below. Set before the call so the second
+    // pass cannot reach it, whatever else changed in between.
+    state.targetPassDone = false;
+
+    return {};
+}
 
 export std::expected<BuildContext, std::string>
 
@@ -2912,1049 +3987,19 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    // ─── Toolchain resolution (docs/21) ────────────────────────────────
-    //
-    // THE WHOLE CHAIN, in the order it is applied. It was documented twice, as
-    // "3 steps" here and "4 steps" further down, and neither list had been
-    // true for a long time — between them they named five of the nine inputs
-    // below and disagreed about two. A comment that undercounts the inputs to
-    // a decision is worse than none: it tells the next reader they have seen
-    // the whole thing.
-    //
-    // The WHAT (which spec) is settled first, then the HOW (which binary).
-    // Anything that WRITES `tcSpec` also writes `tcOrigin`, and that is the
-    // invariant this table rests on — the enumerator names below are real, so
-    // this comment cannot quietly stop matching the code.
-    //
-    //   WHICH SPEC                                       tcOrigin
-    //   1. mcpp.toml [toolchain].<platform> / .default   ManifestToolchain
-    //   2. global config.toml [toolchain] default        GlobalDefault
-    //   3. mcpp.toml [target.<triple>].toolchain         TargetSection
-    //      (--target / [build] target / config default
-    //       select the section; 3 outranks 1 and 2)
-    //   4. the target vocabulary's pin (triple.cppm)     TargetPin
-    //      — a convention, and it stands down when a
-    //        REMEMBERED target would overrule a spec the
-    //        user wrote down
-    //   5. the platform's first-run default, installed   FirstRun
-    //      and persisted by this very invocation
-    //
-    //   WHICH BINARY, from the spec settled above
-    //   6. `msvc@system`  → probe the machine (no xim package exists)
-    //   7. `<family>@<v>` → xim payload; msvc resolves through
-    //                       resolve_managed_msvc, everything else through
-    //                       the bin/-shaped frontend lookup
-    //   8. bare `system`  → the PATH compiler. A deliberate escape hatch, and
-    //                       the ONLY host-compiler route: there is no
-    //                       `gcc@system` (see parse_toolchain_spec)
-    //   9. offline / MCPP_NO_AUTO_INSTALL → hard error rather than a silent
-    //                       ~800 MB download
-    //
-    // AND ONE REVISION, after 1-9 have produced a toolchain: a spec targeting
-    // the MSVC ABI on a machine with no usable MSVC is switched to MinGW-w64
-    // — but only when `tc_origin_is_user_explicit` says mcpp chose it itself.
-    std::filesystem::path explicit_compiler;
-    std::optional<mcpp::config::GlobalConfig> cfg_opt;
-    bool bootstrap_checked = false;
-    auto get_cfg = [&](bool requireBootstrap = true) -> std::expected<mcpp::config::GlobalConfig*, std::string> {
-        if (!cfg_opt) {
-            auto c = mcpp::config::load_or_init(/*quiet=*/false,
-                mcpp::fetcher::make_bootstrap_progress_callback());
-            if (!c) return std::unexpected(c.error().message);
-            cfg_opt = std::move(*c);
-        }
-        // Commands that need bootstrap tools (build, run, toolchain install)
-        // pass requireBootstrap=true to get an early, clear error.
-        if (requireBootstrap && !bootstrap_checked) {
-            bootstrap_checked = true;
-            auto problem = mcpp::config::check_base_init(*cfg_opt);
-            if (!problem.empty()) {
-                return std::unexpected(std::format(
-                    "{}\n  hint: run `mcpp self init --force` to reset and re-initialize",
-                    problem));
-            }
-        }
-        return &*cfg_opt;
-    };
-
-    // Resolve one exact runtime contract before resolving/fixing a toolchain.
-    // The fixup is itself a consumer of RuntimeBinding: doing it first would
-    // recreate #392 by letting directory order choose a libc and only later
-    // discovering what the project selected.
-    mcpp::platform::runtime::RuntimeBinding runtimeBindingSnapshot;
-    if (state.overrides.inherited_runtime_binding) {
-        runtimeBindingSnapshot = *state.overrides.inherited_runtime_binding;
-    } else {
-        auto cfgRuntime = get_cfg();
-        if (!cfgRuntime) return std::unexpected(cfgRuntime.error());
-        auto resolved = mcpp::platform::runtime::resolve_runtime_binding(
-            state.runtimeSelection, {}, (**cfgRuntime).xlingsHome());
-        if (!resolved) return std::unexpected(resolved.error());
-        runtimeBindingSnapshot = std::move(*resolved);
-        // A degradation that nobody prints is indistinguishable from no
-        // degradation, which is the failure this whole area keeps paying for.
-        // A note is not a warning: nothing is wrong with the build, some facts
-        // are simply unavailable — so it is reported once, at info level.
-        if (!runtimeBindingSnapshot.note.empty())
-            mcpp::ui::info("Runtime", runtimeBindingSnapshot.note);
-    }
-    // THE `bin` THIS PROJECT'S BUILD PROGRAMS SEE FIRST — derived ONCE,
-    // here, from the selection that has just been resolved.
-    //
-    // Empty unless the manifest declared `[xlings].subos`. That is deliberate:
-    // prepending the SHARED `subos/default/bin` would make what a build sees
-    // depend on what else has been installed on this machine, so a project
-    // that has not asked for an environment of its own gets the `PATH` mcpp
-    // was started with, byte for byte.
-    //
-    // NOT RE-DERIVED AT THE TWO DELIVERY SITES BELOW, AND NOT FROM
-    // `[xlings] deps`. `mcpp::xlings::runtime` is the sole runtime-selection
-    // policy and `RuntimeBinding::subosDir` is its resolved answer; a second
-    // derivation is how a build ends up with two subos and no way to say which
-    // one it used. The per-package payload paths a program may also need are
-    // already answered, separately, by `MCPP_XPKG_*_DIR`.
-    const std::string projectSubosBin = [&]() -> std::string {
-        using Mode = mcpp::xlings::runtime::RuntimeSelection::Mode;
-        if (runtimeBindingSnapshot.selection.mode != Mode::NamedSubos)
-            return {};
-        auto bin = runtimeBindingSnapshot.subosDir / "bin";
-        std::error_code ec;
-        if (!std::filesystem::is_directory(bin, ec)) return {};
-        return bin.string();
-    }();
-
-    auto runtimePayload = runtimeBindingSnapshot.libc;
-    auto runtimeLibDir = runtimeBindingSnapshot.libraryDirs.empty()
-        ? std::filesystem::path{} : runtimeBindingSnapshot.libraryDirs.front();
-
-    // THE DECLARED RUNTIME PAYLOAD IS PROVIDED BEFORE THE FIRST FIXUP THAT
-    // CONSUMES IT (mcpp#660), and not earlier: a build whose toolchain needs
-    // no C runtime payload must not download one. At most once per build. An
-    // inherited binding is not exempt, because the parent build may have used
-    // a toolchain that needed no payload. The two values derived above are
-    // refreshed with the binding, because detection and the fingerprint read
-    // them after the fixups.
-    bool runtimePayloadProvided = false;
-    auto provide_runtime_payload = [&](const mcpp::toolchain::XimToolchainPackage& pkg) {
-        if (runtimePayloadProvided) return;
-        if (mcpp::toolchain::post_install_fixup_kind(pkg).empty()) return;
-        runtimePayloadProvided = true;
-        auto cfgP = get_cfg();
-        if (!cfgP) return;
-        if (!mcpp::toolchain::ensure_declared_runtime(**cfgP, runtimeBindingSnapshot))
-            return;
-        runtimePayload = runtimeBindingSnapshot.libc;
-        runtimeLibDir = runtimeBindingSnapshot.libraryDirs.empty()
-            ? std::filesystem::path{} : runtimeBindingSnapshot.libraryDirs.front();
-    };
-
-    // mcpp#427: a toolchain fixup that could not run is a DEGRADATION, not a
-    // failure — the build continues without it. But it has to be said, or the
-    // eventual `stdlib.h: No such file or directory` arrives with no way to
-    // connect it to its cause.
-    //
-    // Deduplicated by payload: `ensure_post_install_fixup` is called from up
-    // to four seams in one build (manifest toolchain, default toolchain,
-    // MinGW first-run, build.mcpp host toolchain) and they routinely resolve
-    // the SAME payload. Saying it once is the rule mcpp#417 already paid for.
-    auto fixupNoticed = std::make_shared<std::set<std::string>>();
-    auto report_fixup = [fixupNoticed](
-            const mcpp::toolchain::FixupOutcome& outcome,
-            const std::filesystem::path& payloadRoot) {
-        if (outcome.skippedReason.empty()) return;
-        if (!fixupNoticed->insert(payloadRoot.generic_string()).second) return;
-        // Only the fact this line ADDS. The `Runtime` note above already gave
-        // the cause and the remedy for the same absence; repeating them here
-        // would be the second copy of one message, which is the habit mcpp#417
-        // exists to break.
-        mcpp::ui::info("Toolchain", std::format(
-            "used as installed — not patched against a C runtime ({})",
-            outcome.skippedReason));
-    };
-
-    constexpr std::string_view kCurrentPlatform = mcpp::platform::name;
-
-    // Toolchain resolution priority: see the table at the top of this
-    // function. Stated once, where `tcOrigin` is introduced — this used to be
-    // a second, shorter and differently-wrong list of the same thing.
-    //
-    // Resolve the build profile, overlaid by any [profile.<name>] from the
-    // manifest → buildConfig. `effectiveProfile` outlives the block: the
-    // build.mcpp env contract exposes it as MCPP_PROFILE.
-    std::string effectiveProfile;
-    {
-        auto& pname = effectiveProfile;
-        // Precedence lives in resolve_profile_name (above) so execute.cppm's
-        // fast paths settle it identically without running prepare_build.
-        // Release is opt-in via --release / --profile release; a project that
-        // wants its plain `mcpp build` optimized sets
-        // [build].default-profile = "release" (mcpp's own mcpp.toml does this,
-        // so the released binary stays -O2).
-        pname = resolve_profile_name(*state.m, state.overrides.profile, state.overrides.profile_fallback);
-        mcpp::manifest::Profile pr;
-        if (pname == "dev" || pname == "debug") { pr.optLevel = "0"; pr.debug = true; }
-        else if (pname == "dist")               { pr.optLevel = "3"; pr.strip = true; }
-        // (built-in dist intentionally leaves lto off: several packaged gcc
-        //  payloads ship without the LTO plugin; enable via [profile.dist].)
-        else                                    { pr.optLevel = "2"; } // release
-        if (auto it = state.m->profiles.find(pname); it != state.m->profiles.end()) pr = it->second;
-        // #519 — a profile may override the whole-graph form. OPTIONAL, so a
-        // profile that does not mention it leaves `[build]` standing; a plain
-        // value would reset it, because the block above REPLACES `pr` wholesale
-        // with the declared profile.
-        if (pr.dependencyLinkageDeclared)
-            state.m->buildConfig.dependencyLinkage = pr.dependencyLinkage;
-        state.m->buildConfig.optLevel = pr.optLevel;
-        state.m->buildConfig.debug    = pr.debug;
-        state.m->buildConfig.lto      = pr.lto;
-        state.m->buildConfig.strip    = pr.strip;
-        state.m->buildConfig.cflags.insert(state.m->buildConfig.cflags.end(),
-                                     pr.cflags.begin(), pr.cflags.end());
-        state.m->buildConfig.cxxflags.insert(state.m->buildConfig.cxxflags.end(),
-                                       pr.cxxflags.begin(), pr.cxxflags.end());
-        state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
-                                      pr.ldflags.begin(), pr.ldflags.end());
-    }
-
-    // Every directory a package payload may legitimately have been INSTALLED
-    // into: the global registry, plus the two project-local data roots a custom
-    // git index installs into. Defined HERE, above its first use, because three
-    // separate questions now depend on the same answer — where a dependency's
-    // cache address is anchored, whether its sources came from a store at all,
-    // and whether a `standard` declaration in its manifest was written by an
-    // author or by a descriptor generator. One definition, three uses; deriving
-    // the same fact twice is how two of them start disagreeing.
-    const auto storeRoots = [&]() -> std::vector<std::filesystem::path> {
-        std::vector<std::filesystem::path> roots;
-        if (auto c = get_cfg()) roots.push_back((*c)->xlingsHome() / "data" / "xpkgs");
-        for (auto& d : mcpp::config::project_xlings_data_roots(state.workRoot))
-            roots.push_back(d / "xpkgs");
-        return roots;
-    }();
-
-    // [package] platforms — fixed vocabulary owned by mcpp (it owns the
-    // target/triple system): the platform name of every row it has
-    // (`platform_name`, beside `artifact_naming`). Unknown values: warning, or
-    // error under --strict.
-    for (auto& pf : state.m->package.platforms) {
-        if (!mcpp::toolchain::triple::is_platform_name(pf)) {
-            auto msg = std::format(
-                "[package] platforms contains unknown platform '{}' "
-                "(expected: {})", pf,
-                mcpp::toolchain::triple::platform_names_joined());
-            if (state.overrides.strict) return std::unexpected(msg);
-            mcpp::diag::warning("manifest/platforms", msg);
-        }
-    }
-
-    auto tcSpec = state.m->toolchain.for_platform(kCurrentPlatform);
-    // Where the spec came from decides whether mcpp may later revise it.
-    // See TcOrigin: mcpp can rewrite a default it chose itself, but must not
-    // silently overrule one the user wrote down.
-    auto tcOrigin = tcSpec.has_value() ? TcOrigin::ManifestToolchain
-                                       : TcOrigin::None;
-    // `--toolchain` shares `ManifestToolchain`'s precedence and not its
-    // spelling: the messages that refuse a spec name where it was written, and
-    // a value from the command line credited to a manifest key sends the
-    // reader to a file that does not contain it.
-    bool tcFromCommandLine = false;
-    bool tcFromConsumer    = false;
-    auto tcSpecSource = [&]() -> std::string {
-        if (tcOrigin == TcOrigin::ManifestToolchain && tcFromConsumer)
-            return std::format("the toolchain chosen for this host tool by {}",
-                               state.overrides.tool_chain);
-        if (tcOrigin == TcOrigin::ManifestToolchain && tcFromCommandLine)
-            return "--toolchain";
-        switch (tcOrigin) {
-            case TcOrigin::ManifestToolchain:
-                return std::format("[toolchain].{}", kCurrentPlatform);
-            case TcOrigin::TargetSection:
-                return std::format("[target.{}].toolchain", state.overrides.target_triple);
-            case TcOrigin::GlobalDefault:
-                return "the default toolchain (`mcpp toolchain default`)";
-            default:
-                return std::format("the toolchain mcpp chose ({})",
-                                   tc_origin_name(tcOrigin));
-        }
-    };
-    // `--toolchain` (arriving as MCPP_TOOLCHAIN, the same side channel
-    // `--offline` and `--jobs` use) beats everything, including the manifest.
-    //
-    // This is the usable form of "which compiler". On this repository the
-    // choice is worth 2.48x — gcc@16.1.0 builds mcpp in 79.9s, llvm@22.1.8 in
-    // 32.2s — but CHANGING THE DEFAULT is an ecosystem decision, not a
-    // performance one: it invalidates every published package's fingerprint and
-    // the three platforms do not yet ship the same llvm. Selecting per build
-    // costs nobody anything and needs no coordination.
-    //
-    // It counts as user-explicit, so mcpp will not quietly revise it.
-    if (const char* tcEnv = std::getenv("MCPP_TOOLCHAIN"); tcEnv && *tcEnv) {
-        tcSpec   = std::string(tcEnv);
-        tcOrigin = TcOrigin::ManifestToolchain;
-        tcFromCommandLine = true;
-    }
-    if (!state.overrides.toolchain.empty()) {
-        tcSpec   = state.overrides.toolchain;
-        tcOrigin = TcOrigin::ManifestToolchain;
-        tcFromConsumer = true;
-    }
-    if (!tcSpec.has_value()) {
-        auto cfg = get_cfg();
-        if (cfg && !(*cfg)->defaultToolchain.empty()) {
-            tcSpec   = (*cfg)->defaultToolchain;
-            tcOrigin = TcOrigin::GlobalDefault;
-        }
-    }
-
-    // ─── Windows first run without Visual Studio ────────────────────────
-    // The host triple on Windows is MSVC-ABI, so the historical default
-    // (llvm) resolves to clang targeting MSVC — which uses the MSVC STL and
-    // the Windows SDK. Neither ships with Windows; both arrive only with
-    // Visual Studio's "Desktop development with C++" workload. On a bare box
-    // that default installs fine and then fails at compile time with no
-    // actionable message.
-    //
-    // Seed only the TARGET axis and let the block right below derive the
-    // rest: the vocabulary table already maps x86_64-windows-gnu to its pin
-    // (winlibs GCC) and to static linkage, so the toolchain answer stays a
-    // single derivation instead of being spelled out a second time here.
-    // "Is MSVC usable here" — either origin. Asking `has_usable_msvc()` (which
-    // probes the machine) would answer "no" on a box that has a pinned
-    // msvc@<toolset> payload and no Visual Studio, and every decision below
-    // would then divert a perfectly good toolchain to mingw.
-    auto msvc_usable_either_origin = [&]() -> bool {
-        auto c = get_cfg();
-        if (!c) return mcpp::toolchain::msvc::has_usable_msvc();
-        return mcpp::toolchain::msvc::msvc_available_here(
-            (*c)->xlingsHome() / "data" / "xpkgs");
-    };
-
-    // THE PLATFORM'S CANONICAL NATIVE DEFAULT — a spec string only; no
-    // install, no persistence. Two places need "what would a native
-    // `mcpp build` pick here, with no --target": the first-run installer
-    // further below (which goes on to install and persist it), and
-    // `host_tc_for_build_program`'s cross branch (which needs a genuine HOST
-    // compiler when nothing was ever recorded as one — see its own comment
-    // for why #622 happened). One derivation, called from both, so they
-    // cannot drift the way a hand-copied second copy would.
-    auto native_first_run_spec = [&]() -> std::string {
-        namespace pins = mcpp::toolchain::triple::pins;
-        if constexpr (mcpp::platform::is_macos) {
-            return std::string(pins::kFirstRunMac);
-        } else if constexpr (mcpp::platform::is_windows) {
-            // A machine with no usable MSVC gets the GNU pin, not an
-            // MSVC-ABI clang it cannot use — mirrors the windows-gnu seed
-            // below, which this function's other caller runs after.
-            return std::string(msvc_usable_either_origin()
-                ? pins::kFirstRunWinMsvc : pins::kFirstRunWinGnu);
-        } else if (mcpp::platform::host_arch == std::string_view("x86_64")) {
-            return std::string(pins::kFirstRunLinuxX86_64);
-        } else {
-            return std::string(pins::kFirstRunLinuxOther);
-        }
-    };
-
-    bool windowsGnuFirstRun = false;
-    if constexpr (mcpp::platform::is_windows) {
-        if (!tcSpec.has_value() && state.overrides.target_triple.empty()
-            && state.m->buildConfig.target.empty()
-            && !msvc_usable_either_origin()) {
-            auto cfgW = get_cfg();
-            if (!cfgW || (*cfgW)->defaultTarget.empty()) {
-                state.overrides.target_triple =
-                    std::string(mcpp::toolchain::triple::pins::kFirstRunWinGnuTarget);
-                windowsGnuFirstRun = true;
-            }
-        }
-    }
-
-    // `[target.<triple>]`'s build-shaping keys, applied the same way whichever
-    // path found the row (#704). The section's toolchain is a statement about
-    // this row the author wrote down, so it replaces `[toolchain]` and the
-    // global default; `--toolchain` and a consumer's decision for a host tool
-    // are statements about THIS invocation and keep precedence over it.
-    auto apply_target_section = [&](const mcpp::manifest::TargetEntry& e) {
-        if (!e.toolchain.empty() && !tcFromCommandLine && !tcFromConsumer) {
-            tcSpec   = e.toolchain;
-            tcOrigin = TcOrigin::TargetSection;
-        }
-        if (!e.linkage.empty()) state.m->buildConfig.linkage = e.linkage;
-        // #336: a per-target C++ runtime contract state.overrides the project
-        // default, so "self-contained everywhere except this triple" is
-        // expressible without touching the cfg() input channel.
-        if (!e.cxxRuntime.empty()) state.m->buildConfig.cxxRuntime = e.cxxRuntime;
-    };
-
-    // ─── --target / --static state.overrides ──────────────────────────────────
-    // Target-axis default resolution when no --target flag was passed:
-    // [build] target (project default, ≙ cargo build.target) >
-    // [toolchain] default_target (global config) > host.
-    if (state.overrides.target_triple.empty() && !state.m->buildConfig.target.empty())
-        state.overrides.target_triple = state.m->buildConfig.target;
-    // Remembered, not requested: this one came out of the global config, so
-    // it must not outrank anything the user wrote down (see the pin below).
-    bool targetFromGlobalDefault = false;
-    if (state.overrides.target_triple.empty()) {
-        if (auto cfg = get_cfg(); cfg && !(*cfg)->defaultTarget.empty()) {
-            state.overrides.target_triple = (*cfg)->defaultTarget;
-            targetFromGlobalDefault = true;
-        }
-    }
-    // Normalize the triple (alias spellings → canonical), validate against
-    // the known-target vocabulary, then apply the manifest [target.<triple>]
-    // override and the vocabulary-table convention (pin + default linkage).
-    if (!state.overrides.target_triple.empty()) {
-        namespace triple = mcpp::toolchain::triple;
-        // THE SPELLING THE PROJECT WROTE, KEPT FOR EVERY DIAGNOSTIC BELOW.
-        // `state.overrides.target_triple` is canonicalised further down, and until
-        // this variable existed the refusals quoted the canonical form:
-        // `--target aarch64-linux` produced "target 'aarch64-linux-gnu' is
-        // registered but not yet supported", a string the reader never typed
-        // and cannot find in their own command.
-        const std::string requestedSpelling = state.overrides.target_triple;
-        auto parsed = triple::parse(state.overrides.target_triple);
-
-        // THE REQUEST IS COMPLETED FROM THE VOCABULARY BEFORE ANYTHING
-        // READS IT, AND THE ORDER RELATIVE TO THE `[target.X]` LOOKUP IS PART
-        // OF THE CONTRACT.
-        //
-        // `parse` fills a missing env segment lexically so the identity stays
-        // total — `x86_64-linux` IS `x86_64-linux-gnu`, and a unit test says so.
-        // Every gate below then asked about the filled value instead of about
-        // the request. See `triple::resolve_request` for the two measurements.
-        //
-        // The lookup that follows keys on `parsed->str()`, so completing after
-        // it would match sections against a triple this build is not going to
-        // use. A project wanting the `planned` row keeps its escape hatch by
-        // WRITING the segment: `--target aarch64-linux-gnu` skips completion
-        // entirely, because a written segment is a request rather than a gap.
-        triple::RequestResolution req;
-        if (parsed) {
-            req    = triple::resolve_request(*parsed);
-            parsed = req.triple;
-        }
-
-        // [target.X] lookup is spelling-independent: a section keyed
-        // `x86_64-w64-mingw32` matches `--target x86_64-windows-gnu` and
-        // vice versa. Unparseable keys/inputs compare exactly (escape hatch).
-        auto it = state.m->targetOverrides.find(state.overrides.target_triple);
-        if (it == state.m->targetOverrides.end() && parsed) {
-            for (auto o = state.m->targetOverrides.begin();
-                 o != state.m->targetOverrides.end(); ++o) {
-                if (auto k = triple::parse(o->first);
-                    k && k->str() == parsed->str()) { it = o; break; }
-            }
-        }
-        bool hasExplicitSection   = it != state.m->targetOverrides.end();
-        bool hasToolchainOverride = hasExplicitSection
-                                 && !it->second.toolchain.empty();
-
-        const triple::TargetInfo* known =
-            parsed ? triple::find_known_target(*parsed) : nullptr;
-
-        // Validation: a typo must never silently fall through to the host
-        // toolchain (the worst failure mode — you think you cross-compiled).
-        // An explicit [target.X] section is the escape hatch for custom
-        // triples outside the vocabulary.
-        // Several rows serve this (arch, os) and the lexical default names none
-        // of them, so there is nothing to complete the request WITH. Refusing
-        // and listing them is the only honest answer; picking one would be an
-        // invented convention. No group has this shape today — the rule is here
-        // so the first one that does gets a diagnosis rather than a guess.
-        if (parsed && req.ambiguous && !hasExplicitSection) {
-            std::string opts;
-            for (auto s : req.supported) {
-                if (!opts.empty()) opts += ", ";
-                opts += std::string(s);
-            }
-            refusal::record(refusal::Code::AmbiguousRequest);
-            return std::unexpected(std::format(
-                "target '{}' does not say which C library, and several are "
-                "supported here.\n"
-                "       candidates: {}\n"
-                "       Name one of them.",
-                requestedSpelling, opts));
-        }
-        if (!known && !hasExplicitSection) {
-            // "UNKNOWN" IS A CLAIM ABOUT THE VOCABULARY, AND IT WAS FALSE FOR
-            // A WHOLE arch+os FAMILY.
-            //
-            // Measured on 2026.8.26.1: `--target riscv64-linux` reported
-            // `unknown target 'riscv64-linux'` while `riscv64-linux-musl` was
-            // sitting in `kKnownTargets` as `planned`. The lexical fill had
-            // produced `riscv64-linux-gnu` — a row that genuinely does not
-            // exist — and the gate reported on the fill.
-            //
-            // A non-empty sibling group means the family IS registered, so this
-            // is the planned refusal wearing the wrong word. It names the row
-            // that exists, which is also the one the reader would have to write
-            // to opt in.
-            if (!req.siblings.empty()) {
-                std::string rows;
-                for (auto s : req.siblings) {
-                    if (!rows.empty()) rows += ", ";
-                    rows += std::string(s);
-                }
-                refusal::record(refusal::Code::TierPlanned);
-                return std::unexpected(std::format(
-                    "target '{}' is registered but not yet supported (planned) — "
-                    "no toolchain is published for it yet.\n"
-                    "       registered rows for this system: {}\n"
-                    "       An explicit [target.<triple>] toolchain override can "
-                    "opt in early.",
-                    requestedSpelling, rows));
-            }
-            auto sug = triple::did_you_mean(requestedSpelling);
-            refusal::record(refusal::Code::UnknownTarget);
-            return std::unexpected(std::format(
-                "unknown target '{}'{}\n"
-                "       known targets: `mcpp toolchain list`; a custom triple needs an\n"
-                "       explicit [target.{}] section in mcpp.toml",
-                requestedSpelling,
-                sug ? std::format(" — did you mean '{}'?", *sug) : "",
-                requestedSpelling));
-        }
-        if (known && known->tier == "planned" && !hasToolchainOverride) {
-            refusal::record(refusal::Code::TierPlanned);
-            // The subject is what the user wrote. When completion filled a
-            // segment, both are shown — otherwise the sentence is about a
-            // string that appears nowhere in their command.
-            const std::string subject =
-                requestedSpelling == parsed->str()
-                    ? std::format("'{}'", requestedSpelling)
-                    : std::format("'{}' (which resolves to '{}')",
-                                  requestedSpelling, parsed->str());
-            return std::unexpected(std::format(
-                "target {} is registered but not yet supported (planned) — "
-                "no toolchain is published for it yet.\n"
-                "       An explicit [target.{}] toolchain override can opt in early.",
-                subject, parsed->str()));
-        }
-        // AN APPLE SDK IS LOCATED, SO ITS ABSENCE IS KNOWN NOW.
-        //
-        // REFUSED HERE AND NOT WITH THE TOOLCHAIN, which is a decision about
-        // WHEN rather than about the message. The iOS rows need the machine's
-        // iPhoneOS or iPhoneSimulator SDK, and that is knowable before any
-        // payload is resolved -- so a machine without Xcode used to download
-        // a 700 MB compiler and then be told the thing it was missing was not
-        // the compiler.
-        //
-        // AND UNLIKE `host_can_serve` BELOW, THIS IS NOT DEFERRED. That
-        // refusal waits for the dependency graph because a package can supply
-        // a target's C library and platform interface. An Apple SDK is not
-        // redistributable, so no package supplies it: there is nothing a later
-        // line could learn that would change this answer.
-        //
-        // The escape hatch that opens the tier gate does NOT open this one.
-        // Declaring a toolchain says which compiler; it says nothing about
-        // where the headers and stub libraries are, and every compiler needs
-        // them.
-        if (parsed && parsed->is_ios()) {
-            const auto which = parsed->is_ios_simulator()
-                ? mcpp::platform::macos::sdk_iphonesim
-                : mcpp::platform::macos::sdk_iphoneos;
-            state.appleSdkLocated = mcpp::platform::macos::sdk_path(which);
-            // AN UNSET FLOOR IS THE LOCATED SDK'S VERSION, READ RATHER THAN
-            // LEFT TO THE DRIVER. `docs/20` promised that an unversioned
-            // triple meant the SDK's own default; measured on macos-15 with
-            // Xcode 16.4, clang given `arm64-apple-ios` with no version
-            // refused thread-local storage for the target, which libc++abi
-            // uses, so the default it chose was older than any SDK on the
-            // machine. The version `xcrun` reports for the located SDK is the
-            // one the SDK was made for, and it enters the manifest here so
-            // that the fingerprint slot, the effective triple and every
-            // report read one value.
-            if (state.appleSdkLocated && state.m->buildConfig.iosDeploymentTarget.empty()) {
-                if (auto v = mcpp::platform::macos::sdk_version(which)) {
-                    state.m->buildConfig.iosDeploymentTarget = *v;
-                    state.iosFloorFromSdk = true;
-                }
-            }
-            if (!state.appleSdkLocated) {
-                // A CODE, BECAUSE THE MATRIX COMPARES REASONS AND NOT ONLY
-                // OUTCOMES. A refusal with no code is recorded as `other`,
-                // which `check_matrix_reasons.sh` refuses on the ground that
-                // it freezes an unnamed branch into the expected table.
-                refusal::record(refusal::Code::AppleSdkAbsent);
-                return std::unexpected(std::format(
-                    "target {} needs the {} SDK, which this machine does not "
-                    "provide.\n"
-                    "       It is not redistributable, so mcpp LOCATES it "
-                    "rather than installing it: `xcrun --sdk {} "
-                    "--show-sdk-path` must answer, which needs Xcode on macOS "
-                    "(not the Command Line Tools alone -- those ship the "
-                    "macOS SDK only).\n"
-                    "       Check `xcode-select -p`, and note that the "
-                    "compiler is not what is missing: these rows pin "
-                    "`xim:llvm`, which every other Apple row also uses.",
-                    parsed->str(), which, which));
-            }
-        }
-        // A `shared` TARGET NAMES A LINK CONTRACT THIS ENGINE DOES NOT RENDER.
-        //
-        // `-sSIDE_MODULE` is a different Emscripten link mode from the
-        // ordinary one (one static image, `artifact_naming`'s `.js`+`.wasm`
-        // pair) and mcpp emits no flag for it. Falling through to the
-        // ordinary link would still WRITE a `.so`-shaped file — the fallback
-        // naming's `sharedLibExt` is empty, so the linker would be asked for
-        // an empty-named output — so this is caught here, by NAME, rather
-        // than reached as an obscure link failure.
-        //
-        // REFUSED HERE AND NOT AT PLAN TIME, same reasoning as the Apple SDK
-        // check above: `parsed` and the manifest's own target list are both
-        // already known, resolving neither an emsdk payload nor any other
-        // toolchain, so an offline build (no emsdk installed) gets this
-        // sentence instead of downloading the SDK first.
-        if (parsed && parsed->object_format()
-                          == triple::ObjectFormat::Wasm) {
-            for (auto const& t : state.m->targets) {
-                if (t.kind != mcpp::manifest::Target::SharedLibrary) continue;
-                return std::unexpected(std::format(
-                    "[targets.{}] kind = \"shared\" is not supported on "
-                    "wasm32-emscripten: a side module needs -sSIDE_MODULE, "
-                    "which mcpp does not render",
-                    t.name));
-            }
-        }
-        // Known, supported — and IMPOSSIBLE ON THIS HOST.
-        //
-        // Without this the target falls through to the host toolchain and the
-        // build SUCCEEDS, which is the failure the check above calls the worst
-        // one, arriving through a different door. Measured on Linux:
-        //
-        //   $ mcpp build --target x86_64-windows-msvc
-        //       Resolved gcc@16.1.0 → x86_64-windows-msvc → …/xim-x-gcc/bin/g++
-        //       Finished dev [unoptimized + debuginfo] in 0.07s
-        //   $ ls target/
-        //       x86_64-linux-gnu/          ← an ELF, reported as a Windows build
-        //
-        // The vocabulary tier says "mcpp supports this target"; it never said
-        // "this machine can produce it". `host_can_serve` is the answer to the
-        // second question and lives beside the payload resolution it has to
-        // agree with.
-        //
-        // The escape hatch stays open on purpose: an explicit `[target.X]`
-        // toolchain override means the author is supplying the cross toolchain
-        // themselves, and mcpp's payload matrix has no standing to refuse it.
-        // DIAGNOSED HERE, REPORTED LATER, AND THE DIFFERENCE IS THE POINT.
-        //
-        // Whether a payload on this machine produces this target is knowable
-        // now. Whether anything ELSE produces it is not: a dependency can
-        // supply the target's platform interface and C library, and the
-        // dependency graph does not exist yet at this line. Refusing here
-        // therefore answered a narrower question than the one it claimed —
-        // measured, a project that only had to add a dependency was told its
-        // machine could not build the target at all.
-        //
-        // The refusal is kept in full, because it is right whenever nothing
-        // supplies the target side, which remains the ordinary case. It is
-        // carried to where the graph is known and released there. Nothing
-        // between here and there consumes the answer: what follows is toolchain
-        // and dependency resolution, and a target no payload serves resolves to
-        // a driver that simply will not be asked to emit anything.
-        //
-        // The escape hatch stays open on purpose: an explicit `[target.X]`
-        // toolchain override means the author is supplying the cross toolchain
-        // themselves, and mcpp's payload matrix has no standing to refuse it.
-        if (known && known->tier != "planned" && !hasToolchainOverride
-            && parsed
-            && !mcpp::toolchain::host_can_serve(*parsed)) {
-            std::string servable;
-            for (auto const& info : triple::known_targets()) {
-                auto t = triple::parse(info.canonical);
-                if (!t || info.tier == "planned") continue;
-                if (!mcpp::toolchain::host_can_serve(*t)) continue;
-                if (!servable.empty()) servable += ", ";
-                servable += t->str();
-            }
-            state.unservedTargetDiagnosis = std::format(
-                "target '{}' cannot be built on this host.\n"
-                "       No toolchain payload here produces it, and nothing in "
-                "the dependency graph\n"
-                "       supplies its system side.\n"
-                "       this host can build with the payload alone: {}\n"
-                "       To build it anyway, depend on a package that implements "
-                "the target's system\n"
-                "       (its kernel interface and C library), or supply your own "
-                "cross toolchain with\n"
-                "       an explicit [target.{}] toolchain = \"…\" section.",
-                parsed->str(),
-                servable.empty() ? "(nothing — `mcpp toolchain list`)" : servable,
-                parsed->str());
-        }
-        // CAPTURED BEFORE CANONICALISATION, BECAUSE CANONICALISATION IS
-        // EXACTLY WHAT DESTROYS IT.
-        //
-        // `str()` renders the filled-in identity, so `x86_64-linux` becomes
-        // `x86_64-linux-gnu` here and every later `parse` of that string reports
-        // an env segment the project never wrote. The request has to be taken
-        // from the ONLY triple that still knows the difference: this one.
-        if (parsed && parsed->envExplicit) state.requestedCAbi = parsed->env;
-        // AND THE SPELLING THE PROJECT USED, FOR THE REPORT ONLY.
-        //
-        // The canonical form is the identity — the output directory, the cache
-        // key, the subject of a `cfg()` — and it must stay filled. The REPORT is
-        // a different thing: it says what was asked for and what resolved, and
-        // heading it `x86_64-linux-gnu` above a line reading `c-abi musl` states
-        // a contradiction the build does not actually contain. A project that
-        // declined to name a C library is shown as having declined.
-        if (parsed && !parsed->envExplicit && !parsed->env.empty()) {
-            auto asWritten = *parsed;
-            asWritten.env.clear();
-            state.targetDisplayName = asWritten.str();
-        }
-
-        // Canonical from here on: cfg evaluation, spec attachment and the
-        // target/ output directory all see one spelling.
-        if (parsed) state.overrides.target_triple = parsed->str();
-
-        if (hasExplicitSection) apply_target_section(it->second);
-        // Convention from the vocabulary table (triple.cppm): the target's
-        // pinned toolchain (host-awareness — native musl-gcc vs triple-named
-        // cross, winlibs mingw vs Linux-hosted cross — lives in the payload
-        // mapping, not here) and its default linkage. GCC 16 pin rationale:
-        // GCC 15 drops module template instantiations at link (remediation
-        // doc A2; packages shipped 2026-07-08/09, GitHub+GitCode).
-        // A convention, not an instruction: on the Windows-GNU first-run path
-        // this is what turns the seeded target into `gcc@16.1.0`.
-        //
-        // It must not fire when it would overrule a toolchain the user wrote
-        // down. The pin is mcpp's own default for a target row — `gcc@16.1.0`
-        // for Windows-GNU, because the mingw payload is what supplies that
-        // target's headers and C library — and an explicit `[toolchain]` line
-        // is not a default. This is the promise the no-Visual-Studio fallback
-        // is built on: mcpp revises its own defaults, never yours.
-        //
-        // HOW THE TARGET WAS NAMED IS NOT PART OF THE QUESTION, and it used to
-        // be. The guard read `targetFromGlobalDefault && user_explicit`, so a
-        // target given on the command line disabled it — and then the row's pin
-        // replaced a toolchain the project had stated. Measured 2026-08-23:
-        // `--target x86_64-windows-gnu` with an explicit `llvm@22.1.8` resolved
-        // `x86_64-w64-mingw32-g++`, and gcc cannot compile libc++'s std module.
-        //
-        // A project that means to use a different compiler for a pinned target
-        // is stating something about its own build, and a project whose target
-        // side comes from its dependency graph is the ordinary reason to do so:
-        // the payload the row names supplies headers and a C library that such
-        // a project does not use. The narrower reading of this guard was
-        // patched with an openkal-specific exception; stating the rule
-        // correctly removes the need for one.
-        // RECORDED, NOT APPLIED. The convention answers "which payload
-        // supplies this target's C library", and whether it is needed depends on
-        // whether the dependency graph supplies one instead. That is knowable
-        // only after resolution, so the decision waits for
-        // `resolve_target_toolchain` and only the candidate is kept here.
-        if (known && !known->pin.empty() && parsed
-            && !parsed->pin_is_capability()) {
-            state.targetRowPin  = std::string(known->pin);
-            state.targetRowName = parsed->str();
-        }
-        if (known && !hasToolchainOverride && !known->pin.empty()
-            && !tc_origin_is_user_explicit(tcOrigin)) {
-            state.targetPinCandidate = std::string(known->pin);
-            state.targetPinIsCapability = parsed && parsed->pin_is_capability();
-        }
-        // A USER'S EXPLICIT TOOLCHAIN OVERRIDES A CONVENTION, NOT A
-        // CAPABILITY — AND UNTIL THIS LINE IT OVERRODE BOTH.
-        //
-        // The block above deliberately steps aside for an explicit
-        // `[toolchain] default`: a hosted row's pin says "this payload supplies
-        // the target's C library", and an author who names their own compiler
-        // has said they will supply it instead. A bare-metal row's pin says
-        // something the author cannot override — the table's own words: "the
-        // pin is llvm on every host because clang/lld are cross-compilers by
-        // construction". A host g++ does not emit riscv64 whatever anyone
-        // declares.
-        //
-        // Measured 2026-08-26:
-        //
-        //     [toolchain] default = "gcc@16.1.0"
-        //     $ mcpp build --target riscv64-none-elf
-        //       g++: error: unrecognized argument in option '-mabi=lp64d'
-        //       g++: note: valid arguments to '-mabi=' are: ms sysv
-        //
-        // — a message about an option, for a decision made here. Refusing at
-        // the decision costs one line; the alternative is a compiler complaining
-        // about flags the reader never wrote.
-        if (known && parsed && parsed->pin_is_capability()
-            && tc_origin_is_user_explicit(tcOrigin) && tcSpec.has_value()) {
-            auto declared = mcpp::toolchain::parse_toolchain_spec(*tcSpec);
-            // WHICH DECLARATIONS THE ROW ACCEPTS IS THE ROW'S PIN, NOT A FIXED
-            // FAMILY.
-            //
-            // This asked `family != Llvm`, which was right while every
-            // capability-pinned row pinned llvm. `wasm32-emscripten` pins
-            // `emsdk@6.0.9`, and emsdk NORMALISES to the llvm family -- `em++`
-            // is clang -- so a declared `llvm@22.1.8` passed this gate, was
-            // never refused, and resolved the generic llvm payload for a target
-            // it cannot emit. The condition is now the pin's own family, which
-            // is the question the row was always answering.
-            const auto pinFamily = [&]() -> std::optional<mcpp::toolchain::Family> {
-                if (known->pin.empty()) return mcpp::toolchain::Family::Llvm;
-                if (auto ps = mcpp::toolchain::parse_toolchain_spec(
-                        std::string(known->pin)))
-                    return ps->family;
-                return std::nullopt;
-            }();
-            const bool declaredMatchesPin =
-                declared && pinFamily && declared->family == *pinFamily
-                // An emsdk row is llvm-family, so the family alone cannot
-                // separate `emsdk@6.0.9` from `llvm@22.1.8`. The pin's own
-                // spelling is what does.
-                && (known->pin.empty()
-                    || tcSpec->find(known->pin.substr(0, known->pin.find('@')))
-                       != std::string::npos);
-            if (declared && !declaredMatchesPin) {
-                // THE REASON TRAVELS WITH THE ROW. The rows refuse for the
-                // same rule and NOT for the same reason, and one sentence
-                // covering all of them would be wrong about the others: a
-                // PE+musl target is not bare metal, a wasm target is neither,
-                // and a reader told the wrong one stops reading.
-                //
-                // Measured before the third arm existed: `--target
-                // wasm32-emscripten` with a declared gcc was refused correctly
-                // and explained with "No gcc payload emits a PE with a musl C
-                // library", which is a true sentence about a different row.
-                //
-                // IT HAPPENED AGAIN, AND ADDING AN ARM IS ONLY HALF THE FIX.
-                // Android became a capability row and this chain still had
-                // three arms, so a declared `llvm@22.1.8` against
-                // `aarch64-linux-android` was refused correctly and explained
-                // with the PE+musl sentence -- the identical wrong answer the
-                // paragraph above records for wasm, reached the same way: by a
-                // fourth case falling into a final `else` that was written as
-                // the third case's answer.
-                //
-                // So the last arm now NAMES ITS OWN ROW and the fallthrough is
-                // generic. A capability added later gets a sentence that is
-                // merely unspecific instead of one that is false, and the
-                // refusal still names the pin either way.
-                std::string_view why = parsed->is_freestanding()
-                    ? "A freestanding target has no per-host cross payload: "
-                      "clang and lld are\n"
-                      "       cross-compilers by construction and gcc is not."
-                    : parsed->is_wasm()
-                    ? "Nothing but Emscripten emits WebAssembly: `em++` is a "
-                      "clang whose target,\n"
-                      "       sysroot and JavaScript glue all come from its own "
-                      "payload."
-                    : parsed->is_android()
-                    ? "An Android target needs bionic, not just an aarch64 or "
-                      "x86_64 back end:\n"
-                      "       its headers, its per-API-level stubs and its "
-                      "loader path are inside the\n"
-                      "       NDK, and no package adds them to another compiler."
-                    : (parsed->is_pe() && parsed->is_musl())
-                    ? "No gcc payload emits a PE with a musl C library — the "
-                      "mingw payload emits\n"
-                      "       PE with the MinGW CRT, which is the separate "
-                      "`-gnu` row."
-                    : "This row's toolchain is the only one that can emit the "
-                      "target at all.";
-                refusal::record(refusal::Code::CapabilityPin);
-                return std::unexpected(std::format(
-                    "target '{}' cannot be emitted by '{}'.\n"
-                    "       {}\n"
-                    "       The row names `{}` as a capability rather than as a "
-                    "preference, so\n"
-                    "       this one line is not a convention you can override.\n"
-                    "       remove the `[toolchain]` line for this target, or set "
-                    "it to `{}`.",
-                    parsed->str(), *tcSpec, why,
-                    known->pin.empty() ? std::string_view("llvm") : known->pin,
-                    known->pin.empty() ? std::string_view("llvm") : known->pin));
-            }
-        }
-        if (known && known->defaultStatic && state.m->buildConfig.linkage.empty())
-            state.m->buildConfig.linkage = "static";
-    }
-    // A HOST BUILD READS ITS OWN ROW (#704). `[target.<triple>]` is looked up
-    // by the triple the build produces, and a build without `--target`
-    // produces the host's. Before this the row applied only when a triple was
-    // named: `[target.x86_64-linux-gnu] cxx_runtime` shaped `--target
-    // x86_64-linux-gnu` and was ignored by `mcpp build` on that same machine,
-    // while the row's `.build` table and its `sysroot` already applied to both.
-    // The triple is not written into `state.overrides.target_triple`: that would make
-    // the host build a target build and turn the row's env segment into a
-    // requested C library.
-    else if (auto* hostRow = find_target_entry(*state.m, mcpp::toolchain::triple::host_triple()))
-        apply_target_section(*hostRow);
-    if (state.overrides.force_static) state.m->buildConfig.linkage = "static";
-
-    // #254: everything compiled INTO this build is resolved for the TARGET —
-    // an xpkg descriptor's per-OS sections (sources, flags, deps) and its xpm
-    // asset/version table all describe code that will run on the target, not
-    // on the machine building it. Previously a compile-time host constant,
-    // which is invisible natively (host == target) and picks the wrong leg
-    // under --target.
-    //
-    // Computed HERE, not earlier: `state.overrides.target_triple` is only complete
-    // above — it is filled from `[build] target` and the config default, then
-    // canonicalized. Reading it before that point would silently fall back to
-    // the host for any project that sets its target in the manifest rather
-    // than on the command line.
-    // ── The device axis, resolved ONCE ────────────────────────────────────
-    //
-    // `--accel` / `--no-accel` over `[build] accel`. `--no-accel` arrives as the
-    // sentinel "(none)", which parse_accel reads as nothing, and printing the
-    // parsed form back normalises the spelling -- so every reader below sees
-    // one string, and a build program sees the same one in MCPP_ACCEL. Read
-    // at call time rather than captured: a `[target.'cfg(...)'.build]` section
-    // may set `accel`, and the merge that applies it runs a few lines down.
-    //
-    // "NO ACCELERATOR" IS THE EMPTY STRING HERE, NOT `accel_str`'s "(none)".
-    //
-    // `accel_str` is a DISPLAY function: it prints `(none)` for an empty set so
-    // an ABI tag reads as a sentence. Handing that spelling on as a value made
-    // two readers wrong at once. A build program saw `MCPP_ACCEL=(none)` while
-    // the manual promised an empty string, so a rule package asking "is there
-    // an accelerator" got a yes and a backend named `(none)`; and the
-    // fingerprint's own guard, `if (!accel.empty())`, was true for every
-    // project on earth, appending `#accel=(none)` to builds that had asked for
-    // nothing. Measured 2026-09-05 with a build program that wrote the value to
-    // a file, which is the only way to see it -- a program's stdout is shown
-    // only when it fails.
-    auto resolvedAccel = [&]() -> std::string {
-        const auto sets = mcpp::pack::parse_accel(
-            state.overrides.accel.empty() ? state.m->buildConfig.accel : state.overrides.accel);
-        return sets.empty() ? std::string{} : mcpp::pack::accel_str(sets);
-    };
-    // The cfg context, with the accelerator layer filled from the resolved
-    // accel's backend names. `cfg(accelerator = "cuda")` is a membership test
-    // over these (prepare_inputs::Ctx::layer_matches); before this the field
-    // was declared, documented, and never written, so the key matched nothing.
-    auto cfgCtx = [&]() {
-        auto c = cfgpred::context_for(state.overrides.target_triple);
-        for (auto const& set : mcpp::pack::parse_accel(resolvedAccel()))
-            c.accelerators.push_back(set.backend);
-        return c;
-    };
-    const auto targetPlatform = mcpp::platform::TargetPlatform::for_os(cfgCtx().os);
-
-    // ── L1: merge conditional [target.'cfg(...)'] sections ───────────────────
-    // Evaluated now (target resolved) against the resolved target — the
-    // --target triple for a cross build, else the host.
-    //
-    // #229: merge_conditional_config MUST run here — before
-    // `packages[0] = makePackageRoot(*root, *m)` snapshots `m->buildConfig`
-    // into `packages[0].privateBuild`/`.manifest` — because that snapshot,
-    // not `*m`, is what the modgraph scan and per-TU compile-flag assembly
-    // actually read afterward. Every dependency (path/git/version alike) gets
-    // the SAME treatment, at the mirror-image point in its own load path
-    // (right before ITS `makePackageRoot`/`propagateLinkFlags`) — see the
-    // dependency-manifest-acquisition block below. That makes this the root
-    // package's half of the one funnel, not a special case: every package is
-    // merged exactly once, immediately before it is captured into `packages[]`.
-    if (!state.m->conditionalConfigs.empty()) {
-        merge_conditional_config(*state.m, cfgCtx());
-    }
-    // `[target.<selector>.abi] threads` -- the ROOT's statement, rendered once,
-    // into channels that already reach the whole artefact: the graph-global
-    // dialect flag set (every C++ translation unit, the std module's own
-    // commands, the scan, every dependency's cache key), the C flags of every
-    // package (the root here, each dependency where it is loaded), and the link.
-    //
-    // For hosted targets that are not PE. On PE the MSVC runtime is always
-    // multithreaded and mingw-w64's threading model belongs to its payload; a
-    // freestanding target has no thread library to select.
-    const bool abiThreadsRendered = [&] {
-        if (!state.m->buildConfig.abiThreads) return false;
-        const auto abiTriple = mcpp::toolchain::triple::parse(
-            state.overrides.target_triple.empty()
-                ? mcpp::toolchain::triple::host_triple().str()
-                : state.overrides.target_triple);
-        return abiTriple && !abiTriple->is_pe() && !abiTriple->is_freestanding();
-    }();
-    auto add_once = [](std::vector<std::string>& v, std::string_view flag) {
-        if (std::ranges::find(v, flag) == v.end()) v.emplace_back(flag);
-    };
-    if (abiThreadsRendered) {
-        add_once(state.m->buildConfig.dialectCxxflags, "-pthread");
-        add_once(state.m->buildConfig.cflags, "-pthread");
-        add_once(state.m->buildConfig.ldflags, "-pthread");
-    }
-    // `[target.<selector>.abi] exceptions` -- design 2026-09-12 (the UI
-    // framework record), section 2.1, A1: the second `abi` member, the
-    // ROOT's statement, rendered once. Reaches the dialect flag set (every
-    // C++ translation unit, the std module's own commands, the scan, every
-    // dependency's cache key) and the link -- NOT the C flags, unlike
-    // `threads`: `-fexceptions` has no C-language meaning worth carrying to
-    // a `.c` translation unit.
-    //
-    // Rendered only where the target's default is OFF: Emscripten's native
-    // toolchain builds without exceptions unless asked. gcc, clang and MSVC
-    // already link with exceptions on, so a host build with the member
-    // declared is byte-identical to one without -- the same property
-    // `threads` has on PE.
-    const bool abiExceptionsRendered = state.m->buildConfig.abiExceptions
-                                     && cfgCtx().os == "emscripten";
-    if (abiExceptionsRendered) {
-        add_once(state.m->buildConfig.dialectCxxflags, "-fexceptions");
-        add_once(state.m->buildConfig.ldflags, "-fexceptions");
-    }
-    // `[build].defines` must reach the scanner (P1689) and the compile edge,
-    // and must participate in the fingerprint. Fold before dependency
-    // resolution / fingerprinting.
-    report_flag_words_changes(*state.m);
-    fold_build_defines_into_flags(state.m->buildConfig);
-
-    // ORIGIN, RESOLVED ONCE.
-    //
-    // The spec used to be parsed TWICE from the same string a dozen lines
-    // apart — once to ask "is this msvc@system", once to get the package —
-    // and each call site drew its own conclusions from the result. Two parses
-    // of one string is two places for the answer to differ, which is the shape
-    // §1 of the three-axes design is about: a platform special case whose cost
-    // is paid at every site that has to know about it.
-    //
-    // `Origin::SystemMsvc` is located on the machine and never resolved
-    // through an xim package — mcpp does not install the machine's Visual
-    // Studio. `Origin::Managed` is everything else, including a VERSIONED
-    // msvc spec, and that is the point: what the manifest says is what gets
-    // used, on every machine, instead of whatever this one happens to have.
-    // RESOLVED HERE, RUN AFTER THE DEPENDENCY GRAPH — AND THE SPLIT IS THE
-    // WHOLE POINT.
-    //
-    // A target row's convention does not name a preferred compiler. It names
-    // the payload that supplies THAT TARGET'S C library. Whether the user's own
-    // toolchain can serve the target instead depends on whether something ELSE
-    // supplies the target side — and that is knowable only once the graph is
-    // resolved, which is after this point in the function.
-    //
-    // Deciding early was measured to be wrong in both directions. Applying the
-    // convention unconditionally replaced a toolchain the user had set with
-    // `mcpp toolchain default`, for a payload their project never used. NOT
-    // applying it turned a working zero-dependency cross build into a failing
-    // one, because clang alone carries no C runtime for `x86_64-windows-gnu`
-    // while the payload the row names does.
-    //
-    // The body does not MOVE; only its execution does. Everything between
-    // here and the call site was measured to read `tc` exactly once, and that
-    // one read wanted the target triple rather than the compiler.
-    std::optional<mcpp::toolchain::Toolchain> tc;
-    // `std::function` AND NOT `auto`, BECAUSE THE FIRST-RUN BRANCH INSIDE
-    // CALLS BACK INTO IT. That branch installs a host default and then has to
-    // resolve THAT default for the requested target — which is what the top of
-    // this same function does. Recursing reuses it; writing it a second time
-    // there would be a second answer to one question. Depth is one: the second
-    // pass takes the `tcSpec.has_value()` branch that the first-run path just
-    // made true.
-    bool firstRunNeedsTargetPass = false;
-    // Guards the one recursive call below. Set before the call so the second
-    // pass cannot reach it, whatever else changed in between.
-    bool targetPassDone = false;
+    if (auto r = phase1_toolchain_spec_and_axes(state); !r) return std::unexpected(r.error());
     std::function<std::expected<void, std::string>()> resolve_target_toolchain;
     resolve_target_toolchain = [&]() -> std::expected<void, std::string> {
       std::optional<mcpp::toolchain::ToolchainSpec> parsedSpec;
       auto tcOriginAxis = mcpp::toolchain::Origin::Managed;
-      if (tcSpec.has_value() && *tcSpec != "system") {
+      if (state.tcSpec.has_value() && *state.tcSpec != "system") {
         // A parse FAILURE is not the same as an unparseable spec being
         // absent: `gcc@system` now fails here by name (see
         // parse_toolchain_spec), and swallowing that would put the error back
         // where it used to happen — somewhere else, saying something else.
-        auto s = mcpp::toolchain::parse_toolchain_spec(*tcSpec);
+        auto s = mcpp::toolchain::parse_toolchain_spec(*state.tcSpec);
         if (!s) return std::unexpected(std::format(
-            "{} = '{}': {}", tcSpecSource(), *tcSpec, s.error()));
+            "{} = '{}': {}", state.tcSpecSource(), *state.tcSpec, s.error()));
         parsedSpec   = std::move(*s);
         tcOriginAxis = mcpp::toolchain::origin_of(*parsedSpec);
       }
@@ -3983,20 +4028,20 @@ prepare_build(bool print_fingerprint,
 
       if (installedPin) {
         for (auto const& n : installedPinNotes) mcpp::ui::info("note", n);
-        explicit_compiler = installedPin->clPath;
+        state.explicit_compiler = installedPin->clPath;
         mcpp::ui::info("Resolved", std::format(
             "{} → msvc {} (installed: {})", parsedSpec->display(),
             installedPin->display_version(), installedPin->clPath.string()));
       } else if (state.tcSpecIsMsvc) {
         if (!mcpp::platform::is_windows) {
             return std::unexpected(std::format(
-                "toolchain '{}' is only available on Windows hosts", *tcSpec));
+                "toolchain '{}' is only available on Windows hosts", *state.tcSpec));
         }
         auto inst = mcpp::toolchain::msvc::detect_installation();
         if (!inst) {
             return std::unexpected(mcpp::toolchain::msvc::install_guidance());
         }
-        explicit_compiler = inst->clPath;
+        state.explicit_compiler = inst->clPath;
         mcpp::ui::info("Resolved", std::format(
             "msvc@system → msvc {} ({})",
             inst->display_version(), inst->clPath.string()));
@@ -4005,7 +4050,7 @@ prepare_build(bool print_fingerprint,
         if (spec->version.empty()) {
             return std::unexpected(std::format(
                 "{} = '{}' is invalid; expected '<pkg>@<version>'",
-                tcSpecSource(), *tcSpec));
+                state.tcSpecSource(), *state.tcSpec));
         }
         // A `--target <triple>` build carries the (already canonical) triple
         // into the spec's target axis: the payload mapping then resolves the
@@ -4042,7 +4087,7 @@ prepare_build(bool print_fingerprint,
         const bool targetPayloadUnservable =
             !state.unservedTargetDiagnosis.empty() && !spec->target.empty();
 
-        auto cfg = get_cfg();
+        auto cfg = state.get_cfg(true);
         if (!cfg) return std::unexpected(cfg.error());
         mcpp::fetcher::Fetcher fetcher(**cfg);
 
@@ -4066,7 +4111,7 @@ prepare_build(bool print_fingerprint,
                     return std::unexpected(*hint);
             }
             return std::unexpected(std::format(
-                "toolchain '{}': {}", *tcSpec, payload.error().message));
+                "toolchain '{}': {}", *state.tcSpec, payload.error().message));
         }
 
         // A pinned MSVC toolset: the payload root IS a VS-shaped root and the
@@ -4085,7 +4130,7 @@ prepare_build(bool print_fingerprint,
             auto inst = mcpp::toolchain::resolve_managed_msvc(
                 mcpp::config::make_xlings_env(**cfg), pkg);
             if (!inst) return std::unexpected(inst.error());
-            explicit_compiler = inst->clPath;
+            state.explicit_compiler = inst->clPath;
             mcpp::ui::info("Resolved", std::format(
                 "{} → msvc {} ({})", spec->display(),
                 inst->display_version(), inst->clPath.string()));
@@ -4095,8 +4140,8 @@ prepare_build(bool print_fingerprint,
             // refused by name -- not reported as a missing frontend, which is
             // a different repair.
             if (!frontendR) return std::unexpected(frontendR.error());
-            explicit_compiler = *frontendR;
-            if (!std::filesystem::exists(explicit_compiler)) {
+            state.explicit_compiler = *frontendR;
+            if (!std::filesystem::exists(state.explicit_compiler)) {
                 return std::unexpected(std::format(
                     "toolchain payload '{}' has no known C++ frontend in {}",
                     pkg.target(),
@@ -4106,13 +4151,13 @@ prepare_build(bool print_fingerprint,
             // manifest [toolchain] path previously ran none, so a freshly
             // auto-installed payload kept its stale install-time cfg /
             // unpatched runtime libs.
-            provide_runtime_payload(pkg);
+            state.provide_runtime_payload(pkg);
             if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
                     **cfg, payload->root, pkg,
-                    runtimeBindingSnapshot.runtimeId, runtimeLibDir); !fixed)
+                    state.runtimeBindingSnapshot.runtimeId, state.runtimeLibDir); !fixed)
                 return std::unexpected(std::format(
                     "toolchain post-install fixup: {}", fixed.error()));
-            else report_fixup(*fixed, payload->root);
+            else state.report_fixup(*fixed, payload->root);
             // Canonical rendering, whatever spelling the manifest/config used:
             // "Resolved gcc@16.1.0 → x86_64-linux-musl → <frontend>".
             //
@@ -4142,16 +4187,16 @@ prepare_build(bool print_fingerprint,
                     "{} — override with `[target.{}] toolchain`",
                     state.overrides.target_triple, state.pinReplacedDefault,
                     state.overrides.target_triple);
-            else if (tcOrigin == TcOrigin::TargetPin
-                  || tcOrigin == TcOrigin::FirstRun)
-                chosenBy = std::format("  ({})", tc_origin_name(tcOrigin));
+            else if (state.tcOrigin == TcOrigin::TargetPin
+                  || state.tcOrigin == TcOrigin::FirstRun)
+                chosenBy = std::format("  ({})", tc_origin_name(state.tcOrigin));
             mcpp::ui::info("Resolved",
                 std::format("{} → {}{}", spec->display(),
-                    mcpp::ui::shorten_path(explicit_compiler,
-                        mcpp::fetcher::make_path_ctx(&**get_cfg(), *state.root)),
+                    mcpp::ui::shorten_path(state.explicit_compiler,
+                        mcpp::fetcher::make_path_ctx(&**state.get_cfg(true), *state.root)),
                     chosenBy));
         }
-      } else if (tcSpec.has_value() && *tcSpec == "system") {
+      } else if (state.tcSpec.has_value() && *state.tcSpec == "system") {
         // REFUSED. THE COMPILER IS THE ONE AXIS THAT IS NOT THE PROJECT'S TO
         // TAKE FROM THE HOST.
         //
@@ -4220,7 +4265,7 @@ prepare_build(bool print_fingerprint,
         // exactly what this machine cannot build. Name the toolchain that
         // will actually work there instead.
         if (mcpp::platform::is_windows
-            && !msvc_usable_either_origin()) {
+            && !state.msvc_usable_either_origin()) {
             refusal::record(refusal::Code::OfflineDownloadRequired);
             return std::unexpected(std::format(
                 "no toolchain configured (and no Visual Studio found).\n"
@@ -4277,7 +4322,7 @@ prepare_build(bool print_fingerprint,
         // — on Windows it re-checks `msvc_usable_either_origin()`, which here
         // is redundant (the seed above already diverted the unusable case
         // onto the windows-gnu target before this block runs) but harmless.
-        std::string defaultSpec = native_first_run_spec();
+        std::string defaultSpec = state.native_first_run_spec();
         auto defaultParsed = mcpp::toolchain::parse_toolchain_spec(defaultSpec);
         // The legacy "-musl" spelling normalizes to (gcc, <host>-linux-musl),
         // so the resolver finds the `<host_arch>-linux-musl-g++` frontend
@@ -4295,7 +4340,7 @@ prepare_build(bool print_fingerprint,
                             defaultSpec, muslDefault ? "musl, static" : "glibc, native ABI"));
         }
 
-        auto cfg = get_cfg();
+        auto cfg = state.get_cfg(true);
         if (!cfg) return std::unexpected(cfg.error());
         mcpp::fetcher::Fetcher fetcher(**cfg);
 
@@ -4312,8 +4357,8 @@ prepare_build(bool print_fingerprint,
         auto defaultFrontendR =
             mcpp::toolchain::payload_frontend(payload->root, defaultPkg);
         if (!defaultFrontendR) return std::unexpected(defaultFrontendR.error());
-        explicit_compiler = *defaultFrontendR;
-        if (!std::filesystem::exists(explicit_compiler)) {
+        state.explicit_compiler = *defaultFrontendR;
+        if (!std::filesystem::exists(state.explicit_compiler)) {
             return std::unexpected(std::format(
                 "default toolchain payload {} has no known C++ frontend in {}",
                 defaultPkg.target(),
@@ -4325,13 +4370,13 @@ prepare_build(bool print_fingerprint,
         // `mcpp toolchain install` performs — without it a fresh sandbox
         // gcc cannot find the C library (stdlib.h: No such file or
         // directory) and a fresh llvm keeps its stale install-time cfg.
-        provide_runtime_payload(defaultPkg);
+        state.provide_runtime_payload(defaultPkg);
         if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
                 **cfg, payload->root, defaultPkg,
-                runtimeBindingSnapshot.runtimeId, runtimeLibDir); !fixed)
+                state.runtimeBindingSnapshot.runtimeId, state.runtimeLibDir); !fixed)
             return std::unexpected(std::format(
                 "default toolchain post-install fixup: {}", fixed.error()));
-        else report_fixup(*fixed, payload->root);
+        else state.report_fixup(*fixed, payload->root);
 
         // Persist the default so we don't ask again next time.
         if (auto wr = mcpp::config::write_default_toolchain(**cfg, defaultSpec); wr) {
@@ -4339,8 +4384,8 @@ prepare_build(bool print_fingerprint,
             mcpp::ui::status("Default", std::format("set to {}", defaultSpec));
         } // best-effort: a failed config write only loses the persistence,
           // not the running build.
-        tcSpec   = defaultSpec;
-        tcOrigin = TcOrigin::FirstRun;
+        state.tcSpec   = defaultSpec;
+        state.tcOrigin = TcOrigin::FirstRun;
 
         // AND IF A TARGET WAS ASKED FOR, RESOLVE FOR IT — THIS BRANCH JUST
         // INSTALLED A HOST COMPILER AND WAS ABOUT TO BUILD WITH IT.
@@ -4369,7 +4414,7 @@ prepare_build(bool print_fingerprint,
         // here would skip it. Its own comment says why that matters: it
         // persists BOTH axes, and persisting only the target leaves
         // `mcpp toolchain list` disagreeing with what the build used.
-        firstRunNeedsTargetPass = !state.overrides.target_triple.empty();
+        state.firstRunNeedsTargetPass = !state.overrides.target_triple.empty();
       }
 
       // Windows first run that got diverted to winlibs GCC: announce it and
@@ -4388,21 +4433,21 @@ prepare_build(bool print_fingerprint,
       // A requirement is a property of the package that states it. It decides
       // this build and nothing else; the first-run answer for the machine is
       // still the one this branch was written for.
-      if (windowsGnuFirstRun && tcSpec.has_value()
-          && tc_origin_may_persist(tcOrigin)) {
+      if (state.windowsGnuFirstRun && state.tcSpec.has_value()
+          && tc_origin_may_persist(state.tcOrigin)) {
         mcpp::ui::info("First run",
             std::format("no toolchain configured and no Visual Studio found — "
                         "using {} for {} (MinGW-w64, self-contained)",
-                        *tcSpec, state.overrides.target_triple));
-        if (auto cfgW = get_cfg(); cfgW) {
-            if (mcpp::config::write_default_toolchain(**cfgW, *tcSpec))
-                (*cfgW)->defaultToolchain = *tcSpec;
+                        *state.tcSpec, state.overrides.target_triple));
+        if (auto cfgW = state.get_cfg(true); cfgW) {
+            if (mcpp::config::write_default_toolchain(**cfgW, *state.tcSpec))
+                (*cfgW)->defaultToolchain = *state.tcSpec;
             if (mcpp::config::write_default_target(**cfgW, state.overrides.target_triple))
                 (*cfgW)->defaultTarget = state.overrides.target_triple;
             mcpp::ui::status("Default",
-                std::format("set to {} → {}", *tcSpec, state.overrides.target_triple));
+                std::format("set to {} → {}", *state.tcSpec, state.overrides.target_triple));
         }
-        tcOrigin = TcOrigin::FirstRun;
+        state.tcOrigin = TcOrigin::FirstRun;
       }
 
       // AND NOW RESOLVE FOR THE TARGET, IF ONE WAS ASKED FOR.
@@ -4440,25 +4485,25 @@ prepare_build(bool print_fingerprint,
       // — SIGSEGV, a stack that ran out. A recursion whose termination depends
       // on state the recursive call does not change is not a depth-one
       // recursion, however its comment reads.
-      if (!targetPassDone
-          && (firstRunNeedsTargetPass
-              || (windowsGnuFirstRun && tcSpec.has_value()))) {
-        targetPassDone = true;
+      if (!state.targetPassDone
+          && (state.firstRunNeedsTargetPass
+              || (state.windowsGnuFirstRun && state.tcSpec.has_value()))) {
+        state.targetPassDone = true;
         return resolve_target_toolchain();
       }
 
       auto detected = mcpp::toolchain::detect(
-          explicit_compiler, runtimePayload, runtimeBindingSnapshot.contractHash);
+          state.explicit_compiler, state.runtimePayload, state.runtimeBindingSnapshot.contractHash);
       if (!detected) return std::unexpected(detected.error().message);
-      tc = std::move(*detected);
+      state.tc = std::move(*detected);
 
       // Something about the resolution the user has to be told, but which is
       // not a failure. Today's only producer is the Windows SDK axis: a managed
       // toolset binds the SDK it was installed with, so a `WindowsSdkDir` in
       // the environment does not apply — and an override that is ignored
       // SILENTLY is indistinguishable from one that was never set.
-      if (!tc->resolutionNote.empty())
-          mcpp::ui::info("note", tc->resolutionNote);
+      if (!state.tc->resolutionNote.empty())
+          mcpp::ui::info("note", state.tc->resolutionNote);
 
       // ── A retargetable driver has to be TOLD what it is targeting ────────
       //
@@ -4512,9 +4557,9 @@ prepare_build(bool print_fingerprint,
       if (!state.overrides.target_triple.empty()) {
           if (auto want = mcpp::toolchain::triple::parse(state.overrides.target_triple);
               want && (want->is_freestanding()
-                       || tc->compiler == mcpp::toolchain::CompilerId::Clang))
+                       || state.tc->compiler == mcpp::toolchain::CompilerId::Clang))
           {
-              tc->targetTriple = want->str();
+              state.tc->targetTriple = want->str();
 
               // AND THE GATE THAT ALREADY EXISTS FOR THIS, APPLIED WHERE THE
               // ANSWER IS KNOWN.
@@ -4542,7 +4587,7 @@ prepare_build(bool print_fingerprint,
               // the final triple would also change what every OTHER clang cross
               // target gets, and those are measured as they stand; the claim
               // being made here is only the one the gate already states.
-              if (want->has_own_sysroot()) tc->linkRuntimeDirs.clear();
+              if (want->has_own_sysroot()) state.tc->linkRuntimeDirs.clear();
 
               // And the flag that says it to the driver — for a HOSTED target
               // only. Freestanding already emits its own `--target`, together
@@ -4550,10 +4595,10 @@ prepare_build(bool print_fingerprint,
               // (freestanding/target.cppm); a second one here would be the same
               // decision in two places.
               if (!want->is_freestanding()
-                  && tc->compiler == mcpp::toolchain::CompilerId::Clang) {
-                  tc->crossTargetFlag =
+                  && state.tc->compiler == mcpp::toolchain::CompilerId::Clang) {
+                  state.tc->crossTargetFlag =
                       "--target=" + want->llvm_triple(
-                          min_platform_version(*state.m, *want, tc->binaryPath));
+                          min_platform_version(*state.m, *want, state.tc->binaryPath));
 
                   // AND THE SAME FLAG ON THE std MODULE'S OWN COMMANDS, FOR A
                   // PAYLOAD THAT SERVES MORE THAN ONE TARGET.
@@ -4582,7 +4627,7 @@ prepare_build(bool print_fingerprint,
                   // targets", and Android is the only row that has it; a future
                   // row brings its own measurement.
                   if (want->is_android()) {
-                      tc->stdModuleTargetFlags = " " + tc->crossTargetFlag;
+                      state.tc->stdModuleTargetFlags = " " + state.tc->crossTargetFlag;
                       // BIONIC'S ctype HEADER AND A MODULE'S EXPORT RULES.
                       //
                       // bionic declares `isalnum` and its neighbours
@@ -4614,13 +4659,13 @@ prepare_build(bool print_fingerprint,
                       auto stdDefines = [&]() -> std::vector<std::string> {
                           auto desc =
                               mcpp::toolchain::payload_descriptor_for_compiler(
-                                  tc->binaryPath);
+                                  state.tc->binaryPath);
                           if (desc && *desc && !(*desc)->stdModuleDefines.empty())
                               return (*desc)->stdModuleDefines;
                           return { "__BIONIC_CTYPE_INLINE=" };
                       }();
                       for (auto const& def : stdDefines)
-                          tc->stdModuleTargetFlags += " -D" + def;
+                          state.tc->stdModuleTargetFlags += " -D" + def;
                   }
 
                   // ── iOS: THE COMPILER IS OURS, THE SDK IS THE MACHINE'S ──
@@ -4665,7 +4710,7 @@ prepare_build(bool print_fingerprint,
                               "gate that locates it did not run for this "
                               "request", want->str()));
                       }
-                      tc->appleSdkRoot = *state.appleSdkLocated;
+                      state.tc->appleSdkRoot = *state.appleSdkLocated;
                       auto sdk = state.appleSdkLocated;
                       // AND THE std MODULE'S OWN COMMAND, WHICH IS A SEPARATE
                       // CHANNEL. Same reason the Android rows set it: the
@@ -4682,8 +4727,8 @@ prepare_build(bool print_fingerprint,
                       // `-isystem`). The string is spliced into a shell
                       // command, and an Xcode installed as `Xcode 16.app` is
                       // a path with a space in it.
-                      tc->stdModuleTargetFlags =
-                          " " + tc->crossTargetFlag
+                      state.tc->stdModuleTargetFlags =
+                          " " + state.tc->crossTargetFlag
                           + " -isysroot " + mcpp::xlings::shq(sdk->string());
                   }
               }
@@ -4708,9 +4753,9 @@ prepare_build(bool print_fingerprint,
               // an ordinary package (`mcpplibs.std.freestanding`), so mcpp's job
               // here is to stop pretending the hosted one exists and to say
               // where the other one is.
-              tc->hasImportStd = false;
-              tc->stdModuleSource.clear();
-              tc->stdCompatSource.clear();
+              state.tc->hasImportStd = false;
+              state.tc->stdModuleSource.clear();
+              state.tc->stdCompatSource.clear();
 
               // ── The target's C library, resolved like its compiler ─────────
               //
@@ -4729,7 +4774,7 @@ prepare_build(bool print_fingerprint,
                       mcpp::toolchain::triple::effective_sysroot(
                           *want, sysroot_override(*state.m, *want));
                   !want_sysroot.empty()) {
-                  if (auto cfg3 = get_cfg(); cfg3) {
+                  if (auto cfg3 = state.get_cfg(true); cfg3) {
                       auto ref = mcpp::xlings::paths::parse_xpkg_ref(want_sysroot);
                       auto xl  = mcpp::config::make_xlings_env(**cfg3);
                       // INSTALLED, NOT MERELY LOOKED UP — THE SAME CHANNEL
@@ -4773,12 +4818,12 @@ prepare_build(bool print_fingerprint,
                               const auto lib =
                                   *dir / "lib"     / std::string(spec->libdir);
                               std::error_code ec2;
-                              tc->targetSysrootRoot = *dir;
-                              tc->targetSysrootPkg  = ref.name;
+                              state.tc->targetSysrootRoot = *dir;
+                              state.tc->targetSysrootPkg  = ref.name;
                               if (std::filesystem::is_directory(inc, ec2))
-                                  tc->targetSysrootInclude = inc;
+                                  state.tc->targetSysrootInclude = inc;
                               if (std::filesystem::is_directory(lib, ec2))
-                                  tc->targetSysrootLib = lib;
+                                  state.tc->targetSysrootLib = lib;
                           }
                       }
                   }
@@ -4788,12 +4833,12 @@ prepare_build(bool print_fingerprint,
 
       // THE MSVC TOOLSET OF THE CLANG ROW, chosen once and recorded before the
       // runtime identity below reads its SDK version. See bind_msvc_sysroot.
-      if (tc->compiler == mcpp::toolchain::CompilerId::Clang
-          && mcpp::toolchain::is_msvc_target(*tc)) {
-          auto bound = bind_msvc_sysroot(*tc, *state.m, [&] { return get_cfg(); });
+      if (state.tc->compiler == mcpp::toolchain::CompilerId::Clang
+          && mcpp::toolchain::is_msvc_target(*state.tc)) {
+          auto bound = bind_msvc_sysroot(*state.tc, *state.m, [&] { return state.get_cfg(true); });
           if (!bound) return std::unexpected(bound.error());
-      } else if (tc->compiler == mcpp::toolchain::CompilerId::MSVC) {
-          if (auto ok = check_cl_row_sysroot(*tc, *state.m); !ok)
+      } else if (state.tc->compiler == mcpp::toolchain::CompilerId::MSVC) {
+          if (auto ok = check_cl_row_sysroot(*state.tc, *state.m); !ok)
               return std::unexpected(ok.error());
       }
 
@@ -4808,10 +4853,10 @@ prepare_build(bool print_fingerprint,
       // `ucrt@<v>` is a COMPATIBILITY FLOOR, not a payload binding like
       // `glibc@<v>`: ucrtbase.dll is an OS component and mcpp ships no
       // redistributable for it. See mcpp.runtime.binding.
-      if (!tc->windowsSdkVersion.empty()) {
+      if (!state.tc->windowsSdkVersion.empty()) {
           mcpp::platform::runtime::bind_windows_ucrt(
-              runtimeBindingSnapshot, tc->windowsSdkVersion);
-          tc->runtimeContractHash = runtimeBindingSnapshot.contractHash;
+              state.runtimeBindingSnapshot, state.tc->windowsSdkVersion);
+          state.tc->runtimeContractHash = state.runtimeBindingSnapshot.contractHash;
       }
 
       // ── Targeting the MSVC ABI without a usable MSVC ─────────────────────
@@ -4825,9 +4870,9 @@ prepare_build(bool print_fingerprint,
       // Deriving the same judgement in two places is how the second case went
       // unnoticed, so they are now one condition with two outcomes.
       const bool targetsMsvcAbi =
-          tc->compiler == mcpp::toolchain::CompilerId::MSVC
-          || mcpp::toolchain::is_msvc_target(*tc);
-      if (targetsMsvcAbi && !msvc_usable_either_origin()) {
+          state.tc->compiler == mcpp::toolchain::CompilerId::MSVC
+          || mcpp::toolchain::is_msvc_target(*state.tc);
+      if (targetsMsvcAbi && !state.msvc_usable_either_origin()) {
           // Native cl.exe is ALWAYS a deliberate choice: mcpp never selects
           // msvc@system on its own — it cannot install one — so the only way it
           // reaches config.toml is a user typing `mcpp toolchain default msvc`.
@@ -4842,7 +4887,7 @@ prepare_build(bool print_fingerprint,
           // a user who wants that failure can pin it in mcpp.toml, which is
           // honoured exactly.
           const bool userChoseMsvcItself =
-              tc->compiler == mcpp::toolchain::CompilerId::MSVC;
+              state.tc->compiler == mcpp::toolchain::CompilerId::MSVC;
           // AND NOT A COMPILER THE GRAPH REQUIRED. The repair below rewrites
           // the machine's default to winlibs GCC, which is right when mcpp's
           // own default cannot work here. A family a package REQUIRED is not
@@ -4851,14 +4896,14 @@ prepare_build(bool print_fingerprint,
           // while having changed the user's configuration on the way there.
           // Refusing at the decision is what the rest of this release is about.
           const bool mayRepair =
-              !tc_origin_is_user_explicit(tcOrigin)
-              && tc_origin_may_persist(tcOrigin)
+              !tc_origin_is_user_explicit(state.tcOrigin)
+              && tc_origin_may_persist(state.tcOrigin)
               && !userChoseMsvcItself
               && !mcpp::platform::env::offline_mode()
               && !mcpp::platform::env::no_auto_install()
               && mcpp::platform::is_windows;
           if (!mayRepair) {
-              return std::unexpected(msvc_unavailable_guidance(*tc));
+              return std::unexpected(msvc_unavailable_guidance(*state.tc));
           }
           // mcpp chose this default itself and it cannot work on this machine.
           // Revise it — including for users who already have `llvm@20.1.7`
@@ -4869,7 +4914,7 @@ prepare_build(bool print_fingerprint,
           mcpp::ui::info("Toolchain",
               std::format("{} targets the MSVC ABI but no Visual Studio "
                           "(MSVC STL + Windows SDK) was found — switching to {} → {}",
-                          tcSpec.value_or("the configured default"),
+                          state.tcSpec.value_or("the configured default"),
                           pins::kFirstRunWinGnu, pins::kFirstRunWinGnuTarget));
 
           state.overrides.target_triple = std::string(pins::kFirstRunWinGnuTarget);
@@ -4884,7 +4929,7 @@ prepare_build(bool print_fingerprint,
               gnuSpec->target = *t;
           auto gnuPkg = mcpp::toolchain::to_xim_package(*gnuSpec);
 
-          auto cfgR = get_cfg();
+          auto cfgR = state.get_cfg(true);
           if (!cfgR) return std::unexpected(cfgR.error());
           mcpp::fetcher::Fetcher fetcherR(**cfgR);
           mcpp::fetcher::InstallProgressHandler progressR;
@@ -4901,20 +4946,20 @@ prepare_build(bool print_fingerprint,
           auto gnuFrontendR =
               mcpp::toolchain::payload_frontend(payloadR->root, gnuPkg);
           if (!gnuFrontendR) return std::unexpected(gnuFrontendR.error());
-          explicit_compiler = *gnuFrontendR;
-          if (!std::filesystem::exists(explicit_compiler)) {
+          state.explicit_compiler = *gnuFrontendR;
+          if (!std::filesystem::exists(state.explicit_compiler)) {
               return std::unexpected(std::format(
                   "MinGW-w64 payload {} has no known C++ frontend in {}",
                   gnuPkg.target(),
                   mcpp::toolchain::payload_frontend_dir(payloadR->root, gnuPkg).string()));
           }
-          provide_runtime_payload(gnuPkg);
+          state.provide_runtime_payload(gnuPkg);
           if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
                   **cfgR, payloadR->root, gnuPkg,
-                  runtimeBindingSnapshot.runtimeId, runtimeLibDir); !fixed)
+                  state.runtimeBindingSnapshot.runtimeId, state.runtimeLibDir); !fixed)
               return std::unexpected(std::format(
                   "MinGW toolchain post-install fixup: {}", fixed.error()));
-          else report_fixup(*fixed, payloadR->root);
+          else state.report_fixup(*fixed, payloadR->root);
 
           // Persist both axes so the repair happens once, not on every build.
           if (mcpp::config::write_default_toolchain(**cfgR, pins::kFirstRunWinGnu))
@@ -4922,19 +4967,19 @@ prepare_build(bool print_fingerprint,
           if (mcpp::config::write_default_target(**cfgR, state.overrides.target_triple))
               (*cfgR)->defaultTarget = state.overrides.target_triple;
 
-          tcSpec   = std::string(pins::kFirstRunWinGnu);
-          tcOrigin = TcOrigin::FirstRun;
+          state.tcSpec   = std::string(pins::kFirstRunWinGnu);
+          state.tcOrigin = TcOrigin::FirstRun;
           auto redetected = mcpp::toolchain::detect(
-              explicit_compiler, runtimePayload,
-              runtimeBindingSnapshot.contractHash);
+              state.explicit_compiler, state.runtimePayload,
+              state.runtimeBindingSnapshot.contractHash);
           if (!redetected) return std::unexpected(redetected.error().message);
-          tc = std::move(*redetected);
+          state.tc = std::move(*redetected);
       }
 
       // For musl-gcc the toolchain is fully self-contained
       // (`<root>/x86_64-linux-musl/{include,lib}` is its own sysroot).
       // musl-gcc's `-dumpmachine` reports `x86_64-linux-musl`.
-      bool isMuslTc = mcpp::toolchain::is_musl_target(*tc);
+      bool isMuslTc = mcpp::toolchain::is_musl_target(*state.tc);
 
       // A musl toolchain only really makes sense with static linkage —
       // dynamic-musl binaries depend on a system /lib/ld-musl-x86_64.so.1
@@ -5005,12 +5050,12 @@ prepare_build(bool print_fingerprint,
     // sub-build is handed when its package names no toolchain (#710), so the
     // tool is built by the compiler the store key records.
     auto host_spec_for_build_program = [&]() -> std::string {
-        if (!tcSpec) return {};
-        if (state.overrides.target_triple.empty()) return *tcSpec;
-        return (tcOrigin == TcOrigin::TargetPin && state.hostSpecBeforeRowPin.has_value()
+        if (!state.tcSpec) return {};
+        if (state.overrides.target_triple.empty()) return *state.tcSpec;
+        return (state.tcOrigin == TcOrigin::TargetPin && state.hostSpecBeforeRowPin.has_value()
                 && !state.hostSpecBeforeRowPin->empty() && *state.hostSpecBeforeRowPin != "system")
             ? *state.hostSpecBeforeRowPin
-            : (tcOrigin == TcOrigin::TargetPin ? native_first_run_spec() : *tcSpec);
+            : (state.tcOrigin == TcOrigin::TargetPin ? state.native_first_run_spec() : *state.tcSpec);
     };
     auto host_tc_for_build_program = [&]() -> std::expected<
             std::pair<std::filesystem::path, mcpp::toolchain::Toolchain>, std::string> {
@@ -5072,11 +5117,11 @@ prepare_build(bool print_fingerprint,
         // toolchain was resolved at all, and its classified refusal is correct.
         if (state.overrides.target_triple.empty())
             return std::pair{
-                explicit_compiler.empty() ? tc->binaryPath : explicit_compiler,
-                as_host(*tc)};
+                state.explicit_compiler.empty() ? state.tc->binaryPath : state.explicit_compiler,
+                as_host(*state.tc)};
         if (hostTcCache)
             return std::pair{hostTcCache->first, as_host(hostTcCache->second)};
-        if (!tcSpec || *tcSpec == "system" || state.tcSpecIsMsvc) {
+        if (!state.tcSpec || *state.tcSpec == "system" || state.tcSpecIsMsvc) {
             // A READABLE REFUSAL THAT HAD NO CODE, so the target matrix
             // recorded four identical `other` cells for it. The sentence was
             // right; the classification was missing. Measured on windows-2022
@@ -5122,7 +5167,7 @@ prepare_build(bool print_fingerprint,
         }
         // Deliberately NO target injection: the spec resolves for the host.
         auto pkg = mcpp::toolchain::to_xim_package(*spec);
-        auto cfgH = get_cfg();
+        auto cfgH = state.get_cfg(true);
         if (!cfgH) return std::unexpected(cfgH.error());
         mcpp::fetcher::Fetcher fetcher(**cfgH);
         mcpp::fetcher::InstallProgressHandler progress;
@@ -5141,13 +5186,13 @@ prepare_build(bool print_fingerprint,
                 pkg.target(),
                     mcpp::toolchain::payload_frontend_dir(payload->root, pkg).string()));
         }
-        provide_runtime_payload(pkg);
+        state.provide_runtime_payload(pkg);
         if (auto fixed = mcpp::toolchain::ensure_post_install_fixup(
                 **cfgH, payload->root, pkg,
-                runtimeBindingSnapshot.runtimeId, runtimeLibDir); !fixed)
+                state.runtimeBindingSnapshot.runtimeId, state.runtimeLibDir); !fixed)
             return std::unexpected(std::format(
                 "host toolchain post-install fixup: {}", fixed.error()));
-        else report_fixup(*fixed, payload->root);
+        else state.report_fixup(*fixed, payload->root);
         // SAME THREE ARGUMENTS THE NATIVE CALL USES (line ~3550), not the
         // one-argument form. `detect()` probes `payloadPaths` — the
         // fine-grained glibc/linux-headers xpkg directories `resolve_link_model`
@@ -5182,7 +5227,7 @@ prepare_build(bool print_fingerprint,
         // them here is not a parallel derivation; it is the one this function
         // already had in scope and the native call already trusts.
         auto htc = mcpp::toolchain::detect(
-            frontend, runtimePayload, runtimeBindingSnapshot.contractHash);
+            frontend, state.runtimePayload, state.runtimeBindingSnapshot.contractHash);
         if (!htc) return std::unexpected(htc.error().message);
         mcpp::ui::info("Resolved", std::format(
             "host toolchain for build.mcpp: {}", htc->label()));
@@ -5215,7 +5260,7 @@ prepare_build(bool print_fingerprint,
     // Nothing here decides anything itself — in particular the "a miss proves
     // nothing for this namespace" rule must not be re-derived; see that module.
     if (!state.m->dependencies.empty()) {
-        if (auto cfg2 = get_cfg()) {
+        if (auto cfg2 = state.get_cfg(true)) {
             auto xlEnv  = mcpp::config::make_xlings_env(**cfg2);
             auto policy = mcpp::pm::policy_for(**cfg2);
             // Same routing the dependency walk below uses (the `index_route`
@@ -5223,7 +5268,7 @@ prepare_build(bool print_fingerprint,
             mcpp::pm::IndexRoute route{ &state.m->indices, *state.root, *cfg2 };
             for (auto& [depName, spec] : state.m->dependencies) {
                 auto decision = mcpp::pm::decide_for_dependency(
-                    route, depName, spec, xlEnv, targetPlatform, policy);
+                    route, depName, spec, xlEnv, *state.targetPlatform, policy);
                 if (!decision.shouldRefresh) {
                     mcpp::log::verbose("index", std::format(
                         "{}: {}", decision.subject,
@@ -5283,7 +5328,7 @@ prepare_build(bool print_fingerprint,
         !state.overrides.inherited_runtime_binding
         && (!runtimeOwnerManifest.xlings.empty() || !targetSysroot.empty());
     if (!state.m->indices.empty() || materializeRootRuntime) {
-        auto cfg2 = get_cfg();
+        auto cfg2 = state.get_cfg(true);
         if (cfg2) {
             mcpp::xlings::ProjectEnv penv;
             if (materializeRootRuntime) {
@@ -5740,14 +5785,14 @@ prepare_build(bool print_fingerprint,
     {
         if (s.isPath() || s.isGit()) return {};
         if (!mcpp::pm::is_version_constraint(s.version)) return {};
-        auto cfg = get_cfg();
+        auto cfg = state.get_cfg(true);
         if (!cfg) return std::unexpected(cfg.error());
         // 0.0.10+: use structured namespace from DependencySpec. The route (not
         // a bare Fetcher) is what reaches a descriptor served by a project
         // `[indices]` entry — see #308.
         auto resolved = mcpp::pm::resolve_semver(
             s.namespace_, s.shortName.empty() ? depName : s.shortName,
-            s.version, index_route(*cfg), targetPlatform);
+            s.version, index_route(*cfg), *state.targetPlatform);
         if (!resolved) return std::unexpected(resolved.error());
         mcpp::ui::info("Resolved",
             std::format("{} {} → v{}", depName, s.version, *resolved));
@@ -5789,7 +5834,7 @@ prepare_build(bool print_fingerprint,
         [&](const mcpp::pm::DependencyCoordinate& coord)
             -> std::optional<std::string>
     {
-        auto cfg = get_cfg();
+        auto cfg = state.get_cfg(true);
         if (!cfg) return std::nullopt;
         return index_route(*cfg).read(coord);
     };
@@ -6039,7 +6084,7 @@ prepare_build(bool print_fingerprint,
                 // this already-failed path and its result never leaves the
                 // error string (see Fetcher::scan_short_name_matches).
                 std::string hint;
-                if (auto cfg = get_cfg()) {
+                if (auto cfg = state.get_cfg(true)) {
                     auto suggestions = mcpp::pm::cross_namespace_suggestions(
                         index_route(*cfg), candidates.front().shortName);
                     if (!suggestions.empty()) {
@@ -6069,7 +6114,7 @@ prepare_build(bool print_fingerprint,
                 // is from last month" are easy to confuse. State which index
                 // answered and how old it is, so the next step is obvious
                 // instead of guessed at.
-                if (auto cfgA = get_cfg()) {
+                if (auto cfgA = state.get_cfg(true)) {
                     hint += std::format("\n  index: {}\n  hint: `mcpp index update` "
                                         "if it was published recently",
                         mcpp::pm::staleness_note(
@@ -6079,7 +6124,7 @@ prepare_build(bool print_fingerprint,
                 // nothing about the package: nothing has been downloaded to look
                 // in. That is a download the run needs, not a wrong selector.
                 if (mcpp::platform::env::offline_mode()) {
-                    if (auto cfgO = get_cfg();
+                    if (auto cfgO = state.get_cfg(true);
                         cfgO && !mcpp::xlings::default_index_status(
                                      mcpp::config::make_xlings_env(**cfgO), 0).present) {
                         hint += "\n  offline: the package index has never been fetched; "
@@ -6118,7 +6163,7 @@ prepare_build(bool print_fingerprint,
                          const std::string& version)
         -> std::expected<LoadedDep, std::string>
     {
-        auto cfg = get_cfg();
+        auto cfg = state.get_cfg(true);
         if (!cfg) return std::unexpected(cfg.error());
         mcpp::fetcher::Fetcher fetcher(**cfg);
 
@@ -6167,7 +6212,7 @@ prepare_build(bool print_fingerprint,
             }
             if (field.kind == mcpp::manifest::McppField::TableBody) {
                 auto dm = mcpp::manifest::synthesize_from_xpkg_lua(
-                    *luaContent, shortName, version, targetPlatform);
+                    *luaContent, shortName, version, *state.targetPlatform);
                 if (!dm) return false;
                 for (auto const& [generatedPath, _] : dm->buildConfig.generatedFiles) {
                     if (!generatedPath.empty()) return true;
@@ -6199,7 +6244,7 @@ prepare_build(bool print_fingerprint,
         const int recipeRevision = [&] {
             if (!luaContent) return 0;
             for (auto const& e : mcpp::manifest::list_xpkg_version_entries(
-                     *luaContent, targetPlatform))
+                     *luaContent, *state.targetPlatform))
                 if (e.version == version) return e.revision;
             return 0;
         }();
@@ -6255,7 +6300,7 @@ prepare_build(bool print_fingerprint,
                 auto field = mcpp::manifest::extract_mcpp_field(*luaContent);
                 if (field.kind == mcpp::manifest::McppField::TableBody) {
                     auto depManifest = mcpp::manifest::synthesize_from_xpkg_lua(
-                        *luaContent, shortName, version, targetPlatform);
+                        *luaContent, shortName, version, *state.targetPlatform);
                     if (!depManifest) {
                         return std::unexpected(std::format(
                             "dependency '{}': {}", depName, depManifest.error().format()));
@@ -6424,7 +6469,7 @@ prepare_build(bool print_fingerprint,
             // version. Scoped: restored when this dependency's install returns,
             // compat retries below included.
             mcpp::build::BuildProgramEnv hookEnv;
-            fill_target_build_env(hookEnv, *state.m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
+            fill_target_build_env(hookEnv, *state.m, state.tc ? &*state.tc : nullptr, state.cfg_opt ? &*state.cfg_opt : nullptr);
             hookEnv.targetTriple = state.overrides.target_triple;
             // Six names, fixed by install_hook_env; one guard each.
             const auto hookVars = mcpp::build::install_hook_env(hookEnv);
@@ -6545,7 +6590,7 @@ prepare_build(bool print_fingerprint,
             if (auto r = loadFrom(matches.front()); !r) return std::unexpected(r.error());
         } else if (field.kind == mcpp::manifest::McppField::TableBody) {
             auto dm = mcpp::manifest::synthesize_from_xpkg_lua(
-                *luaContent, shortName, version, targetPlatform);
+                *luaContent, shortName, version, *state.targetPlatform);
             if (!dm) return std::unexpected(std::format(
                 "dependency '{}': {}", depName, dm.error().format()));
             warn_unknown_xpkg_keys(*dm, depName);
@@ -6611,13 +6656,13 @@ prepare_build(bool print_fingerprint,
         // pass through loadVersionDep.
         if (!manifest->conditionalConfigs.empty()) {
             merge_conditional_config(*manifest,
-                                    cfgCtx());
+                                    state.cfgCtx());
         }
         report_flag_words_changes(*manifest);
         fold_build_defines_into_flags(manifest->buildConfig);
         // The root's `abi.threads` reaches a dependency's C translation units
         // here; its C++ units already receive it through the dialect flag set.
-        if (abiThreadsRendered) add_once(manifest->buildConfig.cflags, "-pthread");
+        if (state.abiThreadsRendered) state.add_once(manifest->buildConfig.cflags, "-pthread");
 
         return std::pair{effRoot, std::move(*manifest)};
     };
@@ -6918,7 +6963,7 @@ prepare_build(bool print_fingerprint,
             }
         }
         if (declared.empty()) return;
-        auto cfg = get_cfg();
+        auto cfg = state.get_cfg(true);
         if (!cfg) return;
         auto xlEnv = mcpp::config::make_xlings_env(**cfg);
         std::set<std::string> answered;
@@ -8060,14 +8105,14 @@ prepare_build(bool print_fingerprint,
                 // overlap converge here; cross-major or otherwise
                 // unsatisfiable pairs fall through to a hard error (a future
                 // PR adds multi-version mangling as a Level-1 fallback).
-                auto cfg = get_cfg();
+                auto cfg = state.get_cfg(true);
                 if (!cfg) return std::unexpected(cfg.error());
 
                 auto merged = mcpp::pm::try_merge_semver(
                     key.ns, key.shortName,
                     it->second.constraint,
                     item.originalConstraint,
-                    index_route(*cfg), targetPlatform);
+                    index_route(*cfg), *state.targetPlatform);
                 if (!merged) {
                     // Level 1 fallback: multi-version mangling. Two
                     // versions can't be reconciled by SemVer, but they
@@ -8664,13 +8709,13 @@ prepare_build(bool print_fingerprint,
             // snapshot this manifest's flags/sources into `packages[]`.
             if (!dep_manifest->conditionalConfigs.empty()) {
                 merge_conditional_config(*dep_manifest,
-                    cfgCtx());
+                    state.cfgCtx());
             }
             report_flag_words_changes(*dep_manifest);
             fold_build_defines_into_flags(dep_manifest->buildConfig);
             // The root's `abi.threads` reaches this dependency's C translation
             // units here, as it does for a version dependency.
-            if (abiThreadsRendered) add_once(dep_manifest->buildConfig.cflags, "-pthread");
+            if (state.abiThreadsRendered) state.add_once(dep_manifest->buildConfig.cflags, "-pthread");
         } else {
             auto loaded = loadVersionDep(name, key.ns, key.shortName, spec.version);
             if (!loaded) return std::unexpected(loaded.error());
@@ -9012,7 +9057,7 @@ prepare_build(bool print_fingerprint,
                     reqCompilerBy, family));
             }
 
-            if (auto cfg = get_cfg(); cfg) {
+            if (auto cfg = state.get_cfg(true); cfg) {
                 auto pkg = mcpp::toolchain::to_xim_package(*spec);
                 if (auto picked = mcpp::toolchain::resolve_version_match(
                         "", mcpp::toolchain::list_installed_versions(
@@ -9108,17 +9153,17 @@ prepare_build(bool print_fingerprint,
         // something that does not depend on either of them.
         if (!state.targetPinCandidate.empty()
             && (!graphSuppliesSystem || state.targetPinIsCapability)) {
-            if (tcOrigin == TcOrigin::GlobalDefault && tcSpec.has_value()
-                && *tcSpec != state.targetPinCandidate)
-                state.pinReplacedDefault = *tcSpec;
+            if (state.tcOrigin == TcOrigin::GlobalDefault && state.tcSpec.has_value()
+                && *state.tcSpec != state.targetPinCandidate)
+                state.pinReplacedDefault = *state.tcSpec;
             // Kept for the build program's host resolution; see the
             // declaration. Taken from every origin, not only the global
             // default, because a `[toolchain]` the manifest named is just as
             // much the host's compiler as a remembered default is.
-            if (tcSpec.has_value() && *tcSpec != state.targetPinCandidate)
-                state.hostSpecBeforeRowPin = *tcSpec;
-            tcSpec   = state.targetPinCandidate;
-            tcOrigin = TcOrigin::TargetPin;
+            if (state.tcSpec.has_value() && *state.tcSpec != state.targetPinCandidate)
+                state.hostSpecBeforeRowPin = *state.tcSpec;
+            state.tcSpec   = state.targetPinCandidate;
+            state.tcOrigin = TcOrigin::TargetPin;
         }
 
         // THE GRAPH'S REQUIREMENT, TAKEN AS AN INSTRUCTION RATHER THAN AS A
@@ -9148,11 +9193,11 @@ prepare_build(bool print_fingerprint,
         // mismatch further down against what the driver actually turned out to
         // be, which is the only place that answer exists.
         const bool tcIsSystemEscapeHatch =
-            tcSpec.has_value() && *tcSpec == "system";
+            state.tcSpec.has_value() && *state.tcSpec == "system";
         if (!reqCompiler.empty() && !tcIsSystemEscapeHatch) {
             std::string haveFamily;
-            if (tcSpec.has_value())
-                if (auto s = mcpp::toolchain::parse_toolchain_spec(*tcSpec); s)
+            if (state.tcSpec.has_value())
+                if (auto s = mcpp::toolchain::parse_toolchain_spec(*state.tcSpec); s)
                     haveFamily =
                         std::string(mcpp::toolchain::family_name(s->family));
 
@@ -9163,7 +9208,7 @@ prepare_build(bool print_fingerprint,
                 // graph disagreeing with one of them is a real contradiction and
                 // `check_requirements` reports it further down with both names.
                 // Nothing to do here but leave the value alone.
-                if (tc_origin_is_user_explicit(tcOrigin)) {
+                if (tc_origin_is_user_explicit(state.tcOrigin)) {
                     // fall through to check_requirements
                 }
                 // A ROW'S PIN THAT SURVIVED TO HERE CANNOT BE OVERRIDDEN BY
@@ -9182,7 +9227,7 @@ prepare_build(bool print_fingerprint,
                 // Either way the requirement cannot be honoured, and saying so
                 // here — where both halves are known — beats a compiler
                 // complaining about a file the reader never named.
-                else if (tcOrigin == TcOrigin::TargetPin) {
+                else if (state.tcOrigin == TcOrigin::TargetPin) {
                     // THE TWO ROWS REFUSE UNDER ONE RULE AND FOR TWO
                     // REASONS, AND ONE REMEDY DOES NOT SERVE BOTH.
                     //
@@ -9238,11 +9283,11 @@ prepare_build(bool print_fingerprint,
                     auto pickedSpec = resolve_required_family(reqCompiler);
                     if (!pickedSpec)
                         return std::unexpected(pickedSpec.error());
-                    state.graphCompilerReplaced   = tcSpec.value_or("");
+                    state.graphCompilerReplaced   = state.tcSpec.value_or("");
                     state.graphCompilerRequiredBy = reqCompilerBy;
                     state.graphCompilerFamily     = reqCompiler;
-                    tcSpec   = *pickedSpec;
-                    tcOrigin = TcOrigin::GraphRequirement;
+                    state.tcSpec   = *pickedSpec;
+                    state.tcOrigin = TcOrigin::GraphRequirement;
                 }
             }
         }
@@ -9280,8 +9325,8 @@ prepare_build(bool print_fingerprint,
         // this release is about, a predicate answering a question narrower than
         // the one it is asked.
         if (!state.targetRowPin.empty() && !graphSuppliesSystem
-            && tc_origin_is_user_explicit(tcOrigin) && tcSpec.has_value()) {
-            auto declared = mcpp::toolchain::parse_toolchain_spec(*tcSpec);
+            && tc_origin_is_user_explicit(state.tcOrigin) && state.tcSpec.has_value()) {
+            auto declared = mcpp::toolchain::parse_toolchain_spec(*state.tcSpec);
             auto rowTc    = mcpp::toolchain::parse_toolchain_spec(state.targetRowPin);
             if (declared && rowTc && declared->family != rowTc->family) {
                 refusal::record(refusal::Code::ConventionUnreplaced);
@@ -9299,7 +9344,7 @@ prepare_build(bool print_fingerprint,
                     "       openkal-llvm-runtime are the ones in the index), or "
                     "remove the `[toolchain]`\n"
                     "       line so `{}` is used for this target.",
-                    state.targetRowName, state.targetRowPin, *tcSpec, state.targetRowPin));
+                    state.targetRowName, state.targetRowPin, *state.tcSpec, state.targetRowPin));
             }
         }
         if (auto r = resolve_target_toolchain(); !r)
@@ -9356,10 +9401,10 @@ prepare_build(bool print_fingerprint,
         // silent, so a requirement needs no selector. The engine's value is
         // entered first, so a package stating the same name cannot replace it.
         std::map<std::string, std::string> platformFactOrigin;   // name -> the key that sets it
-        if (tc) {
-            if (auto t = mcpp::toolchain::triple::parse(tc->targetTriple);
+        if (state.tc) {
+            if (auto t = mcpp::toolchain::triple::parse(state.tc->targetTriple);
                 t && (t->is_android() || t->is_apple())) {
-                const auto value = min_platform_version(*state.m, *t, tc->binaryPath);
+                const auto value = min_platform_version(*state.m, *t, state.tc->binaryPath);
                 std::string name, origin;
                 if (t->is_android()) {
                     auto row = state.m->targetOverrides.find(t->str());
@@ -9917,7 +9962,7 @@ prepare_build(bool print_fingerprint,
         // package for the build program (MCPP_DEVICE_SOURCES); the engine has
         // no compile rule for them and never will.
         {
-            const auto buildAccel = mcpp::pack::parse_accel(resolvedAccel());
+            const auto buildAccel = mcpp::pack::parse_accel(state.resolvedAccel());
             for (std::size_t i = 0; i < packages.size(); ++i) {
                 auto& pkg = packages[i];
                 auto& bc  = pkg.manifest.buildConfig;
@@ -10113,7 +10158,7 @@ prepare_build(bool print_fingerprint,
             }
             auto const& fromGraph = split->second;
             if (!fromGraph.empty()) {
-                if (auto cfg = get_cfg()) {
+                if (auto cfg = state.get_cfg(true)) {
                     if (auto pv = provision_xlings_addresses(
                             **cfg, fromGraph, *state.root,
                             "[xlings.workspace] entries declared by dependencies");
@@ -10802,7 +10847,7 @@ prepare_build(bool print_fingerprint,
                             state.runtimeSelection);
                     sub.inherited_runtime_binding = std::make_shared<
                         const mcpp::platform::runtime::RuntimeBinding>(
-                            runtimeBindingSnapshot);
+                            state.runtimeBindingSnapshot);
                     sub.tool_chain    = state.overrides.tool_chain.empty()
                         ? std::format("root → {}:{}", depName, toolName)
                         : std::format("{} → {}:{}", state.overrides.tool_chain, depName,
@@ -10956,10 +11001,10 @@ prepare_build(bool print_fingerprint,
             // library resolved, and the three answers that keep a board
             // package from naming a toolchain. One call, so a new answer
             // reaches every build program at once — see fill_target_build_env.
-            fill_target_build_env(bpEnv, *state.m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
-            bpEnv.toolsBin = projectSubosBin;
-            bpEnv.profile      = effectiveProfile;
-            bpEnv.accel        = resolvedAccel();
+            fill_target_build_env(bpEnv, *state.m, state.tc ? &*state.tc : nullptr, state.cfg_opt ? &*state.cfg_opt : nullptr);
+            bpEnv.toolsBin = state.projectSubosBin;
+            bpEnv.profile      = state.effectiveProfile;
+            bpEnv.accel        = state.resolvedAccel();
             // The DECLARING package's setting, not the root project's: a rule
             // generating a declaration for this package must match how this
             // package is compiled.
@@ -11442,10 +11487,10 @@ prepare_build(bool print_fingerprint,
         };
 
         tsd::Inputs in;
-        if (tc) {
-            if (auto tt = mcpp::toolchain::triple::parse(tc->targetTriple)) {
+        if (state.tc) {
+            if (auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple)) {
                 in.llvmTriple         = tt->llvm_triple(
-                    min_platform_version(*state.m, *tt, tc->binaryPath));
+                    min_platform_version(*state.m, *tt, state.tc->binaryPath));
                 in.targetOs           = tt->os;
                 in.targetEnv          = tt->env;
                 in.freestandingTarget = tt->is_freestanding();
@@ -11484,13 +11529,13 @@ prepare_build(bool print_fingerprint,
                     in.sysrootXpkg = mcpp::toolchain::triple::effective_sysroot(
                         *tt, sysroot_override(*state.m, *tt));
             }
-            in.payloadLibcRef      = tc->targetSysrootPkg;
-            in.payloadCxxInterface = tc->stdlibId;
+            in.payloadLibcRef      = state.tc->targetSysrootPkg;
+            in.payloadCxxInterface = state.tc->stdlibId;
             // The compiler is a layer, and it is the one layer no package can
             // supply. It enters here so that a requirement has something to be
             // checked against and so the report can show the whole stack.
-            in.compilerFamily  = std::string(tc->compiler_family());
-            in.compilerVersion = tc->version;
+            in.compilerFamily  = std::string(state.tc->compiler_family());
+            in.compilerVersion = state.tc->version;
             // WHETHER THE PAYLOAD HAS A COMPILER RUNTIME FOR AN APPLE CROSS
             // TARGET, read from the payload's own resource directory. Clang's
             // Darwin driver adds `libclang_rt.<platform>.a` from there when
@@ -11502,13 +11547,13 @@ prepare_build(bool print_fingerprint,
             // said earlier (mcpp#630). The engine never looks in Xcode for the
             // archive: a compiler runtime the payload lacks is a graph
             // package, as it is on the bare rows.
-            if (!tc->appleSdkRoot.empty()) {
-                if (auto tt = mcpp::toolchain::triple::parse(tc->targetTriple);
+            if (!state.tc->appleSdkRoot.empty()) {
+                if (auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
                     tt && tt->is_ios()) {
                     const std::string archive = std::format(
                         "libclang_rt.{}.a", tt->is_ios_simulator() ? "iossim" : "ios");
                     const auto payloadRoot =
-                        tc->binaryPath.parent_path().parent_path();
+                        state.tc->binaryPath.parent_path().parent_path();
                     bool found = false;
                     std::error_code ec;
                     for (auto const& ver : std::filesystem::directory_iterator(
@@ -11550,13 +11595,13 @@ prepare_build(bool print_fingerprint,
         // There is no third shape. The row needs lld by name; when the
         // payload has none, the answer is a refusal at the decision, not a
         // different link.
-        if (auto fsT = tc.has_value()
-                     ? mcpp::toolchain::triple::parse(tc->targetTriple)
+        if (auto fsT = state.tc.has_value()
+                     ? mcpp::toolchain::triple::parse(state.tc->targetTriple)
                      : std::nullopt;
             fsT && fsT->is_freestanding()) {
             auto fsSpec = mcpp::freestanding::resolve(*fsT);
             if (fsSpec && !fsSpec->lldEmulation.empty()
-                && mcpp::freestanding::resolve_lld(tc->binaryPath).empty()) {
+                && mcpp::freestanding::resolve_lld(state.tc->binaryPath).empty()) {
                 refusal::record(refusal::Code::LldRequiredAbsent);
                 return std::unexpected(std::format(
                     "target '{}' links through lld directly, and this toolchain "
@@ -11583,7 +11628,7 @@ prepare_build(bool print_fingerprint,
         // one that declares `c-environment = "platform"`, because the
         // exception in §3.4 is about the C ENVIRONMENT a package sees, not
         // about whether `kal_*` may be called from it.
-        if (tc) tc->kernelAbiIsOpenkal =
+        if (state.tc) state.tc->kernelAbiIsOpenkal =
             resolvedTargetSide.kernelAbi.interfaceName == "openkal";
 
         // [c-abi] REALISATION — design §3.2-§3.4. Everything below is
@@ -11595,7 +11640,7 @@ prepare_build(bool print_fingerprint,
         // `[c-abi]` block, and those absences are diagnostic data with
         // nothing in them to realise — `cenv::realise` requires `declared`
         // (cenv.cppm) and would be reading fields nobody wrote.
-        if (tc && resolvedTargetSide.cAbiDecl
+        if (state.tc && resolvedTargetSide.cAbiDecl
             && resolvedTargetSide.cAbiDecl->declared) {
             // `cenv::realise` FIRST, THE COMPILER-FAMILY GATE SECOND — not
             // the other way around (coordinator report, openkal-musl 0.15.0
@@ -11620,7 +11665,7 @@ prepare_build(bool print_fingerprint,
             // realisation is non-empty (the Cygwin-flavoured substitution),
             // and MinGW's `long` is 32-bit regardless of flags (openkal-musl
             // measured), so the gate below still refuses it.
-            auto tt = mcpp::toolchain::triple::parse(tc->targetTriple);
+            auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             auto realised = mcpp::toolchain::cenv::realise(
                 *resolvedTargetSide.cAbiDecl, tt ? tt->os : std::string{},
                 tt ? tt->arch : std::string{}, tt && tt->is_freestanding());
@@ -11629,7 +11674,7 @@ prepare_build(bool print_fingerprint,
                 return std::unexpected(realised.error());
             }
             if ((!realised->tokens.empty() || !realised->builtinsTokens.empty())
-                && !mcpp::toolchain::is_clang(*tc)) {
+                && !mcpp::toolchain::is_clang(*state.tc)) {
                 refusal::record(refusal::Code::CEnvUnrealisable);
                 return std::unexpected(std::format(
                     "the C library ('{}', {}) declares [c-abi] whose "
@@ -11644,14 +11689,14 @@ prepare_build(bool print_fingerprint,
                     "       Select one: [toolchain] default = \"llvm@<version>\", "
                     "or [target.<triple>] toolchain = \"llvm@<version>\".",
                     resolvedTargetSide.cAbi.interfaceName,
-                    resolvedTargetSide.cAbi.impl, tc->compiler_family()));
+                    resolvedTargetSide.cAbi.impl, state.tc->compiler_family()));
             }
-            tc->cEnvTokens          = realised->tokens;
-            tc->cEnvBuiltinsTokens  = realised->builtinsTokens;
-            tc->cEnvExpectWcharBits = realised->expectWcharBits;
-            tc->cEnvExpectLongBytes = realised->expectLongBytes;
-            tc->cEnvExpectDefined   = realised->expectDefined;
-            tc->cEnvExpectUndefined = realised->expectUndefined;
+            state.tc->cEnvTokens          = realised->tokens;
+            state.tc->cEnvBuiltinsTokens  = realised->builtinsTokens;
+            state.tc->cEnvExpectWcharBits = realised->expectWcharBits;
+            state.tc->cEnvExpectLongBytes = realised->expectLongBytes;
+            state.tc->cEnvExpectDefined   = realised->expectDefined;
+            state.tc->cEnvExpectUndefined = realised->expectUndefined;
 
             // VERIFICATION, NOT TRUST (design §3.2). The probe's argv is the
             // IDENTITY-AFFECTING SUBSET of the real command line — the
@@ -11662,9 +11707,9 @@ prepare_build(bool print_fingerprint,
             // is what makes this probe cheap AND cacheable across every
             // package that shares this build's target side.
             //
-            if (tc->cEnvExpectWcharBits != 0 || tc->cEnvExpectLongBytes != 0
-                || !tc->cEnvExpectDefined.empty()
-                || !tc->cEnvExpectUndefined.empty()) {
+            if (state.tc->cEnvExpectWcharBits != 0 || state.tc->cEnvExpectLongBytes != 0
+                || !state.tc->cEnvExpectDefined.empty()
+                || !state.tc->cEnvExpectUndefined.empty()) {
                 // THE FREESTANDING TARGET HAD NEVER REACHED THE PROBE, AND
                 // THAT IS WHY 2026.9.18.3 MEASURED THE HOST (mcpp#674
                 // review, 2026-09-20). `Toolchain::crossTargetFlag` is set
@@ -11710,18 +11755,18 @@ prepare_build(bool print_fingerprint,
                     }
                 }
                 auto assembled = mcpp::toolchain::cenv_probe::assemble_argv(
-                    tc->crossTargetFlag, freestandingFlags,
-                    tc->cEnvTokens, tc->cEnvBuiltinsTokens,
-                    tt && tt->is_freestanding(), tc->targetTriple);
+                    state.tc->crossTargetFlag, freestandingFlags,
+                    state.tc->cEnvTokens, state.tc->cEnvBuiltinsTokens,
+                    tt && tt->is_freestanding(), state.tc->targetTriple);
                 if (!assembled) {
                     refusal::record(refusal::Code::CEnvUnrealisable);
                     return std::unexpected(assembled.error());
                 }
                 const auto& probeArgv = *assembled;
                 auto probe = mcpp::toolchain::cenv_probe::verify(
-                    tc->binaryPath, probeArgv,
-                    tc->cEnvExpectWcharBits, tc->cEnvExpectLongBytes,
-                    tc->cEnvExpectDefined, tc->cEnvExpectUndefined,
+                    state.tc->binaryPath, probeArgv,
+                    state.tc->cEnvExpectWcharBits, state.tc->cEnvExpectLongBytes,
+                    state.tc->cEnvExpectDefined, state.tc->cEnvExpectUndefined,
                     mcpp::home::cache_root());
                 if (!probe) {
                     refusal::record(refusal::Code::CEnvUnrealisable);
@@ -11742,7 +11787,7 @@ prepare_build(bool print_fingerprint,
                         "measured from the compiler's own predefined macros, "
                         "compiled with the exact tokens this build derived "
                         "from the declaration.",
-                        tc->targetTriple, lines));
+                        state.tc->targetTriple, lines));
                 }
             }
         }
@@ -11763,15 +11808,15 @@ prepare_build(bool print_fingerprint,
         // decide on its own), and it does not stop a build the previous
         // release would have allowed — it names, once, the gap the previous
         // release left silent.
-        if (tc && resolvedTargetSide.cAbi.fromGraph()
-            && !mcpp::toolchain::is_clang(*tc)) {
+        if (state.tc && resolvedTargetSide.cAbi.fromGraph()
+            && !mcpp::toolchain::is_clang(*state.tc)) {
             mcpp::diag::degraded("target/c-abi-isolation", std::format(
                 "the target's C library ('{}', {}) comes from the "
                 "dependency graph, and the resolved compiler ('{}') has no "
                 "way to stop its own driver from also searching the host's "
                 "C library headers",
                 resolvedTargetSide.cAbi.interfaceName,
-                resolvedTargetSide.cAbi.impl, tc->compiler_family()),
+                resolvedTargetSide.cAbi.impl, state.tc->compiler_family()),
                 "a host header can still satisfy an #include the graph's "
                 "own headers do not, silently — a Clang-family toolchain "
                 "closes that search entirely (docs/22 'Adaptation To The "
@@ -11784,13 +11829,13 @@ prepare_build(bool print_fingerprint,
         // availability check links and runs without the archive; refusing it
         // would trade a diagnosed hazard for a regression. The degradation
         // names the platform, the file and the package that supplies it.
-        if (resolvedTargetSide.compilerRuntime.absent() && tc) {
-            auto tt = mcpp::toolchain::triple::parse(tc->targetTriple);
+        if (resolvedTargetSide.compilerRuntime.absent() && state.tc) {
+            auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             mcpp::diag::degraded("target/compiler-runtime", std::format(
                 "the toolchain payload carries no compiler runtime for {} "
                 "(no libclang_rt.{}.a under its lib/clang/*/lib/darwin), and no "
                 "package in the graph provides mcpp:compiler-runtime",
-                tc->targetTriple,
+                state.tc->targetTriple,
                 tt && tt->is_ios_simulator() ? "iossim" : "ios"),
                 "a program that reaches an availability check "
                 "(`__builtin_available`, or a system header that uses it) fails "
@@ -11813,7 +11858,7 @@ prepare_build(bool print_fingerprint,
         // HERE AND NOT LATER: `ensure_built` runs at :7368 and every compile
         // line is assembled after it. A std BMI built against a different C
         // library than its importers is what e2e 181 catches.
-        if (tc) tc->cAbiPrebuilt = resolvedTargetSide.cAbi.prebuilt();
+        if (state.tc) state.tc->cAbiPrebuilt = resolvedTargetSide.cAbi.prebuilt();
 
         // ── The target side's include set is a property of the BUILD ─────────
         //
@@ -11950,13 +11995,13 @@ prepare_build(bool print_fingerprint,
         // key, are `mcpp.toolchain.predefines`. That module is the
         // specification and the implementation of the same thing, so this
         // site decides only WHERE the tokens go, never WHICH they are.
-        if (tc) {
+        if (state.tc) {
             std::string targetOs;
-            if (auto ttOs = mcpp::toolchain::triple::parse(tc->targetTriple))
+            if (auto ttOs = mcpp::toolchain::triple::parse(state.tc->targetTriple))
                 targetOs = ttOs->os;
             const auto engineDefines =
                 mcpp::toolchain::predefines::define_tokens(
-                    targetOs, tc->kernelAbiIsOpenkal);
+                    targetOs, state.tc->kernelAbiIsOpenkal);
             // Into `cflags`/`cxxflags` only: these are all `-D`, and the
             // channel that builds an assembly unit's flags keeps the -D/-U/-I
             // words of those two (`compile_commands::unit_asm_flags`), so a
@@ -11967,8 +12012,8 @@ prepare_build(bool print_fingerprint,
             }
         }
 
-        if (tc && (tc->kernelAbiIsOpenkal || !tc->cEnvTokens.empty()
-                   || !tc->cEnvBuiltinsTokens.empty())) {
+        if (state.tc && (state.tc->kernelAbiIsOpenkal || !state.tc->cEnvTokens.empty()
+                   || !state.tc->cEnvBuiltinsTokens.empty())) {
             for (auto& p : packages) {
                 // `__OPENKAL__` is emitted above, with the rest of the
                 // engine's own defines; it is NOT subject to the
@@ -11976,12 +12021,12 @@ prepare_build(bool print_fingerprint,
                 // exception is about which C environment a package's headers
                 // see, not about whether its code may call `kal_*`.
                 if (p.manifest.cEnvironment == "platform") continue;
-                appendUniqueFlags(p.privateBuild.cflags, tc->cEnvTokens);
-                appendUniqueFlags(p.privateBuild.cxxflags, tc->cEnvTokens);
-                appendUniqueFlags(p.privateBuild.asmflags, tc->cEnvTokens);
-                appendUniqueFlags(p.privateBuild.cflags, tc->cEnvBuiltinsTokens);
-                appendUniqueFlags(p.privateBuild.cxxflags, tc->cEnvBuiltinsTokens);
-                appendUniqueFlags(p.privateBuild.asmflags, tc->cEnvBuiltinsTokens);
+                appendUniqueFlags(p.privateBuild.cflags, state.tc->cEnvTokens);
+                appendUniqueFlags(p.privateBuild.cxxflags, state.tc->cEnvTokens);
+                appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvTokens);
+                appendUniqueFlags(p.privateBuild.cflags, state.tc->cEnvBuiltinsTokens);
+                appendUniqueFlags(p.privateBuild.cxxflags, state.tc->cEnvBuiltinsTokens);
+                appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvBuiltinsTokens);
             }
         }
 
@@ -12127,7 +12172,7 @@ prepare_build(bool print_fingerprint,
         // name that statement rather than a global default it is not using.
         if (auto why = tsd::check_requirements(
                 resolvedTargetSide, requirements,
-                tc_origin_is_user_explicit(tcOrigin) ? tc_origin_name(tcOrigin)
+                tc_origin_is_user_explicit(state.tcOrigin) ? tc_origin_name(state.tcOrigin)
                                                      : std::string_view{})) {
             refusal::record(refusal::Code::LayerRequirement);
             return std::unexpected(*why);
@@ -12295,7 +12340,7 @@ prepare_build(bool print_fingerprint,
             !state.targetDisplayName.empty()
                 ? state.targetDisplayName
                 : (resolvedTargetCanonical.empty()
-                       ? (tc ? tc->targetTriple : std::string{})
+                       ? (state.tc ? state.tc->targetTriple : std::string{})
                        : resolvedTargetCanonical);
         if (!resolvedTargetSide.llvmTriple.empty()
             && !reportedTargetName.empty()) {
@@ -12412,7 +12457,7 @@ prepare_build(bool print_fingerprint,
     // `pkg.manifest.buildConfig` produced a build in which every layer
     // predicate matched and no flag reached the compiler.
     if (targetSideResolved) {
-        auto layerCtx = cfgCtx();
+        auto layerCtx = state.cfgCtx();
         layerCtx.layersKnown     = true;
         layerCtx.compiler        = resolvedTargetSide.compiler.interfaceName;
         layerCtx.compilerRuntime = resolvedTargetSide.compilerRuntime.interfaceName;
@@ -12500,7 +12545,7 @@ prepare_build(bool print_fingerprint,
         }
 
         lf::TargetFacts targetFacts;
-        if (auto t = mcpp::toolchain::triple::parse(tc->targetTriple))
+        if (auto t = mcpp::toolchain::triple::parse(state.tc->targetTriple))
             targetFacts.hasLoader = !t->is_freestanding();
         // The libc axis. Spelled exactly as `compute_flags` spells it, because
         // the two must agree about what `-static` means: an image linked that
@@ -12509,7 +12554,7 @@ prepare_build(bool print_fingerprint,
         targetFacts.fullStaticLibc =
             state.m->buildConfig.linkage == "static"
             && mcpp::toolchain::target_supports_full_static(
-                   tc->targetTriple, mcpp::platform::supports_full_static);
+                   state.tc->targetTriple, mcpp::platform::supports_full_static);
 
         for (std::size_t i = 1; i < packages.size(); ++i) {
             auto const& pkg = packages[i].manifest;
@@ -12680,10 +12725,10 @@ prepare_build(bool print_fingerprint,
         // C library, which compiler and which C++ standard library resolved,
         // and the three answers that keep a board package from naming a
         // toolchain. One call — see fill_target_build_env.
-        fill_target_build_env(bpEnv, *state.m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
-        bpEnv.toolsBin = projectSubosBin;
-        bpEnv.profile      = effectiveProfile;
-        bpEnv.accel        = resolvedAccel();
+        fill_target_build_env(bpEnv, *state.m, state.tc ? &*state.tc : nullptr, state.cfg_opt ? &*state.cfg_opt : nullptr);
+        bpEnv.toolsBin = state.projectSubosBin;
+        bpEnv.profile      = state.effectiveProfile;
+        bpEnv.accel        = state.resolvedAccel();
         fill_package_build_env(bpEnv, *state.m);
         bpEnv.packFormat   = state.overrides.pack_format;
         bpEnv.packStageDir = state.overrides.pack_stage_dir;
@@ -12837,9 +12882,9 @@ prepare_build(bool print_fingerprint,
             // looked up, so a name the manifest declares is not refused here.
             {
                 const auto rowKey = [&]() -> std::string {
-                    if (!tc) return {};
-                    auto t = mcpp::toolchain::triple::parse(tc->targetTriple);
-                    return t ? t->str() : tc->targetTriple;
+                    if (!state.tc) return {};
+                    auto t = mcpp::toolchain::triple::parse(state.tc->targetTriple);
+                    return t ? t->str() : state.tc->targetTriple;
                 }();
                 const auto row = state.m->targetOverrides.find(rowKey);
                 const auto manifestNames = [&](std::string_view name) {
@@ -13108,11 +13153,11 @@ prepare_build(bool print_fingerprint,
     // through the same cppfly merge, so the c++fly gates (and the
     // c++latest/c++fly per-toolchain std spelling) stay graph-consistent.
     std::string stdFlagAndDialect = mcpp::toolchain::cppfly::std_flag(
-        *tc, state.m->cppStandard.canonical, state.m->cppStandard.level);
+        *state.tc, state.m->cppStandard.canonical, state.m->cppStandard.level);
     if (state.m->cppStandard.experimental) {
         // c++fly is best-effort by design: say exactly what this toolchain
         // got and what it lacks (the value's contract, design §5.4).
-        auto fly = mcpp::toolchain::cppfly::resolve(*tc);
+        auto fly = mcpp::toolchain::cppfly::resolve(*state.tc);
         std::string enabled, skipped;
         for (auto& f : fly.features) {
             auto& dst = f.enabled ? enabled : skipped;
@@ -13122,12 +13167,12 @@ prepare_build(bool print_fingerprint,
             if (!f.enabled) dst += std::format(" ({})", f.reason);
         }
         std::println("c++fly on {}: {}; enabled: {}; skipped: {}",
-                     tc->label(), stdFlagAndDialect,
+                     state.tc->label(), stdFlagAndDialect,
                      enabled.empty() ? "(none)" : enabled,
                      skipped.empty() ? "(none)" : skipped);
     }
     for (auto& f : mcpp::toolchain::cppfly::effective_dialect_flags(
-             *tc, state.m->cppStandard.experimental,
+             *state.tc, state.m->cppStandard.experimental,
              mcpp::manifest::dialect_flags(state.m->buildConfig))) {
         stdFlagAndDialect += ' ';
         stdFlagAndDialect += f;
@@ -13157,7 +13202,7 @@ prepare_build(bool print_fingerprint,
             auto tmp = std::filesystem::temp_directory_path()
                      / std::format("mcpp_p1689_{}", std::random_device{}());
             std::filesystem::create_directories(tmp);
-            return mcpp::modgraph::scan_packages_p1689(scannedPackages, *tc, tmp,
+            return mcpp::modgraph::scan_packages_p1689(scannedPackages, *state.tc, tmp,
                                                        stdFlagAndDialect);
         }
         return mcpp::modgraph::scan_packages(scannedPackages);
@@ -13229,7 +13274,7 @@ prepare_build(bool print_fingerprint,
             // The scope gate. A package whose root is under a store directory
             // arrived from an index and its declaration was written by a
             // descriptor generator, not by the person reading this diagnostic.
-            if (mcpp::build::path_is_under_any(pkg.root, storeRoots))
+            if (mcpp::build::path_is_under_any(pkg.root, state.storeRoots))
                 continue;
             auto declared = mcpp::manifest::normalize_cpp_standard(
                 pkg.manifest.package.standard);
@@ -13278,7 +13323,7 @@ prepare_build(bool print_fingerprint,
     // stopped testing the condition it claims to test.
     if (needsStdModule) {
         const auto prebuilt = mcpp::toolchain::cppfly::effective_dialect_flags(
-            *tc, state.m->cppStandard.experimental,
+            *state.tc, state.m->cppStandard.experimental,
             mcpp::manifest::dialect_flags(state.m->buildConfig));
         // THE ROOT PACKAGE ONLY, and the narrowing is a correctness bound
         // rather than a shortcut.
@@ -13364,7 +13409,7 @@ prepare_build(bool print_fingerprint,
                 pkg.manifest.package.name, pkg.manifest.stdModule,
                 pkg.root.string()));
         }
-        tc->stdModuleSource   = src;
+        state.tc->stdModuleSource   = src;
         // AND THE COMPAT MODULE, FROM THE SAME PACKAGE OR NOT AT ALL.
         //
         // `std.compat` is a second module over the SAME library. Leaving it
@@ -13388,24 +13433,24 @@ prepare_build(bool print_fingerprint,
                     pkg.manifest.package.name, pkg.manifest.stdCompatModule,
                     pkg.root.string()));
             }
-            tc->stdCompatSource = csrc;
+            state.tc->stdCompatSource = csrc;
         } else {
-            tc->stdCompatSource.clear();
+            state.tc->stdCompatSource.clear();
         }
-        tc->targetCxxRuntime  = true;
-        tc->hasImportStd      = true;
-        tc->importStdMinLevel = 20;   // libc++'s own floor; see clang.cppm
+        state.tc->targetCxxRuntime  = true;
+        state.tc->hasImportStd      = true;
+        state.tc->importStdMinLevel = 20;   // libc++'s own floor; see clang.cppm
         // The target, first. On a freestanding target that means the whole ISA
         // profile --- `--target', `-march', `-mabi', `-mcmodel' --- because a
         // module built without them disagrees with every unit that imports it,
         // and clang reports that as an ABI mismatch naming a .pcm file rather
         // than the flag that split them. On a hosted one it is the triple alone.
         std::string flags;
-        if (auto fs = mcpp::toolchain::triple::parse(tc->targetTriple);
+        if (auto fs = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             fs && fs->is_freestanding()) {
             if (auto spec = mcpp::freestanding::resolve(*fs))
                 flags += mcpp::freestanding::compile_prefix(*spec, true);
-        } else if (!tc->crossTargetFlag.empty()) {
+        } else if (!state.tc->crossTargetFlag.empty()) {
             // `crossTargetFlag` and not `targetTriple`. The triple is mcpp's
             // vocabulary (`aarch64-macos`); the flag carries the spelling a
             // compiler takes (`arm64-apple-macos14.0`). Measured: emitting the
@@ -13413,12 +13458,12 @@ prepare_build(bool print_fingerprint,
             // triple it has never heard of and then treats as a bare-metal
             // aarch64 — the module and its importers would agree with each
             // other and with nothing else.
-            flags += " " + tc->crossTargetFlag;
+            flags += " " + state.tc->crossTargetFlag;
             // AND THE SECOND CHANNEL. `hostflags.cppm` reaches every ordinary
             // translation unit; this command is assembled here instead, so a
             // `std.pcm` built with SEH would be imported by units built with
             // DWARF. Same function, not a second copy of the decision.
-            for (auto& f : mcpp::toolchain::graph_runtime_compile_flags(*tc))
+            for (auto& f : mcpp::toolchain::graph_runtime_compile_flags(*state.tc))
                 flags += " " + f;
         }
         // `__OPENKAL__` AND THE REALISED [c-abi] ENVIRONMENT REACH THE STD
@@ -13428,15 +13473,15 @@ prepare_build(bool print_fingerprint,
         // comment above), so it needs the same broadcast the ordinary
         // per-package loop gives every other unit — this is that same rule,
         // stated once more at the one site it cannot reach on its own.
-        if (tc->kernelAbiIsOpenkal) flags += " -D__OPENKAL__";
+        if (state.tc->kernelAbiIsOpenkal) flags += " -D__OPENKAL__";
         if (pkg.manifest.cEnvironment != "platform") {
-            for (auto& t : tc->cEnvTokens)         flags += " " + t;
-            for (auto& t : tc->cEnvBuiltinsTokens)  flags += " " + t;
+            for (auto& t : state.tc->cEnvTokens)         flags += " " + t;
+            for (auto& t : state.tc->cEnvBuiltinsTokens)  flags += " " + t;
         }
         // Everything up to here says which machine the module is for; what
         // follows says where its headers are. The codegen step needs only the
         // first — see Toolchain::stdModuleTargetFlags.
-        tc->stdModuleTargetFlags = flags;
+        state.tc->stdModuleTargetFlags = flags;
         for (auto& f : pkg.manifest.buildConfig.stdModuleFlags) {
             // A flag naming a path is relative to the package that named it,
             // for the same reason the module source is.
@@ -13509,25 +13554,25 @@ prepare_build(bool print_fingerprint,
         // stops the build if it reaches a `<ctype.h>` that is not its own).
         // Emitted ahead of them, glibc's `<math.h>` shadowed libc++'s wrapper
         // and `<complex>` failed on `std::__builtin_isnan` (measured).
-        if (tc->cAbiPrebuilt) {
+        if (state.tc->cAbiPrebuilt) {
             mcpp::toolchain::HostFlagOptions hopt;
             hopt.cfgBypass             = mcpp::toolchain::HostFlagOptions::CfgBypass::Always;
             hopt.cAbiPrebuilt          = true;
             hopt.cxxFromGraph          = true;
-            hopt.appleSdkRoot          = tc->appleSdkRoot;
+            hopt.appleSdkRoot          = state.tc->appleSdkRoot;
             // Target-keyed, not host-keyed (#685) — see `min_platform_version`.
             const bool cAbiTargetIsMacos = [&] {
-                auto cAbiTt = mcpp::toolchain::triple::parse(tc->targetTriple);
+                auto cAbiTt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
                 return cAbiTt && cAbiTt->os == "macos";
             }();
             hopt.macosDeploymentTarget = mcpp::platform::macos::deployment_target(
                 cAbiTargetIsMacos, state.m->buildConfig.macosDeploymentTarget);
             for (auto& t : mcpp::toolchain::host_compile_tokens(
-                     *tc, hopt, mcpp::toolchain::no_escape)) {
+                     *state.tc, hopt, mcpp::toolchain::no_escape)) {
                 const auto q = " " + mcpp::xlings::shq(t);
                 if (flags.find(q) == std::string::npos) flags += q;
             }
-            for (auto& t : mcpp::toolchain::apple_float_macro_words(*tc)) {
+            for (auto& t : mcpp::toolchain::apple_float_macro_words(*state.tc)) {
                 const auto q = " " + mcpp::xlings::shq(t);
                 if (flags.find(q) == std::string::npos) flags += q;
             }
@@ -13536,7 +13581,7 @@ prepare_build(bool print_fingerprint,
         // (mcpp.manifest.flag_words), one quoted word each.
         for (auto& w : mcpp::manifest::flag_words(targetSideUsage.cxxflags))
             flags += " " + mcpp::xlings::shq(w);
-        tc->stdModuleFlags = flags;
+        state.tc->stdModuleFlags = flags;
         break;
     }
 
@@ -13558,18 +13603,18 @@ prepare_build(bool print_fingerprint,
     //     It is REPORTED ONCE rather than refused: refusing would break a
     //     program that built yesterday, and the report names the two lines
     //     that make the hazard disappear.
-    if (tc && !tc->appleSdkRoot.empty() && targetSideResolved
+    if (state.tc && !state.tc->appleSdkRoot.empty() && targetSideResolved
         && !resolvedTargetSide.cxx.fromGraph()) {
         if (!needsStdModule) {
-            tc->appleSdkCxxHeaders = true;
-            tc->hasImportStd = false;
-            tc->stdModuleSource.clear();
-            tc->stdCompatSource.clear();
+            state.tc->appleSdkCxxHeaders = true;
+            state.tc->hasImportStd = false;
+            state.tc->stdModuleSource.clear();
+            state.tc->stdCompatSource.clear();
         } else {
             mcpp::diag::degraded("target/cxx-runtime", std::format(
                 "{} links the SDK's libc++ under the toolchain payload's "
                 "libc++ headers and std module, which are a different "
-                "release of the library", tc->targetTriple),
+                "release of the library", state.tc->targetTriple),
                 "the program links while no inline path in the newer headers "
                 "names an export the SDK's dylib lacks; `std::unordered_map` "
                 "over `std::string` and `std::atomic<T>::notify_all` are two "
@@ -13583,7 +13628,7 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    if (needsStdModule && !tc->hasImportStd) {
+    if (needsStdModule && !state.tc->hasImportStd) {
         // A freestanding target reaches here for a reason the generic message
         // gets wrong. Nothing is missing from the toolchain — libc++'s std
         // module is right there — it is that `std` is ONE module over the whole
@@ -13634,7 +13679,7 @@ prepare_build(bool print_fingerprint,
         // the earliest time at which it is known.
         const bool hostedStdProvided =
             capProviders.find("hosted-standard-library") != capProviders.end();
-        if (auto ft = mcpp::toolchain::triple::parse(tc->targetTriple);
+        if (auto ft = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             ft && ft->is_freestanding() && !hostedStdProvided)
         {
             return std::unexpected(std::format(
@@ -13658,31 +13703,31 @@ prepare_build(bool print_fingerprint,
                 "       The target's C library itself comes from the BOARD "
                 "package (riscv-virt-rt\n"
                 "       exports `mcpplibs.riscv_virt_rt`).",
-                tc->targetTriple));
+                state.tc->targetTriple));
         }
         return std::unexpected(std::format(
             "source imports std but toolchain '{}' provides no std module source",
-            tc->label()));
+            state.tc->label()));
     }
     // `import std` availability is two-dimensional once C++20 is a legal level:
     // having a std module source is not the same as being able to build it at
     // the project's level. Every toolchain mcpp ships answers 20; only an MSVC
     // STL older than microsoft/STL#3977 answers 23, and those users would
     // otherwise get an error from inside std.ixx.
-    if (needsStdModule && tc->importStdMinLevel > 0
-        && state.m->cppStandard.level < tc->importStdMinLevel) {
+    if (needsStdModule && state.tc->importStdMinLevel > 0
+        && state.m->cppStandard.level < state.tc->importStdMinLevel) {
         return std::unexpected(std::format(
             "source imports std but toolchain '{}' provides the std module only "
             "from {} up, while [package].standard resolves to '{}'; raise the "
             "standard or drop `import std;`",
-            tc->label(),
-            mcpp::manifest::cpp_standard_level_name(tc->importStdMinLevel),
+            state.tc->label(),
+            mcpp::manifest::cpp_standard_level_name(state.tc->importStdMinLevel),
             state.m->package.standard));
     }
 
     // Compute fingerprint (no lockfile in M1 → empty hash)
     mcpp::toolchain::FingerprintInputs fpi;
-    fpi.toolchain            = *tc;
+    fpi.toolchain            = *state.tc;
     fpi.cppStandard         = state.m->package.standard;
     // Target-keyed, not host-keyed (#685): the fingerprint must fold
     // `macos_deployment_target` whenever THIS BUILD's resolved toolchain
@@ -13690,7 +13735,7 @@ prepare_build(bool print_fingerprint,
     // macOS — see the discriminator comment on `min_platform_version` and
     // on `canonical_compile_flags`.
     const bool fpTargetIsMacos = [&] {
-        auto fpTt = mcpp::toolchain::triple::parse(tc->targetTriple);
+        auto fpTt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
         return fpTt && fpTt->os == "macos";
     }();
     fpi.compileFlags        = canonical_compile_flags(*state.m, fpTargetIsMacos)
@@ -13704,9 +13749,9 @@ prepare_build(bool print_fingerprint,
     // when non-empty (`tc->cEnvTokens` is empty whenever no `[c-abi]` block
     // resolved), so a graph that declares nothing keeps the directory it
     // already had.
-    if (tc->kernelAbiIsOpenkal) fpi.compileFlags += " openkal-kernel-abi";
-    for (auto& t : tc->cEnvTokens)        fpi.compileFlags += " cenv:" + t;
-    for (auto& t : tc->cEnvBuiltinsTokens) fpi.compileFlags += " cenv:" + t;
+    if (state.tc->kernelAbiIsOpenkal) fpi.compileFlags += " openkal-kernel-abi";
+    for (auto& t : state.tc->cEnvTokens)        fpi.compileFlags += " cenv:" + t;
+    for (auto& t : state.tc->cEnvBuiltinsTokens) fpi.compileFlags += " cenv:" + t;
     // A package opting OUT via `c-environment = "platform"` (§3.4) still
     // changes what ITS OWN objects contain, relative to a graph where it
     // did not opt out — so the opt-out is folded in too, named by the
@@ -13728,7 +13773,7 @@ prepare_build(bool print_fingerprint,
     // not move the fingerprint either — the same "declares nothing, byte
     // identical" guarantee the rest of this block already gives, which this
     // loop had broken on its own.
-    if (!tc->cEnvTokens.empty() || !tc->cEnvBuiltinsTokens.empty()) {
+    if (!state.tc->cEnvTokens.empty() || !state.tc->cEnvBuiltinsTokens.empty()) {
         for (auto& pkg : packages)
             if (pkg.manifest.cEnvironment == "platform")
                 fpi.compileFlags += " cenv-platform:" + pkg.manifest.package.name;
@@ -13748,14 +13793,14 @@ prepare_build(bool print_fingerprint,
     // apply, so two builds that differ only in it are two builds. Appended
     // only when set, so a project that asks for no accelerator keeps the
     // build directory it has.
-    if (const auto accel = resolvedAccel(); !accel.empty()) {
+    if (const auto accel = state.resolvedAccel(); !accel.empty()) {
         fpi.compileFlags += " #accel=";
         fpi.compileFlags += accel;
     }
     if (state.m->cppStandard.experimental) {
         // c++fly gate flags are derived (not manifest-declared): fold them in
         // so a cppfly table change across mcpp versions re-fingerprints.
-        for (auto& f : mcpp::toolchain::cppfly::resolve(*tc).flags) {
+        for (auto& f : mcpp::toolchain::cppfly::resolve(*state.tc).flags) {
             fpi.compileFlags += ' ';
             fpi.compileFlags += f;
         }
@@ -13782,7 +13827,7 @@ prepare_build(bool print_fingerprint,
         // here, and the gcc and clang std module builders do not read it, so
         // their commands are unchanged; clang on the MSVC ABI is given no CRT
         // model at all (see `MechanismInput::msvcCrtModelEmitted`).
-        const auto& stdDialect = mcpp::toolchain::dialect_for(*tc);
+        const auto& stdDialect = mcpp::toolchain::dialect_for(*state.tc);
         const auto stdCrt = mcpp::toolchain::msvc_crt_flag(
             stdDialect, mcpp::toolchain::msvc_wants_static_crt(
                             state.m->buildConfig.linkage, state.m->buildConfig.cxxRuntime));
@@ -13791,14 +13836,14 @@ prepare_build(bool print_fingerprint,
         // locally because `tc` (not a `triple::Triple`) is what is in scope
         // here (#685).
         const bool stdTargetIsMacos = [&] {
-            auto stdTt = mcpp::toolchain::triple::parse(tc->targetTriple);
+            auto stdTt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
             return stdTt && stdTt->os == "macos";
         }();
         if (state.overrides.plan_only) {
             // Described, not compiled: the paths and commands are the ones
             // ensure_built would use, from the one derivation in stdmod.cppm.
             auto described = mcpp::toolchain::describe_std_module(
-                *tc, state.m->package.standard, stdFlagAndDialect,
+                *state.tc, state.m->package.standard, stdFlagAndDialect,
                 mcpp::platform::macos::deployment_target(
                     stdTargetIsMacos, state.m->buildConfig.macosDeploymentTarget),
                 mcpp::toolchain::default_cache_root(), stdCrt);
@@ -13813,7 +13858,7 @@ prepare_build(bool print_fingerprint,
             describedStdModule  = std::move(*described);
         } else {
             auto sm = mcpp::toolchain::ensure_built(
-                *tc, state.m->package.standard, stdFlagAndDialect,
+                *state.tc, state.m->package.standard, stdFlagAndDialect,
                 mcpp::platform::macos::deployment_target(
                     stdTargetIsMacos, state.m->buildConfig.macosDeploymentTarget),
                 mcpp::toolchain::default_cache_root(), stdCrt);
@@ -13850,7 +13895,7 @@ prepare_build(bool print_fingerprint,
             // above already succeeded with the same inputs -- so it only
             // means the description is unavailable for the plan, silently.
             auto described = mcpp::toolchain::describe_std_module(
-                *tc, state.m->package.standard, stdFlagAndDialect,
+                *state.tc, state.m->package.standard, stdFlagAndDialect,
                 mcpp::platform::macos::deployment_target(
                     stdTargetIsMacos, state.m->buildConfig.macosDeploymentTarget),
                 mcpp::toolchain::default_cache_root(), stdCrt);
@@ -13859,7 +13904,7 @@ prepare_build(bool print_fingerprint,
     }
 
     if (state.print_fingerprint) {
-        std::println("Toolchain: {}", tc->label());
+        std::println("Toolchain: {}", state.tc->label());
         std::println("Fingerprint: {}", fp.hex);
         for (std::size_t i = 0; i < fp.parts.size(); ++i) {
             std::println("  [{}] {}", i + 1, fp.parts[i]);
@@ -13869,19 +13914,19 @@ prepare_build(bool print_fingerprint,
     BuildContext ctx;
     ctx.strict      = state.overrides.strict;
     ctx.manifest    = *state.m;
-    ctx.tc          = *tc;
+    ctx.tc          = *state.tc;
     ctx.fp          = fp;
     ctx.runtimeSelection = state.runtimeSelection;
-    ctx.runtimeBinding = runtimeBindingSnapshot;
-    ctx.profile     = effectiveProfile;
+    ctx.runtimeBinding = state.runtimeBindingSnapshot;
+    ctx.profile     = state.effectiveProfile;
     ctx.activeFeatureRequest = state.overrides.features;
-    ctx.compilerChoice = { std::string(tc_origin_name(tcOrigin)),
+    ctx.compilerChoice = { std::string(tc_origin_name(state.tcOrigin)),
                            state.graphCompilerRequiredBy,
                            state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
                                                          : state.graphCompilerReplaced };
     ctx.cacheMode   = state.cacheMode;
     ctx.projectRoot= *state.root;
-    ctx.outputDir  = target_dir(*tc, fp, state.workRoot);
+    ctx.outputDir  = target_dir(*state.tc, fp, state.workRoot);
     {
         std::error_code ec;
         const bool firstPlan = !std::filesystem::exists(ctx.outputDir / "build.ninja", ec);
@@ -13926,7 +13971,7 @@ prepare_build(bool print_fingerprint,
     // A `path` dependency is the opposite on both counts: it is the user's
     // working tree, and editing it is the point.
     {
-        std::vector<std::filesystem::path> owned = storeRoots;
+        std::vector<std::filesystem::path> owned = state.storeRoots;
         owned.push_back(mcpp::home::root());
         std::vector<std::filesystem::path> roots;
         // The same enumeration answers a second reader: which packages were
@@ -14007,7 +14052,7 @@ prepare_build(bool print_fingerprint,
         // by content: if the early pass did not run, or ran on a different
         // list, this is still the site that makes the record true.
         if (!fromGraph.empty()) {
-            if (auto cfg = get_cfg()) {
+            if (auto cfg = state.get_cfg(true)) {
                 if (auto pv = provision_xlings_addresses(
                         **cfg, fromGraph, *state.root,
                         "[xlings.workspace] entries declared by dependencies");
@@ -14030,7 +14075,7 @@ prepare_build(bool print_fingerprint,
             }
         }
         if (!xlingsSpecs.empty()) {
-            if (auto cfg = get_cfg()) {
+            if (auto cfg = state.get_cfg(true)) {
                 auto xlEnv = mcpp::config::make_xlings_env(**cfg);
                 for (auto const& spec : xlingsSpecs) {
                     auto ref = mcpp::xlings::paths::parse_xpkg_ref(spec);
@@ -14061,19 +14106,19 @@ prepare_build(bool print_fingerprint,
     // `tag_check` already treats an unnamed dimension as don't-care, so one
     // full tag on this side is correct for both.
     {
-        const auto canonicalTriple = tc->targetTriple.empty()
+        const auto canonicalTriple = state.tc->targetTriple.empty()
             ? mcpp::toolchain::triple::host_triple().str()
             : [&] {
-                  auto t = mcpp::toolchain::triple::parse(tc->targetTriple);
-                  return t ? t->str() : tc->targetTriple;
+                  auto t = mcpp::toolchain::triple::parse(state.tc->targetTriple);
+                  return t ? t->str() : state.tc->targetTriple;
               }();
         auto currentTag = mcpp::pack::cxx_surface_tag(
-            *tc, canonicalTriple, state.m->cppStandard.level);
+            *state.tc, canonicalTriple, state.m->cppStandard.level);
         // What THIS build targets on the device axis. Absent means it asks for
         // no accelerator, and every artifact then satisfies it vacuously —
         // which is correct, and is why a descriptor lists its CPU-only variant
         // first: the first accepted artifact wins.
-        currentTag.accel = mcpp::pack::parse_accel(resolvedAccel());
+        currentTag.accel = mcpp::pack::parse_accel(state.resolvedAccel());
         for (std::size_t i = 1; i < packages.size(); ++i) {
             auto const& pkg = packages[i];
             if (!mcpp::pack::is_distribution_package(pkg.manifest)) continue;
@@ -14142,9 +14187,9 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    auto planResult = mcpp::build::make_plan(*state.m, *tc, fp, scan.graph, report.topoOrder,
+    auto planResult = mcpp::build::make_plan(*state.m, *state.tc, fp, scan.graph, report.topoOrder,
                                              packages, *state.root, ctx.outputDir,
-                                             stdBmiPath, stdObjectPath, storeRoots);
+                                             stdBmiPath, stdObjectPath, state.storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
     // Resolved far above, where the dependency graph first exists. It is
@@ -14170,7 +14215,7 @@ prepare_build(bool print_fingerprint,
                                 std::vector<std::string> requiresModules) {
             if (source.empty() || commands.empty()) return;
             auto inv = mcpp::build::recover_invocation(
-                commands, source, tc->binaryPath, sm.cacheDir,
+                commands, source, state.tc->binaryPath, sm.cacheDir,
                 mcpp::platform::is_windows);
             if (!inv) {
                 state.planNotes.push_back({"MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED",
@@ -14189,9 +14234,9 @@ prepare_build(bool print_fingerprint,
                 .requiresModules = std::move(requiresModules),
             });
         };
-        add_std_unit(tc->stdModuleSource, sm.stdCommands, sm.objectPath,
+        add_std_unit(state.tc->stdModuleSource, sm.stdCommands, sm.objectPath,
                     sm.bmiPath, "std", {});
-        add_std_unit(tc->stdCompatSource, sm.compatCommands, sm.compatObjectPath,
+        add_std_unit(state.tc->stdCompatSource, sm.compatCommands, sm.compatObjectPath,
                     sm.compatBmiPath, "std.compat", {"std"});
     }
 
@@ -14221,7 +14266,7 @@ prepare_build(bool print_fingerprint,
         const auto providerName = mcpp::build::qualified_package_name(provider);
         auto const& bc = ctx.plan.manifest.buildConfig;
         const auto format = dist::format_for(
-            tc->targetTriple,
+            state.tc->targetTriple,
             mcpp::platform::is_windows ? dist::Format::Pe
             : mcpp::platform::is_macos ? dist::Format::MachO
                                        : dist::Format::Elf);
@@ -14305,7 +14350,7 @@ prepare_build(bool print_fingerprint,
         namespace dist = mcpp::build::dist;
         auto const& bc = ctx.plan.manifest.buildConfig;
         const auto format = dist::format_for(
-            tc->targetTriple,
+            state.tc->targetTriple,
             mcpp::platform::is_windows ? dist::Format::Pe
             : mcpp::platform::is_macos ? dist::Format::MachO
                                        : dist::Format::Elf);
@@ -14485,7 +14530,7 @@ prepare_build(bool print_fingerprint,
     // `requireBootstrap=false` because nothing here needs the bootstrap
     // toolchain.
     int globalDefaultJobs = 0;
-    if (auto c = get_cfg(/*requireBootstrap=*/false))
+    if (auto c = state.get_cfg(/*requireBootstrap=*/false))
         globalDefaultJobs = static_cast<int>((*c)->defaultJobs);
     ctx.globalDefaultJobs = globalDefaultJobs;
 
@@ -14522,9 +14567,9 @@ prepare_build(bool print_fingerprint,
                                                 ctx.plan.scheduleTag, decision.reason));
 
     }
-    ctx.plan.runtimeBinding = runtimeBindingSnapshot;
+    ctx.plan.runtimeBinding = state.runtimeBindingSnapshot;
     mcpp::build::merge_runtime_binding_contract(
-        ctx.plan, runtimeBindingSnapshot);
+        ctx.plan, state.runtimeBindingSnapshot);
     ctx.plan.compileDbPath = state.workRoot / "compile_commands.json";
     // GCC: a clean `*link:` for this build, so the payload's specs cannot
     // inject other homes' rpath entries into the artifact. AFTER the plan is
@@ -14534,9 +14579,9 @@ prepare_build(bool print_fingerprint,
     // A link input only: a plan that builds nothing (`plan_only`) neither reads
     // it nor runs the driver to produce it, and its compile arguments are the
     // same without it.
-    if (tc->compiler == mcpp::toolchain::CompilerId::GCC && !state.overrides.plan_only)
+    if (state.tc->compiler == mcpp::toolchain::CompilerId::GCC && !state.overrides.plan_only)
         ctx.plan.gccCleanSpecs = mcpp::toolchain::write_clean_link_specs(
-            tc->binaryPath, ctx.outputDir);
+            state.tc->binaryPath, ctx.outputDir);
 
     // ── Declared build-graph nodes → the plan ───────────────────────────────
     //
@@ -14896,8 +14941,8 @@ prepare_build(bool print_fingerprint,
     ctx.plan.stdCompatObjectPath = stdCompatObjectPath;
 
     // Clang: discover clang-scan-deps for P1689 dyndep scanning.
-    if (mcpp::toolchain::is_clang(*tc)) {
-        if (auto sd = mcpp::toolchain::clang::find_scan_deps(*tc)) {
+    if (mcpp::toolchain::is_clang(*state.tc)) {
+        if (auto sd = mcpp::toolchain::clang::find_scan_deps(*state.tc)) {
             ctx.plan.scanDepsPath = *sd;
         }
     }
@@ -14914,14 +14959,14 @@ prepare_build(bool print_fingerprint,
             if (cu.kind == mcpp::SourceKind::GasAsm)       hasGas = true;
             else if (cu.kind == mcpp::SourceKind::NasmAsm) hasNasm = true;
         }
-        if (hasGas && mcpp::toolchain::dialect_for(*tc).id == "msvc") {
+        if (hasGas && mcpp::toolchain::dialect_for(*state.tc).id == "msvc") {
             return std::unexpected(std::string(
                 "GAS assembly sources (.S/.s) are not supported by the MSVC "
                 "toolchain; use NASM syntax (.asm) or a MinGW/LLVM toolchain, "
                 "or `!`-exclude them in [build].sources"));
         }
         if (hasNasm) {
-            auto trip = mcpp::toolchain::triple::parse(tc->targetTriple)
+            auto trip = mcpp::toolchain::triple::parse(state.tc->targetTriple)
                             .value_or(mcpp::toolchain::triple::host_triple());
             auto fmt = trip.nasm_format();
             if (!fmt) {
@@ -14941,7 +14986,7 @@ prepare_build(bool print_fingerprint,
             // gate the compiler toolchain uses (index refresh before
             // install, blocking install, hard error on failure) — see the
             // toolchain resolution block above (~line 872-899).
-            auto cfgNasm = get_cfg();
+            auto cfgNasm = state.get_cfg(true);
             if (!cfgNasm) return std::unexpected(cfgNasm.error());
 
             std::optional<std::filesystem::path> nasmBin =
@@ -15072,13 +15117,13 @@ prepare_build(bool print_fingerprint,
             scriptFiles.push_back(*r);
         }
 
-        const auto trip = mcpp::toolchain::triple::parse(tc->targetTriple)
+        const auto trip = mcpp::toolchain::triple::parse(state.tc->targetTriple)
                               .value_or(mcpp::toolchain::triple::host_triple());
 
         // Rules 3 and 4 are early returns rather than nesting: the body below is
         // ~150 lines and an `else` around all of it reads as an accident.
         auto plan_resources = [&]() -> std::expected<void, std::string> {
-            const auto  dialectId = mcpp::toolchain::dialect_for(*tc).id;
+            const auto  dialectId = mcpp::toolchain::dialect_for(*state.tc).id;
             const bool msvcStyle = (dialectId == "msvc");
             const std::string_view outExt = msvcStyle ? ".res" : ".o";
             const auto resDir = ctx.plan.outputDir / "res";
@@ -15277,14 +15322,14 @@ prepare_build(bool print_fingerprint,
 
             // Lazy + hard failure, exactly like nasm: a dropped resource
             // surfaces as "where did my icon go", which is unattributable.
-            auto tool = rsrc::find_rc_tool(*tc, dialectId);
+            auto tool = rsrc::find_rc_tool(*state.tc, dialectId);
             if (!tool) {
                 return std::unexpected(std::format(
                     "[resources] needs a Windows resource compiler for the "
                     "{} toolchain targeting {}, and none was found next to "
                     "{}.\n  Expected {} in the toolchain's own bin directory "
                     "(mcpp does not search PATH for build tools).",
-                    dialectId, trip.str(), tc->binaryPath.string(),
+                    dialectId, trip.str(), state.tc->binaryPath.string(),
                     msvcStyle ? "rc.exe or llvm-rc"
                               : "<triple>-windres, windres or llvm-windres"));
             }
@@ -15311,7 +15356,7 @@ prepare_build(bool print_fingerprint,
                 ctx.plan.rcFlags.push_back(ip + abs.string());
             }
             if (msvcStyle && tool->name().find("llvm-rc") != std::string::npos) {
-                for (auto const& ev : tc->envOverrides) {
+                for (auto const& ev : state.tc->envOverrides) {
                     if (ev.key != "INCLUDE") continue;
                     // Shared splitter: `;` only. See rsrc::split_env_list —
                     // the drive colon is not a separator.
@@ -15338,7 +15383,7 @@ prepare_build(bool print_fingerprint,
     //
     // `--cache=local|off` skips this block entirely: nothing is read and, in
     // run_build_plan, nothing is written.
-    auto cfg2 = get_cfg();
+    auto cfg2 = state.get_cfg(true);
     if (cfg2 && ctx.cacheMode == CacheMode::Global) {
         std::error_code mkEc;
         std::filesystem::create_directories(ctx.outputDir, mkEc);
@@ -15361,23 +15406,23 @@ prepare_build(bool print_fingerprint,
         // fails loudly instead of recursing until the stack dies.
         namespace ck = mcpp::build::cache_key;
         auto axes = ck::build_axes(
-            *tc, *state.m, stdFlagAndDialect,
+            *state.tc, *state.m, stdFlagAndDialect,
             mcpp::toolchain::cppfly::effective_dialect_flags(
-                *tc, state.m->cppStandard.experimental,
+                *state.tc, state.m->cppStandard.experimental,
                 mcpp::manifest::dialect_flags(state.m->buildConfig)),
             // ONE SLOT, BOTH PLATFORMS. See `min_platform_version`: a target
             // is either Apple or Android, and the level selects which bionic
             // symbols are visible, so two levels must be two build
             // directories.
             [&] {
-                auto tt = mcpp::toolchain::triple::parse(tc->targetTriple);
-                return tt ? min_platform_version(*state.m, *tt, tc->binaryPath)
+                auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
+                return tt ? min_platform_version(*state.m, *tt, state.tc->binaryPath)
                           : std::string{};
             }(),
             // The GLOBAL registry root — the same one `fill_package_config`
             // relativizes against below, so both halves of the key describe
             // payload paths the same way.
-            storeRoots.empty() ? std::filesystem::path{} : storeRoots.front(),
+            state.storeRoots.empty() ? std::filesystem::path{} : state.storeRoots.front(),
             // The bit `make_plan` decided and `compute_flags` emits. Reading
             // it here rather than re-deriving is what keeps the objects a
             // cache entry HOLDS and the objects a build ASKS FOR describable
@@ -15464,8 +15509,8 @@ prepare_build(bool print_fingerprint,
             // MCPP_HOME; a project-local payload falls back to the `<pkg>`
             // prefix inside fill_package_config and is equally stable.
             ck::fill_package_config(pa, packages[idx],
-                                    storeRoots.empty() ? std::filesystem::path{}
-                                                       : storeRoots.front());
+                                    state.storeRoots.empty() ? std::filesystem::path{}
+                                                       : state.storeRoots.front());
             pa.sources = pkgSources[idx];
             const bool selfIsIndex = idx > 0
                 && idx - 1 < dep_cache_identities.size()
@@ -15548,7 +15593,7 @@ prepare_build(bool print_fingerprint,
             // and the package stops looking like a store package at all. The
             // question here is where the payload was INSTALLED, which is a
             // statement about the path, not about the inode.
-            if (!mcpp::build::path_is_under_any(pkgRoot.root, storeRoots))
+            if (!mcpp::build::path_is_under_any(pkgRoot.root, state.storeRoots))
                 continue;
 
             const auto& depName = depIdent->packageName;
@@ -15556,7 +15601,7 @@ prepare_build(bool print_fingerprint,
                 ? pkgRoot.manifest.package.version
                 : depIdent->version;
 
-            auto bmiT = mcpp::toolchain::bmi_traits(*tc);
+            auto bmiT = mcpp::toolchain::bmi_traits(*state.tc);
             mcpp::bmi_cache::CacheKey key {
                 .cacheRoot   = mcpp::home::cache_root(),
                 .indexName   = depIdent->indexName,
