@@ -1652,9 +1652,11 @@ std::optional<BootstrapProgress> download_progress_of(std::string_view line) {
 
 // The events of one `xlings interface update_packages` run, rendered with the
 // renderer every other acquisition uses (mcpp::ui::ProgressBar and
-// DownloadProgress). A `progress` event names a step (its `message`, or its
-// `phase`) and a percentage; a step that changes finishes the previous bar.
-// A `download_progress` data event is an index artifact being fetched. A line
+// DownloadProgress). A `progress` event carries a phase and a percentage;
+// one bar is drawn per phase (xlings reports `index_sync`, one event per
+// repository, and `index_rebuild`, one event per descriptor file), so a
+// refresh prints a few lines off a terminal rather than one per file. A
+// `download_progress` data event is an index artifact being fetched. A line
 // that is not an event is not rendered: an xlings that predates structured
 // index progress printed its own terminal text on this stream, and the bar
 // is what replaces it.
@@ -1666,13 +1668,12 @@ public:
         if (kind == "result") {
             resultExit_ = static_cast<int>(ls.find_num("exitCode"));
         } else if (kind == "progress") {
-            auto label = ls.find_str("message");
-            if (label.empty()) label = ls.find_str("phase");
-            if (label.empty()) return;
-            if (!bar_ || label != label_) {
+            const auto phase = ls.find_str("phase");
+            if (phase.empty()) return;
+            if (!bar_ || phase != label_) {
                 if (bar_) bar_->finish();
-                bar_.emplace("Updating", std::format("package index: {}", label));
-                label_ = label;
+                bar_.emplace("Updating", phase_label(phase));
+                label_ = phase;
             }
             const auto pct = std::clamp(ls.find_num("percent"), 0.0, 100.0);
             bar_->update(static_cast<std::size_t>(pct));
@@ -1697,8 +1698,14 @@ public:
     }
 
 private:
+    static std::string phase_label(std::string_view phase) {
+        if (phase == "index_sync")    return "package index (sync)";
+        if (phase == "index_rebuild") return "package index (rebuild)";
+        return std::format("package index ({})", phase);
+    }
+
     std::optional<mcpp::ui::ProgressBar> bar_;
-    std::string                          label_;
+    std::string                          label_;   // the phase being drawn
     mcpp::ui::DownloadProgress           download_;
     int                                  resultExit_ = -1;
 };
