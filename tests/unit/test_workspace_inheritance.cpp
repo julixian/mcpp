@@ -236,8 +236,12 @@ TEST(HostToolToolchain, AMemberToolReadsItsWorkspaceToolchain) {
           "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n");
     auto tool = mcpp::manifest::load(root / "tool" / "mcpp.toml");
     ASSERT_TRUE(tool.has_value());
-    EXPECT_EQ(mcpp::build::host_tool_declared_toolchain(*tool, root / "tool", "linux"),
-              std::optional<std::string>("gcc@15.1.0"));
+    // Compared through the value: with clang and the MSVC STL, constructing
+    // std::optional<std::string> from a literal fails to instantiate in this
+    // translation unit, which includes gtest's headers and imports std.
+    auto tc15 = mcpp::build::host_tool_declared_toolchain(*tool, root / "tool", "linux");
+    ASSERT_TRUE(tc15.has_value());
+    EXPECT_EQ(*tc15, "gcc@15.1.0");
 
     // The tool's own declaration wins over the workspace's.
     write(root / "tool" / "mcpp.toml",
@@ -245,8 +249,9 @@ TEST(HostToolToolchain, AMemberToolReadsItsWorkspaceToolchain) {
           "[toolchain]\ndefault = \"gcc@16.1.0\"\n");
     tool = mcpp::manifest::load(root / "tool" / "mcpp.toml");
     ASSERT_TRUE(tool.has_value());
-    EXPECT_EQ(mcpp::build::host_tool_declared_toolchain(*tool, root / "tool", "linux"),
-              std::optional<std::string>("gcc@16.1.0"));
+    auto tc16 = mcpp::build::host_tool_declared_toolchain(*tool, root / "tool", "linux");
+    ASSERT_TRUE(tc16.has_value());
+    EXPECT_EQ(*tc16, "gcc@16.1.0");
 
     std::error_code ec;
     fs::remove_all(root, ec);
