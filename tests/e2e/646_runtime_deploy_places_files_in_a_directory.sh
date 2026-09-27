@@ -9,8 +9,11 @@
 #      file beside the executable; a test binary finds the same layout;
 #   2. a dependency's entry resolves `from` against the dependency and lands in
 #      the consumer's bin/<to>;
-#   3. one file name in two directories is not a collision, and two sources for
-#      one destination are refused naming the destination;
+#   3. one file name in two directories is not a collision, and two DIFFERENT
+#      sources for one destination are refused at BUILD TIME (mcpp#723,
+#      SPEC-007 R4.2), naming every source and the destination -- planning no
+#      longer refuses this, because at planning time neither source may exist
+#      yet to compare;
 #   4. a destination that leaves the executable's directory is refused naming
 #      the entry.
 set -e
@@ -91,14 +94,43 @@ CPP
 rm -rf tests
 echo "test layout OK"
 
-# ── 3. Two sources for one destination ────────────────────────────────────
+# ── 3. Two DIFFERENT sources for one destination ──────────────────────────
+# `assets/layers/lvp_icd.json` ("layer manifest") and the dependency's
+# `share/vulkan/icd.d/lvp_icd.json` ("library_path": ...) disagree, so the
+# merged destination is refused -- at BUILD time (`mcpp stage`), not at
+# planning: mcpp#723 merges the two sources into one stage edge instead of
+# refusing the second one at `add_deploy`.
 write_manifest '{ from = "assets/layers/lvp_icd.json", to = "vulkan/icd.d" }'
 if "$MCPP" build > collision.log 2>&1; then
-    fail "two sources for bin/vulkan/icd.d/lvp_icd.json were accepted" collision.log
+    fail "two different sources for bin/vulkan/icd.d/lvp_icd.json were accepted" collision.log
 fi
-grep -Eq "runtime deploy collision: .* both target 'bin.vulkan.icd\.d.lvp_icd\.json'" collision.log \
-    || fail "the collision is not refused naming the destination" collision.log
+grep -q "sources disagree" collision.log \
+    || fail "the refusal does not say the sources disagree" collision.log
+grep -q "vulkan/icd.d/lvp_icd.json" collision.log \
+    || fail "the refusal does not name the destination" collision.log
+grep -q "layers/lvp_icd.json" collision.log \
+    || fail "the refusal does not name the root's source" collision.log
+grep -q "icd/share/vulkan/icd.d/lvp_icd.json" collision.log \
+    || fail "the refusal does not name the dependency's source" collision.log
 echo "collision OK"
+
+# The SAME shape with IDENTICAL bytes is not a collision at all: two sources
+# for one destination merge into one stage edge, and the build succeeds
+# (mcpp#723). The source must be named `lvp_icd.json` too -- the destination
+# filename is the source's own filename, not `to`.
+mkdir -p assets/icd2
+cp "$TMP/icd/share/vulkan/icd.d/lvp_icd.json" assets/icd2/lvp_icd.json
+write_manifest '{ from = "assets/icd2/lvp_icd.json", to = "vulkan/icd.d" }'
+"$MCPP" build > merge.log 2>&1 || fail "identical bytes for one destination were refused" merge.log
+grep -q 'library_path' "$bin/vulkan/icd.d/lvp_icd.json" 2>/dev/null \
+    || fail "the merged destination does not carry the shared bytes" merge.log
+G=$(find target -name build.ninja | head -1)
+STAGE_LINES=$(grep -c "^build .*vulkan/icd\.d/lvp_icd\.json : stage_file" "$G" 2>/dev/null || true)
+[ "$STAGE_LINES" -eq 1 ] \
+    || fail "expected exactly one stage_file edge, found $STAGE_LINES" "$G"
+grep "^build .*vulkan/icd\.d/lvp_icd\.json : stage_file" "$G" | grep -qF "icd2/lvp_icd.json" \
+    || fail "the merged edge does not list the root's second source" "$G"
+echo "identical-bytes merge OK"
 
 # ── 4. A destination outside the executable's directory ───────────────────
 write_manifest '{ from = "assets/readme.txt", to = "../outside" }'

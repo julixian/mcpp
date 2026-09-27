@@ -437,7 +437,15 @@ struct BuildPlan {
     // byte-for-byte unchanged; only a Windows prebuilt-DLL package (or a test
     // that ships a .dll) populates it. dest is relative to outputDir.
     struct DeployFile {
-        std::filesystem::path source;   // absolute source DLL
+        // Absolute source paths. Usually one; more than one means two or more
+        // packages of this graph each generate a file for this destination
+        // (SPEC-007 R4.2) — an `artifacts` dependency and its consumer asking
+        // one plugin for the same translation catalog is the case #723 was
+        // filed for. Planning no longer refuses this: at planning time a
+        // generated source may not exist yet, so its content cannot be
+        // compared. `mcpp stage` (mcpp.build.stage) is where the sources are
+        // actually checked, at build time, against each other's bytes.
+        std::vector<std::filesystem::path> sources;
         std::filesystem::path dest;     // relative to outputDir, e.g. bin/libopenblas.dll
     };
     std::vector<DeployFile>            runtimeDeployFiles;
@@ -1430,12 +1438,20 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
 
     // `toDir` is a `runtime.deploy` destination, relative to the executable's
     // directory; empty and "." both mean that directory itself, which is where
-    // every `deploy_files` entry goes. The collision check keys on the full
-    // relative destination, so two files of one name in two directories do not
-    // collide, and two sources for one destination still do.
+    // every `deploy_files` entry goes. The check keys on the full relative
+    // destination, so two files of one name in two directories do not
+    // collide.
+    //
+    // Two sources for one destination are no longer refused HERE (SPEC-007
+    // R4.2, #723): at planning time a generated source may not exist yet, so
+    // its content cannot be compared. Both stay as inputs of the one
+    // `stage_file` edge this destination becomes (ninja_backend.cppm), and
+    // `mcpp stage` (mcpp.build.stage) is where the invariant — one
+    // destination, one content — is actually checked, once the sources exist.
+    // A source already listed for this destination (the ordinary case: the
+    // same file reached through two graph edges) is not duplicated.
     auto add_deploy = [&](const std::filesystem::path& source,
-                          std::string_view toDir = {})
-        -> std::optional<std::string> {
+                          std::string_view toDir = {}) {
         const auto normalized = source.lexically_normal();
         auto destDir = std::filesystem::path("bin");
         if (!toDir.empty() && toDir != ".") destDir /= std::filesystem::path(toDir);
@@ -1443,25 +1459,20 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         auto existing = std::ranges::find_if(plan.runtimeDeployFiles,
             [&](auto const& value) { return value.dest == dest; });
         if (existing != plan.runtimeDeployFiles.end()) {
-            if (existing->source.lexically_normal() != normalized) {
-                return std::format(
-                    "runtime deploy collision: '{}' and '{}' both target '{}'",
-                    existing->source.string(), normalized.string(), dest.string());
-            }
-            return std::nullopt;
+            if (std::ranges::find(existing->sources, normalized)
+                == existing->sources.end())
+                existing->sources.push_back(normalized);
+            return;
         }
-        plan.runtimeDeployFiles.push_back({normalized, dest});
-        return std::nullopt;
+        plan.runtimeDeployFiles.push_back({{normalized}, dest});
     };
     // Structured deploy files are explicit and platform-neutral.  Legacy
     // library_dirs keeps its one-train DLL discovery behavior below.
     for (auto const& source : plan.linkIntent.deployFiles) {
-        if (auto collision = add_deploy(source))
-            return std::unexpected(std::move(*collision));
+        add_deploy(source);
     }
     for (auto const& entry : plan.linkIntent.deploy) {
-        if (auto collision = add_deploy(entry.from, entry.to))
-            return std::unexpected(std::move(*collision));
+        add_deploy(entry.from, entry.to);
     }
     for (auto const& dir : plan.linkIntent.runtimeSearchDirs) {
         std::error_code dirEc;
@@ -1472,8 +1483,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             std::ranges::transform(ext, ext.begin(),
                 [](unsigned char c){ return std::tolower(c); });
             if (ext != ".dll") continue;
-            if (auto collision = add_deploy(entry.path()))
-                return std::unexpected(std::move(*collision));
+            add_deploy(entry.path());
         }
     }
     // The same private runtime directories embedded as executable RUNPATH are

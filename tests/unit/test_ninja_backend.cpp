@@ -1090,7 +1090,7 @@ TEST(NinjaBackend, StdArtifactsAndRuntimeDllsUseTheStageRule) {
     plan.stdObjectPath = "/cache/bmi/fp/std.o";
     plan.stdCompatBmiPath = "/cache/bmi/fp/pcm.cache/std.compat.pcm";
     plan.stdCompatObjectPath = "/cache/bmi/fp/std.compat.o";
-    plan.runtimeDeployFiles.push_back({"/pkg/lib/libfoo.dll", "bin/libfoo.dll"});
+    plan.runtimeDeployFiles.push_back({{"/pkg/lib/libfoo.dll"}, "bin/libfoo.dll"});
 
     auto ninja = emit_ninja_string(plan);
 
@@ -1166,7 +1166,7 @@ TEST(NinjaBackend, DeployedDllsAreOrderOnlyInputsOfTheLink) {
     // The linker reads the import library, never the deployed DLL, so a DLL
     // that changes (or a deploy entry a later plan adds) must not relink.
     auto plan = program_plan("x86_64-w64-windows-gnu", false);
-    plan.runtimeDeployFiles.push_back({"/pkg/lib/libfoo.dll", "bin/libfoo.dll"});
+    plan.runtimeDeployFiles.push_back({{"/pkg/lib/libfoo.dll"}, "bin/libfoo.dll"});
     auto ninja = emit_ninja_string(plan);
     auto link = ninja.find("build bin/app.exe");
     ASSERT_NE(link, std::string::npos) << ninja;
@@ -1541,7 +1541,8 @@ TEST(NinjaBackendPeRuntime, ToolchainCoupledStagesTheToolsetCrtBesideTheExe) {
         EXPECT_EQ(d.dest.parent_path(), std::filesystem::path("bin"))
             << "a DLL must land in the same directory as the .exe: "
             << d.dest.string();
-        EXPECT_EQ(d.source.extension(), ".dll") << d.source.string();
+        ASSERT_EQ(d.sources.size(), 1u);
+        EXPECT_EQ(d.sources.front().extension(), ".dll") << d.sources.front().string();
     }
 
     auto ninja = emit_ninja_string(plan);
@@ -1589,7 +1590,7 @@ TEST(NinjaBackendPeRuntime, AProjectsOwnDeployFileOutranksTheToolsets) {
     FakeRedistDir redist;
     auto plan = msvc_plan_with_redist(redist, "toolchain-coupled");
     plan.runtimeDeployFiles.push_back(
-        {"/vendor/msvcp140.dll", std::filesystem::path("bin") / "msvcp140.dll"});
+        {{"/vendor/msvcp140.dll"}, std::filesystem::path("bin") / "msvcp140.dll"});
 
     auto flags = compute_flags(plan);
     for (auto const& d : flags.toolchainRuntimeDeploy)

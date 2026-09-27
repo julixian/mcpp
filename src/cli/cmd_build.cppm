@@ -906,19 +906,25 @@ export int cmd_dyndep(const mcpplibs::cmdline::ParsedArgs& parsed) {
 }
 
 // Invoked by ninja during build (stage_file rule):
-//   mcpp stage --output <dst> <src>
+//   mcpp stage --output <dst> <src>...
 //
 // Publishes a cache-owned artifact (std BMI, std.o, runtime DLL) into the
 // build directory. See mcpp.build.stage for the semantics — in particular why
 // an already-equivalent destination is left untouched (#311).
+//
+// More than one source (SPEC-007 R4.2, mcpp#723) means two or more packages
+// of this graph deploy the same destination; `stage_files` places it when
+// every source is byte-identical and otherwise fails, naming every source
+// and the destination. One source — every invocation before this feature —
+// takes the exact path it always has.
 export int cmd_stage(const mcpplibs::cmdline::ParsedArgs& parsed) {
     std::filesystem::path outPath = parsed.option_or_empty("output").value();
     if (outPath.empty()) {
         std::println(stderr, "error: --output <path> required");
         return 2;
     }
-    if (parsed.positional_count() != 1) {
-        std::println(stderr, "error: stage requires exactly one source path");
+    if (parsed.positional_count() < 1) {
+        std::println(stderr, "error: stage requires at least one source path");
         return 2;
     }
 
@@ -931,9 +937,13 @@ export int cmd_stage(const mcpplibs::cmdline::ParsedArgs& parsed) {
     if (!verify.empty())
         opts.verify = mcpp::build::stage::parse_verify(verify);
 
-    auto r = mcpp::build::stage::stage_file(
-        mcpp::platform::fs::extended_length(std::filesystem::path{parsed.positional(0)}),
-        mcpp::platform::fs::extended_length(outPath), opts);
+    std::vector<std::filesystem::path> sources;
+    for (std::size_t i = 0; i < parsed.positional_count(); ++i)
+        sources.push_back(mcpp::platform::fs::extended_length(
+            std::filesystem::path{parsed.positional(i)}));
+
+    auto r = mcpp::build::stage::stage_files(
+        sources, mcpp::platform::fs::extended_length(outPath), opts);
     if (!r) {
         std::println(stderr, "error: {}", r.error().message);
         return 1;

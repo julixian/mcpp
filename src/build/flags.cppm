@@ -1547,16 +1547,19 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                     auto clash = std::ranges::find_if(plan.runtimeDeployFiles,
                         [&](auto const& d) { return d.dest == dest; });
                     if (clash != plan.runtimeDeployFiles.end()) {
-                        if (clash->source.lexically_normal()
-                            != src.lexically_normal())
+                        if (std::ranges::none_of(clash->sources,
+                                [&](auto const& s) {
+                                    return s.lexically_normal()
+                                        == src.lexically_normal();
+                                }))
                             f.diagnostics.push_back(std::format(
                                 "toolchain-coupled would stage '{}' beside the "
                                 "artifact, but this project already deploys "
                                 "'{}' there; keeping the project's file",
-                                src.string(), clash->source.string()));
+                                src.string(), clash->sources.front().string()));
                         continue;
                     }
-                    f.toolchainRuntimeDeploy.push_back({src, dest});
+                    f.toolchainRuntimeDeploy.push_back({{src}, dest});
                 }
             }
         }

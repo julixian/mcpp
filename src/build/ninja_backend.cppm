@@ -1935,7 +1935,16 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         for (auto const& d : plan.linkIntent.runtimeSearchDirs)
             dirs += " " + ninja_command_word(d.string());
         append("rule place_dlls\n");
-        append("  command = $mcpp place-dlls --output $out --depfile $out.d $in" + dirs + "\n");
+        // `$placed` (SPEC-007 R4.2/R4.3, #723 self-review: one destination,
+        // one writer) names, per edge, the DLLs the merged deploy list
+        // already places directly beside THIS program. `place-dlls` skips
+        // them — that list is the authority for its own destinations, and
+        // this mechanism only compares and warns instead of racing it. It is
+        // always exactly one shell word, comma-joining the names (never
+        // empty in the ninja_command_word sense: `''`/`""` when there is
+        // nothing to say) so it can never absorb `$in` or the directories
+        // that follow it, whatever it lists.
+        append("  command = $mcpp place-dlls --output $out --depfile $out.d $in $placed" + dirs + "\n");
         append("  depfile = $out.d\n");
         append("  deps = gcc\n");
         append("  description = DLLS $in\n\n");
@@ -2958,6 +2967,18 @@ std::string emit_ninja_string(const BuildPlan& plan) {
             append("build " + exe + ".dlls: place_dlls " + exe
                    + (prepareStamps.empty() ? std::string{} : " |" + prepareStamps)
                    + "\n");
+            // One destination, one writer (SPEC-007 R4.2/R4.3, #723 self-
+            // review): the names the merged deploy list already places in
+            // THIS program's own directory. `place-dlls` must not place a
+            // second, competing copy of one of these — see the `$placed`
+            // comment above, and `place_runtime_dlls` in mcpp.pack.
+            std::string placedHere;
+            for (auto const& d : deployFiles) {
+                if (d.dest.parent_path() != lu.output.parent_path()) continue;
+                if (!placedHere.empty()) placedHere += ',';
+                placedHere += d.dest.filename().string();
+            }
+            append("  placed = " + ninja_command_word(placedHere) + "\n");
             append("default " + exe + ".dlls\n\n");
         }
 
@@ -2975,10 +2996,20 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     // previous `mcpp run` gets the skip-if-equivalent treatment instead of a
     // hard "cannot copy" failure.
     // Inert on RPATH platforms where the merged deploy list is empty.
+    //
+    // SPEC-007 R4.2 (#723): a destination with more than one source (two
+    // packages of this graph each generated the same file) becomes ONE edge
+    // with every source as an input, not one edge per source. `mcpp stage`
+    // is where they are checked against each other's bytes — planning cannot,
+    // because a generated source may not exist yet. A destination with
+    // exactly one source (every project before this feature, and most
+    // packages after it) emits the exact same line as always: the loop below
+    // reduces to the one-word case with no change in spelling.
     for (auto const& d : deployFiles) {
-        append(std::format("build {} : stage_file {}\n",
-            escape_ninja_path(d.dest),
-            escape_ninja_path(d.source)));
+        std::string ins;
+        for (auto const& s : d.sources) ins += " " + escape_ninja_path(s);
+        append(std::format("build {} : stage_file{}\n",
+            escape_ninja_path(d.dest), ins));
     }
     if (!deployFiles.empty())
         append("\n");
