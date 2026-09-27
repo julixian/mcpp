@@ -628,6 +628,34 @@ TEST(CacheKey, PicIsRecordedInEntryJsonSoAHitCanBeAudited) {
     EXPECT_EQ(j["profile"]["pic"], true);
 }
 
+// The CRT model on the MSVC ABI is whole-build like PIC (#718): switching
+// `cxx_runtime` must not be served an object compiled against the other CRT.
+// Off the MSVC ABI the axis is empty, so no other entry's key moves.
+TEST(CacheKey, TheMsvcCrtModelChangesTheKeyOnlyOnTheMsvcAbi) {
+    auto key_for = [](std::string triple, mcpp::toolchain::CompilerId id,
+                      std::string cxxRuntime) {
+        mcpp::toolchain::Toolchain tc;
+        tc.compiler = id;
+        tc.targetTriple = std::move(triple);
+        mcpp::manifest::Manifest m;
+        m.buildConfig.cxxRuntime = std::move(cxxRuntime);
+        auto b = ck::build_axes(tc, m, "-std=c++23", {}, {});
+        return std::pair{b.crt, ck::key_hex(b, pkg())};
+    };
+    using mcpp::toolchain::CompilerId;
+    for (auto id : {CompilerId::Clang, CompilerId::MSVC}) {
+        auto [crtStatic, keyStatic]   = key_for("x86_64-pc-windows-msvc", id, "self-contained");
+        auto [crtDynamic, keyDynamic] = key_for("x86_64-pc-windows-msvc", id, "toolchain-coupled");
+        EXPECT_FALSE(crtStatic.empty());
+        EXPECT_NE(crtStatic, crtDynamic);
+        EXPECT_NE(keyStatic, keyDynamic);
+    }
+    auto [crtA, keyA] = key_for("x86_64-linux-gnu", CompilerId::GCC, "self-contained");
+    auto [crtB, keyB] = key_for("x86_64-linux-gnu", CompilerId::GCC, "toolchain-coupled");
+    EXPECT_TRUE(crtA.empty());
+    EXPECT_TRUE(crtB.empty());
+}
+
 TEST(CacheKey, PicDefaultsOffSoExistingEntriesKeepTheirIdentity) {
     ck::BuildAxes fresh;
     EXPECT_FALSE(fresh.pic);

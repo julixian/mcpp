@@ -352,15 +352,29 @@ std::optional<CrtWordVerdict> check_crt_word(std::string_view word,
         return std::nullopt;
     }
 
+    // A DEBUG CRT WORD IS NEVER REDUNDANT. The model states static or dynamic
+    // and nothing about debug (that axis is deferred, docs/20), while the std
+    // module and the link are built against the release CRT it resolved. A
+    // debug word therefore compiles its units against a CRT nothing else uses.
+    const bool debugWord = word.ends_with("d") || word.ends_with("_dbg");
+    if (debugWord) {
+        return CrtWordVerdict{true, std::format(
+            "`{}` in {} asks for a debug CRT, which the CRT model does not "
+            "express; the standard library module and the link use {}. Remove "
+            "the flag",
+            word, key, staticCrt ? "the static CRT, /MT" : "the dynamic CRT, /MD")};
+    }
     std::string_view wordValue =
         *wantsStatic ? "the static CRT (/MT)" : "the dynamic CRT (/MD)";
     if (*wantsStatic == staticCrt) {
         return CrtWordVerdict{false, std::format(
             "`{}` in {} agrees with the CRT model this build already "
-            "resolved and says nothing new. Write `cxx_runtime = "
-            "\"self-contained\"` (or `linkage = \"static\"`) instead if {} "
-            "should stay an explicit statement, and drop the flag",
-            word, key, wordValue)};
+            "resolved and says nothing new. Write {} instead if {} should "
+            "stay an explicit statement, and drop the flag",
+            word, key,
+            staticCrt ? "`cxx_runtime = \"self-contained\"` (or `linkage = \"static\"`)"
+                      : "`cxx_runtime = \"toolchain-coupled\"` (or `\"host-coupled\"`)",
+            wordValue)};
     }
     return CrtWordVerdict{true, std::format(
         "`{}` in {} asks for {}, which contradicts the CRT model this build "

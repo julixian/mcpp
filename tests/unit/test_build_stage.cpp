@@ -286,6 +286,21 @@ TEST(BuildStageFiles, ThreeSourcesWhereOnlyTheLastDisagreesAreAllNamed) {
         << r.error().message;
 }
 
+TEST(BuildStageFiles, AMissingSourceIsNamedAsMissingNotAsADisagreement) {
+    Tmp tmp;
+    auto a = tmp.path / "a.bin";
+    auto b = tmp.path / "never-written.bin";
+    auto dst = tmp.path / "dst.bin";
+    write_file(a, "X");
+
+    auto r = stage_files({a, b}, dst, no_retry());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("does not exist"), std::string::npos) << r.error().message;
+    EXPECT_NE(r.error().message.find(b.string()), std::string::npos) << r.error().message;
+    EXPECT_EQ(r.error().message.find("disagree"), std::string::npos) << r.error().message;
+    EXPECT_FALSE(std::filesystem::exists(dst));
+}
+
 TEST(BuildStageFiles, EmptySourceListIsAnError) {
     Tmp tmp;
     auto r = stage_files({}, tmp.path / "dst.bin", no_retry());

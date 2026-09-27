@@ -266,13 +266,19 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
     // NOT gated on `needsStdModule`: the CRT model is a link-time fact for
     // every MSVC-ABI build, with or without `import std`.
     //
-    // THE ROOT PACKAGE ONLY, the same bound the dialect check above uses and
-    // for the same reason: `cxx_runtime` and `linkage` are root-level keys,
-    // so a dependency's own `cxxflags` cannot state the graph's CRT model.
+    // EVERY PACKAGE'S `cxxflags`, because each reaches its own package's
+    // units after the graph's flags and would compile them against another
+    // CRT: one image, two CRTs. `dialect_cxxflags` is the root's alone (a
+    // dependency's reaches no command). `cxx_runtime` and `linkage` are
+    // root-level keys, so a dependency's agreeing word is not warned: the key
+    // the warning would name cannot be written there, and the word changes
+    // nothing. Its contradicting word is refused like the root's.
     if (mcpp::toolchain::is_msvc_target(*state.tc)) {
         const bool wantsStatic = mcpp::toolchain::msvc_wants_static_crt(
             state.m->buildConfig.linkage, state.m->buildConfig.cxxRuntime);
-        for (auto const& pkg : std::span{state.packages}.first(1)) {
+        for (std::size_t i = 0; i < state.packages.size(); ++i) {
+            auto const& pkg = state.packages[i];
+            const bool isRoot = i == 0;
             auto check_words = [&](std::span<const std::string> list,
                                    std::string_view key)
                     -> std::expected<void, std::string> {
@@ -284,18 +290,24 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
                         return std::unexpected(verdict->message);
                     // Redundant, not degraded: the engine does exactly what
                     // it would have done without the flag.
-                    mcpp::diag::warning("build/msvc-crt-word",
-                        verdict->message);
+                    if (isRoot)
+                        mcpp::diag::warning("build/msvc-crt-word",
+                            verdict->message);
                 }
                 return {};
             };
             const auto cxxflagsWords =
                 mcpp::manifest::flag_words(pkg.manifest.buildConfig.cxxflags);
-            if (auto r = check_words(cxxflagsWords, "[build] cxxflags"); !r)
+            const auto cxxflagsKey = isRoot
+                ? std::string("[build] cxxflags")
+                : std::format("the [build] cxxflags of dependency '{}'",
+                              pkg.manifest.package.name);
+            if (auto r = check_words(cxxflagsWords, cxxflagsKey); !r)
                 return std::unexpected(r.error());
-            if (auto r = check_words(pkg.manifest.buildConfig.dialectCxxflags,
-                                     "[build] dialect_cxxflags"); !r)
-                return std::unexpected(r.error());
+            if (isRoot)
+                if (auto r = check_words(pkg.manifest.buildConfig.dialectCxxflags,
+                                         "[build] dialect_cxxflags"); !r)
+                    return std::unexpected(r.error());
         }
     }
 

@@ -188,6 +188,8 @@ public:
 
     void update(std::span<const DownloadFile> files, double elapsed_sec);
     void finish();   // finish the active bar if any (idempotent)
+    // Finish the active bar as not completed: the run that fed it failed.
+    void finish_failed();
 
 private:
     std::optional<ProgressBar>      bar_;
@@ -744,6 +746,12 @@ DownloadProgress::~DownloadProgress() { finish(); }
 
 void DownloadProgress::finish() {
     if (bar_) bar_->finish();
+    bar_.reset();
+    active_.clear();
+}
+
+void DownloadProgress::finish_failed() {
+    if (bar_) bar_->finish_failed(active_);
     bar_.reset();
     active_.clear();
 }

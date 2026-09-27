@@ -9,6 +9,7 @@ import mcpp.build.prepare_inputs;
 
 import std;
 import mcpp.diag;
+import mcpp.build.stage;
 import mcpp.build.refusal;
 import mcpp.build.version_floor;
 import mcpp.home;
@@ -359,6 +360,18 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                                              state.stdBmiPath, state.stdObjectPath, state.storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
+    // SPEC-007 R4.3: a declared deploy outranks a search directory's file of
+    // the same name, and a difference between the two is said here, where
+    // the user sees it (the post-link placement edge says it only under -v).
+    for (auto const& s : ctx.plan.shadowedSearchDirDlls) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(s.declared, ec)
+            && !mcpp::build::stage::same_content(s.declared, s.offered))
+            mcpp::diag::warning("build/deploy-shadows-search-dir", std::format(
+                "'{}' is placed by this project's deploy list; the runtime "
+                "search directories also offer a different '{}', which is "
+                "not used", s.declared.string(), s.offered.string()));
+    }
     // Resolved far above, where the dependency graph first exists. It is
     // attached here rather than threaded through `make_plan` because nothing
     // that function does depends on it: the flag assembly that does reads the

@@ -58,6 +58,21 @@ TEST(ProgressBarPlain, AFailedItemIsNotReportedDone) {
     EXPECT_EQ(out.find(" done"), std::string::npos) << out;
 }
 
+TEST(DownloadProgressPlain, AnInterruptedDownloadIsNotReportedDone) {
+    mcpp::ui::disable_color();
+    mcpp::ui::set_live_progress(false);
+    testing::internal::CaptureStdout();
+    {
+        mcpp::ui::DownloadProgress dl;
+        const mcpp::ui::DownloadFile f{"xim-index.tar.gz", 10, 100, true, false};
+        dl.update(std::span{&f, 1}, 0.2);
+        dl.finish_failed();
+    }
+    auto out = testing::internal::GetCapturedStdout();
+    EXPECT_NE(out.find("xim-index.tar.gz did not complete"), std::string::npos) << out;
+    EXPECT_EQ(out.find(" done"), std::string::npos) << out;
+}
+
 TEST(ProgressBarLive, RedrawsInPlace) {
     mcpp::ui::disable_color();
     mcpp::ui::set_live_progress(true);

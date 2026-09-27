@@ -55,6 +55,7 @@ import mcpp.libs.json;
 import mcpp.manifest;
 import mcpp.modgraph.scanner;
 import mcpp.toolchain.detect;
+import mcpp.toolchain.dialect;
 import mcpp.toolchain.fingerprint;
 import mcpp.toolchain.linkmodel;
 import mcpp.toolchain.triple;
@@ -199,6 +200,13 @@ struct BuildAxes {
     // Decided by `make_plan` (BuildPlan::needsPic) and passed in, so the
     // compiler flag and this key read the same bit.
     bool        pic   = false;
+    // The CRT model word on the MSVC ABI (`/MT`, `-fms-runtime-lib=dll`, ...),
+    // empty off it. Whole-build like `pic`: every object of the graph is
+    // compiled against it, and an object of one CRT in an image of the other
+    // is a second CRT state. Derived by the same helper and from the same two
+    // root keys as the flag builder (flags.cppm), so that switching
+    // `cxx_runtime` cannot be served an object compiled for the other model.
+    std::string crt;
 };
 
 // Axes D/E/F for one package.
@@ -330,6 +338,7 @@ nlohmann::json to_json(const BuildAxes& b, const PackageAxes& p) {
         {"lto", b.lto},
         {"strip", b.strip},
         {"pic", b.pic},
+        {"crt", b.crt},
     };
     j["package"] = {
         {"index", p.indexName},
@@ -378,6 +387,7 @@ std::string key_hex(const BuildAxes& b, const PackageAxes& p) {
     put(s, "lto",      b.lto   ? "1" : "0");
     put(s, "strip",    b.strip ? "1" : "0");
     put(s, "pic",      b.pic   ? "1" : "0");
+    put(s, "crt",      b.crt);
     // D
     put(s, "index",    p.indexName);
     put(s, "pkg",      p.packageName);
@@ -410,6 +420,9 @@ BuildAxes build_axes(const mcpp::toolchain::Toolchain& tc,
 {
     BuildAxes b;
     b.pic             = needsPic;
+    b.crt             = mcpp::toolchain::msvc_abi_crt_word(
+        tc, mcpp::toolchain::msvc_wants_static_crt(
+                rootManifest.buildConfig.linkage, rootManifest.buildConfig.cxxRuntime));
     b.compilerId      = std::string(tc.compiler_name());
     b.compilerVersion = tc.version;
     // Same rule the whole-project fingerprint uses: prefer the declared driver

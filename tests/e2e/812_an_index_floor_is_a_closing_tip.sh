@@ -55,6 +55,8 @@ grep -q '^error:' a.err && fail "A: a refresh that kept a usable index printed a
 [ "$(grep -c '^tip:' a.err)" = 1 ] || fail "A: expected exactly one tip line" a.err
 tail -1 a.err | grep -q '^tip: .*requires a newer mcpp' \
     || fail "A: the tip is not the last line of the run" a.err
+grep -q '^tip: .*requires mcpp >= 9999.9.9.9' a.err \
+    || fail "A: the tip does not name the version the index asks for" a.err
 grep -q 'min_mcpp = "0.0.1"' "$DATA/index.toml" \
     || fail "A: the guard did not keep the previous, usable tree" "$DATA/index.toml"
 echo "ok: A. a floor bump seen by a refresh is one closing tip"

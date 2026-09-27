@@ -192,7 +192,7 @@ An index can require a newer mcpp than the one running (`index.toml`
 brings in such an index keeps the previous copy, and the run ends with one line:
 
 ```
-tip: the refreshed package index `mcpplibs` requires a newer mcpp; this run used the previous index. Upgrade to see newer packages: xlings update mcpp
+tip: the refreshed package index `mcpplibs` requires a newer mcpp; this run used the previous index. It requires mcpp >= 2026.10.1.1; this is mcpp 2026.9.28.1. Upgrade: xlings update mcpp
 ```
 
 A run that did not refresh an index says nothing about it. A run that fails

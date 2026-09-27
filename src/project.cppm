@@ -582,10 +582,17 @@ resolve_member_dir(const mcpp::manifest::Manifest& rootManifest,
     }
 
     // Step 3: the directory path or basename `[workspace] members` writes.
+    // The path is compared as a path, so `./modules/base/`, and on Windows
+    // `modules\base`, name the member written `modules/base`.
+    auto as_path = [](std::string_view s) {
+        auto p = std::filesystem::path(s).lexically_normal();
+        return (!p.has_filename() && p.has_parent_path()) ? p.parent_path() : p;
+    };
+    const auto filterPath = as_path(package_filter);
     std::vector<std::size_t> byPath;
     for (std::size_t i = 0; i < members.size(); ++i) {
         auto basename = members[i].dir.filename().string();
-        if (basename == package_filter || members[i].memberPath == package_filter)
+        if (basename == package_filter || as_path(members[i].memberPath) == filterPath)
             byPath.push_back(i);
     }
 

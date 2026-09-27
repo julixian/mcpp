@@ -52,6 +52,11 @@ floor_violation(std::string_view minMcpp, std::string_view ownVersion);
 // running binary.
 std::string e0006_message(std::string violation, bool distroManaged);
 
+// The closing half of an index-floor notice: the version the index asks for
+// (omitted when unknown) and the upgrade command for this install layout,
+// the same advice E0006 gives (`distro_managed_install`).
+std::string index_floor_upgrade_advice(std::string_view minMcpp);
+
 // Pure predicate — no reporting, no registration, no dedup. For callers that
 // need to ask "would this tree be usable?" without the side effects of
 // check_index_floor (the refresh guard asks it twice per refresh).
@@ -188,6 +193,17 @@ bool distro_managed_install()
     auto self = mcpp::platform::fs::self_exe_path();
     return self.string().find("/opt/mcpp/") != std::string::npos;
 #endif
+}
+
+std::string index_floor_upgrade_advice(std::string_view minMcpp)
+{
+    const std::string_view how = distro_managed_install()
+        ? "update the mcpp-bin package with your AUR helper"
+        : "xlings update mcpp";
+    return minMcpp.empty()
+        ? std::format("Upgrade: {}", how)
+        : std::format("It requires mcpp >= {}; this is mcpp {}. Upgrade: {}",
+                      minMcpp, mcpp::MCPP_VERSION, how);
 }
 
 bool index_usable(const std::filesystem::path& indexRoot)

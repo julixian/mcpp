@@ -1536,11 +1536,13 @@ std::expected<void, std::string> run_build_program(
     }
     mcpp::ui::info("build.mcpp", "compiling");
     // GCC resolves imported BMIs via gcm.cache/ relative to the compile cwd, so
-    // any compile that imports a module — `mcpp`, `std`, or both — has to run
-    // from bdir, where they were staged. One condition, not two: a build.mcpp
-    // that imports only std needs exactly the same cwd as one that imports
-    // only mcpp. Otherwise the project root is fine.
-    const bool needsBmiCwd = usesModule || stdStagedInBdir;
+    // any compile that imports a module — `mcpp`, `std`, a build rule's host
+    // module, or any mix — has to run from bdir, where they were staged or
+    // compiled. One condition: a build.mcpp that imports only a rule needs
+    // exactly the same cwd as one that imports only mcpp (a rule-only program
+    // compiled in the project root and failed with "failed to read compiled
+    // module", e2e 807 under GCC). Otherwise the project root is fine.
+    const bool needsBmiCwd = usesModule || stdStagedInBdir || !env.hostModules.empty();
     std::string compileCwd = needsBmiCwd ? bdir.string() : root.string();
     auto cres = mcpp::platform::process::capture_exec(compileArgv, compileEnv,
                                                      compileCwd);

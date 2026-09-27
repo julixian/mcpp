@@ -166,4 +166,49 @@ find "$SYSTEM_DIST" -iname "vcruntime140.dll" | grep -q . \
 
 echo "ok: mcpp pack carries the DLL by default, and --mode system resolves the defaulted contract to host-coupled instead of refusing"
 
+# A dependency's `[build] cxxflags` reach its own units after the graph's
+# flags, so a CRT word there would compile them against the other CRT: one
+# image, two CRTs. A contradicting word is refused, naming the dependency;
+# an agreeing one is accepted without a warning (`cxx_runtime` is the root's).
+cd "$TMP"
+mkdir -p dep/src
+printf 'export module dep;\nexport int dep_value() { return 7; }\n' > dep/src/dep.cppm
+write_dep() {   # $1 = the dependency's cxxflags word
+    cat > dep/mcpp.toml <<TOML
+[package]
+name    = "dep"
+version = "0.1.0"
+
+[targets.dep]
+kind = "lib"
+
+[build]
+cxxflags = ["$1"]
+TOML
+}
+mkdir -p user/src
+printf 'import dep;\nint main() { return dep_value() == 7 ? 0 : 1; }\n' > user/src/main.cpp
+cat > user/mcpp.toml <<'TOML'
+[package]
+name    = "user"
+version = "0.1.0"
+
+[dependencies]
+dep = { path = "../dep" }
+TOML
+cd user
+write_dep_here() { (cd .. && write_dep "$1"); }
+write_dep_here "-fms-runtime-lib=static"
+if "$MCPP" build > dep-static.log 2>&1; then
+    fail "a dependency's contradicting CRT word was not refused" dep-static.log
+fi
+grep -q "dependency 'dep'" dep-static.log && grep -q -- "-fms-runtime-lib=static" dep-static.log \
+    || fail "the refusal does not name the dependency and the word" dep-static.log
+write_dep_here "-fms-runtime-lib=dll"
+"$MCPP" build > dep-dll.log 2>&1 || fail "a dependency's agreeing CRT word was refused" dep-dll.log
+if grep -q "agrees with the CRT model" dep-dll.log; then
+    fail "a dependency's agreeing CRT word was warned" dep-dll.log
+fi
+echo "ok: a dependency's contradicting CRT word is refused by name; an agreeing one is accepted silently"
+
 echo "PASS: 814 the llvm row defaults to the dynamic CRT"

@@ -375,7 +375,7 @@ int run(int argc, char** argv) {
             .option(cl::Option("static").help(
                 "Force static linking (-static). On Linux, prefer pairing with --target <arch>-linux-musl"))
             .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Build only the named workspace member (package name first, then directory)"))
+                .help("Build only the named workspace member (namespace.name or package name, then directory)"))
             .option(cl::Option("profile").takes_value().value_name("NAME")
                 .help("Build profile: dev (default) | release | dist | <[profile.*] name>"))
             .option(cl::Option("release").help("Shorthand for --profile release"))
@@ -419,7 +419,7 @@ int run(int argc, char** argv) {
             .option(cl::Option("target-triple").takes_value().value_name("TRIPLE")
                 .help("Alias for --target"))
             .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Run only the named workspace member (package name first, then directory; single-member, no --workspace fan-out)"))
+                .help("Run only the named workspace member (namespace.name or package name, then directory; single-member, no --workspace fan-out)"))
             // DECLARED ON THE THREE COMMANDS THAT BUILD BEFORE THEY ACT, AS ON
             // `build`. The value has always reached them: the pre-parse loop
             // above publishes it as MCPP_TOOLCHAIN for every command, and
@@ -519,7 +519,7 @@ int run(int argc, char** argv) {
             .option(cl::Option("strict")
                 .help("Treat manifest schema warnings (unknown feature/platform) as errors"))
             .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Run tests only for the named workspace member (package name first, then directory)"))
+                .help("Run tests only for the named workspace member (namespace.name or package name, then directory)"))
             .option(cl::Option("toolchain").takes_value().value_name("SPEC")
                 .help("Build the tests with this toolchain for one invocation, e.g. llvm@22.1.8"))
             .option(cl::Option("cache").takes_value().value_name("MODE")
@@ -684,7 +684,7 @@ int run(int argc, char** argv) {
                     .help("Describe the variant built for no accelerator"))
                 .option(cl::Option("static").help("Describe the build with --static"))
                 .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                    .help("Describe only the named workspace member (package name first, then directory)"))
+                    .help("Describe only the named workspace member (namespace.name or package name, then directory)"))
                 .option(cl::Option("profile").takes_value().value_name("NAME")
                     .help("Build profile: dev (default) | release | dist | <[profile.*] name>"))
                 .option(cl::Option("release").help("Shorthand for --profile release"))

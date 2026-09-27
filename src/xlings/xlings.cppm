@@ -1682,9 +1682,9 @@ public:
             const auto key = subject.empty() ? phase : phase + "/" + subject;
             if (!bar_ || key != label_) {
                 if (bar_) bar_->finish();
-                bar_.emplace("Updating", subject.empty()
-                    ? phase_label(phase)
-                    : std::format("package index {}", subject));
+                shown_ = subject.empty() ? phase_label(phase)
+                                         : std::format("package index {}", subject);
+                bar_.emplace("Updating", shown_);
                 label_ = key;
             }
             const auto pct = std::clamp(ls.find_num("percent"), 0.0, 100.0);
@@ -1704,9 +1704,12 @@ public:
     }
     // The exit code the result event carried, or -1 when none arrived.
     int result_exit() const { return resultExit_; }
+    // The run failed or was stopped: the open bar says the step did not
+    // complete rather than reporting it done.
+    void fail() { failed_ = true; }
     ~IndexRefreshRenderer() {
-        if (bar_) bar_->finish();
-        download_.finish();
+        if (bar_) failed_ ? bar_->finish_failed(shown_) : bar_->finish();
+        failed_ ? download_.finish_failed() : download_.finish();
     }
 
 private:
@@ -1718,6 +1721,8 @@ private:
 
     std::optional<mcpp::ui::ProgressBar> bar_;
     std::string                          label_;   // the phase (and repository) drawn
+    std::string                          shown_;   // the bar's label
+    bool                                 failed_ = false;
     mcpp::ui::DownloadProgress           download_;
     int                                  resultExit_ = -1;
 };
@@ -2175,23 +2180,27 @@ int update_index(const Env& env, bool quiet) {
     // refreshed the index. `quiet` governs the refresh's own narration, not
     // these: they are the one thing the refresh has to say.
     (void)quiet;
+    auto advice = [&](const std::filesystem::path& dir) {
+        auto it = out.requiredMcpp.find(dir);
+        return mcpp::pm::index_floor_upgrade_advice(
+            it == out.requiredMcpp.end() ? std::string_view{} : std::string_view{it->second});
+    };
     for (auto& dir : out.rolledBack) {
         mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
             "the refreshed package index `{}` requires a newer mcpp; this run "
-            "used the previous index. Upgrade to see newer packages: "
-            "xlings update mcpp", dir.filename().string()));
+            "used the previous index. {}", dir.filename().string(), advice(dir)));
     }
     for (auto& dir : out.recovered) {
         mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
             "the package index `{}` was restored from a local snapshot this mcpp "
-            "can read; the published index requires a newer mcpp. Upgrade: "
-            "xlings update mcpp", dir.filename().string()));
+            "can read; the published index requires a newer mcpp. {}",
+            dir.filename().string(), advice(dir)));
     }
     for (auto& dir : out.stillUnusable) {
         mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
             "the package index `{}` requires a newer mcpp and no earlier copy is "
-            "usable; packages it serves cannot be resolved. Upgrade: "
-            "xlings update mcpp", dir.filename().string()));
+            "usable; packages it serves cannot be resolved. {}",
+            dir.filename().string(), advice(dir)));
     }
     return rc;
 }
@@ -2235,7 +2244,6 @@ int update_index_unguarded(const Env& env, bool quiet) {
     std::string cmd = std::format("{} interface update_packages --args {} {} {}",
         build_command_prefix(env), shq_meta("{}"), mcpp::platform::null_redirect,
         mcpp::platform::is_windows ? "<NUL" : "</dev/null");
-    (void)quiet;
     mcpp::platform::env::note_network_access();
     // The index sync is a network git operation; a single transient blip (DNS,
     // TLS reset, a mirror hiccup) otherwise fails a cold `mcpp self env` /
@@ -2254,6 +2262,7 @@ int update_index_unguarded(const Env& env, bool quiet) {
                 std::chrono::duration_cast<std::chrono::milliseconds>(refreshBound),
                 std::chrono::milliseconds{0}, &timedOut);
             if (rc == 0 && renderer.result_exit() > 0) rc = renderer.result_exit();
+            if (rc != 0 || timedOut) renderer.fail();
         }
         if (rc == 0 && !timedOut) { mark_known_indexes_refreshed(env); return 0; }
         // A refresh that exceeded its bound is not retried: the retries exist for
@@ -2276,8 +2285,13 @@ int update_index_unguarded(const Env& env, bool quiet) {
             std::this_thread::sleep_for(std::chrono::seconds(delay));
         }
     }
-    mcpp::log::verbose("index", std::format(
-        "index update failed after {} attempts (rc {})", kMaxAttempts, rc));
+    // Said, not only logged, to a caller that refreshes on its own (`quiet`:
+    // the TTL refresh before a build), which continues with the local index;
+    // `mcpp index update` reports the failure itself.
+    if (quiet)
+        std::println(stderr,
+            "warning: the package index refresh failed after {} attempts (exit {}); "
+            "continuing with the local index", kMaxAttempts, rc);
     return rc;
 }
 } // namespace

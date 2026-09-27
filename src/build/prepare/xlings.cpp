@@ -429,24 +429,27 @@ std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state)
                                 penv.workspace.emplace_back(entry.target, entry.pin());
                         }
             }
-            // `state.workRoot` is where THIS invocation writes (SPEC-005
-            // R2.1's cache directory under `emit build-database`'s
-            // `plan_only`, or a host tool's private store under tool
-            // provisioning); `runtimeSelection.ownerRoot` is always the real
-            // project root (`select_runtime`, `runtime_selection.cppm`),
-            // regardless of either. The two used to disagree on where the
-            // runtime-environment half (`penv`: deps/subos/workspace) of
-            // `.mcpp/.xlings.json` belongs whenever they differ: the custom-
-            // indices half already went to `workRoot`, but `penv` went to
-            // `ownerRoot` — the actual project tree — which is exactly what
-            // `emit` must never write into (design 2026-09-27 §4.3, mcpp#724
-            // side finding B). Both halves now go to the one root this
-            // invocation writes everything else to, `workRoot`; when it
-            // equals `ownerRoot` (an ordinary rooted build) that is the same
-            // write the `if` branch always made, so this is one call in
-            // every case, not two.
-            mcpp::config::ensure_project_index_dir(
-                **cfg2, state.workRoot, state.m->indices, penv);
+            // Two halves, two roots. The custom-indices half belongs to
+            // `state.workRoot`, where this invocation writes. The runtime-
+            // environment half (`penv`: deps/subos/workspace) belongs to the
+            // runtime's owner, `runtimeSelection.ownerRoot`: the workspace
+            // root when a member builds (e2e 205), the project root otherwise.
+            // Under `plan_only` (`emit build-database`) nothing is written
+            // into the project (SPEC-005 R2.1, mcpp#724 side finding B, e2e
+            // 817), so the owner's half goes to the planning directory too.
+            const auto& runtimeRoot = state.overrides.plan_only
+                ? state.workRoot : state.runtimeSelection.ownerRoot;
+            if (runtimeRoot == state.workRoot) {
+                mcpp::config::ensure_project_index_dir(
+                    **cfg2, state.workRoot, state.m->indices, penv);
+            } else {
+                if (!state.m->indices.empty())
+                    mcpp::config::ensure_project_index_dir(
+                        **cfg2, state.workRoot, state.m->indices, {});
+                if (materializeRootRuntime)
+                    mcpp::config::ensure_project_index_dir(
+                        **cfg2, runtimeRoot, {}, penv);
+            }
 
             // `[xlings] deps` are DECLARED above and, until now, nothing
             // installed them (mcpp-index #281 §9).

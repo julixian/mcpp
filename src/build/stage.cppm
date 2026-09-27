@@ -370,6 +370,15 @@ std::expected<StageOutcome, StageError> stage_files(
         return std::unexpected(StageError{
             std::format("staging '{}' requires at least one source", dst.string())});
     }
+    // A source that is not there is named as such: the step that should have
+    // written it failed or does not exist, which is not a disagreement.
+    if (srcs.size() > 1)
+        for (auto const& s : srcs) {
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(s, ec))
+                return std::unexpected(StageError{std::format(
+                    "a source of '{}' does not exist: {}", dst.string(), s.string())});
+        }
     for (std::size_t i = 1; i < srcs.size(); ++i) {
         if (!same_content(srcs.front(), srcs[i])) {
             std::string list;

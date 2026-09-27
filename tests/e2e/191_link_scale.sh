@@ -97,7 +97,10 @@ echo "  ok: built $((N + 1)) objects"
 ninja_file=$(find target -name build.ninja | head -1)
 [ -n "$ninja_file" ] || { echo "FAIL: no build.ninja"; exit 1; }
 bdir=$(dirname "$ninja_file")
-bin_rel=$(cd "$bdir" && ls bin/ 2>/dev/null | head -1)
+# The program by its name: on an MSVC-ABI row bin/ also holds the toolset's
+# runtime DLLs staged beside it (docs/20, toolchain-coupled), and relinking
+# one of those names re-runs a copy, which writes no response file.
+bin_rel=$(cd "$bdir" && ls bin/ 2>/dev/null | grep -E '^scale(\.exe)?$' | head -1)
 [ -n "$bin_rel" ] || { echo "FAIL: nothing was linked"; exit 1; }
 
 # Relink with the response file kept, so its real contents can be inspected —

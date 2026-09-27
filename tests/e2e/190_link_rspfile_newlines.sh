@@ -66,7 +66,10 @@ echo "  ok: link rules declare rspfile_content = \$in_newline"
 # 2. Observable: ninja keeps the response file under -d keeprsp, and it holds
 #    one object per line rather than all of them on the first.
 bdir=$(dirname "$ninja_file")
-bin_rel=$(cd "$bdir" && ls bin/ 2>/dev/null | head -1)
+# The program by its name: on an MSVC-ABI row bin/ also holds the toolset's
+# runtime DLLs staged beside it (docs/20, toolchain-coupled), and relinking
+# one of those names re-runs a copy, which writes no response file.
+bin_rel=$(cd "$bdir" && ls bin/ 2>/dev/null | grep -E '^multi(\.exe)?$' | head -1)
 [ -n "$bin_rel" ] || { echo "FAIL: no linked binary to inspect"; exit 1; }
 (cd "$bdir" && rm -f "bin/$bin_rel" && ninja -d keeprsp "bin/$bin_rel" > /dev/null 2>&1) \
     || { echo "FAIL: relink under -d keeprsp"; exit 1; }

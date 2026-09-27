@@ -1584,7 +1584,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
                     // the toolset's copy is a different program than the one
                     // the manifest describes.
                     auto clash = std::ranges::find_if(plan.runtimeDeployFiles,
-                        [&](auto const& d) { return d.dest == dest; });
+                        [&](auto const& d) { return d.is_destination(dest, /*peTarget=*/true); });
                     if (clash != plan.runtimeDeployFiles.end()) {
                         if (std::ranges::none_of(clash->sources,
                                 [&](auto const& s) {

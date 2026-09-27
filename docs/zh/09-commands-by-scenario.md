@@ -178,7 +178,7 @@ $ mcpp index status
 的副本，运行以一行结尾：
 
 ```
-tip: the refreshed package index `mcpplibs` requires a newer mcpp; this run used the previous index. Upgrade to see newer packages: xlings update mcpp
+tip: the refreshed package index `mcpplibs` requires a newer mcpp; this run used the previous index. It requires mcpp >= 2026.10.1.1; this is mcpp 2026.9.28.1. Upgrade: xlings update mcpp
 ```
 
 没有刷新索引的运行不提及它。因某个包只由这样的索引提供而失败的运行，在使它

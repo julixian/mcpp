@@ -1136,6 +1136,31 @@ constexpr std::string_view sdk_lib_arch = "x64";
 
 namespace {
 
+// Whether version directory name `a` is newer than `b`, compared by
+// dot-separated components, numerically where both are numbers (`14.9` is
+// older than `14.10`) and as text otherwise. An empty name is the oldest.
+bool newer_version(std::string_view a, std::string_view b) {
+    auto next = [](std::string_view& s) {
+        const auto dot = s.find('.');
+        const auto part = s.substr(0, dot);
+        s = dot == std::string_view::npos ? std::string_view{} : s.substr(dot + 1);
+        return part;
+    };
+    auto number = [](std::string_view p) -> std::optional<unsigned long long> {
+        unsigned long long n = 0;
+        const auto r = std::from_chars(p.data(), p.data() + p.size(), n);
+        if (p.empty() || r.ec != std::errc{} || r.ptr != p.data() + p.size()) return std::nullopt;
+        return n;
+    };
+    while (!a.empty() || !b.empty()) {
+        const auto pa = next(a), pb = next(b);
+        const auto na = number(pa), nb = number(pb);
+        if (na && nb) { if (*na != *nb) return *na > *nb; }
+        else if (pa != pb) return pa > pb;
+    }
+    return false;
+}
+
 // Highest version dir under `root/Include` that actually carries the UCRT
 // headers; `want` (from WindowsSdkVersion) wins if it is one of them.
 std::optional<WindowsSdk> pick_sdk_in(const std::filesystem::path& root,
@@ -1154,7 +1179,7 @@ std::optional<WindowsSdk> pick_sdk_in(const std::filesystem::path& root,
         auto v = e.path().filename().string();
         if (!usable(e.path(), v)) continue;
         if (!want.empty() && v == want) return WindowsSdk{root, v};
-        if (v > best) best = v;
+        if (newer_version(v, best)) best = v;
     }
     if (best.empty()) return std::nullopt;
     return WindowsSdk{root, best};
@@ -1498,7 +1523,7 @@ std::filesystem::path vc_redist_dir_under(const std::filesystem::path& vc,
                 continue;
             if (c.path().string().find("debug_nonredist") != std::string::npos)
                 continue;
-            if (auto ver = v.path().filename().string(); ver > bestVer) {
+            if (auto ver = v.path().filename().string(); newer_version(ver, bestVer)) {
                 bestVer = ver;
                 best = c.path();
             }

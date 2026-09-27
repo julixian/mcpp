@@ -124,6 +124,9 @@ struct GuardOutcome {
     std::vector<std::filesystem::path> recovered;
     // Index trees left unusable — nothing local could serve them.
     std::vector<std::filesystem::path> stillUnusable;
+    // The `min_mcpp` of each refreshed tree found unusable, read before a
+    // rollback replaces it, so a notice can name the version it asks for.
+    std::map<std::filesystem::path, std::string> requiredMcpp;
 
     bool degraded() const {
         return !rolledBack.empty() || !recovered.empty() || !stillUnusable.empty();
@@ -329,6 +332,8 @@ int guarded_refresh(const std::filesystem::path& dataRoot,
             prune(dataRoot, dir);
             continue;
         }
+        if (auto c = mcpp::pm::read_index_contract(dir))
+            out.requiredMcpp[dir] = c->minMcpp;
         auto wasUsable = usableBefore.find(dir);
         if (wasUsable != usableBefore.end() && wasUsable->second) {
             // Got worse. This is the case the invariant exists for.

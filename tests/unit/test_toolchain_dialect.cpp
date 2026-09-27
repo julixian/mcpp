@@ -231,11 +231,12 @@ TEST(MsvcAbiCrtWord, EveryContractResolvesToExactlyOneWordPerRow) {
 // resolved for every MSVC-ABI row.
 TEST(CheckCrtWord, AgreeingWordIsRedundantContradictingWordIsRefused) {
     // Recognised spellings, both dash conventions and both drivers.
-    for (auto* word : {"/MT", "-MT", "/MTd", "-MTd",
-                       "-fms-runtime-lib=static", "-fms-runtime-lib=static_dbg"}) {
+    for (auto* word : {"/MT", "-MT", "-fms-runtime-lib=static"}) {
         auto agree = check_crt_word(word, /*staticCrt=*/true, "[build] cxxflags");
         ASSERT_TRUE(agree.has_value()) << word;
         EXPECT_FALSE(agree->contradicts) << word;
+        // The key it names states the same model.
+        EXPECT_NE(agree->message.find("self-contained"), std::string::npos) << agree->message;
         auto disagree = check_crt_word(word, /*staticCrt=*/false, "[build] cxxflags");
         ASSERT_TRUE(disagree.has_value()) << word;
         EXPECT_TRUE(disagree->contradicts) << word;
@@ -243,14 +244,26 @@ TEST(CheckCrtWord, AgreeingWordIsRedundantContradictingWordIsRefused) {
         EXPECT_NE(disagree->message.find("[build] cxxflags"), std::string::npos)
             << disagree->message;
     }
-    for (auto* word : {"/MD", "-MD", "/MDd", "-MDd",
-                       "-fms-runtime-lib=dll", "-fms-runtime-lib=dll_dbg"}) {
+    for (auto* word : {"/MD", "-MD", "-fms-runtime-lib=dll"}) {
         auto agree = check_crt_word(word, /*staticCrt=*/false, "dialect_cxxflags");
         ASSERT_TRUE(agree.has_value()) << word;
         EXPECT_FALSE(agree->contradicts) << word;
+        EXPECT_NE(agree->message.find("toolchain-coupled"), std::string::npos) << agree->message;
+        EXPECT_EQ(agree->message.find("self-contained"), std::string::npos) << agree->message;
         auto disagree = check_crt_word(word, /*staticCrt=*/true, "dialect_cxxflags");
         ASSERT_TRUE(disagree.has_value()) << word;
         EXPECT_TRUE(disagree->contradicts) << word;
+    }
+    // A debug CRT word is refused under either model: the model has no debug
+    // axis, and the std module and the link use the release CRT.
+    for (auto* word : {"/MTd", "-MTd", "/MDd", "-MDd",
+                       "-fms-runtime-lib=static_dbg", "-fms-runtime-lib=dll_dbg"}) {
+        for (bool staticCrt : {true, false}) {
+            auto v = check_crt_word(word, staticCrt, "[build] cxxflags");
+            ASSERT_TRUE(v.has_value()) << word;
+            EXPECT_TRUE(v->contradicts) << word;
+            EXPECT_NE(v->message.find("debug CRT"), std::string::npos) << v->message;
+        }
     }
     // A word this axis does not recognise says nothing about it.
     EXPECT_FALSE(check_crt_word("-O2", true, "[build] cxxflags").has_value());

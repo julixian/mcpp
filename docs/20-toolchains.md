@@ -1270,8 +1270,13 @@ now states its own CRT, so a literal `/MT`, `/MD`, `/MTd`, `/MDd` or
 can never be the only voice. One that **agrees** with the resolved model is
 warned as redundant, naming the key (`cxx_runtime` or `linkage`) to write
 instead; one that **contradicts** it is refused, naming the word, the key it
-was found in, and the value it corresponds to. The engine never lets the
-last word on the command line decide silently.
+was found in, and the value it corresponds to. A dependency's `[build]
+cxxflags` are checked too, since they reach that package's own units: a
+contradicting word is refused, naming the package, and an agreeing one is
+not warned, because `cxx_runtime` is the root's key. A debug word (`/MTd`,
+`/MDd`, `-fms-runtime-lib=*_dbg`) is always refused: the model has no debug
+axis, and the standard library module and the link use the release CRT. The
+engine never lets the last word on the command line decide silently.
 
 > **Upgrading to 2026.9.28.1?** `cl`-row projects are unchanged apart from
 > gaining the staged DLLs beside their programs. **LLVM-row programs move

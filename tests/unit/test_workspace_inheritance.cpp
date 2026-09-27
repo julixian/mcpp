@@ -310,7 +310,12 @@ TEST(ResolveMember, PackageNamePathAndBasenameAllSelectTheOneMember) {
     f.member("modules/base", "ws-base");
     auto ws = f.root_manifest("[workspace]\nmembers = [\"modules/base\"]\n");
 
-    for (std::string_view filter : {"ws-base", "base", "modules/base"}) {
+    std::vector<std::string_view> filters{"ws-base", "base", "modules/base",
+                                          "./modules/base", "modules/base/"};
+#if defined(_WIN32)
+    filters.push_back("modules\\base");
+#endif
+    for (std::string_view filter : filters) {
         SCOPED_TRACE(std::string(filter));
         testing::internal::CaptureStderr();
         auto m = mcpp::project::resolve_member_dir(ws, f.root, filter);

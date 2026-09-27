@@ -1082,6 +1082,17 @@ TEST(NinjaBackend, McppBinaryIsBoundEvenWithoutDyndep) {
     EXPECT_NE(ninja.find("\nmcpp      = "), std::string::npos) << ninja;
 }
 
+// SPEC-007 R4.2: one destination, one writer. On a PE target two spellings
+// that differ only in case are one file where the program runs, so they are
+// one destination; elsewhere they are two.
+TEST(DeployDestination, FoldsCaseOnlyOnAPeTarget) {
+    const mcpp::build::BuildPlan::DeployFile d{{"/a/Foo.DLL"}, "bin/Foo.DLL"};
+    EXPECT_TRUE(d.is_destination("bin/Foo.DLL", /*peTarget=*/false));
+    EXPECT_FALSE(d.is_destination("bin/foo.dll", /*peTarget=*/false));
+    EXPECT_TRUE(d.is_destination("bin/foo.dll", /*peTarget=*/true));
+    EXPECT_FALSE(d.is_destination("bin/sub/foo.dll", /*peTarget=*/true));
+}
+
 TEST(NinjaBackend, StdArtifactsAndRuntimeDllsUseTheStageRule) {
     auto plan = minimal_plan();
     plan.toolchain.compiler = mcpp::toolchain::CompilerId::Clang;

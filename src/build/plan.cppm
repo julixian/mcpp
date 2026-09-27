@@ -447,8 +447,31 @@ struct BuildPlan {
         // actually checked, at build time, against each other's bytes.
         std::vector<std::filesystem::path> sources;
         std::filesystem::path dest;     // relative to outputDir, e.g. bin/libopenblas.dll
+
+        // Whether `other` names this destination. On a PE target the
+        // comparison folds case: the file systems a Windows program runs from
+        // and its loader both do, so `Foo.DLL` and `foo.dll` are one file
+        // there, whatever the build host's file system does.
+        bool is_destination(const std::filesystem::path& other, bool peTarget) const {
+            if (!peTarget) return dest == other;
+            auto fold = [](std::string s) {
+                std::ranges::transform(s, s.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return s;
+            };
+            return fold(dest.generic_string()) == fold(other.generic_string());
+        }
     };
     std::vector<DeployFile>            runtimeDeployFiles;
+    // A DLL a runtime search directory offers under a name the deploy list
+    // declares (SPEC-007 R4.3). The declared file is placed; the planning
+    // caller compares the two and warns on a difference, because the output
+    // of the post-link placement edge is not shown on a successful build.
+    struct ShadowedDll {
+        std::filesystem::path declared;   // the deploy list's source
+        std::filesystem::path offered;    // the search directory's file
+    };
+    std::vector<ShadowedDll>           shadowedSearchDirDlls;
     // Aggregated host-runtime requirements from dependency packages'
     // [runtime] metadata. Capability/provider-driven — no platform special-casing
     // in mcpp: providers (e.g. compat.glx-runtime) declare these per platform.
@@ -1450,6 +1473,10 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     // destination, one content — is actually checked, once the sources exist.
     // A source already listed for this destination (the ordinary case: the
     // same file reached through two graph edges) is not duplicated.
+    // On a PE target a destination is compared without case
+    // (DeployFile::is_destination).
+    const bool peTarget = targetTriple.empty() ? bool(mcpp::platform::is_windows)
+                                               : targetTriple.is_pe();
     auto add_deploy = [&](const std::filesystem::path& source,
                           std::string_view toDir = {}) {
         const auto normalized = source.lexically_normal();
@@ -1457,7 +1484,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         if (!toDir.empty() && toDir != ".") destDir /= std::filesystem::path(toDir);
         const auto dest = destDir / source.filename();
         auto existing = std::ranges::find_if(plan.runtimeDeployFiles,
-            [&](auto const& value) { return value.dest == dest; });
+            [&](auto const& value) { return value.is_destination(dest, peTarget); });
         if (existing != plan.runtimeDeployFiles.end()) {
             if (std::ranges::find(existing->sources, normalized)
                 == existing->sources.end())
@@ -1474,6 +1501,18 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     for (auto const& entry : plan.linkIntent.deploy) {
         add_deploy(entry.from, entry.to);
     }
+    // A DLL found in a runtime search directory is a derived source: it
+    // yields to a destination the lists above declare (SPEC-007 R4.3, one
+    // destination, one writer), as the toolset's staged runtime does
+    // (flags.cppm). The post-link placement compares the two files and warns
+    // on a difference. Two search directories offering one name are two
+    // derived sources of one destination and are checked by `mcpp stage`.
+    const auto declaredCount = plan.runtimeDeployFiles.size();
+    auto declared = [&](const std::filesystem::path& dest) -> const BuildPlan::DeployFile* {
+        for (auto const& d : std::span{plan.runtimeDeployFiles}.first(declaredCount))
+            if (d.is_destination(dest, peTarget)) return &d;
+        return nullptr;
+    };
     for (auto const& dir : plan.linkIntent.runtimeSearchDirs) {
         std::error_code dirEc;
         if (!std::filesystem::is_directory(dir, dirEc)) continue;
@@ -1483,6 +1522,10 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             std::ranges::transform(ext, ext.begin(),
                 [](unsigned char c){ return std::tolower(c); });
             if (ext != ".dll") continue;
+            if (auto const* d = declared(std::filesystem::path("bin") / entry.path().filename())) {
+                plan.shadowedSearchDirDlls.push_back({d->sources.front(), entry.path()});
+                continue;
+            }
             add_deploy(entry.path());
         }
     }
