@@ -2357,17 +2357,66 @@ host_tool_declared_toolchain(const mcpp::manifest::Manifest& tool,
     return effective.toolchain.for_platform(platform);
 }
 
+// PrepareState carries prepare_build's working state across the phases it is
+// decomposed into (see the file-header comment for the decomposition this
+// belongs to, and the GCC 16.1 constraint that shapes it). Each phase is an
+// ordinary function taking `PrepareState&`; the state itself is constructed
+// once, in prepare_build, and lives for the whole call — including across a
+// phase that stores a closure for a LATER phase to call (`resolveTargetToolchain`
+// below): such a closure captures `state` itself rather than individual
+// locals, so it stays valid no matter which phase's stack frame created it.
+//
+// Members are added here as prepare_build's phases are extracted; a member
+// exists because some phase after the one that computes it still reads it, or
+// because a stored closure needs it to remain valid past its own phase. A
+// value read and written within a single phase stays an ordinary local in
+// that phase's function body — it does not move here.
+//
+// Not copied: copying this by value would copy every dependency-graph and
+// plan structure prepare_build ever builds, silently, at whichever call
+// happened to pass it by value instead of by reference.
+//
+// In an anonymous namespace (TU-local), because it holds a `ToolPurpose`
+// (also TU-local): a namespace-scope class is part of the module's reachable
+// declaration set even when not `export`ed, and a reachable class may not
+// expose a TU-local member type. `prepare_build` (exported) only ever uses
+// PrepareState inside its body, never in its own signature, so this does not
+// narrow prepare_build's own interface.
+namespace {
+struct PrepareState {
+    PrepareState(bool print_fingerprint_, bool includeDevDeps_,
+                 std::vector<mcpp::manifest::Target> extraTargets_,
+                 BuildOverrides overrides_)
+        : print_fingerprint(print_fingerprint_),
+          includeDevDeps(includeDevDeps_),
+          extraTargets(std::move(extraTargets_)),
+          overrides(std::move(overrides_)),
+          // Which tool tiers this invocation needs. Named once so the two
+          // provisioning passes cannot disagree — a `mcpp build` that
+          // installed the run tier and a `mcpp run` that did not would be the
+          // same defect twice.
+          toolPurpose(overrides.will_run ? ToolPurpose::Run : ToolPurpose::Build) {}
+
+    PrepareState(const PrepareState&) = delete;
+    PrepareState& operator=(const PrepareState&) = delete;
+
+    // ── prepare_build's parameters, unchanged for every phase ──────────────
+    bool print_fingerprint;
+    bool includeDevDeps;
+    std::vector<mcpp::manifest::Target> extraTargets;
+    BuildOverrides overrides;
+    const ToolPurpose toolPurpose;
+};
+} // namespace
+
 export std::expected<BuildContext, std::string>
 
 prepare_build(bool print_fingerprint,
               bool includeDevDeps = false,
               std::vector<mcpp::manifest::Target> extraTargets = {},
               BuildOverrides overrides = {}) {
-    // Which tool tiers this invocation needs. Named once so the two
-    // provisioning passes cannot disagree — a `mcpp build` that installed the
-    // run tier and a `mcpp run` that did not would be the same defect twice.
-    const ToolPurpose toolPurpose =
-        overrides.will_run ? ToolPurpose::Run : ToolPurpose::Build;
+    PrepareState state(print_fingerprint, includeDevDeps,
+                        std::move(extraTargets), std::move(overrides));
     pending_flag_words_notes().clear();
 
     // A refusal decided early and released late. `host_can_serve` answers
@@ -2461,9 +2510,9 @@ prepare_build(bool print_fingerprint,
     // `host_tc_for_build_program`, which is why it is declared out here.
     bool tcSpecIsMsvc = false;
 
-    auto root = overrides.project_root.empty()
+    auto root = state.overrides.project_root.empty()
         ? mcpp::project::find_manifest_root(std::filesystem::current_path())
-        : std::optional<std::filesystem::path>(overrides.project_root);
+        : std::optional<std::filesystem::path>(state.overrides.project_root);
     if (!root) {
         return std::unexpected("no mcpp.toml found in current directory or any parent");
     }
@@ -2513,8 +2562,8 @@ prepare_build(bool print_fingerprint,
     std::optional<mcpp::project::EffectiveManifest> effective;
     std::expected<mcpp::manifest::Manifest, std::string> m =
         std::unexpected(std::string{});
-    if (overrides.preloaded_manifest) {
-        m = *overrides.preloaded_manifest;
+    if (state.overrides.preloaded_manifest) {
+        m = *state.overrides.preloaded_manifest;
     } else {
         auto loaded = mcpp::project::load_effective_manifest(*root);
         if (!loaded) return std::unexpected(loaded.error());
@@ -2546,7 +2595,7 @@ prepare_build(bool print_fingerprint,
     // Only the ROOT is refused. As a dependency this is exactly what the
     // package is for — the consumer compiles the interface and links the
     // artifact, which is the whole design.
-    if (!overrides.preloaded_manifest && mcpp::pack::is_distribution_package(*m)) {
+    if (!state.overrides.preloaded_manifest && mcpp::pack::is_distribution_package(*m)) {
         return std::unexpected(std::format(
             "'{}' is a distribution package produced by `mcpp pack`, not a source tree.\n"
             "  Its sources are interface declarations; the definitions are in the\n"
@@ -2566,11 +2615,11 @@ prepare_build(bool print_fingerprint,
     if (m->workspace.present) {
         std::string targetMember;
 
-        if (!overrides.package_filter.empty()) {
+        if (!state.overrides.package_filter.empty()) {
             // -p <name>: find matching member by directory basename or path
             for (auto& mp : m->workspace.members) {
                 auto basename = std::filesystem::path(mp).filename().string();
-                if (basename == overrides.package_filter || mp == overrides.package_filter) {
+                if (basename == state.overrides.package_filter || mp == state.overrides.package_filter) {
                     targetMember = mp;
                     break;
                 }
@@ -2578,7 +2627,7 @@ prepare_build(bool print_fingerprint,
             if (targetMember.empty()) {
                 return std::unexpected(std::format(
                     "workspace member '{}' not found in [workspace].members",
-                    overrides.package_filter));
+                    state.overrides.package_filter));
             }
         } else if (m->package.name.empty()) {
             // Virtual workspace: find a member with a program target ("is
@@ -2641,7 +2690,7 @@ prepare_build(bool print_fingerprint,
         if (effective && effective->member) {
             runtimeWorkspaceRoot = effective->workspaceRoot;
             wsManifest = std::move(*effective->workspace);
-        } else if (overrides.preloaded_manifest) {
+        } else if (state.overrides.preloaded_manifest) {
             auto wsRoot = mcpp::project::find_workspace_root(*root);
             if (!wsRoot.empty()) {
                 if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
@@ -2665,8 +2714,8 @@ prepare_build(bool print_fingerprint,
         return std::unexpected(*bad);
 
     mcpp::xlings::runtime::RuntimeSelection runtimeSelection;
-    if (overrides.inherited_runtime_selection) {
-        runtimeSelection = *overrides.inherited_runtime_selection;
+    if (state.overrides.inherited_runtime_selection) {
+        runtimeSelection = *state.overrides.inherited_runtime_selection;
     } else {
         std::optional<std::reference_wrapper<const mcpp::manifest::Manifest>> wsRef;
         if (wsManifest) wsRef = std::cref(*wsManifest);
@@ -2682,7 +2731,7 @@ prepare_build(bool print_fingerprint,
     // unchanged; the tool-provisioning pass points it at the tool store
     // instead (BuildOverrides::work_dir).
     const std::filesystem::path workRoot =
-        overrides.work_dir.empty() ? *root : overrides.work_dir;
+        state.overrides.work_dir.empty() ? *root : state.overrides.work_dir;
     {
         std::error_code wdEc;
         std::filesystem::create_directories(workRoot, wdEc);
@@ -2719,7 +2768,7 @@ prepare_build(bool print_fingerprint,
     }
 
     // Inject synthetic targets (e.g. test binaries from `mcpp test`).
-    for (auto& t : extraTargets) m->targets.push_back(t);
+    for (auto& t : state.extraTargets) m->targets.push_back(t);
 
     // #540: a cfg() predicate mcpp cannot evaluate must say so.
     //
@@ -2791,7 +2840,7 @@ prepare_build(bool print_fingerprint,
     // keys). Under --strict they become errors — same policy as the
     // feature/platform schema checks below.
     for (auto const& w : m->schemaWarnings) {
-        if (overrides.strict) return std::unexpected(w);
+        if (state.overrides.strict) return std::unexpected(w);
         mcpp::diag::warning("manifest/schema", w);
     }
 
@@ -2804,7 +2853,7 @@ prepare_build(bool print_fingerprint,
     {
         // Read where the project keeps it. A planning pass that writes
         // elsewhere (plan_only) still resolves against the project's lock.
-        auto lockPath = (overrides.plan_only ? *root : workRoot) / "mcpp.lock";
+        auto lockPath = (state.overrides.plan_only ? *root : workRoot) / "mcpp.lock";
         if (std::filesystem::exists(lockPath)) {
             if (auto lock = mcpp::pm::load(lockPath); lock) {
                 for (auto const& p : lock->packages) {
@@ -2837,19 +2886,19 @@ prepare_build(bool print_fingerprint,
     // identically. This block only adds the diagnostics, which the fast paths
     // have no business emitting: an unparseable value must be reported once, by
     // the invocation that actually resolves the build.
-    const CacheMode cacheMode = resolve_cache_mode(*m, overrides.cache_mode);
+    const CacheMode cacheMode = resolve_cache_mode(*m, state.overrides.cache_mode);
     {
         const char* envMode = std::getenv("MCPP_BUILD_CACHE");
         for (auto [value, origin] : std::initializer_list<
                  std::pair<std::string_view, std::string_view>>{
-                 {overrides.cache_mode,        "--cache"},
+                 {state.overrides.cache_mode,        "--cache"},
                  {envMode ? envMode : "",      "MCPP_BUILD_CACHE"},
                  {m->buildConfig.cacheMode,    "[build] cache"}}) {
             if (value.empty() || parse_cache_mode(value)) continue;
             auto msg = std::format(
                 "{} has unknown cache mode '{}' (expected: global | local | off)",
                 origin, value);
-            if (overrides.strict) return std::unexpected(msg);
+            if (state.overrides.strict) return std::unexpected(msg);
             mcpp::diag::warning("build/cache-mode", msg);
         }
     }
@@ -2924,8 +2973,8 @@ prepare_build(bool print_fingerprint,
     // recreate #392 by letting directory order choose a libc and only later
     // discovering what the project selected.
     mcpp::platform::runtime::RuntimeBinding runtimeBindingSnapshot;
-    if (overrides.inherited_runtime_binding) {
-        runtimeBindingSnapshot = *overrides.inherited_runtime_binding;
+    if (state.overrides.inherited_runtime_binding) {
+        runtimeBindingSnapshot = *state.overrides.inherited_runtime_binding;
     } else {
         auto cfgRuntime = get_cfg();
         if (!cfgRuntime) return std::unexpected(cfgRuntime.error());
@@ -3032,7 +3081,7 @@ prepare_build(bool print_fingerprint,
         // wants its plain `mcpp build` optimized sets
         // [build].default-profile = "release" (mcpp's own mcpp.toml does this,
         // so the released binary stays -O2).
-        pname = resolve_profile_name(*m, overrides.profile, overrides.profile_fallback);
+        pname = resolve_profile_name(*m, state.overrides.profile, state.overrides.profile_fallback);
         mcpp::manifest::Profile pr;
         if (pname == "dev" || pname == "debug") { pr.optLevel = "0"; pr.debug = true; }
         else if (pname == "dist")               { pr.optLevel = "3"; pr.strip = true; }
@@ -3084,7 +3133,7 @@ prepare_build(bool print_fingerprint,
                 "[package] platforms contains unknown platform '{}' "
                 "(expected: {})", pf,
                 mcpp::toolchain::triple::platform_names_joined());
-            if (overrides.strict) return std::unexpected(msg);
+            if (state.overrides.strict) return std::unexpected(msg);
             mcpp::diag::warning("manifest/platforms", msg);
         }
     }
@@ -3104,14 +3153,14 @@ prepare_build(bool print_fingerprint,
     auto tcSpecSource = [&]() -> std::string {
         if (tcOrigin == TcOrigin::ManifestToolchain && tcFromConsumer)
             return std::format("the toolchain chosen for this host tool by {}",
-                               overrides.tool_chain);
+                               state.overrides.tool_chain);
         if (tcOrigin == TcOrigin::ManifestToolchain && tcFromCommandLine)
             return "--toolchain";
         switch (tcOrigin) {
             case TcOrigin::ManifestToolchain:
                 return std::format("[toolchain].{}", kCurrentPlatform);
             case TcOrigin::TargetSection:
-                return std::format("[target.{}].toolchain", overrides.target_triple);
+                return std::format("[target.{}].toolchain", state.overrides.target_triple);
             case TcOrigin::GlobalDefault:
                 return "the default toolchain (`mcpp toolchain default`)";
             default:
@@ -3135,8 +3184,8 @@ prepare_build(bool print_fingerprint,
         tcOrigin = TcOrigin::ManifestToolchain;
         tcFromCommandLine = true;
     }
-    if (!overrides.toolchain.empty()) {
-        tcSpec   = overrides.toolchain;
+    if (!state.overrides.toolchain.empty()) {
+        tcSpec   = state.overrides.toolchain;
         tcOrigin = TcOrigin::ManifestToolchain;
         tcFromConsumer = true;
     }
@@ -3198,12 +3247,12 @@ prepare_build(bool print_fingerprint,
 
     bool windowsGnuFirstRun = false;
     if constexpr (mcpp::platform::is_windows) {
-        if (!tcSpec.has_value() && overrides.target_triple.empty()
+        if (!tcSpec.has_value() && state.overrides.target_triple.empty()
             && m->buildConfig.target.empty()
             && !msvc_usable_either_origin()) {
             auto cfgW = get_cfg();
             if (!cfgW || (*cfgW)->defaultTarget.empty()) {
-                overrides.target_triple =
+                state.overrides.target_triple =
                     std::string(mcpp::toolchain::triple::pins::kFirstRunWinGnuTarget);
                 windowsGnuFirstRun = true;
             }
@@ -3221,40 +3270,40 @@ prepare_build(bool print_fingerprint,
             tcOrigin = TcOrigin::TargetSection;
         }
         if (!e.linkage.empty()) m->buildConfig.linkage = e.linkage;
-        // #336: a per-target C++ runtime contract overrides the project
+        // #336: a per-target C++ runtime contract state.overrides the project
         // default, so "self-contained everywhere except this triple" is
         // expressible without touching the cfg() input channel.
         if (!e.cxxRuntime.empty()) m->buildConfig.cxxRuntime = e.cxxRuntime;
     };
 
-    // ─── --target / --static overrides ──────────────────────────────────
+    // ─── --target / --static state.overrides ──────────────────────────────────
     // Target-axis default resolution when no --target flag was passed:
     // [build] target (project default, ≙ cargo build.target) >
     // [toolchain] default_target (global config) > host.
-    if (overrides.target_triple.empty() && !m->buildConfig.target.empty())
-        overrides.target_triple = m->buildConfig.target;
+    if (state.overrides.target_triple.empty() && !m->buildConfig.target.empty())
+        state.overrides.target_triple = m->buildConfig.target;
     // Remembered, not requested: this one came out of the global config, so
     // it must not outrank anything the user wrote down (see the pin below).
     bool targetFromGlobalDefault = false;
-    if (overrides.target_triple.empty()) {
+    if (state.overrides.target_triple.empty()) {
         if (auto cfg = get_cfg(); cfg && !(*cfg)->defaultTarget.empty()) {
-            overrides.target_triple = (*cfg)->defaultTarget;
+            state.overrides.target_triple = (*cfg)->defaultTarget;
             targetFromGlobalDefault = true;
         }
     }
     // Normalize the triple (alias spellings → canonical), validate against
     // the known-target vocabulary, then apply the manifest [target.<triple>]
     // override and the vocabulary-table convention (pin + default linkage).
-    if (!overrides.target_triple.empty()) {
+    if (!state.overrides.target_triple.empty()) {
         namespace triple = mcpp::toolchain::triple;
         // THE SPELLING THE PROJECT WROTE, KEPT FOR EVERY DIAGNOSTIC BELOW.
-        // `overrides.target_triple` is canonicalised further down, and until
+        // `state.overrides.target_triple` is canonicalised further down, and until
         // this variable existed the refusals quoted the canonical form:
         // `--target aarch64-linux` produced "target 'aarch64-linux-gnu' is
         // registered but not yet supported", a string the reader never typed
         // and cannot find in their own command.
-        const std::string requestedSpelling = overrides.target_triple;
-        auto parsed = triple::parse(overrides.target_triple);
+        const std::string requestedSpelling = state.overrides.target_triple;
+        auto parsed = triple::parse(state.overrides.target_triple);
 
         // THE REQUEST IS COMPLETED FROM THE VOCABULARY BEFORE ANYTHING
         // READS IT, AND THE ORDER RELATIVE TO THE `[target.X]` LOOKUP IS PART
@@ -3279,7 +3328,7 @@ prepare_build(bool print_fingerprint,
         // [target.X] lookup is spelling-independent: a section keyed
         // `x86_64-w64-mingw32` matches `--target x86_64-windows-gnu` and
         // vice versa. Unparseable keys/inputs compare exactly (escape hatch).
-        auto it = m->targetOverrides.find(overrides.target_triple);
+        auto it = m->targetOverrides.find(state.overrides.target_triple);
         if (it == m->targetOverrides.end() && parsed) {
             for (auto o = m->targetOverrides.begin();
                  o != m->targetOverrides.end(); ++o) {
@@ -3548,7 +3597,7 @@ prepare_build(bool print_fingerprint,
 
         // Canonical from here on: cfg evaluation, spec attachment and the
         // target/ output directory all see one spelling.
-        if (parsed) overrides.target_triple = parsed->str();
+        if (parsed) state.overrides.target_triple = parsed->str();
 
         if (hasExplicitSection) apply_target_section(it->second);
         // Convention from the vocabulary table (triple.cppm): the target's
@@ -3716,12 +3765,12 @@ prepare_build(bool print_fingerprint,
     // named: `[target.x86_64-linux-gnu] cxx_runtime` shaped `--target
     // x86_64-linux-gnu` and was ignored by `mcpp build` on that same machine,
     // while the row's `.build` table and its `sysroot` already applied to both.
-    // The triple is not written into `overrides.target_triple`: that would make
+    // The triple is not written into `state.overrides.target_triple`: that would make
     // the host build a target build and turn the row's env segment into a
     // requested C library.
     else if (auto* hostRow = find_target_entry(*m, mcpp::toolchain::triple::host_triple()))
         apply_target_section(*hostRow);
-    if (overrides.force_static) m->buildConfig.linkage = "static";
+    if (state.overrides.force_static) m->buildConfig.linkage = "static";
 
     // #254: everything compiled INTO this build is resolved for the TARGET —
     // an xpkg descriptor's per-OS sections (sources, flags, deps) and its xpm
@@ -3730,7 +3779,7 @@ prepare_build(bool print_fingerprint,
     // which is invisible natively (host == target) and picks the wrong leg
     // under --target.
     //
-    // Computed HERE, not earlier: `overrides.target_triple` is only complete
+    // Computed HERE, not earlier: `state.overrides.target_triple` is only complete
     // above — it is filled from `[build] target` and the config default, then
     // canonicalized. Reading it before that point would silently fall back to
     // the host for any project that sets its target in the manifest rather
@@ -3758,7 +3807,7 @@ prepare_build(bool print_fingerprint,
     // only when it fails.
     auto resolvedAccel = [&]() -> std::string {
         const auto sets = mcpp::pack::parse_accel(
-            overrides.accel.empty() ? m->buildConfig.accel : overrides.accel);
+            state.overrides.accel.empty() ? m->buildConfig.accel : state.overrides.accel);
         return sets.empty() ? std::string{} : mcpp::pack::accel_str(sets);
     };
     // The cfg context, with the accelerator layer filled from the resolved
@@ -3766,7 +3815,7 @@ prepare_build(bool print_fingerprint,
     // over these (prepare_inputs::Ctx::layer_matches); before this the field
     // was declared, documented, and never written, so the key matched nothing.
     auto cfgCtx = [&]() {
-        auto c = cfgpred::context_for(overrides.target_triple);
+        auto c = cfgpred::context_for(state.overrides.target_triple);
         for (auto const& set : mcpp::pack::parse_accel(resolvedAccel()))
             c.accelerators.push_back(set.backend);
         return c;
@@ -3802,9 +3851,9 @@ prepare_build(bool print_fingerprint,
     const bool abiThreadsRendered = [&] {
         if (!m->buildConfig.abiThreads) return false;
         const auto abiTriple = mcpp::toolchain::triple::parse(
-            overrides.target_triple.empty()
+            state.overrides.target_triple.empty()
                 ? mcpp::toolchain::triple::host_triple().str()
-                : overrides.target_triple);
+                : state.overrides.target_triple);
         return abiTriple && !abiTriple->is_pe() && !abiTriple->is_freestanding();
     }();
     auto add_once = [](std::vector<std::string>& v, std::string_view flag) {
@@ -3954,8 +4003,8 @@ prepare_build(bool print_fingerprint,
         // right package/frontend (e.g. aarch64-linux-musl-g++ for a cross
         // musl build, never the host g++). Escape-hatch triples outside the
         // language don't parse and leave the spec on the host target.
-        if (!overrides.target_triple.empty()) {
-            if (auto t = mcpp::toolchain::triple::parse(overrides.target_triple))
+        if (!state.overrides.target_triple.empty()) {
+            if (auto t = mcpp::toolchain::triple::parse(state.overrides.target_triple))
                 spec->target = *t;
         }
         auto pkg = mcpp::toolchain::to_xim_package(*spec);
@@ -4082,8 +4131,8 @@ prepare_build(bool print_fingerprint,
                 chosenBy = std::format(
                     "\n             target default for {}, replacing your "
                     "{} — override with `[target.{}] toolchain`",
-                    overrides.target_triple, pinReplacedDefault,
-                    overrides.target_triple);
+                    state.overrides.target_triple, pinReplacedDefault,
+                    state.overrides.target_triple);
             else if (tcOrigin == TcOrigin::TargetPin
                   || tcOrigin == TcOrigin::FirstRun)
                 chosenBy = std::format("  ({})", tc_origin_name(tcOrigin));
@@ -4307,11 +4356,11 @@ prepare_build(bool print_fingerprint,
         // second implementation here would be a second answer to one question,
         // which is the shape this release exists to remove.
         // RECORDED HERE, ACTED ON BELOW — the Windows first-run block that
-        // follows SETS `overrides.target_triple` itself, and returning from
+        // follows SETS `state.overrides.target_triple` itself, and returning from
         // here would skip it. Its own comment says why that matters: it
         // persists BOTH axes, and persisting only the target leaves
         // `mcpp toolchain list` disagreeing with what the build used.
-        firstRunNeedsTargetPass = !overrides.target_triple.empty();
+        firstRunNeedsTargetPass = !state.overrides.target_triple.empty();
       }
 
       // Windows first run that got diverted to winlibs GCC: announce it and
@@ -4335,14 +4384,14 @@ prepare_build(bool print_fingerprint,
         mcpp::ui::info("First run",
             std::format("no toolchain configured and no Visual Studio found — "
                         "using {} for {} (MinGW-w64, self-contained)",
-                        *tcSpec, overrides.target_triple));
+                        *tcSpec, state.overrides.target_triple));
         if (auto cfgW = get_cfg(); cfgW) {
             if (mcpp::config::write_default_toolchain(**cfgW, *tcSpec))
                 (*cfgW)->defaultToolchain = *tcSpec;
-            if (mcpp::config::write_default_target(**cfgW, overrides.target_triple))
-                (*cfgW)->defaultTarget = overrides.target_triple;
+            if (mcpp::config::write_default_target(**cfgW, state.overrides.target_triple))
+                (*cfgW)->defaultTarget = state.overrides.target_triple;
             mcpp::ui::status("Default",
-                std::format("set to {} → {}", *tcSpec, overrides.target_triple));
+                std::format("set to {} → {}", *tcSpec, state.overrides.target_triple));
         }
         tcOrigin = TcOrigin::FirstRun;
       }
@@ -4451,8 +4500,8 @@ prepare_build(bool print_fingerprint,
       // already names: a RETARGETABLE driver has to be told. gcc is not one — a
       // gcc payload IS its target — so the mingw and musl-gcc crosses keep
       // answering from `-dumpmachine`, which for them remains a measured fact.
-      if (!overrides.target_triple.empty()) {
-          if (auto want = mcpp::toolchain::triple::parse(overrides.target_triple);
+      if (!state.overrides.target_triple.empty()) {
+          if (auto want = mcpp::toolchain::triple::parse(state.overrides.target_triple);
               want && (want->is_freestanding()
                        || tc->compiler == mcpp::toolchain::CompilerId::Clang))
           {
@@ -4630,7 +4679,7 @@ prepare_build(bool print_fingerprint,
                   }
               }
           }
-          if (auto want = mcpp::toolchain::triple::parse(overrides.target_triple);
+          if (auto want = mcpp::toolchain::triple::parse(state.overrides.target_triple);
               want && want->is_freestanding())
           {
               // `import std` is structurally hosted, and turning it off is the
@@ -4814,7 +4863,7 @@ prepare_build(bool print_fingerprint,
                           tcSpec.value_or("the configured default"),
                           pins::kFirstRunWinGnu, pins::kFirstRunWinGnuTarget));
 
-          overrides.target_triple = std::string(pins::kFirstRunWinGnuTarget);
+          state.overrides.target_triple = std::string(pins::kFirstRunWinGnuTarget);
           // The x86_64-windows-gnu row is defaultStatic; the target block that
           // normally applies that already ran, so mirror just this one field.
           if (m->buildConfig.linkage.empty()) m->buildConfig.linkage = "static";
@@ -4822,7 +4871,7 @@ prepare_build(bool print_fingerprint,
           auto gnuSpec = mcpp::toolchain::parse_toolchain_spec(
               std::string(pins::kFirstRunWinGnu));
           if (!gnuSpec) return std::unexpected(gnuSpec.error());
-          if (auto t = mcpp::toolchain::triple::parse(overrides.target_triple))
+          if (auto t = mcpp::toolchain::triple::parse(state.overrides.target_triple))
               gnuSpec->target = *t;
           auto gnuPkg = mcpp::toolchain::to_xim_package(*gnuSpec);
 
@@ -4861,8 +4910,8 @@ prepare_build(bool print_fingerprint,
           // Persist both axes so the repair happens once, not on every build.
           if (mcpp::config::write_default_toolchain(**cfgR, pins::kFirstRunWinGnu))
               (*cfgR)->defaultToolchain = std::string(pins::kFirstRunWinGnu);
-          if (mcpp::config::write_default_target(**cfgR, overrides.target_triple))
-              (*cfgR)->defaultTarget = overrides.target_triple;
+          if (mcpp::config::write_default_target(**cfgR, state.overrides.target_triple))
+              (*cfgR)->defaultTarget = state.overrides.target_triple;
 
           tcSpec   = std::string(pins::kFirstRunWinGnu);
           tcOrigin = TcOrigin::FirstRun;
@@ -4916,7 +4965,7 @@ prepare_build(bool print_fingerprint,
     if (!m->buildConfig.generatedFiles.empty()) {
         std::vector<std::filesystem::path> staleGenerated;
         if (auto r = materialize_generated_files(
-                *root, *m, overrides.plan_only ? &staleGenerated : nullptr); !r) {
+                *root, *m, state.overrides.plan_only ? &staleGenerated : nullptr); !r) {
             return std::unexpected(r.error());
         }
         for (auto const& path : staleGenerated)
@@ -4929,9 +4978,9 @@ prepare_build(bool print_fingerprint,
 
     // Canonical rendering of the resolved target (for the env contract).
     std::string resolvedTargetCanonical;
-    if (!overrides.target_triple.empty()) {
-        auto tt = mcpp::toolchain::triple::parse(overrides.target_triple);
-        resolvedTargetCanonical = tt ? tt->str() : overrides.target_triple;
+    if (!state.overrides.target_triple.empty()) {
+        auto tt = mcpp::toolchain::triple::parse(state.overrides.target_triple);
+        resolvedTargetCanonical = tt ? tt->str() : state.overrides.target_triple;
     }
 
     // Host toolchain for build.mcpp (G3): under a cross --target the resolved
@@ -4948,7 +4997,7 @@ prepare_build(bool print_fingerprint,
     // tool is built by the compiler the store key records.
     auto host_spec_for_build_program = [&]() -> std::string {
         if (!tcSpec) return {};
-        if (overrides.target_triple.empty()) return *tcSpec;
+        if (state.overrides.target_triple.empty()) return *tcSpec;
         return (tcOrigin == TcOrigin::TargetPin && hostSpecBeforeRowPin.has_value()
                 && !hostSpecBeforeRowPin->empty() && *hostSpecBeforeRowPin != "system")
             ? *hostSpecBeforeRowPin
@@ -5012,7 +5061,7 @@ prepare_build(bool print_fingerprint,
         // The CROSS branch below is a different question and deliberately
         // unchanged: there `explicit_compiler` is empty because NO host
         // toolchain was resolved at all, and its classified refusal is correct.
-        if (overrides.target_triple.empty())
+        if (state.overrides.target_triple.empty())
             return std::pair{
                 explicit_compiler.empty() ? tc->binaryPath : explicit_compiler,
                 as_host(*tc)};
@@ -5210,9 +5259,9 @@ prepare_build(bool print_fingerprint,
     // be resolved where the information it needs actually exists.
     std::string targetSysroot;
     {
-        auto tt = overrides.target_triple.empty()
+        auto tt = state.overrides.target_triple.empty()
             ? std::optional{mcpp::toolchain::triple::host_triple()}
-            : mcpp::toolchain::triple::parse(overrides.target_triple);
+            : mcpp::toolchain::triple::parse(state.overrides.target_triple);
         // Not on an MSVC-ABI row: there the key names an MSVC toolset, which
         // `bind_msvc_sysroot` locates or installs itself -- an installed
         // toolset of the pinned version must win over a download, and
@@ -5222,7 +5271,7 @@ prepare_build(bool print_fingerprint,
                 *tt, sysroot_override(*m, *tt));
     }
     const bool materializeRootRuntime =
-        !overrides.inherited_runtime_binding
+        !state.overrides.inherited_runtime_binding
         && (!runtimeOwnerManifest.xlings.empty() || !targetSysroot.empty());
     if (!m->indices.empty() || materializeRootRuntime) {
         auto cfg2 = get_cfg();
@@ -5249,7 +5298,7 @@ prepare_build(bool print_fingerprint,
                 // uses, and the feature decided that.
                 for (auto const& f :
                          feature_closure(runtimeOwnerManifest,
-                                         parse_feature_request(overrides.features)))
+                                         parse_feature_request(state.overrides.features)))
                     if (auto it = runtimeOwnerManifest.xlings.featureDeps.find(f);
                         it != runtimeOwnerManifest.xlings.featureDeps.end())
                         for (auto const& address : it->second) {
@@ -5324,8 +5373,8 @@ prepare_build(bool print_fingerprint,
             for (auto const& spec : applicable_xlings_addresses(
                      runtimeOwnerManifest,
                      feature_closure(runtimeOwnerManifest,
-                                     parse_feature_request(overrides.features)),
-                     toolPurpose, /*isRoot=*/true))
+                                     parse_feature_request(state.overrides.features)),
+                     state.toolPurpose, /*isRoot=*/true))
                 rootClaims.push_back({spec, "this project", 0});
             auto rootUnified = mcpp::xlings::addrset::unify(rootClaims);
             if (!rootUnified) {
@@ -5441,7 +5490,7 @@ prepare_build(bool print_fingerprint,
         for (auto const& spec : applicable_xlings_addresses(
                  runtimeOwnerManifest, activeFeaturesByPackage.empty()
                      ? std::vector<std::string>{} : activeFeaturesByPackage[0],
-                 toolPurpose, /*isRoot=*/true))
+                 state.toolPurpose, /*isRoot=*/true))
             claims.push_back({spec, "this project", 0});
         // THE BUCKET IS DECIDED BY WHERE THE WINNING CLAIM SITS IN THIS LIST,
         // not by its distance. The root's own pass provisions exactly the
@@ -5454,7 +5503,7 @@ prepare_build(bool print_fingerprint,
             const auto feats = i < activeFeaturesByPackage.size()
                 ? activeFeaturesByPackage[i] : std::vector<std::string>{};
             for (auto const& spec : applicable_xlings_addresses(
-                     man, feats, toolPurpose, /*isRoot=*/i == 0))
+                     man, feats, state.toolPurpose, /*isRoot=*/i == 0))
                 claims.push_back({spec, describe(i), i == 0 ? 0 : 1});
         }
         auto unified = addrset::unify(claims);
@@ -6367,7 +6416,7 @@ prepare_build(bool print_fingerprint,
             // compat retries below included.
             mcpp::build::BuildProgramEnv hookEnv;
             fill_target_build_env(hookEnv, *m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
-            hookEnv.targetTriple = overrides.target_triple;
+            hookEnv.targetTriple = state.overrides.target_triple;
             // Six names, fixed by install_hook_env; one guard each.
             const auto hookVars = mcpp::build::install_hook_env(hookEnv);
             mcpp::platform::env::ScopedEnv hookVar0(hookVars.at(0).first, hookVars.at(0).second);
@@ -7576,7 +7625,7 @@ prepare_build(bool print_fingerprint,
                 //
                 // Additive fields merge; identity fields (version/path/git) do
                 // not, keeping "a conditional section never silently
-                // overrides an unconditional one" intact. Same rule the
+                // state.overrides an unconditional one" intact. Same rule the
                 // per-edge feature request already follows.
                 auto& dst = pos->second;
                 for (auto const& t : spec.tools)
@@ -7663,7 +7712,7 @@ prepare_build(bool print_fingerprint,
                     "'{}/{}') which no dependency table declares ([dependencies], "
                     "[build-dependencies], [dev-dependencies] or [feature-deps], "
                     "on any row)", f, parentName, depKey, depKey, depFeat);
-                if (overrides.strict) return std::unexpected(msg);
+                if (state.overrides.strict) return std::unexpected(msg);
                 mcpp::diag::warning("features/forwarding", msg);
             }
         }
@@ -7672,7 +7721,7 @@ prepare_build(bool print_fingerprint,
 
     // Pull the root package's active feature-deps into its dependency set before
     // seeding, so `mcpp build --features X` resolves X's optional deps.
-    std::vector<std::string> rootReq = parse_feature_request(overrides.features);
+    std::vector<std::string> rootReq = parse_feature_request(state.overrides.features);
     if (auto fm = mergeActiveFeatureDeps(*m, rootReq); !fm)
         return std::unexpected(fm.error());
     // #243: the root's active features may forward features to its direct deps.
@@ -7687,7 +7736,7 @@ prepare_build(bool print_fingerprint,
     // `[features]`: the token cannot be a macro of the root, so there is no
     // "pure macro usage" to preserve for it.
     std::vector<std::pair<std::string, std::string>> cliForwards;
-    for (auto const& tok : feature_forward_request_tokens(overrides.features)) {
+    for (auto const& tok : feature_forward_request_tokens(state.overrides.features)) {
         auto fwd = mcpp::pm::split_feature_forward_token(tok);
         std::string msg;
         if (!fwd)
@@ -7698,7 +7747,7 @@ prepare_build(bool print_fingerprint,
                               "of '{}' declares '{}'", tok, m->package.name,
                               fwd->first);
         if (!msg.empty()) {
-            if (overrides.strict) return std::unexpected(msg);
+            if (state.overrides.strict) return std::unexpected(msg);
             mcpp::diag::warning("features/request", msg);
             continue;
         }
@@ -7722,7 +7771,7 @@ prepare_build(bool print_fingerprint,
         injectCliForwards(n, req);
         worklist.push_back({n, req, mainPkgLabel, req.version, kMainConsumer, {}});
     }
-    if (includeDevDeps) {
+    if (state.includeDevDeps) {
         for (auto& [n, s] : m->devDependencies) {
             auto req = s;
             injectForwards(*m, rootActive, n, req);
@@ -9167,7 +9216,7 @@ prepare_build(bool print_fingerprint,
                         "         required         {:<14} (required by {})\n"
                         "       {}\n{}",
                         reqCompilerBy, reqCompiler,
-                        targetRowName.empty() ? overrides.target_triple
+                        targetRowName.empty() ? state.overrides.target_triple
                                               : targetRowName,
                         targetPinCandidate,
                         targetPinIsCapability ? "capability" : "convention",
@@ -9231,7 +9280,7 @@ prepare_build(bool print_fingerprint,
                     "target '{}' takes its C library from the '{}' payload, and "
                     "'{}' has none here.\n"
                     "       The row's toolchain is a convention, so naming your "
-                    "own compiler overrides it —\n"
+                    "own compiler state.overrides it —\n"
                     "       but the convention is what supplies this target's "
                     "headers and C library, and\n"
                     "       nothing in the dependency graph supplies them "
@@ -9538,8 +9587,8 @@ prepare_build(bool print_fingerprint,
             // back only the ones whose feature is active. Runs even when no
             // feature is active, so a gated source is excluded by default.
             //
-            // The DROP is build-mode only (!includeDevDeps). `mcpp test`
-            // (includeDevDeps) keeps the full surface so the dev-dependency
+            // The DROP is build-mode only (!state.includeDevDeps). `mcpp test`
+            // (state.includeDevDeps) keeps the full surface so the dev-dependency
             // track's per-test main detection (run_tests / make_plan) still sees
             // gtest_main.cc and prunes it per test — the two tracks stay
             // decoupled; gtest's descriptor keeps gtest_main.cc in base `sources`
@@ -9549,7 +9598,7 @@ prepare_build(bool print_fingerprint,
             // `features` and never in base `sources` (xpkg's `features.X.sources`
             // lands in featureSources alone — compat.spdlog's `compiled`,
             // compat.cjson's `utils`, compat.eigen's `eigen_blas`). Gating the add
-            // on !includeDevDeps meant those sources were never compiled under
+            // on !state.includeDevDeps meant those sources were never compiled under
             // `mcpp test` → link-time `undefined reference` (the eigen_blas
             // `dgemm_` failure, long misread as a linking follow-up: it was
             // source-set resolution, not linking). Add is dedup'd so gtest's
@@ -9595,7 +9644,7 @@ prepare_build(bool print_fingerprint,
                 std::set<std::string> baseGlobs(bc.sources.begin(), bc.sources.end());
                 baseGlobs.insert(pkg.manifest.modules.sources.begin(),
                                  pkg.manifest.modules.sources.end());
-                if (!includeDevDeps) {
+                if (!state.includeDevDeps) {
                     // glob → owned by at least one ACTIVE feature?
                     std::set<std::string> activeNow(active.begin(), active.end());
                     std::map<std::string, bool> gated;
@@ -9662,7 +9711,7 @@ prepare_build(bool print_fingerprint,
             // application order is deterministic and a feature rule wins over
             // a broader base rule via "last flag wins". An inactive feature
             // contributes nothing — its dead globs no longer exist to warn
-            // about. Deliberately OUTSIDE any includeDevDeps gate: like the
+            // about. Deliberately OUTSIDE any state.includeDevDeps gate: like the
             // sources ADD above, `mcpp build` and `mcpp test` must agree
             // (0.0.94 dual-path invariant). featureOrigin tags the entry so
             // the scanner's zero-hit warning can name the owning feature.
@@ -9687,7 +9736,7 @@ prepare_build(bool print_fingerprint,
             }
         };
         if (!packages.empty()) {
-            auto rootReq = parse_feature_request(overrides.features);
+            auto rootReq = parse_feature_request(state.overrides.features);
             // Strict schema check: a requested feature must exist in the
             // target package's [features] table when one is declared (a
             // package with no [features] accepts any request — pure-define
@@ -9703,7 +9752,7 @@ prepare_build(bool print_fingerprint,
             if (auto bad = unknown_requested(packages[0].manifest, rootReq)) {
                 auto msg = std::format(
                     "--features requests '{}' which [features] does not declare", *bad);
-                if (overrides.strict) return std::unexpected(msg);
+                if (state.overrides.strict) return std::unexpected(msg);
                 mcpp::diag::warning("features/request", msg);
             }
             apply(packages[0], rootReq);
@@ -9741,7 +9790,7 @@ prepare_build(bool print_fingerprint,
                     auto msg = std::format(
                         "dependency '{}' does not declare requested feature '{}' "
                         "in its [features] table", pname, f);
-                    if (overrides.strict) return std::unexpected(msg);
+                    if (state.overrides.strict) return std::unexpected(msg);
                     mcpp::diag::warning("features/request", msg);
                 }
             }
@@ -10435,12 +10484,12 @@ prepare_build(bool print_fingerprint,
                 }
             }
 
-            if (overrides.tool_depth >= mcpp::build::tool_store::kMaxDepth
+            if (state.overrides.tool_depth >= mcpp::build::tool_store::kMaxDepth
                 && !toolRequests.empty()) {
                 return std::unexpected(std::format(
                     "tool provisioning nested more than {} levels deep — this is "
                     "almost certainly a cycle.\n  chain: {}",
-                    mcpp::build::tool_store::kMaxDepth, overrides.tool_chain));
+                    mcpp::build::tool_store::kMaxDepth, state.overrides.tool_chain));
             }
 
             for (auto const& [depIdx, wanted] : toolRequests) {
@@ -10536,8 +10585,8 @@ prepare_build(bool print_fingerprint,
                     // this package in THIS graph.
                     const std::string toolSource = std::format(
                         "{}|{}", depPkg.root.lexically_normal().generic_string(), toolName);
-                    if (std::ranges::find(overrides.tool_chain_sources, toolSource)
-                        != overrides.tool_chain_sources.end()) {
+                    if (std::ranges::find(state.overrides.tool_chain_sources, toolSource)
+                        != state.overrides.tool_chain_sources.end()) {
                         std::string askedBy;
                         for (auto const& edge : dependencyEdges) {
                             if (edge.dependencyPackageIndex != depIdx) continue;
@@ -10559,7 +10608,7 @@ prepare_build(bool print_fingerprint,
                             "that request (a feature it does not enable, or a "
                             "`[target.<sel>.feature-deps]` row it does not match).",
                             depName, toolName,
-                            overrides.tool_chain.empty() ? "root" : overrides.tool_chain,
+                            state.overrides.tool_chain.empty() ? "root" : state.overrides.tool_chain,
                             depName, toolName,
                             askedBy.empty() ? std::string("a package of its graph") : askedBy));
                     }
@@ -10673,7 +10722,7 @@ prepare_build(bool print_fingerprint,
                     // build program that must RUN the tool while configuring
                     // meets the same missing file it meets when the tool fails
                     // to build (SPEC-007 R5.3), so no new contract follows.
-                    if (overrides.plan_only) {
+                    if (state.overrides.plan_only) {
                         planNotes.push_back({"MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED",
                             std::format("host tool '{}' of package '{}' is not in "
                                         "the tool store and is not built while "
@@ -10716,9 +10765,9 @@ prepare_build(bool print_fingerprint,
                     sub.target_triple = "";            // HOST — the whole point
                     sub.toolchain     = toolTcSpec;
                     sub.profile       = "release";
-                    sub.cache_mode    = overrides.cache_mode;
-                    sub.tool_depth    = overrides.tool_depth + 1;
-                    sub.tool_chain_sources = overrides.tool_chain_sources;
+                    sub.cache_mode    = state.overrides.cache_mode;
+                    sub.tool_depth    = state.overrides.tool_depth + 1;
+                    sub.tool_chain_sources = state.overrides.tool_chain_sources;
                     sub.tool_chain_sources.push_back(toolSource);
                     // The PRISTINE manifest the resolver produced for this
                     // package — `packages[depIdx].manifest` is a copy that
@@ -10745,9 +10794,9 @@ prepare_build(bool print_fingerprint,
                     sub.inherited_runtime_binding = std::make_shared<
                         const mcpp::platform::runtime::RuntimeBinding>(
                             runtimeBindingSnapshot);
-                    sub.tool_chain    = overrides.tool_chain.empty()
+                    sub.tool_chain    = state.overrides.tool_chain.empty()
                         ? std::format("root → {}:{}", depName, toolName)
-                        : std::format("{} → {}:{}", overrides.tool_chain, depName,
+                        : std::format("{} → {}:{}", state.overrides.tool_chain, depName,
                                       toolName);
                     for (auto const& f : closure) {
                         if (!sub.features.empty()) sub.features += ",";
@@ -10771,9 +10820,9 @@ prepare_build(bool print_fingerprint,
                             sub.tool_chain, sub.work_dir.string(),
                             depPkg.root.string());
                     };
-                    auto subCtx = prepare_build(/*print_fingerprint=*/false,
-                                                /*includeDevDeps=*/false,
-                                                /*extraTargets=*/{}, sub);
+                    auto subCtx = prepare_build(/*state.print_fingerprint=*/false,
+                                                /*state.includeDevDeps=*/false,
+                                                /*state.extraTargets=*/{}, sub);
                     if (!subCtx) {
                         return std::unexpected(std::format(
                             "building host tool '{}:{}' failed: {}{}",
@@ -10906,10 +10955,10 @@ prepare_build(bool print_fingerprint,
             // generating a declaration for this package must match how this
             // package is compiled.
             fill_package_build_env(bpEnv, pkg.manifest);
-            bpEnv.packFormat   = overrides.pack_format;
-            bpEnv.packStageDir = overrides.pack_stage_dir;
-            bpEnv.packStrip           = overrides.pack_strip;
-            bpEnv.packDebugSymbolsDir = overrides.pack_debug_symbols_dir;
+            bpEnv.packFormat   = state.overrides.pack_format;
+            bpEnv.packStageDir = state.overrides.pack_stage_dir;
+            bpEnv.packStrip           = state.overrides.pack_strip;
+            bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
             bpEnv.languageModules = pkg.manifest.language.modules;
             bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;
             if (auto dit = deviceSourcesByPackage.find(pkg.root.string()); dit != deviceSourcesByPackage.end())
@@ -10955,7 +11004,7 @@ prepare_build(bool print_fingerprint,
                 // that follows from the missing directives (a source the
                 // program would have added, say) fails the member under the
                 // ordinary rule (E1).
-                if (overrides.plan_only) {
+                if (state.overrides.plan_only) {
                     planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
                         std::format("dependency '{}': {}",
                                     pkg.manifest.package.name, r.error()),
@@ -11058,10 +11107,10 @@ prepare_build(bool print_fingerprint,
         // requirements already flow through normal dependency mechanics — this
         // pass is the selection-and-validation layer. See the capability-model
         // design doc.
-        // --cap cap=provider[,cap=provider] overrides [capabilities] pins.
-        for (std::size_t p = 0; p < overrides.capabilities.size();) {
-            auto c = overrides.capabilities.find_first_of(", ", p);
-            auto tok = overrides.capabilities.substr(
+        // --cap cap=provider[,cap=provider] state.overrides [capabilities] pins.
+        for (std::size_t p = 0; p < state.overrides.capabilities.size();) {
+            auto c = state.overrides.capabilities.find_first_of(", ", p);
+            auto tok = state.overrides.capabilities.substr(
                 p, c == std::string::npos ? std::string::npos : c - p);
             if (auto eq = tok.find('='); eq != std::string::npos)
                 m->capabilityPins[tok.substr(0, eq)] = tok.substr(eq + 1);
@@ -12627,8 +12676,8 @@ prepare_build(bool print_fingerprint,
         bpEnv.profile      = effectiveProfile;
         bpEnv.accel        = resolvedAccel();
         fill_package_build_env(bpEnv, *m);
-        bpEnv.packFormat   = overrides.pack_format;
-        bpEnv.packStageDir = overrides.pack_stage_dir;
+        bpEnv.packFormat   = state.overrides.pack_format;
+        bpEnv.packStageDir = state.overrides.pack_stage_dir;
         bpEnv.languageModules = m->language.modules;
         bpEnv.ruleModules  = m->buildConfig.ruleModules;
         if (auto dit = deviceSourcesByPackage.find(root->string()); dit != deviceSourcesByPackage.end())
@@ -12645,7 +12694,7 @@ prepare_build(bool print_fingerprint,
         // Same expression as the pre-move call site (and same order), so the
         // contract hash — and therefore the build.mcpp cache — is unchanged
         // across the move for feature-identical builds.
-        bpEnv.features     = feature_closure(*m, parse_feature_request(overrides.features));
+        bpEnv.features     = feature_closure(*m, parse_feature_request(state.overrides.features));
         // mcpp#241 (root): consumer index 0, same owner as the dep loop.
         //
         // AND THE LINK FORM OF EACH DEPENDENCY (#642 E2), to this program only.
@@ -12672,8 +12721,8 @@ prepare_build(bool print_fingerprint,
             ? hostModulesByConsumer.at(0u)
             : decltype(bpEnv.hostModules){};
         // #649 E5: the packaging pass's strip decision, beside its format.
-        bpEnv.packStrip           = overrides.pack_strip;
-        bpEnv.packDebugSymbolsDir = overrides.pack_debug_symbols_dir;
+        bpEnv.packStrip           = state.overrides.pack_strip;
+        bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
         // #647 E1: THE RESOLVED GRAPH, FOR THE ROOT'S PROGRAM ONLY.
         //
         // Every package, dependencies before the packages that request them
@@ -12756,7 +12805,7 @@ prepare_build(bool print_fingerprint,
         auto bp = mcpp::build::run_build_program(
             *m, *root, host->first, host->second,
             m->cppStandard, bpEnv);
-        if (!bp && !overrides.plan_only) {
+        if (!bp && !state.overrides.plan_only) {
             return std::unexpected(bp.error());
         }
         // #699 item 2 (E3): under `emit build-database` (`plan_only`), a
@@ -13736,7 +13785,7 @@ prepare_build(bool print_fingerprint,
             auto stdTt = mcpp::toolchain::triple::parse(tc->targetTriple);
             return stdTt && stdTt->os == "macos";
         }();
-        if (overrides.plan_only) {
+        if (state.overrides.plan_only) {
             // Described, not compiled: the paths and commands are the ones
             // ensure_built would use, from the one derivation in stdmod.cppm.
             auto described = mcpp::toolchain::describe_std_module(
@@ -13800,7 +13849,7 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    if (print_fingerprint) {
+    if (state.print_fingerprint) {
         std::println("Toolchain: {}", tc->label());
         std::println("Fingerprint: {}", fp.hex);
         for (std::size_t i = 0; i < fp.parts.size(); ++i) {
@@ -13809,14 +13858,14 @@ prepare_build(bool print_fingerprint,
     }
 
     BuildContext ctx;
-    ctx.strict      = overrides.strict;
+    ctx.strict      = state.overrides.strict;
     ctx.manifest    = *m;
     ctx.tc          = *tc;
     ctx.fp          = fp;
     ctx.runtimeSelection = runtimeSelection;
     ctx.runtimeBinding = runtimeBindingSnapshot;
     ctx.profile     = effectiveProfile;
-    ctx.activeFeatureRequest = overrides.features;
+    ctx.activeFeatureRequest = state.overrides.features;
     ctx.compilerChoice = { std::string(tc_origin_name(tcOrigin)),
                            graphCompilerRequiredBy,
                            graphCompilerReplaced.empty() ? pinReplacedDefault
@@ -13960,7 +14009,7 @@ prepare_build(bool print_fingerprint,
         // What a RUN would additionally have asked for. Recorded rather than
         // installed: this verb is not running anything, and installing it
         // anyway is the behaviour the tier exists to remove.
-        if (toolPurpose == ToolPurpose::Build) {
+        if (state.toolPurpose == ToolPurpose::Build) {
             for (std::size_t i = 0; i < packages.size() && !ctx.runTierPending; ++i) {
                 const auto& man = packages[i].manifest;
                 const auto feats = i < activeFeaturesByPackage.size()
@@ -14403,13 +14452,13 @@ prepare_build(bool print_fingerprint,
     // own target, and the output directory is shared with plain builds because
     // the fingerprint covers neither input. Stamping it on the plan is what
     // lets the graph say so about itself.
-    ctx.plan.graphShape = (includeDevDeps || !extraTargets.empty())
+    ctx.plan.graphShape = (state.includeDevDeps || !state.extraTargets.empty())
         ? mcpp::build::GraphShape::WithTests
         : mcpp::build::GraphShape::Normal;
     // The device variant an override chose is stamped for the same reason: the
-    // fast path runs without overrides, so a graph written under one must not
+    // fast path runs without state.overrides, so a graph written under one must not
     // be the graph it replays.
-    ctx.plan.accelOverridden = !overrides.accel.empty();
+    ctx.plan.accelOverridden = !state.overrides.accel.empty();
 
     // THE MACHINE'S JOB DEFAULT, resolved unconditionally and never fatally.
     //
@@ -14476,7 +14525,7 @@ prepare_build(bool print_fingerprint,
     // A link input only: a plan that builds nothing (`plan_only`) neither reads
     // it nor runs the driver to produce it, and its compile arguments are the
     // same without it.
-    if (tc->compiler == mcpp::toolchain::CompilerId::GCC && !overrides.plan_only)
+    if (tc->compiler == mcpp::toolchain::CompilerId::GCC && !state.overrides.plan_only)
         ctx.plan.gccCleanSpecs = mcpp::toolchain::write_clean_link_specs(
             tc->binaryPath, ctx.outputDir);
 
@@ -14506,7 +14555,7 @@ prepare_build(bool print_fingerprint,
         // Section 2 of the design record measured that shape: a valid, empty,
         // 52 KB installer with nothing said about it.
         std::set<std::string> stageDirNoPass, stageDirWrongRole;
-        // Carried from the overrides so the refusal below can say WHY there is
+        // Carried from the state.overrides so the refusal below can say WHY there is
         // no tree, which is a different sentence from "you are not packaging".
         std::string stageDirWhy;
         // WHETHER *THIS* ACTION REFERENCED THE STAGED TREE, and deliberately a
@@ -14521,7 +14570,7 @@ prepare_build(bool print_fingerprint,
         // NAMES ids and a collision there costs a duplicate line, not a wrong
         // edge.
         bool thisActionUsesStageDir = false;
-        const bool stagePass = !overrides.pack_stage_dir.empty();
+        const bool stagePass = !state.overrides.pack_stage_dir.empty();
         auto substitute = [&](std::string s, const char* actionId,
                               mcpp::manifest::BuildAction::Role role) {
             auto rep = [&](std::string_view what, const std::string& with) {
@@ -14551,13 +14600,13 @@ prepare_build(bool print_fingerprint,
             if (s.find("${mcpp.stage_dir}") != std::string::npos) {
                 if (!stagePass) {
                     stageDirNoPass.insert(actionId);
-                    stageDirWhy = overrides.pack_stage_reason;
+                    stageDirWhy = state.overrides.pack_stage_reason;
                 } else if (role != mcpp::manifest::BuildAction::Role::Artifact) {
                     stageDirWrongRole.insert(actionId);
                 } else {
                     thisActionUsesStageDir = true;
                 }
-                rep("${mcpp.stage_dir}", overrides.pack_stage_dir.string());
+                rep("${mcpp.stage_dir}", state.overrides.pack_stage_dir.string());
             }
             constexpr std::string_view kTf = "${mcpp.target_file:";
             for (std::size_t p; (p = s.find(kTf)) != std::string::npos; ) {
@@ -14641,7 +14690,7 @@ prepare_build(bool print_fingerprint,
                 if (thisActionUsesStageDir) {
                     a.consumesStageDir = true;
                     a.inputs.push_back(
-                        mcpp::pack::stage_manifest_path(overrides.pack_stage_dir).string());
+                        mcpp::pack::stage_manifest_path(state.overrides.pack_stage_dir).string());
                 }
                 a.packageName = owner;
                 ctx.plan.actions.push_back(std::move(a));
@@ -14659,7 +14708,7 @@ prepare_build(bool print_fingerprint,
         ctx.plan.providedPackFormats.erase(
             std::ranges::unique(ctx.plan.providedPackFormats).begin(),
             ctx.plan.providedPackFormats.end());
-        ctx.plan.packFormat = overrides.pack_format;
+        ctx.plan.packFormat = state.overrides.pack_format;
         if (!stageDirNoPass.empty()) {
             std::string ids;
             for (auto const& n : stageDirNoPass) ids += (ids.empty() ? "" : ", ") + n;
@@ -14957,7 +15006,7 @@ prepare_build(bool print_fingerprint,
     // through `[resources] files`: both would sit at ordinal 1, the package
     // said nothing about code pages, and its own manifest is the one it ships.
     // A DECLARED `utf-8` beside such a manifest is refused below instead.
-    const bool hostToolBuild = overrides.tool_depth > 0;
+    const bool hostToolBuild = state.overrides.tool_depth > 0;
     const bool ownManifest = hostToolBuild
         && std::ranges::any_of(m->resources.files, [&](const auto& f) {
                const auto abs = (f.is_absolute() ? f : (*root / f)).lexically_normal();
@@ -15744,7 +15793,7 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    // Apply [runtime.<capability>] provider = "<pkg>" overrides. Canonical
+    // Apply [runtime.<capability>] provider = "<pkg>" state.overrides. Canonical
     // identity wins; the old short spelling is accepted only when it denotes
     // exactly one provider.  A same-short-name collision is never guessed.
     for (auto& [capKey, prov] : ctx.manifest.runtimeConfig.providerOverrides) {
