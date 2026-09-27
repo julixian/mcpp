@@ -35,7 +35,7 @@ record fixes the following:
 |---|---|---|---|---|
 | 1 | openxlings/xlings | one | interface mode emits `progress` events for an index sync and keeps terminal text off the NDJSON stream | yes; the date version of the day |
 | 2 | Sunrisepeak/mcpp-language-server | one, from a fork | S1: the generated-output record (design §4.4, D6) | no, a specification only |
-| 3 | mcpp-community/mcpp | one | W1 to W12, docs, specs, CHANGELOG, version, xlings pin | yes |
+| 3 | mcpp-community/mcpp | one: #727, which also carries #726's fix (W13) | W1 to W13, docs, specs, CHANGELOG, version, xlings pin | yes |
 | 4 | openxlings/xim-pkgindex | the bot's bump pull request | mcpp's new version | merged by a maintainer account |
 | 5 | mcpplibs/mcpp-index | one, if its CI pin or `latest_mcpp` must move | index consumer pins | no release; the index publishes on merge |
 
@@ -55,11 +55,11 @@ branch, and is merged back when its criteria pass.
 | T3 | W3, W4, W5 | `src/build/plan.cppm` (the unit loop only), `src/build/prepare/target_side.cpp` (the device-source check), `src/build/prepare/driver.cpp`, `src/build/prepare/xlings.cpp` (the project index file), `src/cli/cmd_build.cppm` (the emit failure path), SPEC-005, e2e 688 extended, e2e 808 and 809 | none |
 | T4 | W6 | `src/build/plan.cppm` (`add_deploy` only), `src/build/stage.cppm`, `src/cli/cmd_build.cppm` (`cmd_stage` only), `src/build/ninja_backend.cppm` (the stage and `place_dlls` edges), `src/pack/pack.cppm` (`place_runtime_dlls`), SPEC-007 R4.2 and R4.3, e2e 810 and 811 | none |
 | T5 | W12 | `src/pm/package_fetcher.cppm`, `src/pm/index_contract.cppm`, `src/xlings/xlings.cppm` (`update_index` reporting), `src/ui.cppm` (closing notices), `src/doctor.cppm`, `docs/09` and `docs/50`, e2e 185 updated, e2e 812 | none |
-| T6 | W7 | `src/build/prepare/*.cpp` (phase functions), `.github/tools/` (the size gate), `tests/unit/test_prepare_helpers.cpp` | T1 to T5 merged |
-| T7 | W8 | `modules/manifest/src/toml.cppm`, `modules/manifest/src/types.cppm`, `src/build/prepare/scan.cpp` and `target_side.cpp` (dialect resolution), `src/build/prepare_inputs.cppm`, SPEC-004 §3.1 and §9, e2e 813 | T6 |
-| T8 | W9 | `modules/toolchain-model/src/dialect.cppm`, `src/build/flags.cppm`, `src/build/prepare/scan.cpp` (std-module CRT), `src/build/distribution.cppm`, the toolchain redistributable field (`src/toolchain/msvc.cppm`, the LLVM row's sysroot resolution), `src/pack/pack.cppm` (contract), `docs/20` and `docs/04`, unit tests, e2e 814 (Windows) | T6, T7 |
-| T9 | W10 | `src/build/build_database.cppm`, SPEC-005 §3, e2e 815 | T3, T6; the S1 text |
-| T10 | W11 | `src/ui.cppm` (terminal and non-terminal rendering), `src/xlings/xlings.cppm` (index refresh through the interface), the git fetch in `src/build/prepare/fetch.cpp` and `graph.cpp`, the sandbox bootstrap, `docs/09`, unit tests, e2e 816 | T5, T6; the xlings release |
+| T6 | W7 | `src/build/prepare/*.cpp` (phase functions), `.github/tools/` (the size gate), `tests/unit/test_prepare_helpers.cpp` | every other task merged (the last step; see the design, §11) |
+| T7 | W8 | `modules/manifest/src/toml.cppm`, `modules/manifest/src/types.cppm`, `src/build/prepare/scan.cpp` and `target_side.cpp` (dialect resolution), `src/build/prepare_inputs.cppm`, SPEC-004 §3.1 and §9, e2e 813 | T1 to T5 merged |
+| T8 | W9 | `modules/toolchain-model/src/dialect.cppm`, `src/build/flags.cppm`, `src/build/prepare/scan.cpp` (std-module CRT), `src/build/distribution.cppm`, the toolchain redistributable field (`src/toolchain/msvc.cppm`, the LLVM row's sysroot resolution), `src/pack/pack.cppm` (contract), `docs/20` and `docs/04`, unit tests, e2e 814 (Windows) | T1 to T5 merged; its free-form word rule reads T7's list at merge |
+| T9 | W10 | `src/build/build_database.cppm`, SPEC-005 §3, e2e 815 | T3; the S1 text (Sunrisepeak/mcpp-language-server#28) |
+| T10 | W11 | `src/ui.cppm` (terminal and non-terminal rendering), `src/xlings/xlings.cppm` (index refresh through the interface), the git fetch in `src/build/prepare/fetch.cpp` and `graph.cpp`, the sandbox bootstrap, `docs/09`, unit tests, e2e 816 | T5; the xlings change (X1), with its release before mcpp's |
 | X1 | xlings | `openxlings/xlings`: the interface event stream for `update_packages` | none |
 | L1 | mcppls | `docs/specs` S1 addition | none |
 

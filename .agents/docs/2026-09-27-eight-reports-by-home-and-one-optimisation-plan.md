@@ -5,7 +5,7 @@ status: active
 
 # Eight reports after 2026.9.27.1: what each one is, where it belongs, and one optimisation plan
 
-**Status:** active, revision 3 (2026-09-27). Every decision is settled (§12).
+**Status:** active, revision 4 (2026-09-27). Every decision is settled (§12).
 Nothing described here has been implemented.
 
 - **Revision 1** routed the reports and asked seven questions.
@@ -20,6 +20,10 @@ Nothing described here has been implemented.
   - The reviewer pointed out that `-p` is declared as `--package <NAME>`, so D1
     resolves the package identity first.
   - D2, D3, D8 and D9 are accepted.
+- **Revision 4** records two changes, both made during implementation:
+  - The reviewer added #726, with its pull request #727 (W13, §9.3), and directed
+    that the whole round land in #727 (D10).
+  - The split (W7) moves to the last stage (§11).
 
 **Basis.** Engine code was read at `b439fd97` (origin/main, mcpp 2026.9.27.1). The
 reports cite `52549fbb`, which predates the decomposition of
@@ -69,7 +73,9 @@ usage reading, and this record answers it:
 - **#717.** No current spelling expresses the report's need (measured, §6).
 
 Two further items come from the reviewer rather than from a report: download
-progress (§9.1) and the index floor (§9.2). The same rules route them.
+progress (§9.1) and the index floor (§9.2). The same rules route them. A third,
+#726 with its pull request #727, was added by the reviewer on 2026-09-27 as part
+of the same round (§9.3), and the whole round lands in #727.
 
 ## 1. The ledger
 
@@ -89,15 +95,18 @@ progress (§9.1) and the index floor (§9.2). The same rules route them.
 | #724 §2.3 | Run side-effect-free generators under `emit` | feature | not the engine | decline | none |
 | review | An index that requires a newer mcpp prints `error: ... [E0006]` at the start of a run that then succeeds | defect (measured) | engine | a closing tip at most, and only when the run refreshed an index | W12 |
 | review | Library, git and index acquisitions show no progress, while toolchains do | gap | engine; xlings if its `update_packages` emits no events | one renderer, more producers; non-terminal output without `\r` | W11 |
+| #726 | On Windows an xlings invocation left the registry's shim directory in front of the process `PATH`, kept `XLINGS_HOME` set for the rest of the run, and started xlings in the project's directory | defect (measured on GalTranslPP's Windows CI) | engine | fix, as pull request #727 proposes (§9.3) | W13 |
 | #721 | GCC 16.1 ICE | upstream | not in scope for this round | excluded | none |
 
-Everything is one round and one release, in three stages:
+Everything is one round and one release, in one pull request (#727), in three
+stages:
 
-- **Stage 1** holds the defects: W1 to W6, and W12.
-- **Stage 2** is #722 (W7).
-- **Stage 3** holds the features: W8 to W11.
+- **Stage 1** holds the defects: W1 to W6, W12 and W13.
+- **Stage 2** holds the features: W8 to W11.
+- **Stage 3** is #722 (W7).
 
-§11 gives the order and its reasons.
+§11 gives the order and its reasons, including why the split moved from the
+second stage to the last.
 
 ## 2. #725: a member is a member however the build is rooted
 
@@ -865,9 +874,9 @@ the split, because functions of 1,000 to 2,300 lines exist. If the parsing form
 cannot be built, the function limit is removed from the acceptance. It is not kept
 as a sentence that nothing checks (rule 3). The file gate stays in either case.
 
-## 9. Two items raised in review
+## 9. Items raised in review
 
-These two items do not come from a report. The reviewer raised them on
+These items do not come from the eight reports. The reviewer raised them on
 2026-09-27, and they are routed by the same rules as the reports.
 
 ### 9.1 One progress mechanism for every acquisition (W11)
@@ -1034,6 +1043,63 @@ succeeds has no error to report.
 The first and last criteria fail on 2026.9.27.1: the read site is unchanged at
 `b439fd97`, and `doctor_report` has no such check.
 
+### 9.3 #726: an xlings invocation on Windows leaves the process as it found it (W13)
+
+**Observation (measured on GalTranslPP's Windows CI).** A `vcpkg install` action
+failed with `'C:\Program' is not recognized ...` in a build that installed a
+toolchain or a payload itself; a second build passed.
+
+**Cause (read, and confirmed by isolation runs in #726).** On POSIX the xlings
+command prefix carries `cd <home>`, `XLINGS_HOME` and `PATH`, and nothing reaches
+the build. On Windows two differences existed:
+
+1. **`build_command_prefix` changed the process.**
+   - It set `XLINGS_HOME` and prepended `<mcpp home>/registry/subos/default/bin`
+     to the process `PATH`, and nothing restored either. Three copies of the
+     directory were observed.
+   - ninja and every action then found `xim:llvm`'s `cl`, `link`, `lib` and `rc`
+     shims in front of MSVC's tools, and vcpkg's MSVC detection met them.
+2. **xlings started in mcpp's working directory.**
+   - xlings chooses project mode by walking up to a `.xlings.json`, so in a
+     project that pins its mcpp there, the registry's xlings adopted the project.
+   - It wrote the shims of mcpp's toolchain and payloads into the project's
+     SubOS, whose shims resolve against the user's home.
+
+**Change (pull request #727).**
+
+- **`ScopedInvocationEnv` owns the whole invocation environment on Windows.** It
+  saves, applies and restores `XLINGS_HOME`, the scope variables and `PATH`,
+  newest first.
+- **The Windows command starts in the home.** It is
+  `cd /d "<home>" && "<xlings>"`, as the POSIX one starts with `cd`.
+- **Building a command changes nothing.** The unit tests check that across three
+  guarded invocations.
+
+**Review of #727 (this record).**
+
+- **Guards.** Every use of `build_command_prefix` is in `src/xlings/xlings.cppm`,
+  and each runs under a guard.
+- **No concurrency.** mcpp never runs two xlings invocations at once, so the
+  process-wide save and restore cannot interleave. The one thread near an
+  invocation is the direct install's worker, which runs a single command while
+  the caller's guard is held.
+- **One defect found.** The pull request moved `mcpp.toml` to 2026.9.27.2 but not
+  `MCPP_VERSION` (`modules/versioning/src/version.cppm`). Its Linux job failed on
+  the version check. The round moves both places together at release time.
+- **An interaction with W11.** W11 routes the index refresh through
+  `xlings interface update_packages`. That command is built by
+  `build_command_prefix` inside `update_index_unguarded`, which holds the guard,
+  so the refresh's environment does not reach the build either.
+
+**Criteria.**
+
+- `tests/unit/test_xlings.cpp`:
+  - `NeitherPathNorTheHomeOutlivesTheInvocation`;
+  - `TheWindowsPrefixStartsInTheHome`.
+- The Windows legs of the pull request's CI.
+- GalTranslPP's Windows CI against the branch, which is a real project with a
+  `.xlings.json` at its root and 22 vcpkg ports.
+
 ## 10. What is not done, and why
 
 | Proposal | Source | Why not |
@@ -1051,9 +1117,10 @@ The first and last criteria fail on 2026.9.27.1: the read site is unchanged at
 
 ## 11. Order of work
 
-The reviewer decided that #722 is done in the same round (D7). The round is
-therefore one release, in three stages. The stages are ordered so that each diff
-stays small and reviewable.
+The reviewer decided that #722 is done in the same round (D7) and that the round
+lands in pull request #727 (D10). The round is therefore one pull request and one
+release, in three stages. The stages are ordered so that each diff stays small and
+reviewable.
 
 | Stage | Step | Content | Specs and docs |
 |---|---|---|---|
@@ -1064,28 +1131,37 @@ stays small and reviewable.
 | 1 | W5 | #724 B: no project write under `emit` | SPEC-005 R2.1 (unchanged) |
 | 1 | W6 | #723: one destination, one content, checked when staging; one writer per destination | SPEC-007 R4.2 and R4.3 |
 | 1 | W12 | the index floor is a closing tip, not an error; a doctor check; W12 introduces the reporter's list of closing notices | docs 09 (and its doctor section), docs 50 (`note` severity) |
-| 2 | W7 | #722: split the phase functions | none |
-| 3 | W8 | #717: conditional graph-wide dialect flags | SPEC-004 §3.1, §9 item 10 |
-| 3 | W9 | #718: the CRT model by ABI; `toolchain-coupled` is the MSVC-ABI default | docs 20 and 04; SPEC-006 (the row's CRT) |
-| 3 | W10 | #724 §2: the generated-output record | S1 addition (mcppls), SPEC-005 §3 |
-| 3 | W11 | one progress mechanism; the producers per path | docs 09 |
+| 1 | W13 | #726: an xlings invocation on Windows leaves the process environment as it found it and starts in the home (#727) | CHANGELOG |
+| 2 | W8 | #717: conditional graph-wide dialect flags | SPEC-004 §3.1, §9 item 10 |
+| 2 | W9 | #718: the CRT model by ABI; `toolchain-coupled` is the MSVC-ABI default | docs 20 and 04; SPEC-006 (the row's CRT) |
+| 2 | W10 | #724 §2: the generated-output record | S1 addition (mcppls), SPEC-005 §3 |
+| 2 | W11 | one progress mechanism; the producers per path | docs 09 |
+| 3 | W7 | #722: split the phase functions | none |
 
 The order has three reasons:
 
 1. **Stage 1 comes first because it fixes defects on the present layout.** W1 is
    first in it, because it blocks existing builds, including mcppls's nightly run.
-2. **Stage 2 then splits the phase functions that stage 1 has touched.** Its
-   golden fixtures are regenerated after stage 1, so that the criterion of
-   byte-identical output compares the split with the unsplit code at one point in
-   the history.
-3. **Stage 3 lands in the smaller functions,** in an order fixed by three
-   dependencies:
+2. **Stage 2 holds the features.** Their order is fixed by three dependencies:
    - W8 precedes W9, because W9's rule for free-form CRT words reads the
      `dialect_cxxflags` that W8 makes conditional.
    - W10 waits for the S1 text (D6) and builds on W3.
    - W11 attaches progress rendering to the reporter that W12 introduced.
+3. **Stage 3 splits the phase functions last.**
+   - **Revised during implementation.** Revision 3 placed the split between the
+     defects and the features. Implementation reversed that, for two reasons:
+     - The features run as parallel tasks, and each touches `src/build/prepare/`.
+       A split that moves every phase function while they are written would
+       turn each of their diffs into a conflict inside moved code, which a merge
+       cannot carry.
+     - As the last step, the split is a purely mechanical change against a
+       fixed tree. That is exactly the case its criterion is built for.
+   - **Its criterion.** The criterion of byte-identical output compares the split
+     with the unsplit code at the same commit of the round. The golden fixtures
+     are regenerated from that commit, and the features and defects are then
+     already in them.
 
-Every defect and feature step (W1 to W6 and W8 to W12) has a criterion that fails
+Every defect and feature step (W1 to W6 and W8 to W13) has a criterion that fails
 on 2026.9.27.1 and passes after the change. W7 is a refactor, and its invariants
 hold before and after by construction: the golden fixtures stay byte-identical,
 and ASan stays clean. Its one criterion that fails before is the function-size
@@ -1146,6 +1222,7 @@ Every decision is settled (revision 3, 2026-09-27).
 | D7 | #722 in the same round | accepted: one release, with #722 as stage 2 (§11) |
 | D8 | W12: no error at the read site; the cause goes into a failure message; a closing tip only when the run refreshed an index; a new `mcpp doctor` check | accepted |
 | D9 | W11: measure every acquisition path first, then make the missing paths producers of the one renderer; non-terminal output without `\r` | accepted |
+| D10 | The whole round lands in pull request #727, together with #726's fix, and the combined change is verified as one | given by the reviewer on 2026-09-27 |
 
 ## 13. Self-review of the whole plan
 
