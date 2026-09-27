@@ -2863,13 +2863,13 @@ static std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareSt
             state.tcOrigin = TcOrigin::TargetSection;
         }
         if (!e.linkage.empty()) state.m->buildConfig.linkage = e.linkage;
-        // #336: a per-target C++ runtime contract state.overrides the project
+        // #336: a per-target C++ runtime contract overrides the project
         // default, so "self-contained everywhere except this triple" is
         // expressible without touching the cfg() input channel.
         if (!e.cxxRuntime.empty()) state.m->buildConfig.cxxRuntime = e.cxxRuntime;
     };
 
-    // ─── --target / --static state.overrides ──────────────────────────────────
+    // ─── --target / --static overrides ──────────────────────────────────
     // Target-axis default resolution when no --target flag was passed:
     // [build] target (project default, ≙ cargo build.target) >
     // [toolchain] default_target (global config) > host.
@@ -7708,7 +7708,7 @@ prepare_build(bool print_fingerprint,
                 //
                 // Additive fields merge; identity fields (version/path/git) do
                 // not, keeping "a conditional section never silently
-                // state.overrides an unconditional one" intact. Same rule the
+                // overrides an unconditional one" intact. Same rule the
                 // per-edge feature request already follows.
                 auto& dst = pos->second;
                 for (auto const& t : spec.tools)
@@ -8042,7 +8042,7 @@ prepare_build(bool print_fingerprint,
                     return std::unexpected(std::format(
                         "dependency '{}{}{}' is requested as both a {} dep "
                         "(by '{}') and a {} dep (by '{}'). Pick one.\n"
-                        "       declare '{}{}{}' in the state.root to settle it.",
+                        "       declare '{}{}{}' in the root to settle it.",
                         key.ns, key.ns.empty() ? "" : ".", key.shortName,
                         it->second.source, it->second.requestedBy,
                         sourceKind, item.requestedBy,
@@ -8062,7 +8062,7 @@ prepare_build(bool print_fingerprint,
                     // invariant is safer than silently letting whichever side
                     // arrived first win, which is the accident #630 reports.
                     return std::unexpected(std::format(
-                        "internal: dependency '{}{}{}': the state.root's "
+                        "internal: dependency '{}{}{}': the root's "
                         "declaration arrived after '{}' had already resolved "
                         "it. This is unreachable under first-in-first-out "
                         "worklist seeding; please report this as an mcpp "
@@ -8109,7 +8109,7 @@ prepare_build(bool print_fingerprint,
 
                 mcpp::diag::warning("dependency/source-override", std::format(
                     "'{}{}{}' is declared as a {} dep (by '{}', {}) and as a "
-                    "{} dep (by '{}', {}); the state.root's declaration wins.",
+                    "{} dep (by '{}', {}); the root's declaration wins.",
                     key.ns, key.ns.empty() ? "" : ".", key.shortName,
                     it->second.source, it->second.requestedBy, it->second.sourceRef,
                     sourceKind, item.requestedBy,
@@ -8117,7 +8117,7 @@ prepare_build(bool print_fingerprint,
                                             : sourceRefOf(sourceKind, spec,
                                                           item.resolveRoot,
                                                           item.originalConstraint)),
-                    std::format("declare '{}{}{}' in the state.root to choose the other.",
+                    std::format("declare '{}{}{}' in the root to choose the other.",
                         key.ns, key.ns.empty() ? "" : ".", key.shortName));
 
                 if (it->second.depIndex + 1 < packages.size()) {
@@ -8437,7 +8437,7 @@ prepare_build(bool print_fingerprint,
                         // above: unreachable under FIFO seeding, and refused
                         // by name rather than silently swapped in.
                         return std::unexpected(std::format(
-                            "internal: dependency '{}{}{}': the state.root's "
+                            "internal: dependency '{}{}{}': the root's "
                             "declaration arrived after '{}' had already "
                             "resolved it. This is unreachable under "
                             "first-in-first-out worklist seeding; please "
@@ -8459,10 +8459,10 @@ prepare_build(bool print_fingerprint,
                         key.ns, key.ns.empty() ? "" : ".", key.shortName,
                         sourceKind, it->second.sourceRef, it->second.requestedBy,
                         sourceKind, incomingRef, item.requestedBy,
-                        existingIsRoot ? "the state.root's declaration"
+                        existingIsRoot ? "the root's declaration"
                                        : std::format("'{}', declared first",
                                                      it->second.requestedBy)),
-                        std::format("declare '{}{}{}' in the state.root to choose "
+                        std::format("declare '{}{}{}' in the root to choose "
                                     "the other.",
                             key.ns, key.ns.empty() ? "" : ".", key.shortName));
                 }
@@ -9363,7 +9363,7 @@ prepare_build(bool print_fingerprint,
                     "target '{}' takes its C library from the '{}' payload, and "
                     "'{}' has none here.\n"
                     "       The row's toolchain is a convention, so naming your "
-                    "own compiler state.overrides it —\n"
+                    "own compiler overrides it —\n"
                     "       but the convention is what supplies this target's "
                     "headers and C library, and\n"
                     "       nothing in the dependency graph supplies them "
@@ -9587,7 +9587,7 @@ prepare_build(bool print_fingerprint,
                 && (pkg.manifest.buildConfig.abiThreadsDeclared
                     || pkg.manifest.buildConfig.abiExceptionsDeclared))
                 mcpp::diag::warning("abi/dependency-table", std::format(
-                    "`{}` declares [target.<selector>.abi], which only the state.root "
+                    "`{}` declares [target.<selector>.abi], which only the root "
                     "manifest decides; a dependency states what it needs with "
                     "`requires_abi = {{ threads = true }}` or "
                     "`requires_abi = {{ exceptions = true }}`", pcap));
@@ -11190,7 +11190,7 @@ prepare_build(bool print_fingerprint,
         // requirements already flow through normal dependency mechanics — this
         // pass is the selection-and-validation layer. See the capability-model
         // design doc.
-        // --cap cap=provider[,cap=provider] state.overrides [capabilities] pins.
+        // --cap cap=provider[,cap=provider] overrides [capabilities] pins.
         for (std::size_t p = 0; p < state.overrides.capabilities.size();) {
             auto c = state.overrides.capabilities.find_first_of(", ", p);
             auto tok = state.overrides.capabilities.substr(
@@ -11267,7 +11267,7 @@ prepare_build(bool print_fingerprint,
             return std::format(
                 "`{}` requires the artefact's ABI to have {} ({}), and this "
                 "build does not state it.\n"
-                "       Add to the state.root manifest, for the targets that need it:\n"
+                "       Add to the root manifest, for the targets that need it:\n"
                 "\n"
                 "           [target.'cfg(os = \"<os>\")'.abi]\n"
                 "           {} = true", requirer, member, what, member);
@@ -14182,7 +14182,7 @@ prepare_build(bool print_fingerprint,
                 if (!spec.linkage.empty())
                     mcpp::diag::warning("build/dependency-linkage", std::format(
                         "'{}' asks for dependency '{}' to be linked as '{}'; only "
-                        "the state.root project decides link forms, so this is ignored",
+                        "the root project decides link forms, so this is ignored",
                         packages[i].manifest.package.name, depName, spec.linkage));
 
         for (auto const& [i, form] : dependencyLinkForms) {
@@ -14539,7 +14539,7 @@ prepare_build(bool print_fingerprint,
         ? mcpp::build::GraphShape::WithTests
         : mcpp::build::GraphShape::Normal;
     // The device variant an override chose is stamped for the same reason: the
-    // fast path runs without state.overrides, so a graph written under one must not
+    // fast path runs without overrides, so a graph written under one must not
     // be the graph it replays.
     ctx.plan.accelOverridden = !state.overrides.accel.empty();
 
@@ -15876,7 +15876,7 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    // Apply [runtime.<capability>] provider = "<pkg>" state.overrides. Canonical
+    // Apply [runtime.<capability>] provider = "<pkg>" overrides. Canonical
     // identity wins; the old short spelling is accepted only when it denotes
     // exactly one provider.  A same-short-name collision is never guessed.
     for (auto& [capKey, prov] : ctx.manifest.runtimeConfig.providerOverrides) {
