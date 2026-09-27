@@ -63,6 +63,12 @@ jobs:
         run: bash .github/tools/check_modules_wiring.sh
 
       # Same placement, same reason: pure text, no toolchain, under a second.
+      # Catches the prepare.cppm decomposition growing back into one huge
+      # file one commit at a time — see the script's header.
+      - name: Check src/build/prepare* file lengths
+        run: bash .github/tools/check_file_lengths.sh
+
+      # Same placement, same reason: pure text, no toolchain, under a second.
       #
       # This one is a HARD gate (unlike lint-ci-assertions.sh below) because it
       # has no false positives left — its scope was cut to the two directories
