@@ -10971,9 +10971,9 @@ prepare_build(bool print_fingerprint,
                             sub.tool_chain, sub.work_dir.string(),
                             depPkg.root.string());
                     };
-                    auto subCtx = prepare_build(/*state.print_fingerprint=*/false,
-                                                /*state.includeDevDeps=*/false,
-                                                /*state.extraTargets=*/{}, sub);
+                    auto subCtx = prepare_build(/*print_fingerprint=*/false,
+                                                /*includeDevDeps=*/false,
+                                                /*extraTargets=*/{}, sub);
                     if (!subCtx) {
                         return std::unexpected(std::format(
                             "building host tool '{}:{}' failed: {}{}",
