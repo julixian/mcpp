@@ -53,7 +53,12 @@ import mcpp.ui;
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state) {
+// STEP FUNCTIONS (mcpp#722 / T6), split at the points where phase1's
+// own banners mark a new concern: the closures phase1 assigns onto
+// `state` (each captures only `state`), the target/static override
+// resolution, and the device axis plus the L1 conditional-section merge.
+
+static std::expected<void, std::string> step1_define_early_toolchain_closures(PrepareState& state) {
     // ─── Toolchain resolution (docs/21) ────────────────────────────────
     //
     // THE WHOLE CHAIN, in the order it is applied. It was documented twice, as
@@ -410,6 +415,10 @@ std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& st
     // this row the author wrote down, so it replaces `[toolchain]` and the
     // global default; `--toolchain` and a consumer's decision for a host tool
     // are statements about THIS invocation and keep precedence over it.
+    return {};
+}
+
+static std::expected<void, std::string> step1_target_and_static_overrides(PrepareState& state) {
     auto apply_target_section = [&](const mcpp::manifest::TargetEntry& e) {
         if (!e.toolchain.empty() && !state.tcFromCommandLine && !state.tcFromConsumer) {
             state.tcSpec   = e.toolchain;
@@ -930,6 +939,10 @@ std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& st
     // canonicalized. Reading it before that point would silently fall back to
     // the host for any project that sets its target in the manifest rather
     // than on the command line.
+    return {};
+}
+
+static std::expected<void, std::string> step1_device_axis_and_layer_merge(PrepareState& state) {
     // ── The device axis, resolved ONCE ────────────────────────────────────
     //
     // `--accel` / `--no-accel` over `[build] accel`. `--no-accel` arrives as the
@@ -1079,6 +1092,13 @@ std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& st
     // Guards the one recursive call below. Set before the call so the second
     // pass cannot reach it, whatever else changed in between.
     state.targetPassDone = false;
+    return {};
+}
+
+std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state) {
+    if (auto r = step1_define_early_toolchain_closures(state); !r) return std::unexpected(r.error());
+    if (auto r = step1_target_and_static_overrides(state); !r) return std::unexpected(r.error());
+    if (auto r = step1_device_axis_and_layer_merge(state); !r) return std::unexpected(r.error());
 
     return {};
 }
