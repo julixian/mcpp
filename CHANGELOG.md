@@ -64,6 +64,8 @@
 
 - **`src/build/prepare/` 的阶段函数按其小节拆分(#722)。** 代码逐字移动,不改变语句顺序;七个
   夹具的 `resolution.json`、`build.ninja` 与构建数据库输出与拆分前逐字节相同。
+- **xlings 固定版本为 2026.9.28.1。** 该版本的 interface 协议为 1.2:`update_packages` 按阶段发出
+  进度事件,interface 能力运行期间写到标准输出的文本不再混入事件流(openxlings/xlings#625)。
 
 ### 兼容性
 
