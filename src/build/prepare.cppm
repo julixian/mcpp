@@ -725,4 +725,27 @@ prepare_build(bool print_fingerprint, bool includeDevDeps = false,
               std::vector<mcpp::manifest::Target> extraTargets = {},
               BuildOverrides overrides = {});
 
+// The PlanNotes a failed call recorded before the phase that failed it.
+//
+// On success, `prepare_build` copies `PrepareState::planNotes` into
+// `BuildContext::planNotes` (phase13_finish) — but on failure it returns only
+// `r.error()`, a plain string, and the `PrepareState` that held the notes is a
+// local of `prepare_build` and is gone the moment it returns. A note recorded
+// by an earlier phase (`MCPP_BUILD_DATABASE_PROGRAM_FAILED`, say) was
+// therefore lost on every failure of a later phase, not only the one that
+// motivated this (design 2026-09-27 §4.2, mcpp#724 side finding A, fix item
+// 2): under `emit build-database`'s `plan_only`, a member the caller could
+// otherwise describe the ordinary way (R5.2) instead reported nothing but the
+// later phase's own message.
+//
+// Same per-run-sink discipline as `mcpp::build::refusal` (refusal.cppm), and
+// for the same reason: widening `prepare_build`'s return type would touch
+// every caller of `.error()` to carry something only the failure path of one
+// caller (`emit`) reads. Written immediately before prepare_build's own
+// failing return, from the state that failure saw; read by the caller that
+// turns that failure into diagnostics. `take` reads and clears, so neither a
+// later failure of the SAME call nor a later, unrelated call inherits a stale
+// set of notes.
+export std::vector<PlanNote> take_notes_on_failure();
+
 } // namespace mcpp::build

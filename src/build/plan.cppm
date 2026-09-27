@@ -1854,8 +1854,24 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     };
 
     // 1. Compile units in topological order
+    //
+    // A device-kind source (`SourceKind::Device`) is not one of them. The
+    // engine has no compile rule for it — it is compiled, if at all, by the
+    // package's build program through an action (`mcpp::action`), never by a
+    // `cxx_object`/`c_object` edge — so turning it into a `CompileUnit` here
+    // gave every consumer of `plan.compileUnits` a unit nothing runs: a dead
+    // `cxx_object` edge in `build.ninja` with no consumer, and an entry in
+    // `compile_commands.json` and the S1 document naming a compiler that never
+    // ran on the file (design 2026-09-27 §4.1, mcpp#724). Fixed at the source,
+    // once, so ninja, the compile database and S1 agree without each needing
+    // its own filter for this kind. The file itself still reaches `watch`
+    // (build_database.cppm expands the sources glob directly, not through
+    // `plan.compileUnits`), and it still reaches the package's build program
+    // through `MCPP_DEVICE_SOURCES` (features.cpp), which is the one thing
+    // that does compile it.
     for (auto idx : topoOrder) {
         auto& u = graph.units[idx];
+        if (u.kind == mcpp::SourceKind::Device) continue;
         CompileUnit cu;
         cu.source = u.path;
         cu.packageName = u.packageName;

@@ -462,6 +462,16 @@ struct PrepareState {
     std::vector<std::pair<std::string, std::string>> abiRequiresExceptions;
     std::map<std::string, std::vector<std::string>> capExclusive;
     std::map<std::string, std::vector<std::string>> deviceSourcesByPackage;
+    // Keyed like `deviceSourcesByPackage`, by `pkg.root.string()` (root
+    // package included: `packages[0].root == *root`). Holds a package whose
+    // build program failed IN THIS PASS, under `plan_only` (`emit
+    // build-database`) — the one case a failed program does not already end
+    // the whole call (SPEC-005 R5.2, #699 item 2, E3). A check whose premise
+    // is that program's directives must not run for such a package: with no
+    // directives applied, every premise reads as unmet, which is a symptom of
+    // the recorded `MCPP_BUILD_DATABASE_PROGRAM_FAILED`, not a second defect
+    // (design 2026-09-27 §4.2, mcpp#724 side finding A).
+    std::set<std::string> programFailedPackages;
     std::function<std::optional<std::string>()> checkVersionFloors;
     mcpp::targetside::TargetSide resolvedTargetSide;
     std::optional<std::size_t> cxxLayerProviderIndex;

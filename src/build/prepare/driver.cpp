@@ -24,6 +24,22 @@ import mcpp.platform;
 
 namespace mcpp::build {
 
+namespace {
+// `thread_local` for the same reason `mcpp::build::refusal`'s sink is
+// (refusal.cppm): `prepare_build` recurses for nested host sub-builds on the
+// calling thread, and a failure of the INNER call must not leave notes behind
+// for an outer call that goes on to succeed. Cleared at the top of every
+// `prepare_build` call and on its success path, so only a call that is
+// itself failing can leave something here for its caller to take.
+thread_local std::vector<PlanNote> g_notesOnFailure;
+} // namespace
+
+std::vector<PlanNote> take_notes_on_failure() {
+    auto notes = std::move(g_notesOnFailure);
+    g_notesOnFailure.clear();
+    return notes;
+}
+
 std::expected<BuildContext, std::string>
 prepare_build(bool print_fingerprint,
               bool includeDevDeps,
@@ -32,18 +48,29 @@ prepare_build(bool print_fingerprint,
     PrepareState state(print_fingerprint, includeDevDeps,
                         std::move(extraTargets), std::move(overrides));
     pending_flag_words_notes().clear();
+    g_notesOnFailure.clear();
 
-    if (auto r = phase0_manifest_and_workspace(state); !r) return std::unexpected(r.error());
-    if (auto r = phase1_toolchain_spec_and_axes(state); !r) return std::unexpected(r.error());
-    if (auto r = phase2_define_toolchain_resolver(state); !r) return std::unexpected(r.error());
-    if (auto r = phase3_xlings_before_graph(state); !r) return std::unexpected(r.error());
-    if (auto r = phase4a_graph_load(state); !r) return std::unexpected(r.error());
-    if (auto r = phase4b_graph_worklist(state); !r) return std::unexpected(r.error());
-    if (auto r = phase5_toolchain_after_graph(state); !r) return std::unexpected(r.error());
-    if (auto r = phase6_features_and_host_tools(state); !r) return std::unexpected(r.error());
-    if (auto r = phase9_target_side(state); !r) return std::unexpected(r.error());
-    if (auto r = phase11_scan(state); !r) return std::unexpected(r.error());
+    // Every early return below carries `state.planNotes` as they stood at the
+    // failing phase, so a caller whose only handle on the failure is
+    // `.error()` (a plain string) can still read what an earlier phase
+    // recorded — see `take_notes_on_failure`'s declaration in prepare.cppm.
+    auto fail = [&](std::string message) -> std::unexpected<std::string> {
+        g_notesOnFailure = state.planNotes;
+        return std::unexpected(std::move(message));
+    };
 
+    if (auto r = phase0_manifest_and_workspace(state); !r) return fail(r.error());
+    if (auto r = phase1_toolchain_spec_and_axes(state); !r) return fail(r.error());
+    if (auto r = phase2_define_toolchain_resolver(state); !r) return fail(r.error());
+    if (auto r = phase3_xlings_before_graph(state); !r) return fail(r.error());
+    if (auto r = phase4a_graph_load(state); !r) return fail(r.error());
+    if (auto r = phase4b_graph_worklist(state); !r) return fail(r.error());
+    if (auto r = phase5_toolchain_after_graph(state); !r) return fail(r.error());
+    if (auto r = phase6_features_and_host_tools(state); !r) return fail(r.error());
+    if (auto r = phase9_target_side(state); !r) return fail(r.error());
+    if (auto r = phase11_scan(state); !r) return fail(r.error());
+
+    g_notesOnFailure.clear();
     return phase13_finish(state);
 }
 

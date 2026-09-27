@@ -1622,6 +1622,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
             state.planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
                 bp.error(), mcpp::wire::Severity::Error,
                 (*state.root / "build.mcpp").string()});
+            // Named so the device-source check below (and anything else whose
+            // premise is this program's directives) can tell a package whose
+            // program failed apart from one that simply has no program.
+            state.programFailedPackages.insert(state.root->string());
         }
         if (bp) {
             // THE SAME RULE THE DEPENDENCIES ARE HELD TO, WITH THE ROOT AS A PARTY.
@@ -1764,8 +1768,18 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
     // condition an action needs anyway -- one that compiles a file it does not
     // declare as an input does not rerun when that file changes -- so a rule
     // that satisfies it is a rule that rebuilds correctly.
+    //
+    // THE PREMISE OF THIS CHECK IS THE BUILD PROGRAM'S DIRECTIVES: an action
+    // consuming a device source is one such directive. A package whose program
+    // failed in this pass (`plan_only`, above) applied none of them, so every
+    // device source would read as an orphan -- not a second defect, only the
+    // shape the first one takes here. Such a package already carries its one
+    // diagnostic, `MCPP_BUILD_DATABASE_PROGRAM_FAILED`; this check does not run
+    // for it, exactly as SPEC-005 R5.2 now states (design 2026-09-27 §4.2,
+    // mcpp#724 side finding A).
     for (std::size_t i = 0; i < state.packages.size(); ++i) {
         auto const& pkg = state.packages[i];
+        if (state.programFailedPackages.contains(pkg.root.string())) continue;
         auto dit = state.deviceSourcesByPackage.find(pkg.root.string());
         if (dit == state.deviceSourcesByPackage.end() || dit->second.empty()) continue;
         auto const& mm = (i == 0) ? *state.m : pkg.manifest;
@@ -1781,6 +1795,9 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 orphans += "         " + rel + "\n";
         if (orphans.empty()) continue;
         std::error_code hasEc;
+        // The `programFailedPackages` skip above means this package's program,
+        // if it has one, ran and succeeded — `exists(build.mcpp)` here can no
+        // longer be true of a program that merely started and failed.
         const bool hasProgram = std::filesystem::exists(pkg.root / "build.mcpp", hasEc)
                               || !pkg.manifest.buildConfig.ruleModules.empty();
         refusal::record(refusal::Code::DeviceSourceUnconsumed);

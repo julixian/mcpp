@@ -407,10 +407,28 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                                                   includeDevDeps,
                                                   std::move(discovered->targets), mo);
             if (!ctx) {
+                // A wholly-failed member contributes exactly one `error`
+                // diagnostic, `path` its `mcpp.toml` (SPEC-005 R5.2) — that
+                // invariant is kept exactly, so a note an earlier phase
+                // recorded (most importantly
+                // `MCPP_BUILD_DATABASE_PROGRAM_FAILED`) is folded into THIS
+                // diagnostic's own message instead of becoming a diagnostic of
+                // its own. Without it, a later phase's failure that follows
+                // from the missing directives (SPEC-005 R5.2's own words) read
+                // as a single, unexplained symptom, and the actual cause —
+                // recorded, then discarded the moment `prepare_build` returned
+                // — never reached the reader (design 2026-09-27 §4.2, mcpp#724
+                // side finding A, fix item 2).
+                std::string message = member.empty() ? ctx.error()
+                                                     : std::format("{}: {}", member, ctx.error());
+                for (auto const& note : mcpp::build::take_notes_on_failure())
+                    message += note.path.empty()
+                        ? std::format("\n       earlier in this pass, {}: {}",
+                                      note.code, note.message)
+                        : std::format("\n       earlier in this pass, {} ({}): {}",
+                                      note.code, note.path, note.message);
                 diagnostics.push_back({plan_failure_code(), Severity::Error,
-                    member.empty() ? ctx.error()
-                                   : std::format("{}: {}", member, ctx.error()),
-                    memberPath});
+                                       std::move(message), memberPath});
                 failedMemberRoots.push_back(memberRoot);
                 continue;
             }
