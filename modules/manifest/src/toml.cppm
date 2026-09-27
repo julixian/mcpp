@@ -1014,6 +1014,14 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                     if (!devExts.empty())
                         m.featureDeviceExtensions[fname] = std::move(devExts);
                 }
+                // The host tools this feature makes available (mcpp#709). Which
+                // targets exist is known only after target inference, so the
+                // names are checked in `load`, where the list is complete.
+                {
+                    std::vector<std::string> tools;
+                    read_str_array(ft, "tools", tools);
+                    if (!tools.empty()) m.featureTools[fname] = std::move(tools);
+                }
                 // The module a consumer's build program imports for this rule.
                 if (auto it = ft.find("rule_module");
                     it != ft.end() && it->second.is_string())
@@ -1101,6 +1109,8 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                     // and `tools = [...]` made ordinary builds of rule packages
                     // routine.
                     "device_extensions", "rule_module",
+                    // mcpp#709: the host tools a feature makes available.
+                    "tools",
                 };
                 for (auto& [fkey, fignored] : fval.as_table()) {
                     (void)fignored;
@@ -1842,7 +1852,7 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
             || k == "rev"    || k == "tag"     || k == "branch"
             || k == "features" || k == "default-features"
             || k == "workspace" || k == "visibility"
-            || k == "backend"  || k == "tools"
+            || k == "backend"  || k == "tools" || k == "artifacts"
             || k == "host-module" || k == "reexport"
             || k == "linkage";
     };
@@ -2017,6 +2027,12 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
         if (auto it = sub.find("tools"); it != sub.end() && it->second.is_array()) {
             for (auto& tv : it->second.as_array())
                 if (tv.is_string()) spec.tools.push_back(tv.as_string());
+        }
+        // mcpp#711: `artifacts = ["updater"]` -- the dependency's programs,
+        // built for this package's target and shipped beside its own.
+        if (auto it = sub.find("artifacts"); it != sub.end() && it->second.is_array()) {
+            for (auto& av : it->second.as_array())
+                if (av.is_string()) spec.artifacts.push_back(av.as_string());
         }
         // #355 step 5: `host-module = true` — make this dependency's lib-root
         // module importable from build.mcpp (reusable rules as packages).
@@ -4328,6 +4344,27 @@ std::expected<Manifest, ManifestError> load(const std::filesystem::path& path,
 
     // M5.0: defaults + target inference (uses filesystem context relative to mcpp.toml).
     apply_defaults_and_infer(*m, path.parent_path());
+
+    // `[features].<f>.tools` names this package's own programs (mcpp#709), and
+    // an inferred target exists only after the inference above.
+    for (auto it = m->featureTools.begin(); it != m->featureTools.end(); ++it) {
+        for (auto const& name : it->second) {
+            const Target* target = nullptr;
+            for (std::size_t i = 0; i < m->targets.size(); ++i)
+                if (m->targets[i].name == name) { target = &m->targets[i]; break; }
+            if (target != nullptr && target->kind == Target::Binary) continue;
+            std::string bins;
+            for (std::size_t i = 0; i < m->targets.size(); ++i)
+                if (m->targets[i].kind == Target::Binary)
+                    bins += (bins.empty() ? "" : ", ") + m->targets[i].name;
+            return std::unexpected(ManifestError{std::format(
+                "[features.{}] tools names '{}', which is not a `kind = \"bin\"` "
+                "target of this package (its bin targets: {}). A feature makes "
+                "the package's own programs available as host tools.",
+                it->first, name, bins.empty() ? std::string("none") : bins),
+                path, 0, 0});
+        }
+    }
 
     // A `[target.<sel>.targets.<name>]` row names a target, and an undeclared
     // library target exists only after the inference above, so the name is

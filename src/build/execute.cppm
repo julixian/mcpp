@@ -562,6 +562,9 @@ compute_run_targets(const mcpp::build::BuildPlan& plan) {
     std::vector<std::pair<std::string, std::string>> out;
     for (auto& lu : plan.linkUnits) {
         if (lu.kind != mcpp::build::LinkUnit::Binary) continue;
+        // A dependency's program shipped with this one (mcpp#711) is not a
+        // program of this package, and `mcpp run` does not choose it.
+        if (!lu.artifactOf.empty()) continue;
         out.emplace_back(lu.targetName, lu.output.generic_string());
     }
     return out;
@@ -2219,6 +2222,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
     const mcpp::build::LinkUnit* chosen = nullptr;
     for (auto& lu : ctx->plan.linkUnits) {
         if (lu.kind != mcpp::build::LinkUnit::Binary) continue;
+        if (!lu.artifactOf.empty()) continue;   // mcpp#711; see compute_run_targets
         if (targetName && lu.targetName != *targetName) continue;
         chosen = &lu;
         if (targetName) break;

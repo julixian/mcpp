@@ -2070,6 +2070,14 @@ struct Manifest {
     // feature is a build rule, here is what it compiles and here is how to
     // reach it". A feature with one and not the other is refused at parse time.
     std::map<std::string, std::string> featureRuleModule;
+    // `[features].<f>.tools` -- this package's own `kind = "bin"` targets that
+    // the feature makes available as host tools (mcpp#709). A consumer on whose
+    // behalf the feature is active receives each one as if its dependency edge
+    // had written `tools = [...]`: built once for the build machine, reachable
+    // from its build program through `mcpp::dep_bin`. The key moves a request a
+    // package already knows it needs into the package, so a consumer that
+    // enables a rule does not also have to name the rule's tools.
+    std::map<std::string, std::vector<std::string>> featureTools;
     // Feature System v2 Stage 2a — dependencies activated by a feature. A dep
     // declared ONLY here is optional: pulled into the resolution worklist only
     // when its feature is active (root --features or a dep spec's features=[...]).

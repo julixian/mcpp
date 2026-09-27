@@ -67,6 +67,15 @@ struct DependencySpec {
     // Empty by default: the cost (e.g. protobuf's libprotoc is ~157 extra TUs)
     // is paid by the consumer, so nothing is built unless someone asks.
     std::vector<std::string>    tools;
+    // mcpp#711: programs of the dependency that this consumer SHIPS -- the
+    // names of its `kind = "bin"` targets, built for the consumer's TARGET and
+    // profile as link units of the consumer's own plan, beside its programs in
+    // `bin/`. The counterpart of `tools` (built for the build machine, in a
+    // nested sub-build): a GUI that carries its updater executable wants the
+    // updater for the machine the GUI runs on. An edge that names artifacts
+    // takes the dependency's programs and not its code: nothing of the
+    // package is linked into the consumer through this edge.
+    std::vector<std::string>    artifacts;
     // #355 step 5: compile this dependency's lib-root module interface FOR THE
     // HOST and make it importable from the consumer's build.mcpp — the
     // mechanism behind reusable build rules distributed as ordinary packages

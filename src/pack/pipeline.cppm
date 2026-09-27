@@ -384,7 +384,9 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
     // excluded: a dependency's own `shared` target contributes a link unit to
     // this plan too, and it is never the package being packed.
     auto is_program_link_unit = [&](const mcpp::build::LinkUnit& lu) {
-        if (lu.kind == mcpp::build::LinkUnit::Binary) return true;
+        // A dependency's program shipped beside this one (mcpp#711) is staged
+        // as a file, never packed as the program.
+        if (lu.kind == mcpp::build::LinkUnit::Binary) return lu.artifactOf.empty();
         if (lu.kind != mcpp::build::LinkUnit::SharedLibrary || lu.dependencyOwned)
             return false;
         for (auto const& t : ctx->manifest.targets)
@@ -467,6 +469,12 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
         // destinations are `bin/<to>/<file>`, and the executable is in `bin/`.
         for (auto const& d : ctx->plan.runtimeDeployFiles)
             opts.runtimeFiles.push_back(d.dest.lexically_relative("bin"));
+        // A dependency's program the manifest ships with this one (mcpp#711,
+        // `artifacts = [...]`) is linked into `bin/` beside the executable, so
+        // it is staged the way a deployed file is.
+        for (auto const& u : ctx->plan.linkUnits)
+            if (!u.artifactOf.empty())
+                opts.runtimeFiles.push_back(u.output.lexically_relative("bin"));
         // #634 A3: the Android row reads its closure against the directories
         // its link declared -- a prebuilt library named through `[runtime]
         // link_library_dirs` is a file the link used and the device does not

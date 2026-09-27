@@ -6557,6 +6557,10 @@ prepare_build(bool print_fingerprint,
         // consumer's request must not be silently dropped, which is the
         // #242/#243 failure shape.
         std::vector<std::string> requestedTools;
+        // mcpp#711: the dependency's programs this consumer ships, built in
+        // THIS plan for its target. A package asked for them is scanned and
+        // configured here even when every target it declares is a program.
+        std::vector<std::string> requestedArtifacts;
         // #355 step 5 / #359: does this edge ask for the dependency's lib-root
         // interface as a HOST module, and does it hand its build-time
         // provisions on to this consumer's own consumers?
@@ -6686,6 +6690,19 @@ prepare_build(bool print_fingerprint,
             return t.kind == mcpp::manifest::Target::Library
                 || t.kind == mcpp::manifest::Target::SharedLibrary;
         });
+    };
+    // A package some edge asked for programs to SHIP (mcpp#711). Its programs
+    // are linked in this plan, so it is scanned and configured here like any
+    // library dependency, even when every target it declares is a program.
+    auto isArtifactPackage = [&](std::size_t i) {
+        return std::ranges::any_of(dependencyEdges, [&](const DependencyEdge& e) {
+            return e.dependencyPackageIndex == i && !e.requestedArtifacts.empty();
+        });
+    };
+    // Compiled in this plan: not a package of programs, or one whose programs
+    // this plan ships.
+    auto compilesHere = [&](std::size_t i) {
+        return i == 0 || !isProgramOnlyPackage(packages[i].manifest) || isArtifactPackage(i);
     };
     auto parseVisibility = [](std::string_view visibility) {
         if (visibility == "private")
@@ -7143,6 +7160,10 @@ prepare_build(bool print_fingerprint,
             for (auto const& t : spec.tools)
                 if (std::ranges::find(it->requestedTools, t) == it->requestedTools.end())
                     it->requestedTools.push_back(t);
+            for (auto const& a : spec.artifacts)
+                if (std::ranges::find(it->requestedArtifacts, a)
+                    == it->requestedArtifacts.end())
+                    it->requestedArtifacts.push_back(a);
             for (auto const& f : spec.features)
                 if (std::ranges::find(it->requestedFeatures, f)
                     == it->requestedFeatures.end())
@@ -7179,6 +7200,7 @@ prepare_build(bool print_fingerprint,
             .requestedFeatures = spec.features,
             .defaultFeatures = spec.defaultFeatures,
             .requestedTools = spec.tools,
+            .requestedArtifacts = spec.artifacts,
             .hostModule = hostModule,
             .reexport = spec.reexport,
             .buildOnly = buildOnly,
@@ -8667,7 +8689,8 @@ prepare_build(bool print_fingerprint,
         // application `z.o`), compiled its sources in the consumer's build, and
         // made a tool that depends on the package declaring it a cycle of the
         // consumer's graph although the two builds never meet.
-        const bool depProgramOnly = isProgramOnlyPackage(*dep_manifest);
+        const bool depProgramOnly = isProgramOnlyPackage(*dep_manifest)
+                                 && spec.artifacts.empty();
         auto linkFlagsAdded = depProgramOnly
             ? std::vector<std::string>{}
             : propagateLinkFlags(dep_root, *dep_manifest);
@@ -10035,6 +10058,26 @@ prepare_build(bool print_fingerprint,
             // Aggregate off the authoritative edge graph, exactly like feature
             // activation — a transitive consumer's request must not be
             // silently dropped (#242/#243).
+            // A FEATURE'S TOOLS ARE REQUESTED ON EVERY EDGE INTO ITS PACKAGE
+            // (#709). `[features.<f>] tools` states that enabling `f` needs
+            // those programs, so a consumer enabling it receives them exactly
+            // as if its edge had written `tools = [...]`. Features are unified
+            // per package, so the set is the package's active features, the
+            // same set `[feature-xlings]` is answered from. Added before the
+            // aggregation below, so building, visibility (`dep_bin`) and the
+            // store key are the edge-requested tool's in every respect.
+            for (auto& edge : dependencyEdges) {
+                const auto d = edge.dependencyPackageIndex;
+                if (d >= packages.size() || d >= activeFeaturesByPackage.size()) continue;
+                auto const& ft = packages[d].manifest.featureTools;
+                if (ft.empty()) continue;
+                for (auto const& f : activeFeaturesByPackage[d])
+                    if (auto it = ft.find(f); it != ft.end())
+                        for (auto const& t : it->second)
+                            if (std::ranges::find(edge.requestedTools, t)
+                                == edge.requestedTools.end())
+                                edge.requestedTools.push_back(t);
+            }
             std::map<std::size_t, std::set<std::string>> toolRequests;
             for (auto const& edge : dependencyEdges)
                 for (auto const& t : edge.requestedTools)
@@ -10808,7 +10851,7 @@ prepare_build(bool print_fingerprint,
             auto& pkg = packages[i];
             // A package of programs runs its build program in its own tool
             // sub-build, where its sources are compiled (#649 E6).
-            if (isProgramOnlyPackage(pkg.manifest)) continue;
+            if (!compilesHere(i)) continue;
             std::error_code bpEc;
             if (!std::filesystem::exists(pkg.root / "build.mcpp", bpEc)
                 && pkg.manifest.buildConfig.ruleModules.empty()) continue;
@@ -13023,7 +13066,7 @@ prepare_build(bool print_fingerprint,
     std::vector<mcpp::modgraph::PackageRoot> scannedPackages;
     scannedPackages.reserve(packages.size());
     for (std::size_t i = 0; i < packages.size(); ++i)
-        if (i == 0 || !isProgramOnlyPackage(packages[i].manifest))
+        if (compilesHere(i))
             scannedPackages.push_back(packages[i]);
     auto scan = [&] {
         const char* sel = std::getenv("MCPP_SCANNER");
@@ -14429,6 +14472,7 @@ prepare_build(bool print_fingerprint,
         // become an edge with a blank path, and ninja reports that far away
         // from the typo that caused it.
         std::set<std::string> unresolvedTargets;
+        std::set<std::string> unresolvedArtifacts;
         // `${mcpp.stage_dir}` used where there is no staged tree, and used by an
         // action whose role runs before the link. Both are refusals rather than
         // empty expansions: an empty path is a token the command still accepts,
@@ -14507,6 +14551,33 @@ prepare_build(bool print_fingerprint,
                     if (lu.targetName == name)
                         resolved = lu.output.generic_string();
                 if (resolved.empty()) unresolvedTargets.insert(name);
+                s.replace(p, close - p + 1, resolved);
+            }
+            // `${mcpp.artifact:<package>/<target>}` (mcpp#711): a dependency's
+            // program that an edge requested with `artifacts = [...]`, spelled
+            // like `${mcpp.target_file:}` -- the link unit's build-dir-relative
+            // output -- for the same reason. `<package>` is the dependency's
+            // name with or without its namespace.
+            constexpr std::string_view kArt = "${mcpp.artifact:";
+            for (std::size_t p; (p = s.find(kArt)) != std::string::npos; ) {
+                auto close = s.find('}', p);
+                if (close == std::string::npos) break;
+                const auto ref = s.substr(p + kArt.size(), close - p - kArt.size());
+                const auto slash = ref.rfind('/');
+                std::string resolved;
+                if (slash != std::string::npos) {
+                    const auto pkgName = ref.substr(0, slash);
+                    const auto target  = ref.substr(slash + 1);
+                    for (auto const& lu : ctx.plan.linkUnits) {
+                        if (lu.artifactOf.empty() || lu.targetName != target) continue;
+                        const auto dot = lu.artifactOf.rfind('.');
+                        const auto shortName = dot == std::string::npos
+                            ? lu.artifactOf : lu.artifactOf.substr(dot + 1);
+                        if (lu.artifactOf == pkgName || shortName == pkgName)
+                            resolved = lu.output.generic_string();
+                    }
+                }
+                if (resolved.empty()) unresolvedArtifacts.insert(ref);
                 s.replace(p, close - p + 1, resolved);
             }
             return s;
@@ -14614,6 +14685,21 @@ prepare_build(bool print_fingerprint,
                 "  targets in this build: [{}]\n"
                 "  (a target gated by required_features is absent unless those "
                 "features are active)",
+                bad, known.empty() ? std::string("none") : known));
+        }
+
+        if (!unresolvedArtifacts.empty()) {
+            std::string bad, known;
+            for (auto const& n : unresolvedArtifacts) bad += (bad.empty() ? "" : ", ") + n;
+            for (auto const& lu : ctx.plan.linkUnits)
+                if (!lu.artifactOf.empty())
+                    known += (known.empty() ? "" : ", ") + lu.artifactOf + "/" + lu.targetName;
+            return std::unexpected(std::format(
+                "build.mcpp action references unknown artifact(s) via "
+                "${{mcpp.artifact:<package>/<target>}}: {}\n"
+                "  artifacts in this build: [{}]\n"
+                "  (an artifact exists when a dependency edge requests it with "
+                "`artifacts = [\"<target>\"]`)",
                 bad, known.empty() ? std::string("none") : known));
         }
 
@@ -14925,6 +15011,9 @@ prepare_build(bool print_fingerprint,
             std::vector<std::size_t> peUnits;
             for (std::size_t i = 0; i < ctx.plan.linkUnits.size(); ++i) {
                 auto k = ctx.plan.linkUnits[i].kind;
+                // A dependency's program (mcpp#711) carries its own package's
+                // identity, not this one's.
+                if (!ctx.plan.linkUnits[i].artifactOf.empty()) continue;
                 if (k == mcpp::build::LinkUnit::Binary ||
                     k == mcpp::build::LinkUnit::SharedLibrary)
                     peUnits.push_back(i);
@@ -15026,6 +15115,7 @@ prepare_build(bool print_fingerprint,
             const bool synthVersion = R.declared() && R.synthesize_version_info();
             auto wantsUtf8 = [&](const mcpp::build::LinkUnit& lu) {
                 if (lu.kind != mcpp::build::LinkUnit::Binary) return false;
+                if (!lu.artifactOf.empty()) return false;
                 for (auto const& t : m->targets)
                     if (t.name == lu.targetName)
                         return t.is_program() && codePageOf(t) == "utf-8";
