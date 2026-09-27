@@ -50,7 +50,11 @@ EOF
 
 # `-v` prints each edge ninja runs; the check's is the one that goes through
 # the engine's stamp wrapper.
-ran() { grep -q '__action-stamp' "$1"; }
+# The check ran when its wrapper appears in the verbose log: the positional
+# `__action-stamp`, or the named `__action` that every action of an MSVC-ABI
+# build uses since 2026.9.28.2, because it puts the toolset's C++ runtime first
+# on the action's PATH.
+ran() { grep -qE '__action(-stamp)? ' "$1"; }
 
 "$MCPP" build -v > b1.log 2>&1 || { cat b1.log; echo "FAIL: build failed"; exit 1; }
 ran b1.log || { cat b1.log; echo "FAIL: the first build did not run the check"; exit 1; }

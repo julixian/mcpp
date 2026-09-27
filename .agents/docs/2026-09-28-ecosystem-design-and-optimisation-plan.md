@@ -619,3 +619,72 @@ verify verify-published.sh against the new and the previous pair in fresh SubOS
        sandboxes with the CN mirror; GalTranslPP on Windows with the new mcpp and
        qt-base revision 1; then the issues are closed with their readings
 ```
+
+## 8. Implementation record (revision 4)
+
+The tasks of §7 were implemented on 2026-09-28 in one pull request per
+repository: openxlings/xlings#628 (X1 to X6), mcpp-community/mcpp#730 (M1 to
+M9), an xim-pkgindex pull request (I1 to I3) and an mcpp-index pull request (N1,
+N2), with the issue mcpplibs/mcpp-index#482 (N3). This section states what
+landed where the implementation departed from §7, what was found while
+implementing it, and the readings.
+
+### 8.1 Departures from §7
+
+- **X3.** `prevLines` is kept, deprecated and always 0, rather than dropped: a
+  minor protocol version only adds (interface specification 1.3).
+- **M4.** The edge-advice channel (SPEC-007 R4.5) is a rule for every build
+  edge, not a mechanism of `place-dlls`: an action writes
+  `.mcpp-advice/<its output>.advice` the same way. e2e 821 reads it through an
+  action on both build paths, because on Linux no engine edge writes it.
+- **M5.** `check_workflow_assertions.py` also accepts a `PIPESTATUS` read on the
+  line after the pipe (rule W2), which the workflows use.
+- **M8.** `verify-published.sh` takes `M` and `XS`, binaries to verify in place
+  of the published ones, so that it can be rehearsed before a release; a run
+  that uses either says so at its start and its end.
+- **I2.** `installed()` does not assert that the runtime files are absent. The
+  packaging revision is what replaces an installed payload (xlings
+  2026.9.27.1), and a line naming the runtime files would be the one the static
+  test of I1 refuses.
+
+### 8.2 Found while implementing
+
+- **F1. A Windows test renamed a directory that a scanner still held.** E2E-01
+  (`bootstrap_home_test.ps1`) renamed the portable home 0.2 s after `self init`
+  and failed with "You do not have sufficient access rights"; the same failure
+  had occurred on 2026-09-14 on a branch that did not touch init, and passed on
+  that branch's next run. The test now renames with `[IO.Directory]::Move`,
+  which either renames or leaves the tree intact, retries for at most 10 s, and
+  on failure names the processes running from the tree.
+- **F2. A second producer of terminal frames.** Off a terminal, the sub-index
+  build scripts (`xim-pkgindex-awesome`, `-scode`, `-d2x`) still write
+  `\r[i/n] <ns>::<file>\033[K`; they run in-process and write to stdout
+  directly. It is the class of #626 in a producer X4 did not cover, and it is
+  present in 2026.9.28.1 (openxlings/xlings#629, open). `verify-published.sh`
+  asserts the download lines and reports these frames as a reading.
+- **F3. The index's sweep alert could not open its issue.** The job checks
+  nothing out, so `gh` could not infer the repository ("not a git
+  repository"), and it watched only the `workspace` job. The two red sweeps of
+  2026-09-26 therefore opened nothing (mcpplibs/mcpp-index#482). N2 sets
+  `GH_REPO` and also runs the alert when `mirror-cn-reachable` fails.
+- **F4. A filtered unit run was reported as the unit suite.** A local run of
+  the mcpp unit binaries under a `GTEST_FILTER` naming the new suites printed
+  "134 passed", which counts binaries; the full suite had one stale expectation
+  (the `place-dlls` command now carries `--crt`), found by the macOS self-host
+  row. The unfiltered run passes.
+- **F5. The toolset on the Visual Studio runner is newer than the Qt payload's
+  runtime.** The measurement recorded MSVC 14.51.36231 (Visual Studio 2026) as
+  the toolset whose runtime directory the action `PATH` receives, against the
+  14.44 copy `xim:qt-base` carried: the case D1 and D2 describe is the ordinary
+  state of a current CI image.
+- **F6. The action PATH crossed the invariant that an action's command line
+  survives an upgrade.** An action that declares neither `env` nor `cwd` kept
+  the positional `__action-stamp` spelling so that its command line, and
+  ninja's command hash, stayed the one an earlier engine wrote. D3 gives every
+  action of an MSVC-ABI build the named wrapper with `--path-prepend`, so each
+  such action re-runs once on the first build after the upgrade. The crossing
+  had no test; e2e 780, which recognised a check that ran by the old spelling,
+  failed on the Windows row and found it. The detector accepts both spellings,
+  the comment in `cli.cppm` states the exception, and the CHANGELOG lists the
+  one re-run.
+

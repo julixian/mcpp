@@ -1027,10 +1027,13 @@ int run(int argc, char** argv) {
     // `--path-prepend` puts that directory first on the command's PATH, so a
     // tool the action runs (Qt's moc.exe, a vcpkg port's generator) starts
     // with the toolset's runtime and not with whatever copy a library package
-    // happened to ship beside it (the 2026-09-28 design, §2.9). An action that declares neither keeps the
-    // positional `__action-stamp` spelling above, so its command line -- and
-    // ninja's command hash for its edge -- is the one an earlier engine wrote,
-    // and upgrading re-runs no check and no `prepare`.
+    // happened to ship beside it (the 2026-09-28 design, §2.9). Elsewhere, an
+    // action that declares neither keeps the positional `__action-stamp`
+    // spelling above, so its command line -- and ninja's command hash for its
+    // edge -- is the one an earlier engine wrote, and upgrading re-runs no
+    // check and no `prepare`. On the MSVC ABI the first build after upgrading
+    // to 2026.9.28.2 re-runs each action once, because its command line gained
+    // the directory.
     // `mcpp depfile-filter --raw <file> --out <file> -- <compiler argv>...`
     // (internal: written into build.ninja for GCC on a Windows host, WS2 of
     // the 2026-09-28 design). Runs the compile with inherited stdio and no
