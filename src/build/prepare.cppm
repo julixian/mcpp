@@ -25,7 +25,8 @@
 //                      dependencies' build programs.
 //   target_side.cpp    P9, P10 -- the target side and each dependency's link form.
 //   scan.cpp           P11, P12 -- the module scan, validation, fingerprint.
-//   plan.cpp           P13 -- the BuildContext, mcpp.lock, resolution.json.
+//   plan.cpp           P13 -- the BuildContext.
+//   records.cpp        P13 -- mcpp.lock and resolution.json.
 //   config.cpp, options.cpp, toolchain_env.cpp, fetch.cpp
 //                      the helpers the phases share: manifest merges and
 //                      feature requests; invocation options; target rows,

@@ -509,6 +509,9 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
 std::expected<void, std::string> phase9_target_side(PrepareState& state);
 std::expected<void, std::string> phase11_scan(PrepareState& state);
 std::expected<BuildContext, std::string> phase13_finish(PrepareState& state);
+// P13's records half (records.cpp), called by phase13_finish.
+std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildContext& ctx);
+void step13_resolution_json(PrepareState& state, BuildContext& ctx);
 
 // ── Helpers the phases share, defined in the files named below ─────────────
 
