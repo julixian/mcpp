@@ -420,6 +420,7 @@ a program classifying the outcome reads `reason`:
 | `lld-required-absent` | the target links through lld directly and the resolved toolchain payload ships none |
 | `host-tool-toolchain` | `build.mcpp` under a cross `--target` needs a resolvable HOST toolchain and none is set |
 | `std-module-precompile` | the standard library's module could not be precompiled for this configuration |
+| `msvc-redist-unavailable` | an explicit `cxx_runtime = "toolchain-coupled"` on an MSVC-ABI row whose toolset has no redistributable directory to stage *(2026.9.28.1+)* |
 | `other` | a refusal whose branch has not been given a token yet |
 
 **One token is also printed by `mcpp build` itself.**

@@ -393,6 +393,7 @@ replaced}` —— `origin` 与构建的状态行使用的是同一句话
 | `lld-required-absent` | 目标直接通过 lld 链接，而解析出的工具链载荷不带 lld |
 | `host-tool-toolchain` | 一个交叉 `--target` 下的 `build.mcpp` 需要一个可解析的**宿主**工具链，而一个都没有配置 |
 | `std-module-precompile` | 标准库的模块在这个配置下无法被预编译 |
+| `msvc-redist-unavailable` | 在 MSVC ABI 的行上显式写了 `cxx_runtime = "toolchain-coupled"`，而该行的工具集没有可放置的 redistributable 目录 *(2026.9.28.1+)* |
 | `other` | 一个尚未被赋予记号的拒绝分支 |
 
 **其中一个记号也由 `mcpp build` 自己打印。** `interface-not-provided` 会
