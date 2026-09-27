@@ -385,6 +385,17 @@ bool msvc_available_here(const std::filesystem::path& pkgsDir);
 std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
                                     std::string_view arch = "x64");
 
+// The same directory, reached from the row's SYSROOT rather than from a
+// cl.exe path: the LLVM row (clang++ targeting `*-windows-msvc`) runs no
+// cl.exe of its own, and its `Toolchain::linkRuntimeDirs` holds the LLVM
+// payload's own runtime directories, not this one (clang.cppm). `toolsDir`
+// is `Toolchain::msvcToolsDir` (`<VC>/Tools/MSVC/<v>`), the field
+// `bind_msvc_sysroot` already resolves for this row; `archGnu` is the
+// target triple's GNU-spelled architecture ("x86_64", "aarch64", "i686"),
+// mapped here to the "x64"/"arm64"/"x86" spelling `vc_redist_dir` takes.
+std::filesystem::path vc_redist_dir_for_tools_dir(
+    const std::filesystem::path& toolsDir, std::string_view archGnu);
+
 // Synthesize the environment cl.exe/link.exe need — what vcvars would set,
 // derived directly from the located VC tools + SDK (no vcvarsall.bat run):
 //   INCLUDE = <tools>\include; <sdk>\Include\<v>\{ucrt,um,shared,winrt}
@@ -1460,11 +1471,13 @@ std::vector<std::string> std_compat_build_commands(
                               ref, crtFlag) };
 }
 
-std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
-                                    std::string_view arch) {
-    // <VC>/Tools/MSVC/<ver>/bin/Host<h>/<arch>/cl.exe → up 6 from the arch dir
-    auto vc = clPath.parent_path();
-    for (int i = 0; i < 6 && !vc.empty(); ++i) vc = vc.parent_path();
+namespace {
+
+// The scan shared by both spellings of "where is this toolset's redist":
+// given the `<VC>` root (the parent of `Tools` and `Redist` alike), the
+// newest `Redist\MSVC\<ver>\<arch>\Microsoft.VC*.CRT` directory.
+std::filesystem::path vc_redist_dir_under(const std::filesystem::path& vc,
+                                          std::string_view arch) {
     std::error_code ec;
     auto redist = vc / "Redist" / "MSVC";
     if (!std::filesystem::is_directory(redist, ec)) return {};
@@ -1492,6 +1505,29 @@ std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
         }
     }
     return best;
+}
+
+} // namespace
+
+std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
+                                    std::string_view arch) {
+    // <VC>/Tools/MSVC/<ver>/bin/Host<h>/<arch>/cl.exe → up 6 from the arch dir
+    auto vc = clPath.parent_path();
+    for (int i = 0; i < 6 && !vc.empty(); ++i) vc = vc.parent_path();
+    return vc_redist_dir_under(vc, arch);
+}
+
+std::filesystem::path vc_redist_dir_for_tools_dir(
+    const std::filesystem::path& toolsDir, std::string_view archGnu) {
+    // toolsDir = <VC>/Tools/MSVC/<ver> → up 3 reaches <VC>, the same root
+    // `vc_redist_dir` reaches by walking up from a cl.exe path.
+    auto vc = toolsDir.parent_path()   // Tools/MSVC
+                  .parent_path()      // Tools
+                  .parent_path();     // <VC>
+    std::string_view arch = "x64";
+    if (archGnu == "aarch64")                    arch = "arm64";
+    else if (archGnu == "i686" || archGnu == "x86") arch = "x86";
+    return vc_redist_dir_under(vc, arch);
 }
 
 std::expected<void, DetectError> enrich_toolchain_from_cl(Toolchain& tc) {
@@ -1571,6 +1607,11 @@ std::expected<void, DetectError> enrich_toolchain_from_cl(Toolchain& tc) {
     if (auto redist = vc_redist_dir(tc.binaryPath, parsed->second);
         !redist.empty()) {
         tc.linkRuntimeDirs.push_back(redist);
+        // Also its own field (#718): `msvc_abi_default_contract` and the
+        // staging gate read THIS rather than `linkRuntimeDirs`, which on the
+        // LLVM row holds LLVM's own directories instead — one name for "the
+        // toolset's redistributable" that means the same thing on both rows.
+        tc.msvcRedistDir = redist;
     }
     return {};
 }

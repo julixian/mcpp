@@ -22,6 +22,7 @@ import mcpp.toolchain.hostflags;   // the compile-token producer the package std
 import mcpp.toolchain.cppfly;
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
+import mcpp.toolchain.model;      // is_msvc_target — the MSVC-ABI default (#718)
 import mcpp.toolchain.fingerprint;
 import mcpp.toolchain.registry;
 import mcpp.toolchain.linkmodel;
@@ -251,6 +252,50 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
                     }
                     return q;
                 }()));
+        }
+    }
+
+    // A FREE-FORM CRT WORD IS ALWAYS A SECOND STATEMENT ON THE MSVC ABI (D3,
+    // #718). Every MSVC-ABI build now states its own CRT model, so a literal
+    // `/MT`/`/MD`(`d`) or `-fms-runtime-lib=*` in `[build] cxxflags` or
+    // `dialect_cxxflags` can never be the only voice: agreeing repeats a
+    // fact already resolved (warned, naming the key to write instead);
+    // disagreeing is refused before compiling, naming the word, the key and
+    // the value it corresponds to.
+    //
+    // NOT gated on `needsStdModule`: the CRT model is a link-time fact for
+    // every MSVC-ABI build, with or without `import std`.
+    //
+    // THE ROOT PACKAGE ONLY, the same bound the dialect check above uses and
+    // for the same reason: `cxx_runtime` and `linkage` are root-level keys,
+    // so a dependency's own `cxxflags` cannot state the graph's CRT model.
+    if (mcpp::toolchain::is_msvc_target(*state.tc)) {
+        const bool wantsStatic = mcpp::toolchain::msvc_wants_static_crt(
+            state.m->buildConfig.linkage, state.m->buildConfig.cxxRuntime);
+        for (auto const& pkg : std::span{state.packages}.first(1)) {
+            auto check_words = [&](std::span<const std::string> list,
+                                   std::string_view key)
+                    -> std::expected<void, std::string> {
+                for (auto const& w : list) {
+                    auto verdict = mcpp::toolchain::check_crt_word(
+                        w, wantsStatic, key);
+                    if (!verdict) continue;
+                    if (verdict->contradicts)
+                        return std::unexpected(verdict->message);
+                    // Redundant, not degraded: the engine does exactly what
+                    // it would have done without the flag.
+                    mcpp::diag::warning("build/msvc-crt-word",
+                        verdict->message);
+                }
+                return {};
+            };
+            const auto cxxflagsWords =
+                mcpp::manifest::flag_words(pkg.manifest.buildConfig.cxxflags);
+            if (auto r = check_words(cxxflagsWords, "[build] cxxflags"); !r)
+                return std::unexpected(r.error());
+            if (auto r = check_words(pkg.manifest.buildConfig.dialectCxxflags,
+                                     "[build] dialect_cxxflags"); !r)
+                return std::unexpected(r.error());
         }
     }
 
@@ -690,16 +735,14 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
         // a std BMI built without it structurally lacks std::meta). Both
         // pieces were already in the fingerprint; this fixes the COMMAND
         // construction the fingerprint promised (stdFlagAndDialect above).
-        // #422: the CRT model reaches the std module too. Derived from the
-        // SAME expression the project's TUs use (flags.cppm), through the one
-        // helper, so the two cannot drift. A GNU dialect yields "-static" or ""
-        // here, and the gcc and clang std module builders do not read it, so
-        // their commands are unchanged; clang on the MSVC ABI is given no CRT
-        // model at all (see `MechanismInput::msvcCrtModelEmitted`).
-        const auto& stdDialect = mcpp::toolchain::dialect_for(*state.tc);
-        const auto stdCrt = mcpp::toolchain::msvc_crt_flag(
-            stdDialect, mcpp::toolchain::msvc_wants_static_crt(
-                            state.m->buildConfig.linkage, state.m->buildConfig.cxxRuntime));
+        // #422/#718: the CRT model reaches the std module too, on EVERY
+        // MSVC-ABI row now (cl and clang++ targeting `*-windows-msvc` alike).
+        // `msvc_abi_crt_word` is the SAME helper flags.cppm uses for the
+        // project's TUs, so the two cannot drift; it is empty off the MSVC
+        // ABI, where the gcc and clang std module builders leave it unread.
+        const auto stdCrt = mcpp::toolchain::msvc_abi_crt_word(
+            *state.tc, mcpp::toolchain::msvc_wants_static_crt(
+                           state.m->buildConfig.linkage, state.m->buildConfig.cxxRuntime));
         // Whether THIS build's resolved toolchain targets macOS — the same
         // target-not-host discriminator `min_platform_version` uses, parsed
         // locally because `tc` (not a `triple::Triple`) is what is in scope

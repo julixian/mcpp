@@ -343,8 +343,13 @@ std::expected<StdDerivation, StdModError> derive_std_module(
             isMsvc ? mcpp::toolchain::msvc::std_module_build_commands(
                          tc, cacheDir, cpp_standard_flag, msvc_crt_flag)
           : is_clang(tc)
+            // #718: `msvc_crt_flag` is empty off the MSVC ABI (every row
+            // this build serves except the LLVM one), so passing it here
+            // unconditionally changes nothing for a clang row that targets
+            // anything else.
             ? mcpp::toolchain::clang::std_module_build_commands(
-                  tc, cacheDir, d.bmiPath, sysroot_flag, cpp_standard_flag)
+                  tc, cacheDir, d.bmiPath, sysroot_flag, cpp_standard_flag,
+                  msvc_crt_flag)
             : mcpp::toolchain::gcc::std_module_build_commands(
                   tc, cacheDir, sysroot_flag, cpp_standard_flag);
         if (!tc.stdCompatSource.empty()) {
@@ -354,7 +359,8 @@ std::expected<StdDerivation, StdModError> derive_std_module(
             } else if (is_clang(tc)) {
                 auto compatBmi = mcpp::toolchain::clang::std_compat_bmi_path(cacheDir);
                 d.compatCommands = mcpp::toolchain::clang::std_compat_build_commands(
-                    tc, cacheDir, compatBmi, d.bmiPath, sysroot_flag, cpp_standard_flag);
+                    tc, cacheDir, compatBmi, d.bmiPath, sysroot_flag,
+                    cpp_standard_flag, msvc_crt_flag);
             }
         }
         d.metadata = metadata_for(tc, cpp_standard, cpp_standard_flag,

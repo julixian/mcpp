@@ -1493,6 +1493,15 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     for (auto const& dir : tc.linkRuntimeDirs) {
         append_unique_path(plan.runtimeLibraryDirs, dir);
     }
+    // The MSVC toolset's own redistributable CRT (#718), on the `mcpp run`/
+    // `mcpp test` search path exactly as the staged copy is beside the
+    // artifact (`flags.cppm`'s toolchain-coupled staging) — the two are the
+    // same directory for both the cl.exe row (already inside
+    // `linkRuntimeDirs` above, so this is a harmless duplicate there) and the
+    // LLVM row (where `linkRuntimeDirs` holds LLVM's own directories instead
+    // and would otherwise never mention it).
+    if (!tc.msvcRedistDir.empty())
+        append_unique_path(plan.runtimeLibraryDirs, tc.msvcRedistDir);
     // The private glibc payload exists here for ONE reason: a dlopen()'d
     // library, whose own DT_NEEDED closure never consults the main
     // executable's RUNPATH, must still resolve the same libc the executable

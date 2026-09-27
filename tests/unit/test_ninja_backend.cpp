@@ -1517,6 +1517,7 @@ BuildPlan msvc_plan_with_redist(const FakeRedistDir& redist,
     plan.toolchain.binaryPath      = "cl.exe";
     plan.toolchain.targetTriple    = "x86_64-pc-windows-msvc";
     plan.toolchain.linkRuntimeDirs = {redist.path};
+    plan.toolchain.msvcRedistDir   = redist.path;
     plan.manifest.buildConfig.cxxRuntime = std::string(cxxRuntime);
     plan.linkUnits.push_back({
         .targetName = "app",
@@ -1570,16 +1571,20 @@ TEST(NinjaBackendPeRuntime, ToolchainCoupledStagesTheToolsetCrtBesideTheExe) {
 }
 
 TEST(NinjaBackendPeRuntime, HostCoupledStagesNothing) {
-    // The DEFAULT Windows build. Staging DLLs unasked would change what every
-    // existing project ships, and `host-coupled` is a promise that the machine
-    // provides them — keeping a copy beside the artifact contradicts it.
+    // An EXPLICIT `host-coupled`: the machine is a promise that it provides
+    // the DLLs, and keeping a copy beside the artifact would contradict it.
     FakeRedistDir redist;
     auto plan = msvc_plan_with_redist(redist, "host-coupled");
     EXPECT_TRUE(compute_flags(plan).toolchainRuntimeDeploy.empty());
 
+    // The BARE default (#718): `toolchain-coupled` is now the MSVC-ABI
+    // default for every role, so a project that never mentioned
+    // `cxx_runtime` stages the toolset's redistributable exactly as an
+    // explicit `toolchain-coupled` would — see
+    // `ToolchainCoupledStagesTheToolsetCrtBesideTheExe`.
     auto bare = msvc_plan_with_redist(redist, "");
-    EXPECT_TRUE(compute_flags(bare).toolchainRuntimeDeploy.empty())
-        << "a project that never mentioned cxx_runtime gained staged DLLs";
+    EXPECT_EQ(compute_flags(bare).toolchainRuntimeDeploy.size(), 3u)
+        << "the undeclared MSVC-ABI default no longer stages the redistributable";
 }
 
 TEST(NinjaBackendPeRuntime, AProjectsOwnDeployFileOutranksTheToolsets) {
@@ -1613,6 +1618,70 @@ TEST(NinjaBackendPeRuntime, AnElfToolchainNeverStagesItsRuntimeDirs) {
     plan.toolchain.binaryPath   = "/usr/bin/g++";
     plan.toolchain.targetTriple = "x86_64-linux-gnu";
     EXPECT_TRUE(compute_flags(plan).toolchainRuntimeDeploy.empty());
+}
+
+// #718: every MSVC-ABI row x {undeclared, self-contained, toolchain-coupled,
+// host-coupled, linkage=static} yields exactly one CRT word, spelled for its
+// own driver, and that word is the SAME on the compile line (`f.cxx`,
+// `f.cc`) and — for the LLVM row — the link line (`f.ld`, `f.ldC`). This is
+// the exact property #649 E10 broke: a compile-only flag the clang driver's
+// link step never saw, so it chose `-defaultlib:libcmt` on its own. cl's
+// link line is `link.exe` directly (`LinkShape::MsvcLinkExe`) and carries no
+// compile flag at all — the CRT is baked into the objects it is given — so
+// only the LLVM row's link line is asked to repeat the word.
+TEST(NinjaBackendPeRuntime, CrtWordIsOneWordEqualOnCompileAndLink) {
+    FakeRedistDir redist;
+    struct Row {
+        std::string_view label;
+        mcpp::toolchain::CompilerId compiler;
+        std::string_view staticWord, dynamicWord;
+    };
+    Row rows[] = {
+        {"cl",   mcpp::toolchain::CompilerId::MSVC,  "/MT", "/MD"},
+        {"llvm", mcpp::toolchain::CompilerId::Clang, "-fms-runtime-lib=static",
+                                                     "-fms-runtime-lib=dll"},
+    };
+    struct Case { std::string_view linkage, cxxRuntime; bool wantsStatic; };
+    Case cases[] = {
+        {"", "",                  false},   // undeclared -> toolchain-coupled
+        {"", "self-contained",    true},
+        {"", "toolchain-coupled", false},
+        {"", "host-coupled",      false},
+        {"static", "",            true},
+    };
+    for (auto& row : rows) {
+        for (auto& c : cases) {
+            auto plan = msvc_plan_with_redist(redist, c.cxxRuntime);
+            plan.toolchain.compiler = row.compiler;
+            plan.manifest.buildConfig.linkage = std::string(c.linkage);
+            auto flags = compute_flags(plan);
+            auto want = c.wantsStatic ? row.staticWord : row.dynamicWord;
+            auto other = c.wantsStatic ? row.dynamicWord : row.staticWord;
+            SCOPED_TRACE(std::format("{} linkage='{}' cxx_runtime='{}'",
+                                     row.label, c.linkage, c.cxxRuntime));
+
+            EXPECT_EQ(count_occurrences(flags.cxx, want), 1u) << flags.cxx;
+            EXPECT_EQ(count_occurrences(flags.cc, want), 1u) << flags.cc;
+            EXPECT_EQ(flags.cxx.find(other), std::string::npos);
+            EXPECT_EQ(flags.cc.find(other), std::string::npos);
+
+            // `link_shape` (flags.cppm) picks `LinkShape::PeLld` — the
+            // branch that carries this word on the link line — only when
+            // `current_link_host()` is Windows, a HOST fact fixed at mcpp's
+            // own compile time. A Linux-built test binary always resolves
+            // this plan's link line through the ELF/Generic branch instead,
+            // whatever the plan's TARGET triple says, so the link-line half
+            // of this property is checkable only on a Windows-built mcpp —
+            // see the Windows e2e leg (814) for that half.
+            if constexpr (mcpp::platform::is_windows) {
+                if (row.compiler == mcpp::toolchain::CompilerId::Clang) {
+                    EXPECT_EQ(count_occurrences(flags.ld, want), 1u) << flags.ld;
+                    EXPECT_EQ(flags.ld.find(other), std::string::npos);
+                    EXPECT_EQ(flags.ld, flags.ldC);
+                }
+            }
+        }
+    }
 }
 
 // ── link_failure_advice ──────────────────────────────────────────────────────
