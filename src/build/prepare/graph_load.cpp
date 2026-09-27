@@ -50,7 +50,15 @@ import mcpp.project;
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
+// STEP FUNCTIONS (mcpp#722 / T6): the closures phase4a_graph_load
+// assigns onto `state` (each captures only `state`) are split into two
+// groups; `LoadedDep` is hoisted here so it stays visible to
+// `state.loadVersionDep`, which is defined further down, in the
+// orchestrator itself (see the file's own comment for why it is not
+// split further).
+using LoadedDep = std::pair<std::filesystem::path, mcpp::manifest::Manifest>;
+
+static void step4a_define_split_and_identity_closures(PrepareState& state) {
     // The features each package ends up built with, index-aligned with
     // `packages`. Recorded at activation because the passes that run after it
     // — `[feature-xlings]` provisioning among them — otherwise have no way to
@@ -250,12 +258,9 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
         s.version = std::move(*resolved);
         return {};
     };
+}
 
-    // Acquire a version-source dep at a specific pinned version. Used both
-    // by the first-time walk and by the SemVer merger when a re-fetch at a
-    // different version is needed. Returns the dep's effective root (where
-    // mcpp.toml lives) and a fully loaded manifest.
-    using LoadedDep = std::pair<std::filesystem::path, mcpp::manifest::Manifest>;
+static void step4a_define_candidate_selection_closures(PrepareState& state) {
     // Identity-first candidate probe. A candidate is DISAMBIGUATED by the
     // DECLARED (namespace, name) of whatever descriptor the index holds — never
     // by whether a canonically-named file `<ns>.<short>.lua` happens to exist on
@@ -594,6 +599,11 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
         spec.candidates = std::move(candidates);
         return {};
     };
+}
+
+std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
+    step4a_define_split_and_identity_closures(state);
+    step4a_define_candidate_selection_closures(state);
 
     // 0.0.10+: loadVersionDep accepts structured (ns, shortName) for
     // namespace-aware lookup. depName is the map key (qualified or bare),

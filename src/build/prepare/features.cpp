@@ -61,7 +61,28 @@ import mcpp.wire;               // Severity, for PlanNote (#699 item 2, E3)
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& state) {
+// STEP FUNCTIONS (mcpp#722 / T6), one per section phase6's own banners
+// already named. Statements moved verbatim; `aggregatedRequest` (used by
+// two of these sections) is promoted from a local lambda to a file-scope
+// function of PrepareState&, the same treatment #719 gave every closure
+// that a later phase needed.
+
+static std::pair<std::vector<std::string>, bool>
+aggregatedRequest(PrepareState& state, std::size_t depPkgIndex) {
+            std::vector<std::string> feats;
+            bool anyEdge = false, anyDefault = false;
+            for (auto const& edge : state.dependencyEdges) {
+                if (edge.dependencyPackageIndex != depPkgIndex) continue;
+                anyEdge = true;
+                if (edge.defaultFeatures) anyDefault = true;
+                for (auto const& f : edge.requestedFeatures)
+                    if (std::find(feats.begin(), feats.end(), f) == feats.end())
+                        feats.push_back(f);
+            }
+            return { std::move(feats), anyEdge ? anyDefault : true };
+}
+
+static void step6_check_version_floors_closure(PrepareState& state) {
     // ─── Feature activation (Cargo-style, additive) ────────────────────
     // activated(pkg) = pkg.[features].default ∪ features requested for it
     // (root: --features; deps: the root dep spec's `features = [...]`).
@@ -191,7 +212,9 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
         }
         return std::nullopt;
     };
-    {
+}
+
+static std::expected<void, std::string> step6_activate_features(PrepareState& state) {
         auto sanitize = [](std::string f) {
             for (auto& c : f)
                 c = std::isalnum(static_cast<unsigned char>(c))
@@ -525,23 +548,9 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
         // activation AGREE with resolution (mergeActiveFeatureDeps, which reads
         // the true per-edge spec): a transitive dep's requested features and its
         // consumer's `default-features = false` are no longer silently dropped.
-        auto aggregatedRequest = [&](std::size_t depPkgIndex)
-            -> std::pair<std::vector<std::string>, bool> {
-            std::vector<std::string> feats;
-            bool anyEdge = false, anyDefault = false;
-            for (auto const& edge : state.dependencyEdges) {
-                if (edge.dependencyPackageIndex != depPkgIndex) continue;
-                anyEdge = true;
-                if (edge.defaultFeatures) anyDefault = true;
-                for (auto const& f : edge.requestedFeatures)
-                    if (std::find(feats.begin(), feats.end(), f) == feats.end())
-                        feats.push_back(f);
-            }
-            return { std::move(feats), anyEdge ? anyDefault : true };
-        };
         for (std::size_t i = 1; i < state.packages.size(); ++i) {
             auto& pname = state.packages[i].manifest.package.name;
-            auto [req, depDefaultFeatures] = aggregatedRequest(i);
+            auto [req, depDefaultFeatures] = aggregatedRequest(state, i);
             if (!req.empty() && !state.packages[i].manifest.featuresMap.empty()) {
                 for (auto& f : req) {
                     if (state.packages[i].manifest.featuresMap.contains(f)) continue;
@@ -563,6 +572,10 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                 feature_closure(state.packages[i].manifest, req, depDefaultFeatures);
         }
 
+    return {};
+}
+
+static std::expected<void, std::string> step6_device_extensions_and_rules(PrepareState& state) {
         // ─── Device extensions a rule dependency declared ──────────────────
         //
         // A rule package states which device extensions it compiles, on the
@@ -818,7 +831,10 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
             bc.ruleModules = std::move(applies);
         }
         state.activeFeaturesByPackage.resize(state.packages.size());
+    return {};
+}
 
+static std::expected<void, std::string> step6_xlings_workspace_from_graph(PrepareState& state) {
         // ── The GRAPH's `[xlings.workspace]`, provisioned BEFORE build.mcpp ──
         //
         // Same ordering rule as the host-tool block directly below, and for the
@@ -870,7 +886,11 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                 }
             }
         }
+    return {};
+}
 
+static std::expected<std::map<std::size_t, std::set<std::string>>, std::string>
+step6_host_module_registration(PrepareState& state) {
         // ── #355: HOST tool provisioning ────────────────────────────────────
         //
         // Runs AFTER feature activation (a tool target's gate is a feature) and
@@ -886,7 +906,6 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
         // main build: the sub-build may use the tool package's own toolchain,
         // its own profile, and its own resolution — none of it has to agree
         // with the consumer.
-        {
             // Aggregate off the authoritative edge graph, exactly like feature
             // activation — a transitive consumer's request must not be
             // silently dropped (#242/#243).
@@ -1267,6 +1286,12 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                     mcpp::build::tool_store::kMaxDepth, state.overrides.tool_chain));
             }
 
+    return toolRequests;
+}
+
+static std::expected<void, std::string>
+step6_provision_host_tools(PrepareState& state,
+                           const std::map<std::size_t, std::set<std::string>>& toolRequests) {
             for (auto const& [depIdx, wanted] : toolRequests) {
                 auto& depPkg = state.packages[depIdx];
                 const auto& depName = depPkg.manifest.package.name;
@@ -1685,8 +1710,11 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                     record(binOut);
                 }
             }
-        }
 
+    return {};
+}
+
+static std::expected<void, std::string> step6_dependency_build_programs(PrepareState& state) {
         // ── G2: dependency build.mcpp (Cargo build.rs model) ────────────────
         // Runs AFTER feature activation (the env contract exposes the dep's
         // active features) and BEFORE the modgraph scan (generated sources
@@ -1709,7 +1737,7 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
             // Same edge-graph aggregation as feature activation above, so a
             // dep build.mcpp sees the SAME active feature set the dep is built
             // with (incl. transitive requests / default-features opt-out).
-            auto [req, depDefaultFeatures] = aggregatedRequest(i);
+            auto [req, depDefaultFeatures] = aggregatedRequest(state, i);
             auto dirSafe = [](std::string s) {
                 for (auto& c : s) if (c == '/' || c == '\\' || c == ':') c = '_';
                 return s;
@@ -1879,7 +1907,10 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
         // first pass (above) ran before features were activated. Idempotent:
         // include-dir/flag propagation is unique-append.
         state.computeUsageRequirements();
+    return {};
+}
 
+static std::expected<void, std::string> step6_capability_binding(PrepareState& state) {
         // ─── Capability binding (Stage 3) ──────────────────────────────────
         // For each required capability, bind exactly one provider from the
         // graph. Deterministic: an explicit [capabilities] pin wins; otherwise
@@ -2013,7 +2044,6 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
             }
             // exactly one → bound implicitly.
         }
-    }
 
     // The package that supplies the C++ layer when the graph does, as an index
     // into `packages`. Recorded where the provider is found so that the check
@@ -2034,6 +2064,24 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
     // of the same build). Before this existed, only the second reader was
     // written, and it derived the set itself — which is how the two could
     // describe different worlds.
+    return {};
+}
+
+std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& state) {
+    step6_check_version_floors_closure(state);
+
+    if (auto r = step6_activate_features(state); !r) return std::unexpected(r.error());
+    if (auto r = step6_device_extensions_and_rules(state); !r) return std::unexpected(r.error());
+    if (auto r = step6_xlings_workspace_from_graph(state); !r) return std::unexpected(r.error());
+
+    auto toolRequests = step6_host_module_registration(state);
+    if (!toolRequests) return std::unexpected(toolRequests.error());
+    if (auto r = step6_provision_host_tools(state, *toolRequests); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step6_dependency_build_programs(state); !r) return std::unexpected(r.error());
+    if (auto r = step6_capability_binding(state); !r) return std::unexpected(r.error());
+
 
     return {};
 }
