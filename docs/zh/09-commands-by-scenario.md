@@ -173,6 +173,19 @@ $ mcpp index status
 是传播问题而不是命名问题 —— 索引以 artifact 而非 git clone 的形式到达
 客户端。
 
+索引可以要求比正在运行的 mcpp 更新的版本（`index.toml` 的 `min_mcpp`）。
+这不是本次运行的错误（2026.9.28.1+）。一次刷新若取回这样的索引，会保留先前
+的副本，运行以一行结尾：
+
+```
+tip: the refreshed package index `mcpplibs` requires a newer mcpp; this run used the previous index. Upgrade to see newer packages: xlings update mcpp
+```
+
+没有刷新索引的运行不提及它。因某个包只由这样的索引提供而失败的运行，在使它
+停止的消息中给出 E0006。`mcpp self doctor` 列出正在运行的 mcpp 不满足其下限
+的每一个索引。更早的版本在读到这样的索引时，把 E0006 的文字作为 `error:`
+打印在运行开头，其后成功的运行也是如此。
+
 `--offline`（或 `MCPP_OFFLINE=1`）在单次调用中禁止网络，宁可失败也不拉取。
 `--locked` 在解析结果与 `mcpp.lock` 不一致时失败，而不是改写它，这正是 CI
 作业需要的形状。`mcpp index pin <name> <rev>` 把一个自定义索引的某个

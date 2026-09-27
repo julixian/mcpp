@@ -1304,6 +1304,9 @@ int run(int argc, char** argv) {
         return 2;
     }
     app.run(*parsed);
+    // The run's closing notices come last, after everything the command
+    // printed, whatever its exit status (see mcpp::ui::add_closing_notice).
+    mcpp::ui::print_closing_notices();
     return action_rc;
 }
 

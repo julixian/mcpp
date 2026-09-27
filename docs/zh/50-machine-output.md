@@ -466,6 +466,7 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | 警告 | 没有任何标准库构建命令点名它的模块源文件，该单元因此不被列出 |
 | `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | 说明 | 被请求的宿主工具不在工具库中，命令不构建它；计划给出它将被发布到的路径（2026.9.27.1+；取代 2026.9.26.2 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`） |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | 错误 | 构建程序失败；它所属的包被描述为不含它产生的指令 |
+| `MCPP_INDEX_REQUIRES_NEWER_MCPP` | 说明 | 本次运行刷新的某个索引要求更新的 mcpp；先前的副本被保留或恢复，或者没有可用的副本（2026.9.28.1+；终端运行以结尾的 `tip:` 行打印同一条说明） |
 
 `--protocol-version` 为这条命令声明 `init-mcpp-home`、`read-project`、
 `network`、`write-global-cache` 与 `exec-build-script`，从不声明

@@ -187,6 +187,20 @@ $ mcpp index status
 absent after a refresh is a propagation question, not a naming one — indices
 reach clients as artifacts rather than git clones.
 
+An index can require a newer mcpp than the one running (`index.toml`
+`min_mcpp`). That is not an error of the run (2026.9.28.1+). A refresh that
+brings in such an index keeps the previous copy, and the run ends with one line:
+
+```
+tip: the refreshed package index `mcpplibs` requires a newer mcpp; this run used the previous index. Upgrade to see newer packages: xlings update mcpp
+```
+
+A run that did not refresh an index says nothing about it. A run that fails
+because a package is served only by such an index names E0006 in the message
+that stops it. `mcpp self doctor` lists every index whose floor the running mcpp
+does not meet. Earlier versions printed the E0006 text as `error:` at the start
+of any run that read such an index, including runs that then succeeded.
+
 `--offline` (or `MCPP_OFFLINE=1`) forbids the network for one invocation and
 fails rather than fetch. `--locked` fails when resolution differs from
 `mcpp.lock` instead of rewriting it, which is the shape a CI job wants.

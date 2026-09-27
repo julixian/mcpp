@@ -505,6 +505,7 @@ fails there still fails the build.
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | warning | no standard-library build command names its module source, so that unit is not listed |
 | `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | note | a requested host tool is not in the tool store and is not built by the command; the plan names the path it will be published at (2026.9.27.1+; replaces the 2026.9.26.2 warning `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`) |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | error | a build program failed; its package is described without its directives |
+| `MCPP_INDEX_REQUIRES_NEWER_MCPP` | note | an index refreshed by this run requires a newer mcpp; the previous copy was kept or restored, or none is usable (2026.9.28.1+; the same notice a terminal run prints as its closing `tip:` line) |
 
 `--protocol-version` declares `init-mcpp-home`, `read-project`, `network`,
 `write-global-cache` and `exec-build-script` for the command, and never

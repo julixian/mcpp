@@ -41,6 +41,21 @@ void finished(std::string_view profile, std::chrono::milliseconds elapsed,
 void warning(std::string_view message);
 void error(std::string_view message);
 
+// Closing notices: advisories that concern the run as a whole rather than the
+// step that noticed them, such as a refreshed package index that requires a
+// newer mcpp. They are printed once, after the command's own output, as `tip:`
+// lines on stderr, so that they are the last thing a reader sees and never
+// interleave with a build's progress. A command that writes a machine-readable
+// envelope takes them first and reports them as `note` diagnostics instead.
+// A notice never changes the exit status.
+struct ClosingNotice {
+    std::string code;      // a stable code for machine output
+    std::string message;   // one line; no trailing newline
+};
+void add_closing_notice(std::string code, std::string message);
+std::vector<ClosingNotice> take_closing_notices();
+void print_closing_notices();
+
 // Multi-line Rust-style diagnostic (M4 #8.1).
 // Renders as:
 //
@@ -327,6 +342,36 @@ void error(std::string_view message) {
         std::println(stderr, "{}{}error:{} {}", kBold, kBrightRed, kReset, message);
     } else {
         std::println(stderr, "error: {}", message);
+    }
+}
+
+namespace {
+std::vector<ClosingNotice>& closing_notices() {
+    static std::vector<ClosingNotice> notices;
+    return notices;
+}
+} // namespace
+
+void add_closing_notice(std::string code, std::string message) {
+    auto& all = closing_notices();
+    for (auto const& n : all)
+        if (n.message == message) return;
+    all.push_back({std::move(code), std::move(message)});
+}
+
+std::vector<ClosingNotice> take_closing_notices() {
+    return std::exchange(closing_notices(), {});
+}
+
+void print_closing_notices() {
+    auto notices = take_closing_notices();
+    if (g_quiet) return;
+    init();
+    for (auto const& n : notices) {
+        if (g_color)
+            std::println(stderr, "{}{}tip:{} {}", kBold, kCyan, kReset, n.message);
+        else
+            std::println(stderr, "tip: {}", n.message);
     }
 }
 

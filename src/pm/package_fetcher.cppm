@@ -693,12 +693,17 @@ read_identity_verified_xpkg_lua(const std::filesystem::path& pkgsDir,
     // Index→client version contract: the tree carries its own floor
     // (<indexRoot>/index.toml min_mcpp). Checked here — the single choke
     // point every transport converges on (artifact snapshot, git clone,
-    // [indices] path, CI-restored cache). Loud once per index; the
-    // resolve then fails as not-found with the cause already printed.
-    if (auto violation = mcpp::pm::check_index_floor(pkgsDir.parent_path())) {
-        mcpp::ui::error(*violation);
+    // [indices] path, CI-restored cache).
+    //
+    // NOTHING IS PRINTED HERE. The fact is recorded, and this tree answers no
+    // lookup. Whether it matters is decided later: a lookup that then fails
+    // carries the cause in its own message (unusable_index_hint), and a run
+    // that succeeds has no error to report. The read site used to print the
+    // E0006 text as `error:` at the start of runs that went on to resolve every
+    // package from another tree and exit 0.
+    if (mcpp::pm::index_marked_unusable(pkgsDir.parent_path())
+        || mcpp::pm::check_index_floor(pkgsDir.parent_path()))
         return std::nullopt;
-    }
 
     std::error_code ec;
     if (!std::filesystem::exists(pkgsDir, ec)) return std::nullopt;

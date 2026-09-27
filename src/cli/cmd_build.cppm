@@ -281,6 +281,12 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
     const mcpp::build::BuildOverrides ov = overrides_from_selectors(parsed);
 
     std::vector<Diagnostic> diagnostics;
+    // The run's closing notices belong in the envelope as `note` diagnostics;
+    // taken here, they are not printed again as `tip:` lines at exit.
+    auto take_closing_notes = [&] {
+        for (auto& n : mcpp::ui::take_closing_notices())
+            diagnostics.push_back({std::move(n.code), Severity::Note, std::move(n.message)});
+    };
     auto publish = [&](const std::string& text) -> int {
         if (!outputPath) { std::print("{}", text); return 0; }
         const std::filesystem::path out{*outputPath};
@@ -316,6 +322,7 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                              mcpp::wire::severity_name(d.severity), d.message);
             return 1;
         }
+        take_closing_notes();
         const auto text = mcpp::wire::to_json(mcpp::wire::Envelope{
             .kind = "mcpp.build-database",
             .effects = {Effect::ReadProject},
@@ -482,6 +489,7 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         if (const auto rc = publish(document.dump(2) + "\n"); rc != 0) return rc;
         return hasError ? 1 : 0;
     }
+    take_closing_notes();
     std::vector<Effect> effects{Effect::ReadProject, Effect::WriteGlobalCache};
     if (ranBuildPrograms) effects.push_back(Effect::ExecBuildScript);
     nlohmann::json specJson{{"name", spec}};

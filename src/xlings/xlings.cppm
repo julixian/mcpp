@@ -19,6 +19,7 @@ import mcpp.pm.index_contract;
 import mcpp.pm.index_snapshot;
 import mcpp.platform;
 import mcpp.log;
+import mcpp.ui;                 // closing notices of the refresh guard
 import mcpp.home;
 import mcpp.xpkg_version;
 import mcpp.libs.json;
@@ -2066,25 +2067,30 @@ int update_index(const Env& env, bool quiet) {
     // Report ONLY when the guard had to act. The common path — refresh keeps
     // the index readable — must stay silent, or the notice becomes noise that
     // users learn to skip past, which is the same as not printing it.
+    //
+    // A floor is not an error of the run (an index is data; mcpp is the
+    // program). Each case is one closing notice, printed after the command's
+    // own output (mcpp::ui::add_closing_notice), and only because this run
+    // refreshed the index. `quiet` governs the refresh's own narration, not
+    // these: they are the one thing the refresh has to say.
+    (void)quiet;
     for (auto& dir : out.rolledBack) {
-        print_status("Kept", std::format(
-            "previous index for `{}` — the refreshed one requires a newer mcpp",
-            dir.filename().string()));
-        if (!quiet) {
-            std::println("      Your build continues to work with the packages "
-                         "it already describes.");
-            std::println("      Upgrade to pick up newer packages:  xlings update mcpp");
-        }
+        mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
+            "the refreshed package index `{}` requires a newer mcpp; this run "
+            "used the previous index. Upgrade to see newer packages: "
+            "xlings update mcpp", dir.filename().string()));
     }
     for (auto& dir : out.recovered) {
-        print_status("Restored", std::format(
-            "index `{}` from a local snapshot this mcpp can read",
-            dir.filename().string()));
+        mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
+            "the package index `{}` was restored from a local snapshot this mcpp "
+            "can read; the published index requires a newer mcpp. Upgrade: "
+            "xlings update mcpp", dir.filename().string()));
     }
     for (auto& dir : out.stillUnusable) {
-        mcpp::log::verbose("index", std::format(
-            "index `{}` requires a newer mcpp and no local snapshot is usable",
-            dir.filename().string()));
+        mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
+            "the package index `{}` requires a newer mcpp and no earlier copy is "
+            "usable; packages it serves cannot be resolved. Upgrade: "
+            "xlings update mcpp", dir.filename().string()));
     }
     return rc;
 }

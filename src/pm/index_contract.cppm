@@ -170,7 +170,8 @@ std::string e0006_message(std::string violation, bool distroManaged)
         if (pos != std::string::npos)
             violation.replace(pos, kInstallShUpgrade.size(), kDistroUpgrade);
     }
-    // Append the recommended installer note to every layout.
+    // Append the recommended installer note to every layout, on its own line.
+    if (!violation.empty() && violation.back() != '\n') violation += '\n';
     violation += kXlingsUpgrade;
     return violation;
 }
@@ -221,14 +222,22 @@ std::string unusable_index_hint() {
     auto& reg = unusable_registry();
     if (reg.empty()) return {};
     // Name the index, not just the fact: with several repos configured, "an
-    // index was too new" leaves the reader guessing which one to act on.
+    // index was too new" leaves the reader guessing which one to act on. The
+    // E0006 text travels here, in the message that stops the run, because the
+    // read site no longer prints it (see read_identity_verified_xpkg_lua).
     std::string s = "note: this resolve ran with an index this mcpp cannot read:\n";
+    std::vector<std::string> texts;
     for (auto& u : reg) {
         s += "  " + u.root.string() + "\n";
+        if (std::ranges::find(texts, u.message) == texts.end())
+            texts.push_back(u.message);
     }
-    s += "      Packages served by it were reported as not found. See the "
-         "[E0006] error above,\n"
-         "      or run `mcpp explain E0006`.";
+    for (auto const& t : texts) {
+        s += t;
+        if (!t.empty() && t.back() != '\n') s += '\n';
+    }
+    s += "      Packages served by it were reported as not found. "
+         "Run `mcpp explain E0006` for the details.";
     return s;
 }
 

@@ -32,6 +32,8 @@ import mcpp.platform.process;
 import mcpp.platform.env;
 import mcpp.runtime.elf;
 import mcpp.pm.index_refresh;   // staleness_note for `mcpp why deps`
+import mcpp.pm.index_contract;  // the floor each index declares
+import mcpp.version;            // MCPP_VERSION, compared with each floor
 import mcpp.project;
 import mcpp.toolchain.detect;
 import mcpp.toolchain.msvc;
@@ -367,6 +369,35 @@ export int doctor_report() {
                              (*cfg).xlingsBinary.string()));
         }
         ok(std::format("default index = '{}'", (*cfg).defaultIndex));
+
+        // Every index tree this mcpp reads, against the floor it declares.
+        // A run never reports this as an error (an index is data, and a run
+        // that resolves what it needs has nothing to report), so doctor is
+        // where the state is visible without a failing run.
+        mcpp::ui::status("Checking", "package indexes");
+        const auto dataRoot = mcpp::xlings::paths::index_data(
+            mcpp::config::make_xlings_env(*cfg));
+        std::error_code idxEc;
+        bool anyIndex = false;
+        for (auto const& entry : std::filesystem::directory_iterator(dataRoot, idxEc)) {
+            if (!entry.is_directory(idxEc)) continue;
+            if (!std::filesystem::exists(entry.path() / "pkgs", idxEc)) continue;
+            anyIndex = true;
+            const auto name = entry.path().filename().string();
+            auto contract = mcpp::pm::read_index_contract(entry.path());
+            if (!contract || contract->minMcpp.empty()) {
+                ok(std::format("index '{}' declares no mcpp floor", name));
+            } else if (mcpp::pm::index_usable(entry.path())) {
+                ok(std::format("index '{}' requires mcpp >= {}", name, contract->minMcpp));
+            } else {
+                warn(std::format(
+                    "index '{}' requires mcpp >= {}, and this is mcpp {}; the "
+                    "packages it serves cannot be resolved until mcpp is "
+                    "upgraded (xlings update mcpp). See `mcpp explain E0006`",
+                    name, contract->minMcpp, mcpp::MCPP_VERSION));
+            }
+        }
+        if (!anyIndex) ok("no package index synced yet");
     }
 
     mcpp::ui::status("Checking", "cache health");
