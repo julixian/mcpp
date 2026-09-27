@@ -3,7 +3,7 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [2026.9.27.2] - 2026-09-27
+## [2026.9.28.1] - 2026-09-28
 
 ### 缺陷修复（#726）
 
