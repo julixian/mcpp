@@ -2780,7 +2780,7 @@ struct PrepareState {
 // Forward-declared so a phase function defined ahead of prepare_build's own
 // definition (every phase is, since each is inserted just before it) can
 // still make the recursive host-tool sub-build call.
-static std::expected<void, std::string> phase9_target_side_and_scan(PrepareState& state) {
+static std::expected<void, std::string> phase9_target_side(PrepareState& state) {
     // ── THE TARGET SIDE, RESOLVED ONCE ───────────────────────────────────────
     //
     // HERE AND NOT EARLIER, AND THAT IS THE WHOLE POINT.
@@ -4647,6 +4647,10 @@ static std::expected<void, std::string> phase9_target_side_and_scan(PrepareState
         state.stdFlagAndDialect += ' ';
         state.stdFlagAndDialect += f;
     }
+    return {};
+}
+
+static std::expected<void, std::string> phase11_scan(PrepareState& state) {
 
     // mcpp#225 (E2): observability marker for the source-discovery phase —
     // `mcpp run`'s fast path (build_run_target/try_fast_run in execute.cppm)
@@ -5378,6 +5382,7 @@ static std::expected<void, std::string> phase9_target_side_and_scan(PrepareState
 
     return {};
 }
+
 
 export std::expected<BuildContext, std::string>
 prepare_build(bool print_fingerprint, bool includeDevDeps,
@@ -16372,7 +16377,8 @@ prepare_build(bool print_fingerprint,
     if (auto r = phase4b_graph_worklist(state); !r) return std::unexpected(r.error());
     if (auto r = phase5_toolchain_after_graph(state); !r) return std::unexpected(r.error());
     if (auto r = phase6_features_and_host_tools(state); !r) return std::unexpected(r.error());
-    if (auto r = phase9_target_side_and_scan(state); !r) return std::unexpected(r.error());
+    if (auto r = phase9_target_side(state); !r) return std::unexpected(r.error());
+    if (auto r = phase11_scan(state); !r) return std::unexpected(r.error());
 
     return phase13_finish(state);
 }
