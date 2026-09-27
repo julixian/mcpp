@@ -6130,9 +6130,33 @@ prepare_build(bool print_fingerprint,
             return false;
         };
 
+        // THE DESCRIPTOR'S REVISION IS PART OF WHAT IS INSTALLED (#524 A,
+        // openxlings/xlings#620). A descriptor that changes what it installs
+        // keeps its version and raises the entry's `revision`; a payload whose
+        // recorded revision differs is not this version any more, however
+        // complete it is, and goes back through xlings, which reinstalls it
+        // and records the new revision. A payload with no xlings record at
+        // all is judged by the marker alone, as before.
+        const int recipeRevision = [&] {
+            if (!luaContent) return 0;
+            for (auto const& e : mcpp::manifest::list_xpkg_version_entries(
+                     *luaContent, targetPlatform))
+                if (e.version == version) return e.revision;
+            return 0;
+        }();
+        auto revisionIsCurrent = [&](const std::filesystem::path& p) {
+            const auto installed = mcpp::xlings::paths::installed_revision(p);
+            if (!installed || *installed == recipeRevision) return true;
+            mcpp::log::verbose("fetcher", std::format(
+                "{}@{}: installed revision {}, descriptor revision {}; reinstalling",
+                depName, version, *installed, recipeRevision));
+            return false;
+        };
+
         auto findCompleteInstalled = [&]() -> std::optional<std::filesystem::path> {
             auto p = findRawInstalled();
             if (!p) return std::nullopt;
+            if (!revisionIsCurrent(*p)) return std::nullopt;
             if (mcpp::fallback::is_install_complete(*p)) return p;
             if (installedLayoutMatchesIndex(*p)) {
                 mcpp::fallback::mark_install_complete(*p);

@@ -313,6 +313,23 @@ TEST(XpkgPayload, ABareVersionSelectsWhatXlingsSelected) {
     std::filesystem::remove_all(base);
 }
 
+// The revision xlings recorded for a payload (openxlings/xlings#620): the
+// field when present, 0 for a record that predates it, and nothing at all when
+// there is no record -- which is the case mcpp judges by its marker alone.
+TEST(XpkgPayload, InstalledRevisionReadsTheXlingsRecord) {
+    namespace xp = mcpp::xlings::paths;
+    auto dir = std::filesystem::temp_directory_path()
+             / std::format("mcpp-xpkg-rev-{}", ::getpid());
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    EXPECT_FALSE(xp::installed_revision(dir).has_value());
+    std::ofstream(dir / ".xpkg-install.json") << R"({"os":"linux","version":"2.44.3"})";
+    EXPECT_EQ(xp::installed_revision(dir), 0);
+    std::ofstream(dir / ".xpkg-install.json") << R"({"version":"2.44.3","revision":1})";
+    EXPECT_EQ(xp::installed_revision(dir), 1);
+    std::filesystem::remove_all(dir);
+}
+
 TEST(XpkgEnvVar, BothSpellingsAreDerivedFromOneSanitizer) {
     using mcpp::build::xpkg_env_var;
     // The two sides of the channel must agree; drifting apart would make the

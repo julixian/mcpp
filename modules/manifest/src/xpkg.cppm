@@ -38,6 +38,10 @@ struct XpkgVersionEntry {
     std::string version;          // the literal key, as written
     bool        alias = false;    // entry carries `ref = "..."`
     std::string sha256;           // payload digest when declared at entry level
+    // The packaging revision of this version's payload (xpkg V2 `revision`),
+    // 0 when the entry states none or states something that is not a
+    // non-negative integer -- the reference implementation's reading.
+    int         revision = 0;
 };
 
 // Extract the version entries for `platform` (e.g. "linux", "macosx",
@@ -574,6 +578,40 @@ std::string top_level_table_body_for_key(std::string_view body, std::string_view
     return {};
 }
 
+// The non-negative integer bound to `wantedKey` at the top level of `body`,
+// or 0: `revision = 1` reads 1, and a string, a negative or a fractional value
+// reads as absent.
+int top_level_nonneg_int_for_key(std::string_view body, std::string_view wantedKey) {
+    LuaCursor cur { body };
+    cur.skip_ws_and_comments();
+    while (!cur.eof()) {
+        auto key = cur.read_key();
+        if (key.empty()) {
+            cur.skip_ws_and_comments();
+            if (cur.eof()) break;
+            ++cur.pos;
+            continue;
+        }
+        cur.skip_ws_and_comments();
+        if (!cur.consume('=')) {
+            cur.skip_ws_and_comments();
+            continue;
+        }
+        cur.skip_ws_and_comments();
+        if (cur.peek() == '{') { cur.skip_table(); cur.skip_ws_and_comments(); continue; }
+        if (cur.at_string_start()) { (void)cur.read_string(); cur.skip_ws_and_comments(); continue; }
+        const auto word = cur.read_bareword();
+        if (key == wantedKey) {
+            if (word.empty() || word.size() > 9
+                || !std::ranges::all_of(word, [](char c) { return c >= '0' && c <= '9'; }))
+                return 0;
+            return std::stoi(std::string(word));
+        }
+        cur.skip_ws_and_comments();
+    }
+    return 0;
+}
+
 std::string top_level_string_value_for_key(std::string_view body, std::string_view wantedKey) {
     LuaCursor cur { body };
     cur.skip_ws_and_comments();
@@ -1072,6 +1110,8 @@ list_xpkg_version_entries(std::string_view luaContent,
                 e.alias = entry_is_alias(v, entry_end);
                 e.sha256 = top_level_string_value_for_key(
                     luaContent.substr(v + 1, entry_end - v - 1), "sha256");
+                e.revision = top_level_nonneg_int_for_key(
+                    luaContent.substr(v + 1, entry_end - v - 1), "revision");
                 versions.push_back(std::move(e));
                 q = entry_end + 1;
                 continue;

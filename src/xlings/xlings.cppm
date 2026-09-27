@@ -210,6 +210,12 @@ namespace paths {
     std::optional<std::filesystem::path>
     recorded_payload(const Env& env, const XpkgRef& ref);
 
+    // The packaging revision xlings recorded for the payload in `payloadDir`
+    // (`.xpkg-install.json`, xlings 2026.9.27.1+; openxlings/xlings#620), and
+    // 0 when it recorded none -- the reading xlings itself gives a record that
+    // predates the field. `nullopt` when there is no record at all.
+    std::optional<int> installed_revision(const std::filesystem::path& payloadDir);
+
     // From compiler binary, climb parent dirs to find "xpkgs" directory.
     // Replaces 3 duplicate implementations in flags.cppm, ninja_backend.cppm,
     // stdmod.cppm.
@@ -1064,6 +1070,16 @@ void record_resolutions(const Env& env, std::span<const ResolvedTarget> targets)
         std::filesystem::rename(tmp, path, ec);
         if (ec) std::filesystem::remove(tmp, ec);
     }
+}
+
+std::optional<int> installed_revision(const std::filesystem::path& payloadDir) {
+    std::ifstream in{payloadDir / ".xpkg-install.json", std::ios::binary};
+    if (!in) return std::nullopt;
+    std::string text{std::istreambuf_iterator<char>(in), {}};
+    auto j = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object()) return std::nullopt;
+    if (!j.contains("revision") || !j["revision"].is_number_integer()) return 0;
+    return j["revision"].get<int>();
 }
 
 std::optional<std::filesystem::path>

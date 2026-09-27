@@ -504,6 +504,37 @@ package = {
     EXPECT_EQ(keys[2], "25.0.4.7.1");
 }
 
+// openxlings/xlings#620, mcpp#524 A: a version entry's `revision` is read the
+// way the reference implementation reads it -- a non-negative integer, and 0
+// for anything else or for its absence -- including the per-arch shape, whose
+// arch tables must not be mistaken for the revision.
+TEST(ListXpkgVersions, RevisionIsReadPerEntry) {
+    constexpr auto src = R"(
+package = {
+    name = "rev",
+    xpm = {
+        linux = {
+            ["latest"] = { ref = "1.2.0" },
+            ["1.0.0"]  = { url = "u", sha256 = "a" },
+            ["1.1.0"]  = { url = "u", sha256 = "b", revision = 2 },
+            ["1.2.0"]  = { x86_64 = { url = "u", sha256 = "c" }, revision = 1 },
+            ["1.3.0"]  = { url = "u", sha256 = "d", revision = "3" },
+            ["1.4.0"]  = { url = "u", sha256 = "e", revision = -1 },
+        },
+    },
+}
+)";
+    auto e = mcpp::manifest::list_xpkg_version_entries(
+        src, mcpp::platform::TargetPlatform::for_lint_of("linux"));
+    ASSERT_EQ(e.size(), 6u);
+    EXPECT_EQ(e[0].revision, 0);   // an alias carries none
+    EXPECT_EQ(e[1].revision, 0);
+    EXPECT_EQ(e[2].revision, 2);
+    EXPECT_EQ(e[3].revision, 1);
+    EXPECT_EQ(e[4].revision, 0);   // a string is not a revision
+    EXPECT_EQ(e[5].revision, 0);   // nor is a negative number
+}
+
 // The scanner used to walk the platform table character by character, so a
 // bracket key nested inside a version's own body (mirror tables write
 // `["GLOBAL"] = "https://..."`) counted as a published version.
