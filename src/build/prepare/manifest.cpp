@@ -228,19 +228,14 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
         std::string targetMember;
 
         if (!state.overrides.package_filter.empty()) {
-            // -p <name>: find matching member by directory basename or path
-            for (auto& mp : state.m->workspace.members) {
-                auto basename = std::filesystem::path(mp).filename().string();
-                if (basename == state.overrides.package_filter || mp == state.overrides.package_filter) {
-                    targetMember = mp;
-                    break;
-                }
-            }
-            if (targetMember.empty()) {
-                return std::unexpected(std::format(
-                    "workspace member '{}' not found in [workspace].members",
-                    state.overrides.package_filter));
-            }
+            // `-p <name>`: the package identity first, the member's
+            // directory as a fallback -- one resolver shared with every
+            // other `-p`/`--package` command
+            // (mcpp::project::resolve_member_dir, #725).
+            auto matched = mcpp::project::resolve_member_dir(
+                *state.m, *state.root, state.overrides.package_filter);
+            if (!matched) return std::unexpected(matched.error());
+            targetMember = matched->lexically_relative(*state.root).generic_string();
         } else if (state.m->package.name.empty()) {
             // Virtual workspace: find a member with a program target ("is
             // this the program", #622 A3's `is_program()`, so a member whose
@@ -265,8 +260,17 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
         }
         // else: rooted workspace with [package] — build root normally. Its own
         // `x.workspace = true` entries name its own [workspace.dependencies].
-        else if (state.m->workspace.present)
+        // The workspace context is set here too (#725): it is a property of
+        // where the manifest lives, not of the branch that was taken, so a
+        // member this package reaches through its OWN `path` dependencies
+        // (`depIsMember`, graph.cpp) is recognised as a member and receives
+        // `[workspace.package]`, `[workspace.build]` and `x.workspace = true`
+        // the same way a sibling's `path` dependency does.
+        else if (state.m->workspace.present) {
+            state.runtimeWorkspaceRoot = *state.root;
+            state.wsManifest = *state.m;
             mcpp::project::merge_workspace_deps(*state.m, *state.m, *state.root);
+        }
 
         if (!targetMember.empty()) {
             auto memberDir = *state.root / targetMember;
