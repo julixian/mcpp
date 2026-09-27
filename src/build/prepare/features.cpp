@@ -992,14 +992,17 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                 auto rel   = mcpp::manifest::resolve_lib_root_path(
                     depPkg.manifest, depPkg.root);
                 auto iface = depPkg.root / rel;
-                push(iface, prov::host_module_name(iface, pkg.name));
+                auto rootName = prov::host_module_name(iface, pkg.name);
                 // A missing lib root is reported as such by build_host_module,
                 // and that has to stay the diagnostic. Enumerating the listed
                 // units first would let one of them collide with the missing
                 // root's fallback name and report a collision between a file
                 // and a file that does not exist.
                 std::error_code ec;
-                if (!std::filesystem::exists(iface, ec)) return out;
+                if (!std::filesystem::exists(iface, ec)) {
+                    push(iface, std::move(rootName));
+                    return out;
+                }
 
                 std::set<std::filesystem::path> matched, dropped;
                 for (auto const& g : depPkg.manifest.buildConfig.sources) {
@@ -1034,7 +1037,21 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                     std::string                  name;
                     std::vector<std::string>     imports;
                 };
+                // The lib root is the first node of the same sort (mcpp#720).
+                // Placing it ahead of the sort assumed that it imports no
+                // other unit of its package; a root that does was compiled
+                // before the unit it imports and failed with "module not
+                // found". As the first node it is still emitted first whenever
+                // it imports nothing of its own package, so the order of every
+                // package that built before is unchanged.
                 std::vector<Unit> pending;
+                {
+                    std::ifstream is(root);
+                    std::stringstream buf;
+                    if (is) buf << is.rdbuf();
+                    pending.push_back({root, std::move(rootName),
+                                       prov::declared_imports(buf.str())});
+                }
                 for (auto const& f : matched) {          // std::set: sorted
                     if (dropped.contains(f)) continue;
                     if (std::filesystem::equivalent(f, root, ec)) continue;
@@ -1049,9 +1066,9 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                 }
 
                 // Only names this package itself declares constrain anything.
-                // `import std;` and the lib root are already ahead of every
-                // entry here, and a name from another package is ordered by the
-                // cross-package DFS below rather than by this sort.
+                // `import std;` is ahead of every entry here, and a name from
+                // another package is ordered by the cross-package DFS below
+                // rather than by this sort.
                 std::map<std::string, std::size_t> byName;
                 for (std::size_t i = 0; i < pending.size(); ++i)
                     byName.emplace(pending[i].name, i);
