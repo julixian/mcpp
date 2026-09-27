@@ -36,11 +36,19 @@ export int cmd_publish(const mcpplibs::cmdline::ParsedArgs& parsed) {
         parsed.is_flag_set("dry-run"), parsed.is_flag_set("allow-dirty"));
 }
 
-// `mcpp place-dlls --output <stamp> --depfile <d> <program> <dir>...` -- the
-// edge that follows a Windows program's link when its plan has runtime search
-// directories (mcpp.pack's `place_runtime_dlls`, SPEC-007 R4.3). Internal:
-// only a generated build.ninja names it, and it runs on whatever host builds,
-// because it reads the program's import table rather than asking a loader.
+// `mcpp place-dlls --output <stamp> --depfile <d> <program> <placed> <dir>...`
+// -- the edge that follows a Windows program's link when its plan has runtime
+// search directories (mcpp.pack's `place_runtime_dlls`, SPEC-007 R4.3).
+// Internal: only a generated build.ninja names it, and it runs on whatever
+// host builds, because it reads the program's import table rather than asking
+// a loader.
+//
+// `<placed>` is always present, comma-joining the DLL names the merged deploy
+// list already places directly beside this program (empty when there are
+// none: `ninja_backend.cppm` writes it as one `ninja_command_word`, never as
+// nothing, so this argument position never shifts). SPEC-007 R4.2/R4.3: the
+// deploy list is the single authority for a destination, so this mechanism
+// skips those names instead of writing a second, competing copy.
 //
 // The depfile names every DLL placed, so ninja runs the edge again when one of
 // them changes in its directory; the stamp is the edge's only declared output,
@@ -49,13 +57,19 @@ export int cmd_publish(const mcpplibs::cmdline::ParsedArgs& parsed) {
 export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
     const std::filesystem::path stamp{parsed.option_or_empty("output").value()};
     const std::filesystem::path depfile{parsed.option_or_empty("depfile").value()};
-    if (stamp.empty() || depfile.empty() || parsed.positional_count() < 1) {
-        std::println(stderr, "error: place-dlls requires --output, --depfile and a program");
+    if (stamp.empty() || depfile.empty() || parsed.positional_count() < 2) {
+        std::println(stderr,
+            "error: place-dlls requires --output, --depfile, a program and a placed-names word");
         return 2;
     }
     const std::filesystem::path program{parsed.positional(0)};
+    std::vector<std::string> placedByDeploy;
+    for (auto piece : std::views::split(parsed.positional(1), ',')) {
+        std::string_view name(piece.begin(), piece.end());
+        if (!name.empty()) placedByDeploy.emplace_back(name);
+    }
     std::vector<std::filesystem::path> dirs;
-    for (std::size_t i = 1; i < parsed.positional_count(); ++i)
+    for (std::size_t i = 2; i < parsed.positional_count(); ++i)
         dirs.emplace_back(parsed.positional(i));
 
     // What the previous run placed, recorded in the stamp itself: those copies
@@ -67,12 +81,13 @@ export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
         for (std::string line; std::getline(prev, line);)
             if (!line.empty()) placedBefore.push_back(line);
     }
-    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore);
+    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore, placedByDeploy);
     if (!placed) {
         std::println(stderr, "error: {}", placed.error().message);
         return 1;
     }
     for (auto const& n : placed->notes) std::println("note: {}", n);
+    for (auto const& w : placed->warnings) std::println(stderr, "warning: {}", w);
 
     // The depfile syntax ninja reads (`deps = gcc`): a space and `#` are
     // escaped with a backslash, and `$` is doubled.

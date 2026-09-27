@@ -1471,9 +1471,11 @@ is a table of exactly two strings. `from` is relative to the declaring package's
 root, and `to` is relative to the executable's directory, where `"."` means that
 directory itself. Both are separated by `/` on every host, and neither may be
 absolute, name a drive, or contain an empty, `.` or `..` component; an entry
-that does is refused, and the refusal names its index. Two sources for one
-destination are refused naming the destination, while one file name in two
-directories is not a collision. `deploy` is a key of its own rather than a table
+that does is refused, and the refusal names its index. Two or more sources for
+one destination merge into a single copy, placed once every source is
+byte-identical (mcpp#723); they are refused at build time, naming every source
+and the destination, when they are not. One file name in two directories is
+not a collision. `deploy` is a key of its own rather than a table
 form of `deploy_files`, because a descriptor reader that predates it meets `{`
 inside `deploy_files` and does not terminate, whereas it skips a `runtime` key it
 does not know. `mcpp pack` stages the files of both keys at the same relative

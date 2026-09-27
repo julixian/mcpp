@@ -191,3 +191,103 @@ TEST(BuildStage, VerifyModeParsing) {
     EXPECT_EQ(parse_verify("nonsense"), Verify::Content);
     EXPECT_EQ(parse_verify(""), Verify::Content);
 }
+
+// ── SPEC-007 R4.2 (mcpp#723): a destination with more than one source ──────
+
+TEST(BuildStageFiles, OneSourceIsIdenticalToStageFile) {
+    // The whole point of `stage_files`: a project with exactly one source per
+    // destination -- every project before this feature -- must not notice a
+    // difference. This is not asserted by string-matching a ninja line (that
+    // is `test_ninja_backend.cpp`'s job); here it is the outcome that must
+    // match `stage_file`'s exactly.
+    Tmp tmp;
+    auto src = tmp.path / "src.bin";
+    auto dst = tmp.path / "dst.bin";
+    write_file(src, "payload");
+
+    auto r = stage_files({src}, dst, no_retry());
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_TRUE(r->copied);
+    EXPECT_EQ(read_file(dst), "payload");
+}
+
+TEST(BuildStageFiles, AgreeingSourcesArePlaced) {
+    Tmp tmp;
+    auto a = tmp.path / "a.bin";
+    auto b = tmp.path / "b.bin";
+    auto c = tmp.path / "c.bin";
+    auto dst = tmp.path / "dst.bin";
+    write_file(a, "shared bytes");
+    write_file(b, "shared bytes");
+    write_file(c, "shared bytes");
+
+    auto r = stage_files({a, b, c}, dst, no_retry());
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_TRUE(r->copied);
+    EXPECT_EQ(read_file(dst), "shared bytes");
+}
+
+TEST(BuildStageFiles, AnAlreadyEquivalentDestinationIsNotTouched) {
+    // The #311 property (BuildStage.EquivalentDestinationIsNotTouched) must
+    // survive going through the multi-source entry point too.
+    Tmp tmp;
+    auto a = tmp.path / "a.bin";
+    auto b = tmp.path / "b.bin";
+    auto dst = tmp.path / "dst.bin";
+    write_file(a, "same-bytes");
+    write_file(b, "same-bytes");
+    write_file(dst, "same-bytes");
+    auto before = std::filesystem::file_time_type::clock::now() - std::chrono::hours{2};
+    std::filesystem::last_write_time(dst, before);
+    auto recorded = std::filesystem::last_write_time(dst);
+
+    auto r = stage_files({a, b}, dst, no_retry());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(r->copied);
+    EXPECT_EQ(std::filesystem::last_write_time(dst), recorded);
+}
+
+TEST(BuildStageFiles, DisagreeingSourcesFailNamingEveryOneAndTheDestination) {
+    Tmp tmp;
+    auto a = tmp.path / "qtbase_zh_CN.qm";
+    auto b = tmp.path / "other" / "qtbase_zh_CN.qm";
+    auto dst = tmp.path / "bin" / "translations" / "qt_zh_CN.qm";
+    write_file(a, "catalog A");
+    write_file(b, "catalog B");
+
+    auto r = stage_files({a, b}, dst, no_retry());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find(a.string()), std::string::npos)
+        << r.error().message;
+    EXPECT_NE(r.error().message.find(b.string()), std::string::npos)
+        << r.error().message;
+    EXPECT_NE(r.error().message.find(dst.string()), std::string::npos)
+        << r.error().message;
+    // Refused, not silently resolved to either source: the destination is
+    // untouched (no partial write from a rejected attempt).
+    EXPECT_FALSE(std::filesystem::exists(dst));
+}
+
+TEST(BuildStageFiles, ThreeSourcesWhereOnlyTheLastDisagreesAreAllNamed) {
+    // A pairwise comparison against only the first neighbour would miss a
+    // mismatch between the second and third; every source must be compared.
+    Tmp tmp;
+    auto a = tmp.path / "a.bin";
+    auto b = tmp.path / "b.bin";
+    auto c = tmp.path / "c.bin";
+    auto dst = tmp.path / "dst.bin";
+    write_file(a, "X");
+    write_file(b, "X");
+    write_file(c, "Y");
+
+    auto r = stage_files({a, b, c}, dst, no_retry());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find(c.string()), std::string::npos)
+        << r.error().message;
+}
+
+TEST(BuildStageFiles, EmptySourceListIsAnError) {
+    Tmp tmp;
+    auto r = stage_files({}, tmp.path / "dst.bin", no_retry());
+    ASSERT_FALSE(r.has_value());
+}

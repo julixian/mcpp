@@ -75,6 +75,30 @@ std::expected<StageOutcome, StageError> stage_file(const std::filesystem::path& 
                                                    const std::filesystem::path& dst,
                                                    const StageOptions& opts = {});
 
+// Publish one destination that may have more than one source (SPEC-007 R4.2,
+// mcpp#723): two or more packages of one graph can each generate a
+// byte-identical file and deploy it under the same name, and the plan no
+// longer refuses that at planning time — a generated source may not exist yet
+// when the plan is built, so its content cannot be compared there. This is
+// where the invariant is actually checked, because by build time every source
+// exists: every source is compared against the first by content
+// (`same_content`, never masking the way `bmi_equivalent` does — a deploy
+// target is an ordinary file, not a BMI with a compiler-embedded clock), and
+// the first is staged when they all agree. Disagreement is refused, naming
+// every source and the destination, so the message points at every producer
+// instead of an arbitrary pair.
+//
+// `srcs.size() == 1` is not a special case bolted on top: it takes the same
+// path as every other count, with the comparison loop simply empty, and ends
+// up calling `stage_file` on that one source exactly as before this function
+// existed. This is what keeps a project with one source per destination —
+// every project before this feature — emitting the same `mcpp stage`
+// invocation it always has.
+std::expected<StageOutcome, StageError> stage_files(
+    const std::vector<std::filesystem::path>& srcs,
+    const std::filesystem::path& dst,
+    const StageOptions& opts = {});
+
 // Byte-for-byte comparison (exported for tests). False when either file is
 // unreadable or the sizes differ.
 bool same_content(const std::filesystem::path& a, const std::filesystem::path& b);
@@ -335,6 +359,29 @@ std::expected<StageOutcome, StageError> stage_file(const std::filesystem::path& 
     }
 
     return std::unexpected(StageError{failure_message(src, dst, last)});
+}
+
+std::expected<StageOutcome, StageError> stage_files(
+    const std::vector<std::filesystem::path>& srcs,
+    const std::filesystem::path& dst,
+    const StageOptions& opts)
+{
+    if (srcs.empty()) {
+        return std::unexpected(StageError{
+            std::format("staging '{}' requires at least one source", dst.string())});
+    }
+    for (std::size_t i = 1; i < srcs.size(); ++i) {
+        if (!same_content(srcs.front(), srcs[i])) {
+            std::string list;
+            for (auto const& s : srcs) list += std::format("\n  {}", s.string());
+            return std::unexpected(StageError{std::format(
+                "two or more sources disagree for one destination\n"
+                "  destination: {}\n"
+                "  sources:{}",
+                dst.string(), list)});
+        }
+    }
+    return stage_file(srcs.front(), dst, opts);
 }
 
 } // namespace mcpp::build::stage
