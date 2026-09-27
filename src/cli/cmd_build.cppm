@@ -281,6 +281,12 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
     const mcpp::build::BuildOverrides ov = overrides_from_selectors(parsed);
 
     std::vector<Diagnostic> diagnostics;
+    // The run's closing notices belong in the envelope as `note` diagnostics;
+    // taken here, they are not printed again as `tip:` lines at exit.
+    auto take_closing_notes = [&] {
+        for (auto& n : mcpp::ui::take_closing_notices())
+            diagnostics.push_back({std::move(n.code), Severity::Note, std::move(n.message)});
+    };
     auto publish = [&](const std::string& text) -> int {
         if (!outputPath) { std::print("{}", text); return 0; }
         const std::filesystem::path out{*outputPath};
@@ -316,6 +322,7 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                              mcpp::wire::severity_name(d.severity), d.message);
             return 1;
         }
+        take_closing_notes();
         const auto text = mcpp::wire::to_json(mcpp::wire::Envelope{
             .kind = "mcpp.build-database",
             .effects = {Effect::ReadProject},
@@ -400,10 +407,28 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                                                   includeDevDeps,
                                                   std::move(discovered->targets), mo);
             if (!ctx) {
+                // A wholly-failed member contributes exactly one `error`
+                // diagnostic, `path` its `mcpp.toml` (SPEC-005 R5.2) — that
+                // invariant is kept exactly, so a note an earlier phase
+                // recorded (most importantly
+                // `MCPP_BUILD_DATABASE_PROGRAM_FAILED`) is folded into THIS
+                // diagnostic's own message instead of becoming a diagnostic of
+                // its own. Without it, a later phase's failure that follows
+                // from the missing directives (SPEC-005 R5.2's own words) read
+                // as a single, unexplained symptom, and the actual cause —
+                // recorded, then discarded the moment `prepare_build` returned
+                // — never reached the reader (design 2026-09-27 §4.2, mcpp#724
+                // side finding A, fix item 2).
+                std::string message = member.empty() ? ctx.error()
+                                                     : std::format("{}: {}", member, ctx.error());
+                for (auto const& note : mcpp::build::take_notes_on_failure())
+                    message += note.path.empty()
+                        ? std::format("\n       earlier in this pass, {}: {}",
+                                      note.code, note.message)
+                        : std::format("\n       earlier in this pass, {} ({}): {}",
+                                      note.code, note.path, note.message);
                 diagnostics.push_back({plan_failure_code(), Severity::Error,
-                    member.empty() ? ctx.error()
-                                   : std::format("{}: {}", member, ctx.error()),
-                    memberPath});
+                                       std::move(message), memberPath});
                 failedMemberRoots.push_back(memberRoot);
                 continue;
             }
@@ -482,6 +507,7 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         if (const auto rc = publish(document.dump(2) + "\n"); rc != 0) return rc;
         return hasError ? 1 : 0;
     }
+    take_closing_notes();
     std::vector<Effect> effects{Effect::ReadProject, Effect::WriteGlobalCache};
     if (ranBuildPrograms) effects.push_back(Effect::ExecBuildScript);
     nlohmann::json specJson{{"name", spec}};
@@ -906,19 +932,25 @@ export int cmd_dyndep(const mcpplibs::cmdline::ParsedArgs& parsed) {
 }
 
 // Invoked by ninja during build (stage_file rule):
-//   mcpp stage --output <dst> <src>
+//   mcpp stage --output <dst> <src>...
 //
 // Publishes a cache-owned artifact (std BMI, std.o, runtime DLL) into the
 // build directory. See mcpp.build.stage for the semantics — in particular why
 // an already-equivalent destination is left untouched (#311).
+//
+// More than one source (SPEC-007 R4.2, mcpp#723) means two or more packages
+// of this graph deploy the same destination; `stage_files` places it when
+// every source is byte-identical and otherwise fails, naming every source
+// and the destination. One source — every invocation before this feature —
+// takes the exact path it always has.
 export int cmd_stage(const mcpplibs::cmdline::ParsedArgs& parsed) {
     std::filesystem::path outPath = parsed.option_or_empty("output").value();
     if (outPath.empty()) {
         std::println(stderr, "error: --output <path> required");
         return 2;
     }
-    if (parsed.positional_count() != 1) {
-        std::println(stderr, "error: stage requires exactly one source path");
+    if (parsed.positional_count() < 1) {
+        std::println(stderr, "error: stage requires at least one source path");
         return 2;
     }
 
@@ -931,9 +963,13 @@ export int cmd_stage(const mcpplibs::cmdline::ParsedArgs& parsed) {
     if (!verify.empty())
         opts.verify = mcpp::build::stage::parse_verify(verify);
 
-    auto r = mcpp::build::stage::stage_file(
-        mcpp::platform::fs::extended_length(std::filesystem::path{parsed.positional(0)}),
-        mcpp::platform::fs::extended_length(outPath), opts);
+    std::vector<std::filesystem::path> sources;
+    for (std::size_t i = 0; i < parsed.positional_count(); ++i)
+        sources.push_back(mcpp::platform::fs::extended_length(
+            std::filesystem::path{parsed.positional(i)}));
+
+    auto r = mcpp::build::stage::stage_files(
+        sources, mcpp::platform::fs::extended_length(outPath), opts);
     if (!r) {
         std::println(stderr, "error: {}", r.error().message);
         return 1;

@@ -52,6 +52,11 @@ floor_violation(std::string_view minMcpp, std::string_view ownVersion);
 // running binary.
 std::string e0006_message(std::string violation, bool distroManaged);
 
+// The closing half of an index-floor notice: the version the index asks for
+// (omitted when unknown) and the upgrade command for this install layout,
+// the same advice E0006 gives (`distro_managed_install`).
+std::string index_floor_upgrade_advice(std::string_view minMcpp);
+
 // Pure predicate — no reporting, no registration, no dedup. For callers that
 // need to ask "would this tree be usable?" without the side effects of
 // check_index_floor (the refresh guard asks it twice per refresh).
@@ -170,7 +175,8 @@ std::string e0006_message(std::string violation, bool distroManaged)
         if (pos != std::string::npos)
             violation.replace(pos, kInstallShUpgrade.size(), kDistroUpgrade);
     }
-    // Append the recommended installer note to every layout.
+    // Append the recommended installer note to every layout, on its own line.
+    if (!violation.empty() && violation.back() != '\n') violation += '\n';
     violation += kXlingsUpgrade;
     return violation;
 }
@@ -187,6 +193,17 @@ bool distro_managed_install()
     auto self = mcpp::platform::fs::self_exe_path();
     return self.string().find("/opt/mcpp/") != std::string::npos;
 #endif
+}
+
+std::string index_floor_upgrade_advice(std::string_view minMcpp)
+{
+    const std::string_view how = distro_managed_install()
+        ? "update the mcpp-bin package with your AUR helper"
+        : "xlings update mcpp";
+    return minMcpp.empty()
+        ? std::format("Upgrade: {}", how)
+        : std::format("It requires mcpp >= {}; this is mcpp {}. Upgrade: {}",
+                      minMcpp, mcpp::MCPP_VERSION, how);
 }
 
 bool index_usable(const std::filesystem::path& indexRoot)
@@ -221,14 +238,22 @@ std::string unusable_index_hint() {
     auto& reg = unusable_registry();
     if (reg.empty()) return {};
     // Name the index, not just the fact: with several repos configured, "an
-    // index was too new" leaves the reader guessing which one to act on.
+    // index was too new" leaves the reader guessing which one to act on. The
+    // E0006 text travels here, in the message that stops the run, because the
+    // read site no longer prints it (see read_identity_verified_xpkg_lua).
     std::string s = "note: this resolve ran with an index this mcpp cannot read:\n";
+    std::vector<std::string> texts;
     for (auto& u : reg) {
         s += "  " + u.root.string() + "\n";
+        if (std::ranges::find(texts, u.message) == texts.end())
+            texts.push_back(u.message);
     }
-    s += "      Packages served by it were reported as not found. See the "
-         "[E0006] error above,\n"
-         "      or run `mcpp explain E0006`.";
+    for (auto const& t : texts) {
+        s += t;
+        if (!t.empty() && t.back() != '\n') s += '\n';
+    }
+    s += "      Packages served by it were reported as not found. "
+         "Run `mcpp explain E0006` for the details.";
     return s;
 }
 

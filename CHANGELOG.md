@@ -3,6 +3,92 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026.9.28.1] - 2026-09-28
+
+本版本合入 #717、#718、#720、#722、#723、#724、#725 与 #726 的修复与特性。设计与实施记录见
+`.agents/docs/2026-09-27-eight-reports-by-home-and-one-optimisation-plan.md` 与
+`.agents/docs/2026-09-27-eight-reports-implementation-plan.md`。
+
+### 缺陷修复
+
+- **带 `[package]` 的工作空间根的 `path` 依赖(#725)。** 这样到达的成员此前不被识别为成员:
+  2026.9.26.1 忽略其 `[workspace.dependencies]` 中钉住的版本,2026.9.27.1 拒绝其
+  `workspace = true`。现在工作空间的上下文由清单所在的位置决定,这样的成员按 SPEC-004 §9 第 1 条
+  继承 `[workspace.package]`、`[workspace.build]` 与 `workspace = true`;`[toolchain]`、
+  `[target.<triple>]`、`[indices]` 仍只属于根。
+- **`-p, --package <NAME>` 按包的身份解析(#725)。** 顺序为限定名、包名,然后是成员的路径或
+  目录名(此前唯一的写法,保留)。同一个包名在两个命名空间下出现时拒绝并给出两个限定名;一个值
+  既是某成员的包名又是另一成员的目录名时选择前者并警告。
+- **宿主模块包的 lib root 参与本包单元的导入排序(#720)。** 导入同包其他单元的 lib root 此前
+  先于被导入者编译而失败。不导入同包单元的包顺序不变。
+- **规则认领的设备源不是编译单元(#724)。** 它此前出现在 S1 文档与 `mcpp build` 自己的
+  `compile_commands.json` 中,带一条 C++ 编译命令,`build.ninja` 也带一条无人引用的边。
+- **构建程序失败时,其诊断得以保留(#724)。** 以构建程序的指令为前提的检查(设备源的认领)不再
+  对构建程序已失败的包运行,规划失败路径也保留已记录的说明;此前报告的是「设备源无人编译」。
+- **`emit build-database` 不写入工程目录(#724)。** 声明了 `[xlings]` 载荷的工程此前会得到
+  `.mcpp/.xlings.json`(SPEC-005 R2.1)。
+- **一个放置目标一份内容、一个写入者(#723)。** 同一目标的多个来源在放置时逐字节核对,相同则
+  放置一份,不同则失败并点名全部来源;此前在规划时即被拒绝,即使内容相同。链接后放置 DLL 的步骤
+  不覆盖另一写入者放在程序旁的文件;规划时在运行时搜索目录中找到的同名 DLL 让位于声明的放置,
+  内容不同时在规划时警告(SPEC-007 R4.2、R4.3)。PE 目标上目的地的比较不区分大小写。
+- **只导入构建规则的 `build.mcpp` 在 GCC 下可以编译。** 它此前在工程根目录中编译,找不到位于
+  构建目录 `gcm.cache` 中的规则 BMI;现在导入任一模块的构建程序都在构建目录中编译。
+- **要求更新 mcpp 的索引不再报告为错误。** 读取处不再打印 `error: ... [E0006]`;失败的运行在
+  使其停止的消息中给出 E0006;刷新了索引而遇到下限的运行在最后打印一行 `tip:`,信封中为说明
+  `MCPP_INDEX_REQUIRES_NEWER_MCPP`;`mcpp self doctor` 列出当前 mcpp 不满足其下限的索引。
+- **Windows 上一次 xlings 调用只作用于 xlings 子进程(#726)。** 此前的 Windows 实现在两处与
+  POSIX 不一致:
+  - 每次调用把 registry 的 `subos/default/bin` 加到进程 `PATH` 的最前面,并设置进程级的
+    `XLINGS_HOME`,调用后不恢复。同一次构建安装过载荷后,ninja 与每个动作都先找到 `xim:llvm`
+    注册的 `cl`、`link`、`lib`、`rc` shim,vcpkg 对宿主三元组的编译器检测因此失败。
+  - xlings 在 mcpp 的工作目录中运行,从那里向上找到工程的 `.xlings.json` 而进入工程模式,把 mcpp
+    工具链与载荷的 shim 写进工程的 SubOS。
+
+  现在 `ScopedInvocationEnv` 在调用期间应用 `XLINGS_HOME`、作用域变量与 `PATH` 前缀并在调用后
+  全部恢复;命令以 `cd /d "<home>" &&` 开头,与 POSIX 前缀中的 `cd` 相同。
+
+### 特性
+
+- **条件化的 `dialect_cxxflags`(#717)。** `[target.<selector>.build] dialect_cxxflags` 在命中的
+  目标上把参数加入全图的方言参数:标准库 BMI、扫描与每个编译单元。只读取构建的根包;依赖包自己的
+  全图键不进入其指纹。
+- **MSVC ABI 的 CRT 模型(#718)。** CRT 是目标 ABI 的性质:cl 以 `/MD`、`/MT`,clang++ 以
+  `-fms-runtime-lib=dll`、`static` 表达同一模型,并到达编译、std BMI 与链接。MSVC ABI 的默认契约为
+  `toolchain-coupled`:动态 CRT,工具集的 `vcruntime140.dll`、`msvcp140.dll` 放到程序旁。
+  `cxx_runtime` 与 `linkage` 之外不增加新键;手写的 CRT 参数与模型一致时提示冗余,矛盾时拒绝;
+  依赖包 `[build] cxxflags` 中矛盾的 CRT 参数同样拒绝;调试 CRT 参数(`/MDd` 等)总被拒绝。依赖
+  的全局缓存键包含 CRT 模型。
+- **构建数据库描述规则生成的文件(#724)。** S1 集合的 `ide.generated` 列出生成的文件与目录、
+  同一组选择下 `mcpp build` 写入的路径以及生成它的步骤(S1 0.3.0)。命令仍不运行任何 action。
+- **统一的下载进度。** 工具链与载荷的安装、索引中的库包、`[xlings]` 载荷、索引刷新、`git` 依赖的
+  克隆与沙箱的首次引导由同一个渲染器报告。标准输出不是终端时,每一项只打印开始与结束两行,不含
+  回车与擦除序列。索引刷新经 `xlings interface update_packages` 进行,需要 xlings 2026.9.28.1 的
+  进度事件才逐步显示。
+
+### 内部
+
+- **`src/build/prepare/` 的阶段函数按其小节拆分(#722)。** 代码逐字移动,不改变语句顺序;七个
+  夹具的 `resolution.json`、`build.ninja` 与构建数据库输出与拆分前逐字节相同。该目录下没有超过
+  400 行的函数:`.github/tools/check_function_sizes.sh` 以 clang-tidy 的 `readability-function-size`
+  在以 LLVM 构建得到的编译数据库上检查,拆分前报告 10 处;CI 中尚无能完整构建 mcpp 的 clang 任务,
+  接入见 #729。`mcpp.lock` 与 `resolution.json` 的写入移入 `records.cpp`。
+- **xlings 固定版本为 2026.9.28.1。** 该版本的 interface 协议为 1.2:`update_packages` 按阶段发出
+  进度事件,interface 能力运行期间写到标准输出的文本不再混入事件流(openxlings/xlings#625)。
+
+### 兼容性
+
+- **成员的编译命令可能改变。** 经 `path` 依赖到达、带 `[package]` 的工作空间根的成员,现在收到
+  `[workspace.build]` 与 `[workspace.package]`。
+- **Windows 上 LLVM 行的程序改用动态 CRT。** 它们现在导入 `vcruntime140.dll` 等,文件放在程序旁;
+  写 `cxx_runtime = "self-contained"` 可恢复静态 CRT。cl 行的编译参数不变,程序旁多出这些 DLL。
+- **新增四种拒绝。** 每一种都在消息中给出一行修法:
+  - 手写的 CRT 参数与解析出的模型矛盾;
+  - 在没有 redistributable 目录的行上显式写 `toolchain-coupled`;
+  - 在两个命名空间下都有成员的包名上使用 `-p`;
+  - 手写的调试 CRT 参数,以及依赖包中与模型矛盾的 CRT 参数。
+- **`-p` 的值同时是一个成员的包名与另一个成员的目录名时,选择前者并警告。** 此前按目录名选择。
+- **S1 profile 版本为 0.3.0。** 0.2.0 的消费方忽略新字段。
+
 ## [2026.9.27.1] - 2026-09-27
 
 ### 缺陷修复(#704、#705、#710、#712 至 #716)

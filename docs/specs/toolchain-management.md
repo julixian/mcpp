@@ -4,11 +4,11 @@
 |---|---|
 | 规范编号 | SPEC-006 |
 | 标题 | 工具链管理:身份、来源、选择与载荷契约 |
-| 状态 | 草案 v0.2 |
-| 最后修改 | 2026-09-24 |
+| 状态 | 草案 v0.3 |
+| 最后修改 | 2026-09-28 |
 | 对应实现 | 逐条标注;标为「已实现」的条款对应 mcpp >= 2026.9.24.1。标为「未实现」的条款计划与下一批 LLVM 工具链一同落地,届时按实测修订本规范 |
 | 相关设计文档 | `.agents/docs/2026-09-24-toolchain-selection-and-payload-trust-design.md`、`.agents/docs/2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md` |
-| 相关 issue | mcpp#685、mcpp#687 |
+| 相关 issue | mcpp#685、mcpp#687、mcpp#718 |
 | 使用文档 | [docs/20 - 工具链](../zh/20-toolchains.md)、[docs/32 - 编写载荷](../zh/32-authoring-a-payload.md)、[docs/91 - 工具链内部](../zh/91-toolchain-internals.md) |
 
 本规范定义 mcpp 对工具链的命名、选择和使用方式,以及一个工具链载荷在发布前必须满足的条件。
@@ -119,6 +119,26 @@ MSVC ABI 目标上:SDK 以 `ucrt@<版本>` 进入运行时身份;clang 行的 to
 描述产物的属性(最低系统版本、三元组中的版本段)**必须**按目标判定,与宿主无关;
 只有在宿主上执行的编译(build.mcpp)按宿主判定。macOS 的 deployment target 在任何宿主上都按目标解析与施加。
 
+### 3.7 MSVC ABI 目标的 CRT 模型 已实现
+
+在 `*-windows-msvc` 目标上,CRT 模型(静态或动态)是目标 ABI 的属性,而非某一个编译器的属性:
+`cl.exe` 与以该 ABI 为目标的 clang 行**必须**接收同一个模型,分别以各自驱动的拼写(`/MT`/`/MD`,
+`-fms-runtime-lib=static`/`=dll`)发给编译单元、`std`/`std.compat` BMI 与链接命令。
+
+- 未声明的契约在该 ABI 上,对每个角色都**必须**解析为 `toolchain-coupled`:动态 CRT,并将所选
+  toolset 自带的 `vcruntime140.dll`/`msvcp140.dll` 等文件置于产物旁。
+- `self-contained`,或 `linkage = "static"`,**必须**解析为静态 CRT。
+- `host-coupled` **必须**解析为动态 CRT,且不放置文件。
+- 所选 toolset 不带 `VC\Redist\MSVC\<版本>\<架构>\Microsoft.VC*.CRT` 目录时,未声明的契约**必须**
+  静默解析为 `host-coupled`;显式声明的 `toolchain-coupled` **必须**被拒绝,并指出缺失的目录——
+  这是行的一个属性,不因某一次构建而降级。
+- `[build] cxxflags` 或 `dialect_cxxflags` 中出现的自由拼写 CRT 词(`/MT`、`/MD`、`-fms-runtime-lib=*`
+  等)与已解析的模型一致时**应当**被警告为冗余;不一致时**必须**被拒绝,消息**必须**指出该词、
+  所在的键与该词对应的值。依赖包的 `[build] cxxflags` 同样检查,因为它们作用于该包自己的单元:
+  不一致时**必须**被拒绝并指出该包;一致时不警告,因为替代它的键 `cxx_runtime` 只属于根。
+  调试 CRT 词(`/MTd`、`/MDd`、`-fms-runtime-lib=*_dbg`)**必须**被拒绝:模型不表达调试 CRT,
+  标准库模块与链接使用发布版 CRT。
+
 ---
 
 ## 4. 载荷契约
@@ -228,3 +248,4 @@ xim-pkgindex 的准入脚本 `verify-toolchain.sh` 对一个载荷归档做一�
 |---|---|---|
 | v0.1 | 2026-09-24 | 初版草案:身份与写法、来源与选择(含 MSVC ABI 目标的 sysroot)、载荷契约、构建、验收、发布顺序 |
 | v0.2 | 2026-09-24 | 随 mcpp 2026.9.24.1 更新实现状态:§2.3、§2.4、§3.1 至 §3.6 已实现;§4.2、§6.4 部分实现;§2.2 更正:不带族的 `system` 被拒绝 |
+| v0.3 | 2026-09-28 | 随 mcpp 2026.9.28.1:新增 §3.7,MSVC ABI 的 CRT 模型是目标 ABI 的性质,cl 与 clang++ 同样收到,默认 `toolchain-coupled`(mcpp#718)。 |

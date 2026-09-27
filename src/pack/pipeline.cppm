@@ -457,7 +457,21 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
             flags.contractByRole[static_cast<std::size_t>(
                 mcpp::build::dist::Role::Distributable)]
             == mcpp::build::dist::Contract::ToolchainCoupled;
+        // AN EXPLICIT `--mode system` OUTRANKS A DEFAULTED CONTRACT (#718,
+        // §7.3): the MSVC-ABI default is toolchain-coupled, and asking for
+        // `--mode system` on a project that never wrote `cxx_runtime` down is
+        // an explicit choice for host-coupled, not a contradiction — the
+        // contradiction is reserved for a manifest that SAID
+        // toolchain-coupled and a mode that bundles nothing (checked below,
+        // unchanged).
+        if (opts.mode == mcpp::pack::Mode::None
+            && opts.carryToolchainRuntime
+            && !flags.programCxxRuntimeStated) {
+            opts.carryToolchainRuntime = false;
+        }
         opts.toolchainRuntimeDirs = ctx->plan.toolchain.linkRuntimeDirs;
+        if (!ctx->plan.toolchain.msvcRedistDir.empty())
+            opts.toolchainRuntimeDirs.push_back(ctx->plan.toolchain.msvcRedistDir);
         // Where a third-party dependency's shared library may be found. Both
         // channels, because they answer for different things: the runtime
         // library dirs are what `mcpp run` puts on the loader's path, and the

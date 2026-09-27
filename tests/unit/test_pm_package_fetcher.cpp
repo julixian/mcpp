@@ -2,6 +2,7 @@
 
 import std;
 import mcpp.pm.package_fetcher;
+import mcpp.pm.index_contract;
 
 // Regression for the compat.zlib vs upstream bare zlib.lua collision.
 //
@@ -275,4 +276,34 @@ TEST(PmPackageFetcher, ReadSeededIndexReposToleratesArtifactFields) {
               std::string::npos);
 
     std::filesystem::remove_all(project);
+}
+
+// A tree whose index.toml requires a newer mcpp answers no lookup, and the
+// read prints nothing. The fact is recorded for the message of a run that then
+// fails (unusable_index_hint), which carries the E0006 text itself; a run that
+// resolves every package elsewhere has no error to report. Before this, the
+// read site printed the E0006 text as `error:` at the start of such runs.
+TEST(PackageFetcher, AnIndexThatRequiresANewerMcppIsRecordedNotPrinted) {
+    auto root = make_tempdir("mcpp-floor-read");
+    write_file(root / "index.toml",
+               "[index]\nspec = \"1\"\nmin_mcpp = \"9999.9.9.9\"\n");
+    write_file(root / "pkgs" / "f" / "floorpkg.lua",
+               "package = { spec = \"1\", name = \"floorpkg\", type = \"package\" }\n");
+
+    testing::internal::CaptureStderr();
+    auto first  = mcpp::pm::Fetcher::read_xpkg_lua_from_path(root, "floorns", "floorpkg");
+    auto second = mcpp::pm::Fetcher::read_xpkg_lua_from_path(root, "floorns", "floorpkg");
+    auto err = testing::internal::GetCapturedStderr();
+
+    EXPECT_FALSE(first.has_value());
+    EXPECT_FALSE(second.has_value()) << "a tree recorded as unusable answers no later lookup";
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_TRUE(mcpp::pm::index_marked_unusable(root));
+
+    auto hint = mcpp::pm::unusable_index_hint();
+    EXPECT_NE(hint.find("E0006"), std::string::npos) << hint;
+    EXPECT_NE(hint.find("9999.9.9.9"), std::string::npos) << hint;
+    EXPECT_EQ(hint.find("error above"), std::string::npos) << hint;
+    mcpp::pm::reset_unusable_indexes_for_test();
+    std::filesystem::remove_all(root);
 }

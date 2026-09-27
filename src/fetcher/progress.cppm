@@ -191,6 +191,30 @@ std::vector<mcpp::ui::DownloadFile> to_ui_download_files(const std::vector<File>
     return out;
 }
 
+// One line of git's `--progress` output: the phase and its percentage.
+// `remote: Counting objects:  40% (2/5)` and `Receiving objects: 100% (5/5),
+// 1.20 MiB | 800.00 KiB/s, done.` both parse; the phase has no `remote: `
+// prefix. Any other line (`Cloning into ...`, an error) yields nullopt.
+export struct GitProgress {
+    std::string phase;
+    std::size_t percent = 0;
+};
+export std::optional<GitProgress> parse_git_progress(std::string_view line) {
+    if (line.starts_with("remote: ")) line.remove_prefix(8);
+    const auto colon = line.find(':');
+    if (colon == std::string_view::npos || colon == 0) return std::nullopt;
+    const auto pct = line.find('%', colon);
+    if (pct == std::string_view::npos) return std::nullopt;
+    auto begin = pct;
+    while (begin > colon + 1 && line[begin - 1] >= '0' && line[begin - 1] <= '9') --begin;
+    if (begin == pct) return std::nullopt;
+    GitProgress g;
+    g.phase = std::string(line.substr(0, colon));
+    std::from_chars(line.data() + begin, line.data() + pct, g.percent);
+    if (g.percent > 100) g.percent = 100;
+    return g;
+}
+
 // Adapter from `mcpp::config::BootstrapProgress` (xlings download_progress
 // event) to the centralized download renderer. Used by load_or_init() during
 // the one-time sandbox bootstrap (xim:patchelf, xim:ninja + transitive deps).

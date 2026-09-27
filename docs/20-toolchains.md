@@ -499,7 +499,10 @@ It is a **compatibility floor declaration**, not a payload binding like
 `glibc@2.39` on Linux — `ucrtbase.dll` is a Windows component and mcpp neither
 ships nor substitutes it.
 
-**CRT model.** `/MD` (host-coupled) by default; `/MT` when either
+**CRT model.** `/MD` by default, with the toolset's own redistributable staged
+beside the artifact (`toolchain-coupled` — see [On the MSVC
+runtime](#on-the-msvc-runtime) below for the full model, which applies to `cl`
+and to clang++ on this ABI alike); `/MT` when either
 
 ```toml
 [target.x86_64-windows-msvc]
@@ -1131,7 +1134,7 @@ loaded *into* a process that already has a C++ runtime.
 |---|---|---|
 | ELF (Linux, …) | `toolchain-coupled` | ELF has one global symbol namespace and the first definition loaded wins. A `.so` that statically embedded libstdc++ **exports** it, and the executable linking that library binds *its* `std::` references there — its own `self-contained` contract silently becomes a no-op, and its C++ runtime is whichever build of that library happens to load. |
 | Mach-O | `self-contained` | the mechanism there is already `-load_hidden`, i.e. hidden visibility, so dyld never unifies those symbols; and toolchain-coupled is not available on macOS at all (see the note below). |
-| PE (Windows) | `self-contained` | PE has no global symbol namespace — imports resolve per-DLL by name, so a DLL's private runtime cannot be picked up by anything else. |
+| PE, GNU ABI (MinGW) | `self-contained` | PE has no global symbol namespace — imports resolve per-DLL by name, so a DLL's private runtime cannot be picked up by anything else. The MSVC ABI's own default is a separate rule — see [On the MSVC runtime](#on-the-msvc-runtime) below. |
 
 Setting `shared = "self-contained"` on ELF is supported and does exactly what it
 says: the library embeds the runtime. mcpp additionally passes
@@ -1214,28 +1217,80 @@ artifact than the manifest asked for.
 
 ### On the MSVC runtime
 
-The CRT model is the mechanism here, and it is a **whole-project** switch: cl
-bakes `_MSVC_MT`/`_MSVC_MD` into the one `std` module a project builds, so a
-per-role contract that disagrees with the project's cannot be honoured and is
-reported rather than ignored.
+The CRT model is a property of the **target ABI**, not of the compiler: `cl`
+and clang++ targeting `*-windows-msvc` (the `llvm` row) receive the *same*
+model, each spelling it for its own driver. It is also a **whole-project**
+switch: `cl` bakes `_MSVC_MT`/`_MSVC_MD` into the one `std` module a project
+builds, so a per-role contract that disagrees with the project's cannot be
+honoured and is reported rather than ignored.
 
-| value | meaning on MSVC |
-|---|---|
-| `self-contained` | `/MT` — the static CRT. `linkage = "static"` selects the same thing from the libc axis. |
-| `host-coupled` (default under `/MD`) | the target provides `vcruntime140.dll` / `msvcp140.dll` — i.e. Visual Studio or the redistributable is installed there. |
-| `toolchain-coupled` | the toolset's **own** copy of those DLLs travels with the artifact. |
+| value | meaning on the MSVC ABI | `cl` spelling | clang++ spelling |
+|---|---|---|---|
+| `self-contained` (or `linkage = "static"`) | the static CRT | `/MT` | `-fms-runtime-lib=static` |
+| `toolchain-coupled` (**default**) | the dynamic CRT, with the toolset's own copy of `vcruntime140.dll`/`msvcp140.dll` staged beside the artifact | `/MD` | `-fms-runtime-lib=dll` |
+| `host-coupled` | the dynamic CRT, with nothing staged — the target provides those DLLs itself (Visual Studio, or the redistributable installer) | `/MD` | `-fms-runtime-lib=dll` |
 
-`toolchain-coupled` is worth spelling out, because the obvious reading is
-wrong. `ucrtbase.dll` *is* a Windows component (since Windows 10) and mcpp
-never ships it. `vcruntime140.dll` and `msvcp140.dll` are **not**: every MSVC
-toolset carries them under `VC\Redist\MSVC\<version>\<arch>\`, exactly the
-way a gcc payload carries `libstdc++.so`. Under this contract mcpp stages them
-beside the artifact — which is what makes a default `/MD` build runnable on a
-machine that has only the pinned toolset and no Visual Studio at all.
+**`toolchain-coupled` is the default**, whatever `cxx_runtime` says, for every
+role. This is worth spelling out, because the obvious reading of "portable by
+default" is wrong here: `ucrtbase.dll` *is* a Windows component (since Windows
+10) and mcpp never ships it, but `vcruntime140.dll` and `msvcp140.dll` are
+**not** — every MSVC toolset carries them under
+`VC\Redist\MSVC\<version>\<arch>\`, exactly the way a gcc payload carries
+`libstdc++.so`. Under this contract mcpp stages them beside the artifact
+(on the `mcpp build` output directory) and puts the same directory on the
+`mcpp run`/`mcpp test` search path — which is what makes the default build
+runnable on a machine that has only the pinned toolset and no Visual Studio
+at all.
+
+A resolved toolset that carries no `VC\Redist\MSVC` directory (measured on
+some `msvc@system` installs) cannot deliver `toolchain-coupled`. The
+undeclared default then resolves to `host-coupled` instead, silently — this is
+a property of the row, stated once here, not a warning on every build of it.
+An **explicit** `cxx_runtime = "toolchain-coupled"` on such a row is refused,
+naming the missing directory: an explicit statement a toolset cannot meet is
+an error, never a silent downgrade.
 
 The debug CRT (`vcruntime140d.dll` and friends, under `debug_nonredist\`) is
-never staged: it may not be redistributed.
+never staged: it may not be redistributed, and mcpp's `dev` profile does not
+select it — it states debug information, not a different CRT. That axis stays
+deferred until a consumer needs it.
 
+Combining `toolchain-coupled` or `host-coupled` with `/MT` (`linkage =
+"static"`, or `self-contained`) is a contradiction rather than a missing
+feature — a static CRT leaves no DLL to couple to — so it is reported and
+resolved to `self-contained`. `mcpp pack` enforces the other half: a mode
+that bundles nothing (`--mode static` or `--mode system`) together with an
+*explicit* `toolchain-coupled` cannot deliver it and refuses; `--mode system`
+on a project that never stated a contract resolves the default to
+`host-coupled` instead, since an explicit mode outranks a default.
+
+**A free-form CRT word is always a second statement.** Every MSVC-ABI build
+now states its own CRT, so a literal `/MT`, `/MD`, `/MTd`, `/MDd` or
+`-fms-runtime-lib=*` (either dash) in `[build] cxxflags` or `dialect_cxxflags`
+can never be the only voice. One that **agrees** with the resolved model is
+warned as redundant, naming the key (`cxx_runtime` or `linkage`) to write
+instead; one that **contradicts** it is refused, naming the word, the key it
+was found in, and the value it corresponds to. A dependency's `[build]
+cxxflags` are checked too, since they reach that package's own units: a
+contradicting word is refused, naming the package, and an agreeing one is
+not warned, because `cxx_runtime` is the root's key. A debug word (`/MTd`,
+`/MDd`, `-fms-runtime-lib=*_dbg`) is always refused: the model has no debug
+axis, and the standard library module and the link use the release CRT. The
+engine never lets the last word on the command line decide silently.
+
+> **Upgrading to 2026.9.28.1?** `cl`-row projects are unchanged apart from
+> gaining the staged DLLs beside their programs. **LLVM-row programs move
+> from the static to the dynamic CRT**: before this release clang++ on the
+> MSVC ABI received no model at all and linked `libcmt` regardless of
+> `cxx_runtime`; now it receives the same model `cl` does, defaulting to
+> `toolchain-coupled`. A project that links a prebuilt `/MT` library on this
+> row now fails to link (`LNK2038`, a CRT mismatch) and should state
+> `cxx_runtime = "self-contained"` to restore the static CRT it had before.
+> Two manifests that built before this release are refused after it: a
+> free-form CRT word that contradicts the resolved model, and an explicit
+> `toolchain-coupled` on a row whose toolset ships no redistributable — see
+> above for both.
+>
 > **Upgrading from 2026.8.15 or earlier?** This key used to be **inert** on the
 > MSVC ABI — it reported `not implemented for the MSVC runtime yet` and every
 > value fell back to `/MD`. Since 2026.8.16 it is honoured, so a manifest that
@@ -1243,23 +1298,6 @@ never staged: it may not be redistributed.
 > upgrade**, from `/MD` to `/MT`. It is not a stricter version of the same
 > model, and the switch is silent because the value was always valid. A project
 > that set it while the key did nothing should re-confirm the intended value.
-
-Combining it with `/MT` is a contradiction rather than a missing feature — a
-static CRT leaves no DLL to couple to — so it is reported and resolved to
-`self-contained`. `mcpp pack` enforces the other half: a mode that bundles
-nothing (`--mode system`, `--mode static`) cannot deliver `toolchain-coupled`
-and refuses.
-
-**Clang on the MSVC ABI** (the `llvm` row of `x86_64-windows-msvc`, mcpp
-2026.9.16.1+ for the record). The table above describes `cl.exe`, the one
-compiler mcpp passes a CRT model to. Clang on the MSVC ABI speaks the GNU dialect
-and receives no model, and its driver links the static CRT (`-defaultlib:libcmt`):
-a program built on this row imports no `vcruntime140.dll`, `msvcp140.dll` or
-`api-ms-win-crt-*`, and each DLL carries its own CRT. The row is therefore
-`self-contained` whatever `cxx_runtime` says, `resolution.json` records it so, and
-an explicit `host-coupled` or `toolchain-coupled` prints that the row does not
-deliver it. A project that needs the dynamic CRT on the MSVC ABI builds with
-`msvc@system`.
 
 **Scope.** The contract governs the C++ runtime only. Static **libc** is a separate
 axis (`linkage = "static"` / `--static`, e.g. a musl target), and the deployment

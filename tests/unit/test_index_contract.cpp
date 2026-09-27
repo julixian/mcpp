@@ -84,3 +84,26 @@ TEST(IndexContract, ReadContractRoundTrip) {
     std::filesystem::remove_all(dir);
     EXPECT_FALSE(mcpp::pm::read_index_contract(dir).has_value());
 }
+
+// The upgrade note appended to E0006 starts on its own line. It was appended
+// directly after the "Details:" line and read as one line.
+// The closing tip of a refresh names the version the index asks for, and
+// falls back to the advice alone when the contract could not be read.
+TEST(IndexContract, FloorUpgradeAdviceNamesTheVersionWhenKnown) {
+    auto known = mcpp::pm::index_floor_upgrade_advice("9999.9.9.9");
+    EXPECT_NE(known.find("requires mcpp >= 9999.9.9.9"), std::string::npos) << known;
+    EXPECT_NE(known.find("Upgrade: "), std::string::npos) << known;
+    auto unknown = mcpp::pm::index_floor_upgrade_advice("");
+    EXPECT_EQ(unknown.find(">="), std::string::npos) << unknown;
+    EXPECT_TRUE(unknown.starts_with("Upgrade: ")) << unknown;
+}
+
+TEST(IndexContract, E0006UpgradeNoteStartsOnItsOwnLine) {
+    auto violation = mcpp::pm::floor_violation("2026.8.3.3", "2026.7.28.2");
+    ASSERT_TRUE(violation.has_value());
+    auto text = mcpp::pm::e0006_message(*violation, /*distroManaged=*/false);
+    auto at = text.find("  Upgrade:  'xlings update mcpp'");
+    ASSERT_NE(at, std::string::npos) << text;
+    ASSERT_GT(at, 0u);
+    EXPECT_EQ(text[at - 1], '\n') << text;
+}

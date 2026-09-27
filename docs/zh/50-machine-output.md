@@ -393,6 +393,7 @@ replaced}` —— `origin` 与构建的状态行使用的是同一句话
 | `lld-required-absent` | 目标直接通过 lld 链接，而解析出的工具链载荷不带 lld |
 | `host-tool-toolchain` | 一个交叉 `--target` 下的 `build.mcpp` 需要一个可解析的**宿主**工具链，而一个都没有配置 |
 | `std-module-precompile` | 标准库的模块在这个配置下无法被预编译 |
+| `msvc-redist-unavailable` | 在 MSVC ABI 的行上显式写了 `cxx_runtime = "toolchain-coupled"`，而该行的工具集没有可放置的 redistributable 目录 *(2026.9.28.1+)* |
 | `other` | 一个尚未被赋予记号的拒绝分支 |
 
 **其中一个记号也由 `mcpp build` 自己打印。** `interface-not-provided` 会
@@ -423,7 +424,7 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 
 | 字段 | |
 |---|---|
-| `spec` | `{"name": "s1", "version": "0.2.0"}`；使用 `--spec compile-commands` 时为 `{"name": "compile-commands"}` |
+| `spec` | `{"name": "s1", "version": "0.3.0"}`（2026.9.28.1 之前为 0.2.0）；使用 `--spec compile-commands` 时为 `{"name": "compile-commands"}` |
 | `database` | 该规范对应的文档：一份 S1 构建数据库，或者 `mcpp build --configure-only` 写入 `compile_commands.json` 的那些条目 |
 | `watch` | 一旦发生变化就可能改变这份文档的输入：相对工作区根目录的路径与 glob，或绝对路径 |
 | `inputs-fingerprint` | `fnv1a:<16 位十六进制>`，对上述输入、mcpp 版本与选择器求出的摘要 |
@@ -431,6 +432,11 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 不带 `--format` 时，命令只输出这份文档；`-o <file>` 会把原本要输出的内容
 写入 `<file>`。文档的内容、不写入项目目录这条保证，以及 `watch` 的规则，见
 [SPEC-005](../specs/build-database.md)。
+
+自 2026.9.28.1 起，S1 的集合还在 `ide.generated` 中列出其包的构建程序生成的文件
+（S1 0.3.0 §7.2）。命令不运行任何 action，所以这样的文件在文档所指的目录中尚不存在。
+每一项给出同一组选择下 `mcpp build` 写入的路径（`build-path`）以及写出它的步骤，
+编辑器因此可以说明“这是生成的文件，构建一次即可”，而不是报告缺少头文件。
 
 `emit` 独立规划每一个被选中的成员（#699 第 1 项）：一个成员的规划失败不会
 连累它的兄弟成员。不在项目中，或者被选中的成员全部规划失败时，信封省略
@@ -466,6 +472,7 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | 警告 | 没有任何标准库构建命令点名它的模块源文件，该单元因此不被列出 |
 | `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | 说明 | 被请求的宿主工具不在工具库中，命令不构建它；计划给出它将被发布到的路径（2026.9.27.1+；取代 2026.9.26.2 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`） |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | 错误 | 构建程序失败；它所属的包被描述为不含它产生的指令 |
+| `MCPP_INDEX_REQUIRES_NEWER_MCPP` | 说明 | 本次运行刷新的某个索引要求更新的 mcpp；先前的副本被保留或恢复，或者没有可用的副本（2026.9.28.1+；终端运行以结尾的 `tip:` 行打印同一条说明） |
 
 `--protocol-version` 为这条命令声明 `init-mcpp-home`、`read-project`、
 `network`、`write-global-cache` 与 `exec-build-script`，从不声明

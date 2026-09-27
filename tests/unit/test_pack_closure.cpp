@@ -285,6 +285,86 @@ TEST(PackClosurePe, ForceBundleReachesTheSystemList) {
     EXPECT_TRUE(with.platform.empty());
 }
 
+// ── SPEC-007 R4.2/R4.3: one destination, one writer (#723 self-review) ──
+//
+// `place_runtime_dlls` is the function behind the `place-dlls` ninja edge.
+// These fixtures give it a real PE program and a real search directory (the
+// PE reader is not a fake), and a `placedByDeploy` list, which is the only
+// part `ninja_backend.cppm` computes from the plan — everything else here is
+// this function's own decision.
+
+namespace {
+
+std::string read_bytes(const std::filesystem::path& p) {
+    std::ifstream is(p, std::ios::binary);
+    return std::string{std::istreambuf_iterator<char>(is), {}};
+}
+
+}  // namespace
+
+TEST(PlaceRuntimeDlls, ANameTheDeployListPlacesIsNeitherOverwrittenNorPlaced) {
+    Tree t;
+    auto exe = t.write("bin/app.exe", pe_importing({"foo.dll"}));
+    // The deploy list's own file, already beside the program (as it would be
+    // by the time this edge runs — an order-only dependency of the link).
+    t.write("bin/foo.dll", pe_importing({}) + "DEPLOYED");
+    // A different "foo.dll" the runtime search directory also offers.
+    t.write("deps/foo.dll", pe_importing({}) + "SEARCHDIR");
+
+    auto r = mcpp::pack::place_runtime_dlls(
+        exe, {t.root / "deps"}, /*placedBefore=*/{}, /*placedByDeploy=*/{"foo.dll"});
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_TRUE(r->names.empty()) << "the deploy list's name was placed a second time";
+    EXPECT_TRUE(r->sources.empty());
+    ASSERT_EQ(r->warnings.size(), 1u);
+    EXPECT_NE(r->warnings[0].find("foo.dll"), std::string::npos) << r->warnings[0];
+    // Not overwritten: the file beside the program is still the deploy list's.
+    EXPECT_EQ(read_bytes(t.root / "bin" / "foo.dll"), pe_importing({}) + "DEPLOYED");
+}
+
+TEST(PlaceRuntimeDlls, ANameTheDeployListPlacesWithMatchingBytesIsSilent) {
+    Tree t;
+    auto exe = t.write("bin/app.exe", pe_importing({"foo.dll"}));
+    const auto bytes = pe_importing({}) + "SAME";
+    t.write("bin/foo.dll", bytes);
+    t.write("deps/foo.dll", bytes);
+
+    auto r = mcpp::pack::place_runtime_dlls(
+        exe, {t.root / "deps"}, {}, {"foo.dll"});
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_TRUE(r->names.empty());
+    EXPECT_TRUE(r->warnings.empty());
+}
+
+TEST(PlaceRuntimeDlls, TheDeployListNameIsMatchedCaseInsensitively) {
+    Tree t;
+    auto exe = t.write("bin/app.exe", pe_importing({"Foo.DLL"}));
+    // The deploy list itself may spell the name differently (it named a
+    // destination file, not this program's import table entry); the match
+    // against `placedByDeploy` must not depend on which case either side used.
+    t.write("bin/Foo.DLL", pe_importing({}) + "DEPLOYED");
+    t.write("deps/Foo.DLL", pe_importing({}) + "SEARCHDIR");
+
+    auto r = mcpp::pack::place_runtime_dlls(
+        exe, {t.root / "deps"}, {}, {"foo.dll"});
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_TRUE(r->names.empty())
+        << "PE names are case-insensitive; the deploy list's entry should still match";
+}
+
+TEST(PlaceRuntimeDlls, ANameNotInTheDeployListIsPlacedAsBefore) {
+    Tree t;
+    auto exe = t.write("bin/app.exe", pe_importing({"foo.dll"}));
+    t.write("deps/foo.dll", pe_importing({}) + "PAYLOAD");
+
+    auto r = mcpp::pack::place_runtime_dlls(exe, {t.root / "deps"});
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_EQ(r->names, (Names{"foo.dll"}));
+    EXPECT_EQ(r->sources, (std::vector<std::filesystem::path>{t.root / "deps" / "foo.dll"}));
+    EXPECT_TRUE(r->warnings.empty());
+    EXPECT_EQ(read_bytes(t.root / "bin" / "foo.dll"), pe_importing({}) + "PAYLOAD");
+}
+
 // ── Mach-O ───────────────────────────────────────────────────────────────
 
 TEST(PackClosureMachO, AnRpathDylibBesideTheProgramIsAMemberTransitively) {

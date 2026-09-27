@@ -261,11 +261,17 @@ int run_streaming(std::string_view command,
 // Stdout and stderr share the pipe, as they do for every captured deadline
 // run; a caller that parses stdout redirects stderr in the command itself.
 // Returns -1 when the launcher could not run the command at all.
+//
+// `split_on_cr` also ends a line at a carriage return that is not part of a
+// CRLF pair. A command that redraws one progress line in place (git with
+// `--progress`) then reaches `on_line` once per redraw, as it happens, rather
+// than once per finished phase.
 int run_streaming_bounded(std::string_view command,
                           std::function<void(std::string_view line)> on_line,
                           std::chrono::milliseconds total,
                           std::chrono::milliseconds idle,
-                          bool* timed_out);
+                          bool* timed_out,
+                          bool split_on_cr = false);
 
 // Run `command`, passing stdout/stderr through to the terminal.
 // Optionally captures stdout into `output` if non-null.
@@ -931,7 +937,8 @@ BoundedOutcome dispatch_bounded(
     std::string_view windowsCommandLine = {},
     std::chrono::milliseconds idle = std::chrono::milliseconds{0},
     bool ownGroup = false,
-    const std::function<void(std::string_view)>* on_line = nullptr)
+    const std::function<void(std::string_view)>* on_line = nullptr,
+    bool splitOnCr = false)
 {
     BoundedOutcome outcome;
 
@@ -957,7 +964,8 @@ BoundedOutcome dispatch_bounded(
     struct StreamCtx {
         std::string*                                     buffer;
         const std::function<void(std::string_view)>*     on_line;
-    } streamCtx{ &outcome.output, on_line };
+        bool                                             splitOnCr;
+    } streamCtx{ &outcome.output, on_line, splitOnCr };
     using Sink = void (*)(void*, const char*, unsigned long);
     const Sink sink = !capture ? nullptr
         : on_line == nullptr
@@ -967,8 +975,22 @@ BoundedOutcome dispatch_bounded(
         : +[](void* ctx, const char* data, unsigned long len) {
               auto* c = static_cast<StreamCtx*>(ctx);
               c->buffer->append(data, len);
+              // The end of the next line: a newline, or with `splitOnCr` a
+              // carriage return followed by anything but a newline. A carriage
+              // return that is the last byte so far waits for the next chunk,
+              // which decides whether it was half of a CRLF.
+              auto next_end = [c]() -> std::size_t {
+                  const auto nl = c->buffer->find('\n');
+                  if (!c->splitOnCr) return nl;
+                  for (std::size_t i = 0; i < c->buffer->size() && i < nl; ++i) {
+                      if ((*c->buffer)[i] != '\r') continue;
+                      if (i + 1 == c->buffer->size()) return std::string::npos;
+                      if ((*c->buffer)[i + 1] != '\n') return i;
+                  }
+                  return nl;
+              };
               std::size_t pos;
-              while ((pos = c->buffer->find('\n')) != std::string::npos) {
+              while ((pos = next_end()) != std::string::npos) {
                   std::string_view line{c->buffer->data(), pos};
                   while (!line.empty() && line.back() == '\r') line.remove_suffix(1);
                   (*c->on_line)(line);
@@ -1067,7 +1089,8 @@ int run_streaming_bounded(std::string_view command,
                           std::function<void(std::string_view line)> on_line,
                           std::chrono::milliseconds total,
                           std::chrono::milliseconds idle,
-                          bool* timed_out)
+                          bool* timed_out,
+                          bool split_on_cr)
 {
     if (timed_out) *timed_out = false;
     if (command.empty() || (total.count() <= 0 && idle.count() <= 0)) return -1;
@@ -1079,7 +1102,7 @@ int run_streaming_bounded(std::string_view command,
         on_line ? std::move(on_line) : [](std::string_view) {};
     auto r = dispatch_bounded(argv, {}, {}, total, /*capture=*/true,
                               windows_shell_command_line(sealed), idle,
-                              /*ownGroup=*/true, &sink);
+                              /*ownGroup=*/true, &sink, split_on_cr);
     if (!r.supported) return -1;
     if (timed_out) *timed_out = r.timed_out;
     return r.exit_code;

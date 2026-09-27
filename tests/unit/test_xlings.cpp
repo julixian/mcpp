@@ -599,7 +599,6 @@ TEST(XlingsInvocationEnv, GlobalModeIsAnAbsentProjectDirectory) {
 
 TEST(XlingsInvocationEnv, TheProcessEnvironmentIsUnchangedAfterwards) {
     namespace env = mcpp::platform::env;
-    // Held so that what the Windows prefix sets process-wide is restored too.
     env::ScopedEnv keepPath("PATH", env::get("PATH"));
     env::ScopedEnv keepHome("XLINGS_HOME", env::get("XLINGS_HOME"));
     env::ScopedEnv prior("XLINGS_PROJECT_DIR", std::string("prior-project"));
@@ -624,6 +623,49 @@ TEST(XlingsInvocationEnv, TheProcessEnvironmentIsUnchangedAfterwards) {
 #endif
     }
     EXPECT_EQ(env::get("XLINGS_PROJECT_DIR"), std::optional<std::string>("prior-project"));
+}
+
+// #726: the sandbox's `bin` in front of PATH and XLINGS_HOME reach the xlings
+// child only. They used to stay in the process on Windows, so every action of a
+// build that had installed a payload found `xim:llvm`'s `cl`, `link` and `lib`
+// shims in front of MSVC's tools, while a build that installed nothing did not.
+TEST(XlingsInvocationEnv, NeitherPathNorTheHomeOutlivesTheInvocation) {
+    namespace env = mcpp::platform::env;
+    env::ScopedEnv keepPath("PATH", env::get("PATH"));
+    env::ScopedEnv keepHome("XLINGS_HOME", std::string("shell-home"));
+    const auto pathBefore = env::get("PATH");
+
+    auto e = xlings_env("");
+    for (int i = 0; i < 3; ++i) {
+        mcpp::xlings::ScopedInvocationEnv scope(e);
+        (void)mcpp::xlings::build_command_prefix(e);
+#if defined(_WIN32)
+        EXPECT_EQ(env::get("XLINGS_HOME"), std::optional<std::string>(e.home.string()));
+        const auto path = env::get("PATH");
+        ASSERT_TRUE(path.has_value());
+        const auto bin = (e.home / "subos" / "default" / "bin").string();
+        EXPECT_EQ(path->substr(0, bin.size()), bin) << *path;
+#endif
+    }
+    EXPECT_EQ(env::get("PATH"), pathBefore);
+    EXPECT_EQ(env::get("XLINGS_HOME"), std::optional<std::string>("shell-home"));
+
+    // Building a command alone changes nothing on any platform.
+    (void)mcpp::xlings::build_command_prefix(e);
+    EXPECT_EQ(env::get("PATH"), pathBefore);
+    EXPECT_EQ(env::get("XLINGS_HOME"), std::optional<std::string>("shell-home"));
+}
+
+// #726: on Windows too the registry's xlings starts in its home, never in the
+// directory mcpp was started from, so a project's `.xlings.json` cannot put it
+// in that project's mode.
+TEST(XlingsInvocationEnv, TheWindowsPrefixStartsInTheHome) {
+    mcpp::xlings::Env e;
+    e.home = "C:\\Users\\a b\\.mcpp\\registry";
+    e.binary = "C:\\Users\\a b\\.mcpp\\registry\\bin\\xlings.exe";
+    EXPECT_EQ(mcpp::xlings::windows_command_prefix(e),
+              "cd /d \"C:\\Users\\a b\\.mcpp\\registry\" && "
+              "\"C:\\Users\\a b\\.mcpp\\registry\\bin\\xlings.exe\"");
 }
 
 #if !defined(_WIN32)

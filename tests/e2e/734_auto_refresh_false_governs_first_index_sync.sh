@@ -55,7 +55,7 @@ set -e
 [ "$rc" -ne 0 ] || fail "A: the build succeeded with an unsynced custom index" build.log
 grep -q "mcpp index update" build.log || fail "A: the refusal does not name mcpp index update" build.log
 grep -q "auto_refresh = false" build.log || fail "A: the refusal does not name the setting" build.log
-if grep -q '^update' "$TMP/stub.log" 2>/dev/null; then
+if grep -qE '^update|^interface update_packages' "$TMP/stub.log" 2>/dev/null; then
     fail "B: the custom index was synced although auto_refresh = false" "$TMP/stub.log"
 fi
 echo "PASS: 734 auto_refresh = false governs the first custom index sync"

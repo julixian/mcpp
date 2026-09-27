@@ -36,11 +36,18 @@ export int cmd_publish(const mcpplibs::cmdline::ParsedArgs& parsed) {
         parsed.is_flag_set("dry-run"), parsed.is_flag_set("allow-dirty"));
 }
 
-// `mcpp place-dlls --output <stamp> --depfile <d> <program> <dir>...` -- the
-// edge that follows a Windows program's link when its plan has runtime search
-// directories (mcpp.pack's `place_runtime_dlls`, SPEC-007 R4.3). Internal:
-// only a generated build.ninja names it, and it runs on whatever host builds,
-// because it reads the program's import table rather than asking a loader.
+// `mcpp place-dlls --output <stamp> --depfile <d> <program> <dir>...`
+// -- the edge that follows a Windows program's link when its plan has runtime
+// search directories (mcpp.pack's `place_runtime_dlls`, SPEC-007 R4.3).
+// Internal: only a generated build.ninja names it, and it runs on whatever
+// host builds, because it reads the program's import table rather than asking
+// a loader.
+//
+// The command line names no DLL. Which DLLs beside the program belong to
+// another writer (a declared deploy, the toolchain's staged runtime) is
+// decided below, from the program's directory, the stamp and the search
+// directories, so that the command does not change when the plan's deploy set
+// does (SPEC-007 R4.2/R4.3).
 //
 // The depfile names every DLL placed, so ninja runs the edge again when one of
 // them changes in its directory; the stamp is the edge's only declared output,
@@ -50,7 +57,8 @@ export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
     const std::filesystem::path stamp{parsed.option_or_empty("output").value()};
     const std::filesystem::path depfile{parsed.option_or_empty("depfile").value()};
     if (stamp.empty() || depfile.empty() || parsed.positional_count() < 1) {
-        std::println(stderr, "error: place-dlls requires --output, --depfile and a program");
+        std::println(stderr,
+            "error: place-dlls requires --output, --depfile and a program");
         return 2;
     }
     const std::filesystem::path program{parsed.positional(0)};
@@ -67,12 +75,43 @@ export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
         for (std::string line; std::getline(prev, line);)
             if (!line.empty()) placedBefore.push_back(line);
     }
-    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore);
+    // ONE DESTINATION, ONE WRITER (SPEC-007 R4.3, #723). A DLL already beside
+    // the program that this edge did not place, and that a runtime search
+    // directory also offers, is another writer's: a declared deploy or the
+    // toolchain's staged runtime, both completed before the link this edge
+    // follows. It is never overwritten; `place_runtime_dlls` compares it with
+    // the directory's copy and warns on a difference. A DLL only the
+    // program's directory holds (a library the project built there) is not
+    // one this edge could write, and stays an ordinary member of the closure.
+    // Decided here, from the directories, so the edge's command does not
+    // change when the plan's deploy set does.
+    std::vector<std::string> placedByOthers;
+    {
+        std::error_code dirEc;
+        const auto here = program.has_parent_path() ? program.parent_path()
+                                                    : std::filesystem::path(".");
+        for (auto const& e : std::filesystem::directory_iterator(here, dirEc)) {
+            if (!e.is_regular_file(dirEc)) continue;
+            auto ext = e.path().extension().string();
+            std::ranges::transform(ext, ext.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext != ".dll") continue;
+            const auto name = e.path().filename().string();
+            if (std::ranges::find(placedBefore, name) != placedBefore.end()) continue;
+            const bool offered = std::ranges::any_of(dirs, [&](auto const& d) {
+                std::error_code fe;
+                return std::filesystem::is_regular_file(d / name, fe);
+            });
+            if (offered) placedByOthers.push_back(name);
+        }
+    }
+    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore, placedByOthers);
     if (!placed) {
         std::println(stderr, "error: {}", placed.error().message);
         return 1;
     }
     for (auto const& n : placed->notes) std::println("note: {}", n);
+    for (auto const& w : placed->warnings) std::println(stderr, "warning: {}", w);
 
     // The depfile syntax ninja reads (`deps = gcc`): a space and `#` are
     // escaped with a backslash, and `$` is doubled.

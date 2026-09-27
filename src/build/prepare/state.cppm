@@ -462,6 +462,16 @@ struct PrepareState {
     std::vector<std::pair<std::string, std::string>> abiRequiresExceptions;
     std::map<std::string, std::vector<std::string>> capExclusive;
     std::map<std::string, std::vector<std::string>> deviceSourcesByPackage;
+    // Keyed like `deviceSourcesByPackage`, by `pkg.root.string()` (root
+    // package included: `packages[0].root == *root`). Holds a package whose
+    // build program failed IN THIS PASS, under `plan_only` (`emit
+    // build-database`) — the one case a failed program does not already end
+    // the whole call (SPEC-005 R5.2, #699 item 2, E3). A check whose premise
+    // is that program's directives must not run for such a package: with no
+    // directives applied, every premise reads as unmet, which is a symptom of
+    // the recorded `MCPP_BUILD_DATABASE_PROGRAM_FAILED`, not a second defect
+    // (design 2026-09-27 §4.2, mcpp#724 side finding A).
+    std::set<std::string> programFailedPackages;
     std::function<std::optional<std::string>()> checkVersionFloors;
     mcpp::targetside::TargetSide resolvedTargetSide;
     std::optional<std::size_t> cxxLayerProviderIndex;
@@ -499,6 +509,9 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
 std::expected<void, std::string> phase9_target_side(PrepareState& state);
 std::expected<void, std::string> phase11_scan(PrepareState& state);
 std::expected<BuildContext, std::string> phase13_finish(PrepareState& state);
+// P13's records half (records.cpp), called by phase13_finish.
+std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildContext& ctx);
+void step13_resolution_json(PrepareState& state, BuildContext& ctx);
 
 // ── Helpers the phases share, defined in the files named below ─────────────
 
@@ -561,9 +574,12 @@ std::string min_platform_version(const mcpp::manifest::Manifest& m,
 
 // fetch.cpp: git remotes, network retries, xlings addresses and their provisioning
 std::string git_cache_head(const std::filesystem::path& gitRoot);
+// `progressLabel`, when given, draws git's `--progress` download phase as
+// one bar labelled with it (W11); the command must pass `--progress`.
 mcpp::platform::process::RunResult run_with_network_retry(
         std::string_view command,
-        const std::function<void()>& between = {});
+        const std::function<void()>& between = {},
+        std::string_view progressLabel = {});
 std::vector<std::string>
 applicable_xlings_addresses(const mcpp::manifest::Manifest& man,
                             const std::vector<std::string>& activeFeatures,

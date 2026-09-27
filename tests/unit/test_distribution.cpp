@@ -215,6 +215,52 @@ TEST(Distribution, MingwParity) {
     EXPECT_EQ(dist::resolve(in).unitFlags, " -static");
 }
 
+// #718 §7.2/§7.3: the MSVC-ABI whole-project default. Undeclared resolves to
+// toolchain-coupled when the toolset has a redistributable, and to
+// host-coupled — silently — when it does not; `linkage = "static"` or an
+// explicit `self-contained` both mean the static CRT regardless.
+TEST(Distribution, MsvcAbiDefaultContractRow) {
+    EXPECT_EQ(dist::msvc_abi_default_contract(/*staticCrt=*/false, /*hasRedist=*/true),
+              dist::Contract::ToolchainCoupled);
+    EXPECT_EQ(dist::msvc_abi_default_contract(/*staticCrt=*/false, /*hasRedist=*/false),
+              dist::Contract::HostCoupled);
+    EXPECT_EQ(dist::msvc_abi_default_contract(/*staticCrt=*/true, /*hasRedist=*/true),
+              dist::Contract::SelfContained);
+    EXPECT_EQ(dist::msvc_abi_default_contract(/*staticCrt=*/true, /*hasRedist=*/false),
+              dist::Contract::SelfContained)
+        << "a static CRT needs no redistributable to be self-contained";
+}
+
+// `role_contracts` takes the SAME default for every role once
+// `ContractStatement::msvcAbiDefault` is set — a per-role judgement about a
+// format's hazard (the way MinGW's PE cell has one) has no place on this ABI.
+TEST(Distribution, RoleContractsUsesTheMsvcAbiDefaultForEveryRole) {
+    dist::ContractStatement s;
+    s.msvcAbiDefault = dist::Contract::ToolchainCoupled;
+    auto c = dist::role_contracts(s, dist::Format::Pe, {});
+    EXPECT_EQ(c.program,      dist::Contract::ToolchainCoupled);
+    EXPECT_EQ(c.intermediate, dist::Contract::ToolchainCoupled);
+    EXPECT_EQ(c.tests,        dist::Contract::ToolchainCoupled);
+    EXPECT_EQ(c.shared,       dist::Contract::ToolchainCoupled);
+    EXPECT_FALSE(c.programStated);
+    EXPECT_FALSE(c.sharedStated);
+
+    // An explicit statement still outranks the default, on this ABI as on
+    // every other.
+    s.cxxRuntime = "host-coupled";
+    auto explicitC = dist::role_contracts(s, dist::Format::Pe, {});
+    EXPECT_EQ(explicitC.program, dist::Contract::HostCoupled);
+    EXPECT_TRUE(explicitC.programStated);
+
+    // Off the MSVC ABI (`msvcAbiDefault` unset), the format's own per-role
+    // defaults are untouched — SharedLibrary still gets the ELF-only
+    // toolchain-coupled default, not the MSVC-ABI one.
+    dist::ContractStatement elf;
+    auto elfC = dist::role_contracts(elf, dist::Format::Elf, {});
+    EXPECT_EQ(elfC.program, dist::Contract::SelfContained);
+    EXPECT_EQ(elfC.shared,  dist::Contract::ToolchainCoupled);
+}
+
 // MSVC's self-contained form IS the /MT runtime, and mcpp emits it — the
 // switch is `msvcStaticCrt`, derived once by `msvc_wants_static_crt` from the
 // two manifest keys that mean the same physical thing on this ABI.
@@ -899,38 +945,47 @@ TEST(Distribution, TheOlderSpellingStatesEveryRole) {
 }
 
 // ---------------------------------------------------------------------------
-// #649 E10 -- clang on the MSVC ABI is given no CRT model, and its driver links
-// the static CRT (`-defaultlib:libcmt`). The table recorded `host-coupled`
-// beside an artifact that imports no vcruntime DLL. It now records what the
-// row delivers, and an explicit request the row does not deliver says so.
-TEST(Distribution, ClangOnTheMsvcAbiRecordsTheStaticCrtItsDriverLinks) {
+// #649 E10, closed by #718. Clang on the MSVC ABI used to be given no CRT
+// model at all (`MechanismInput::msvcCrtModelEmitted`), so the table recorded
+// `host-coupled` beside an artifact that imported no vcruntime DLL. Every
+// MSVC-ABI row now receives the SAME model — one helper, `msvc_abi_crt_word`,
+// spells it for cl and for clang++ alike — so the mechanism table has no cell
+// left that distinguishes a driver: it reads only `msvcStaticCrt`,
+// `requested` and `explicitRequest`, none of which name a compiler. That is
+// the property that made the field removable rather than merely unused; a
+// row without a redistributable directory is a planning-time refusal for an
+// explicit `toolchain-coupled` (prepare/plan.cpp), not a table cell, and an
+// undeclared one is resolved to `host-coupled` before this table ever runs
+// (`dist::msvc_abi_default_contract`).
+TEST(Distribution, NoMechanismCellDistinguishesClangFromClOnTheMsvcAbi) {
     dist::MechanismInput in;
-    in.format              = dist::Format::Pe;
-    in.stdlibId            = "msvc";
-    in.msvcCrtModelEmitted = false;
+    in.format   = dist::Format::Pe;
+    in.stdlibId = "msvc";
 
-    for (auto requested : {dist::Contract::SelfContained,
-                           dist::Contract::HostCoupled,
-                           dist::Contract::ToolchainCoupled}) {
-        in.requested       = requested;
-        in.explicitRequest = false;
-        auto quiet = dist::resolve(in);
-        EXPECT_EQ(quiet.effective, dist::Contract::SelfContained);
-        EXPECT_FALSE(quiet.degraded);
-        EXPECT_FALSE(quiet.deployToolchainRuntime);
-        EXPECT_TRUE(quiet.unitFlags.empty());
-    }
-
+    // /MD, requesting (and delivering) the toolchain's own copy.
+    in.msvcStaticCrt   = false;
     in.explicitRequest = true;
-    in.requested = dist::Contract::HostCoupled;
-    auto undelivered = dist::resolve(in);
-    EXPECT_EQ(undelivered.effective, dist::Contract::SelfContained);
-    EXPECT_TRUE(undelivered.degraded);
-    EXPECT_NE(undelivered.diagnostic.find("not delivered"), std::string::npos)
-        << undelivered.diagnostic;
-    EXPECT_NE(undelivered.diagnostic.find("libcmt"), std::string::npos)
-        << undelivered.diagnostic;
+    in.requested       = dist::Contract::ToolchainCoupled;
+    auto coupled = dist::resolve(in);
+    EXPECT_EQ(coupled.effective, dist::Contract::ToolchainCoupled);
+    EXPECT_TRUE(coupled.deployToolchainRuntime);
+    EXPECT_FALSE(coupled.degraded);
+    EXPECT_TRUE(coupled.diagnostic.empty());
 
-    in.requested = dist::Contract::SelfContained;
-    EXPECT_FALSE(dist::resolve(in).degraded);
+    // /MT, requesting (and delivering) the static CRT.
+    in.msvcStaticCrt = true;
+    in.requested     = dist::Contract::SelfContained;
+    auto selfContained = dist::resolve(in);
+    EXPECT_EQ(selfContained.effective, dist::Contract::SelfContained);
+    EXPECT_FALSE(selfContained.degraded);
+    EXPECT_TRUE(selfContained.diagnostic.empty());
+
+    // The undeclared default: quiet, whichever way `msvcStaticCrt` reads.
+    in.explicitRequest = false;
+    in.msvcStaticCrt   = false;
+    in.requested       = dist::Contract::HostCoupled;
+    auto quiet = dist::resolve(in);
+    EXPECT_EQ(quiet.effective, dist::Contract::HostCoupled);
+    EXPECT_FALSE(quiet.degraded);
+    EXPECT_TRUE(quiet.diagnostic.empty());
 }

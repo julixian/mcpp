@@ -1,6 +1,6 @@
 // plan.cpp -- P13: the BuildContext: the plan, prebuilt dependencies,
-// assembly units, Windows resources, the global cache, mcpp.lock and
-// resolution.json.
+// assembly units, Windows resources and the global cache. mcpp.lock and
+// resolution.json are written by records.cpp.
 
 module mcpp.build.prepare;
 import :state;
@@ -9,6 +9,7 @@ import mcpp.build.prepare_inputs;
 
 import std;
 import mcpp.diag;
+import mcpp.build.stage;
 import mcpp.build.refusal;
 import mcpp.build.version_floor;
 import mcpp.home;
@@ -22,6 +23,7 @@ import mcpp.toolchain.hostflags;   // the compile-token producer the package std
 import mcpp.toolchain.cppfly;
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
+import mcpp.toolchain.model;      // is_msvc_target — the MSVC-ABI default (#718)
 import mcpp.toolchain.fingerprint;
 import mcpp.toolchain.registry;
 import mcpp.toolchain.linkmodel;
@@ -76,23 +78,17 @@ import mcpp.bmi_cache;
 
 namespace mcpp::build {
 
-std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
-    BuildContext ctx;
-    ctx.strict      = state.overrides.strict;
-    ctx.manifest    = *state.m;
-    ctx.tc          = *state.tc;
-    ctx.fp          = state.fp;
-    ctx.runtimeSelection = state.runtimeSelection;
-    ctx.runtimeBinding = state.runtimeBindingSnapshot;
-    ctx.profile     = state.effectiveProfile;
-    ctx.activeFeatureRequest = state.overrides.features;
-    ctx.compilerChoice = { std::string(tc_origin_name(state.tcOrigin)),
-                           state.graphCompilerRequiredBy,
-                           state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
-                                                         : state.graphCompilerReplaced };
-    ctx.cacheMode   = state.cacheMode;
-    ctx.projectRoot= *state.root;
-    ctx.outputDir  = target_dir(*state.tc, state.fp, state.workRoot);
+
+// SUB-STEPS (mcpp#722 / T6). Each function below is one section of
+// phase13_finish, named for what its own banner already called it,
+// extracted verbatim: statements moved, not reordered or rewritten. Every
+// step takes the same (PrepareState&, BuildContext&) pair phase13_finish
+// held locally, called in the original order from the slimmed-down
+// phase13_finish at the bottom of this file. Internal linkage: these
+// names are this file's own, not part of mcpp.build.prepare's surface;
+// the two records steps live in records.cpp and are declared in `:state`.
+
+static std::expected<void, std::string> step13_source_packages(PrepareState& state, BuildContext& ctx) {
     {
         std::error_code ec;
         const bool firstPlan = !std::filesystem::exists(ctx.outputDir / "build.ninja", ec);
@@ -167,6 +163,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         }
         ctx.depSourceRoots = std::move(roots);
     }
+    return {};
+}
+
+static std::expected<void, std::string> step13_runner_and_xlings(PrepareState& state, BuildContext& ctx) {
     // Where a runner may find the programs this project declared (#544). The
     // same resolution `fillXpkgDirs` hands to build programs, kept as
     // directories rather than env vars because the reader is mcpp's own
@@ -258,6 +258,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             }
         }
     }
+    return {};
+}
+
+static std::expected<void, std::string> step13_prebuilt_check(PrepareState& state, BuildContext& ctx) {
     // ─── Prebuilt dependencies: check before planning to link them ─────
     //
     // Here rather than at each place a dependency manifest is loaded, because
@@ -297,7 +301,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                 return std::unexpected(ok.error());
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_link_forms(PrepareState& state, BuildContext& ctx) {
     // ── #519: the form each dependency takes, APPLIED ──────────────────────
     //
     // The answers were computed before the root build program (see there).
@@ -352,12 +359,34 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                     t.kind = mcpp::manifest::Target::SharedLibrary;
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_make_plan(PrepareState& state, BuildContext& ctx) {
     auto planResult = mcpp::build::make_plan(*state.m, *state.tc, state.fp, state.scan.graph, state.report.topoOrder,
                                              state.packages, *state.root, ctx.outputDir,
                                              state.stdBmiPath, state.stdObjectPath, state.storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
+    // SPEC-007 R4.3: a declared deploy outranks a search directory's file of
+    // the same name, and a difference between the two is said here, where
+    // the user sees it (the post-link placement edge says it only under -v).
+    // A declared source that an action writes is left to that edge: at
+    // planning it may still hold the previous build's bytes.
+    std::set<std::filesystem::path> actionOutputs;
+    for (auto const& a : ctx.plan.actions)
+        for (auto const& o : a.outputs)
+            actionOutputs.insert(std::filesystem::path(o).lexically_normal());
+    for (auto const& s : ctx.plan.shadowedSearchDirDlls) {
+        if (actionOutputs.contains(s.declared.lexically_normal())) continue;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(s.declared, ec)
+            && !mcpp::build::stage::same_content(s.declared, s.offered))
+            mcpp::diag::warning("build/deploy-shadows-search-dir", std::format(
+                "'{}' is placed by this project's deploy list; the runtime "
+                "search directories also offer a different '{}', which is "
+                "not used", s.declared.string(), s.offered.string()));
+    }
     // Resolved far above, where the dependency graph first exists. It is
     // attached here rather than threaded through `make_plan` because nothing
     // that function does depends on it: the flag assembly that does reads the
@@ -405,7 +434,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         add_std_unit(state.tc->stdCompatSource, sm.compatCommands, sm.compatObjectPath,
                     sm.compatBmiPath, "std.compat", {"std"});
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_cxx_private_runtime(PrepareState& state, BuildContext& ctx) {
     // A DEPENDENCY'S C++ SHARED LIBRARY OVER A C++ RUNTIME THAT IS A PACKAGE
     // (#641, item 5).
     //
@@ -507,7 +539,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                 providerName, provider.package.version, constrained, staticRemedy));
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_cxx_process_runtime(PrepareState& state, BuildContext& ctx) {
     // ONE PROCESS, ONE C++ RUNTIME; ONE STATIC PACKAGE, ONE IMAGE (#646).
     //
     // Both are decided by `make_plan` and the contract table; this is where a
@@ -526,14 +561,53 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             .tests   = mcpp::build::image_loads_cxx_shared_library(
                 ctx.plan, mcpp::build::LinkUnit::TestBinary),
         };
+        // The MSVC-ABI whole-project default (#718, §7.3) — read the same way
+        // flags.cppm does, so the record this check reads and the flags a
+        // build actually emits cannot disagree about which contract an
+        // undeclared row resolved to.
+        const std::optional<dist::Contract> msvcAbiDefault =
+            mcpp::toolchain::is_msvc_target(*state.tc)
+                ? std::optional(dist::msvc_abi_default_contract(
+                      mcpp::toolchain::msvc_wants_static_crt(
+                          bc.linkage, bc.cxxRuntime),
+                      !state.tc->msvcRedistDir.empty()))
+                : std::nullopt;
         const auto contracts = dist::role_contracts(
             dist::ContractStatement{
                 .cxxRuntime       = bc.cxxRuntime,
                 .cxxRuntimeTests  = bc.cxxRuntimeTests,
                 .cxxRuntimeShared = bc.cxxRuntimeShared,
                 .staticStdlib     = bc.staticStdlib,
+                .msvcAbiDefault   = msvcAbiDefault,
             },
             format, load);
+        // A ROW WITHOUT A REDISTRIBUTABLE DIRECTORY CANNOT DELIVER AN
+        // EXPLICIT `toolchain-coupled`, AND SAYS SO BEFORE COMPILING.
+        //
+        // The undeclared case is silent (`msvc_abi_default_contract` already
+        // resolved it to host-coupled above); an explicit statement that
+        // cannot be met is an error, never a downgrade with a warning — the
+        // same rule `mcpp pack`'s mode contradiction follows.
+        if (mcpp::toolchain::is_msvc_target(*state.tc)
+            && state.tc->msvcRedistDir.empty()) {
+            struct { dist::Contract c; bool stated; std::string_view role; } rows[] = {
+                {contracts.program, contracts.programStated, "distributable"},
+                {contracts.tests,   contracts.testsStated,   "test"},
+                {contracts.shared,  contracts.sharedStated,  "shared-library"},
+            };
+            for (auto const& r : rows) {
+                if (r.c != dist::Contract::ToolchainCoupled || !r.stated) continue;
+                refusal::record(refusal::Code::MsvcRedistUnavailable);
+                return std::unexpected(std::format(
+                    "cxx_runtime = \"toolchain-coupled\" cannot be delivered "
+                    "for the {} target: this MSVC toolset carries no "
+                    "VC\\Redist\\MSVC directory to stage vcruntime140.dll / "
+                    "msvcp140.dll from.\n"
+                    "       Use cxx_runtime = \"host-coupled\", or a toolset "
+                    "that ships its redistributable.",
+                    r.role));
+            }
+        }
         // F3a. A stated self-contained program over a coupled C++ shared
         // library of this build: the program would carry a static C++ runtime
         // and the library would load a shared one. The unstated case needs no
@@ -658,7 +732,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                             "= \"shared\" }}", first));
         }
     }
+    return {};
+}
 
+static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
     // The module graph outlives the plan for one consumer: `mcpp pack`, which
     // has to know which units are INTERFACE (published as source) and which
     // are implementation (published only as an object). The plan flattens that
@@ -748,7 +825,9 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     if (state.tc->compiler == mcpp::toolchain::CompilerId::GCC && !state.overrides.plan_only)
         ctx.plan.gccCleanSpecs = mcpp::toolchain::write_clean_link_specs(
             state.tc->binaryPath, ctx.outputDir);
+}
 
+static std::expected<void, std::string> step13_build_graph_actions(PrepareState& state, BuildContext& ctx) {
     // ── Declared build-graph nodes → the plan ───────────────────────────────
     //
     // Collected here rather than inside make_plan because the engine-variable
@@ -1105,7 +1184,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     }
     ctx.plan.stdCompatBmiPath = state.stdCompatBmiPath;
     ctx.plan.stdCompatObjectPath = state.stdCompatObjectPath;
+    return {};
+}
 
+static std::expected<void, std::string> step13_assembly_units(PrepareState& state, BuildContext& ctx) {
     // Clang: discover clang-scan-deps for P1689 dyndep scanning.
     if (mcpp::toolchain::is_clang(*state.tc)) {
         if (auto sd = mcpp::toolchain::clang::find_scan_deps(*state.tc)) {
@@ -1196,7 +1278,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             ctx.plan.nasmPath = *nasmBin;
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_windows_resources(PrepareState& state, BuildContext& ctx) {
     // ─── Windows resources: [resources] → a tracked link input (mcpp#365) ──
     //
     // Four rules, in this order:
@@ -1536,7 +1621,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         if (trip.is_pe())
             if (auto r = plan_resources(); !r) return std::unexpected(r.error());
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_dependency_cache(PrepareState& state, BuildContext& ctx) {
     // ─── Global dependency cache: per-package keys, hit → stage edges ──
     //
     // Every index package gets a key over the axes that actually reach its
@@ -1865,154 +1953,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         }
     }
     // ──────────────────────────────────────────────────────────────────
+    return {};
+}
 
-    // Write/update mcpp.lock for any version-based deps that succeeded.
-    // Path deps are intentionally NOT locked — their source is local filesystem.
-    //
-    // mcpp#363: the version entries come from `resolved` — what the walk
-    // actually picked — not from `m->dependencies`, which still holds the
-    // constraint the user wrote and only covers DIRECT deps. Reading the input
-    // instead of the output made the lock record `^1.92.8` (a range locks
-    // nothing) and omit the transitive graph entirely. Git entries deliberately
-    // stay on `m->dependencies`: their lock line is read back as a resolution
-    // anchor (#329), keyed by the root manifest's map key, and that contract is
-    // unchanged here.
-    {
-        mcpp::lockfile::Lockfile lock;
-        lock.schemaVersion = 2;
-
-        // The lock key for a dep the ROOT declares is the map key it declared
-        // it under (`compat.imgui`, `gtest`) — that is the key #329's git anchor
-        // lookup uses, and changing it would silently unpin every branch dep.
-        // A dep reached only transitively has no such key, so it is written
-        // under its fully-qualified identity.
-        auto lock_name_for = [&](const ResolvedKey& k) -> std::string {
-            for (auto const& [n, s] : state.m->dependencies) {
-                const std::string sn = s.shortName.empty() ? n : s.shortName;
-                if (s.namespace_ == k.ns && sn == k.shortName) return n;
-            }
-            return mcpp::pm::compat::qualified_name(k.ns, k.shortName);
-        };
-
-        // Lock custom index shas from manifest [indices] section.
-        for (auto const& [idxName, spec] : state.m->indices) {
-            if (spec.is_local() || spec.is_builtin()) continue;
-            mcpp::lockfile::LockedIndex li;
-            li.name = idxName;
-            li.url  = spec.url;
-            li.rev  = spec.rev;   // may be empty if not yet resolved
-            lock.indices.push_back(std::move(li));
-        }
-
-        // Git deps: root-declared only, unchanged (see the note above).
-        for (auto const& [name, spec] : state.m->dependencies) {
-            if (!spec.isGit()) continue;
-            mcpp::lockfile::LockedPackage lp;
-            lp.name    = name;
-            lp.version = spec.gitRev;
-            auto gitIt = state.root_git_lock_identities.find(name);
-            if (gitIt == state.root_git_lock_identities.end()) {
-                lp.source = std::format("git+{}#{}={}",
-                    spec.git, spec.gitRefKind, spec.gitRev);
-                lp.hash = "fnv1a:" + mcpp::toolchain::hash_string(lp.source);
-            } else {
-                lp.source = gitIt->second.source;
-                lp.hash = gitIt->second.hash;
-            }
-            lock.packages.push_back(std::move(lp));
-        }
-
-        // Version deps: the whole resolved graph, at the versions actually
-        // chosen. `resolved` is an ordered map, so the file is deterministic.
-        for (auto const& [key, rec] : state.resolved) {
-            if (rec.source != "version") continue;   // path / git handled elsewhere
-            if (rec.version.empty()) continue;
-            // See ResolvedRecord::devOnly: `mcpp test` resolves dev-deps and
-            // `mcpp build` does not, so writing them would make the file depend
-            // on which command ran last.
-            if (rec.devOnly) continue;
-            mcpp::lockfile::LockedPackage lp;
-            lp.name       = lock_name_for(key);
-            lp.namespace_ = key.ns;
-            lp.version    = rec.version;
-            // Use the namespace and resolved version as the source identifier.
-            // For custom indices, include the index name for traceability.
-            auto sourceIndex = lp.namespace_.empty()
-                ? std::string(mcpp::pm::kDefaultNamespace)
-                : lp.namespace_;
-            lp.source     = std::format("index+{}@{}", sourceIndex, lp.version);
-            // Use a deterministic hash based on namespace + name + version.
-            // A future PR can replace this with a real content hash from the
-            // xpkg.lua's declared sha256 or from the install plan.
-            //
-            // NOT `std::hash<std::string>`: its output is implementation-defined
-            // (MSVC FNV-1a, libstdc++/libc++ MurmurHash), so the same dependency
-            // used to hash differently on Windows and Linux while the `fnv1a:`
-            // prefix claimed otherwise. `index_package_digest` is FNV-1a on
-            // every host.
-            lp.hash = mcpp::pm::index_package_digest(sourceIndex, lp.name, lp.version);
-            lock.packages.push_back(std::move(lp));
-        }
-        if (!lock.packages.empty() || !lock.indices.empty()) {
-            auto lockPath = state.workRoot / "mcpp.lock";
-            // `--locked` ASSERTS THAT THIS RESOLUTION IS THE RECORDED ONE.
-            //
-            // The file has always been written after the walk and never read
-            // back as a constraint; its own header says so ("does not yet pin
-            // future builds"). Making it an input to resolution is a change to
-            // the resolver. Making it an ASSERTION is not, and it is the half
-            // that reproducibility actually needs: a release build, a CI job or
-            // an audit can demand that what resolved today is what was recorded,
-            // and find out when it is not.
-            //
-            // THE FAILURE NAMES THE DIFFERENCE. "The lock is out of date" is
-            // true and useless; which package moved, from which version to
-            // which, is what the reader does something about.
-            if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1") {
-                auto prior = mcpp::lockfile::load(lockPath);
-                if (!prior) {
-                    return std::unexpected(std::format(
-                        "--locked was given and there is no readable mcpp.lock at {}\n"
-                        "       Run the same command without --locked once to record "
-                        "this resolution, then commit mcpp.lock.",
-                        lockPath.string()));
-                }
-                auto key = [](const mcpp::lockfile::LockedPackage& p) {
-                    return p.namespace_.empty() ? p.name
-                                                : p.namespace_ + "." + p.name;
-                };
-                std::map<std::string, std::string> was, now;
-                for (auto const& p : prior->packages) was[key(p)] = p.version;
-                for (auto const& p : lock.packages)    now[key(p)] = p.version;
-                std::vector<std::string> drift;
-                for (auto const& [k, v] : now) {
-                    auto it = was.find(k);
-                    if (it == was.end())      drift.push_back(k + " " + v + " (not in the lock)");
-                    else if (it->second != v) drift.push_back(k + " " + it->second + " -> " + v);
-                }
-                for (auto const& [k, v] : was)
-                    if (!now.contains(k)) drift.push_back(k + " " + v + " (no longer resolved)");
-                if (!drift.empty()) {
-                    std::string msg = "--locked was given and this resolution "
-                                      "differs from mcpp.lock:";
-                    for (auto const& d : drift) msg += "\n         " + d;
-                    msg += "\n       Re-run without --locked to update the lock, "
-                           "or pin the dependency that moved.";
-                    return std::unexpected(msg);
-                }
-            }
-            (void)mcpp::lockfile::write(lock, lockPath);
-        }
-
-        // Same data, second consumer: the "Compiling <dep> v<version>" banner.
-        // It reads this rather than re-deriving from the manifest, so the banner
-        // and the lock cannot disagree about what was built.
-        for (auto const& [key, rec] : state.resolved) {
-            if (rec.source != "version" || rec.version.empty()) continue;
-            ctx.resolvedVersions[lock_name_for(key)] = rec.version;
-        }
-    }
-
+static std::expected<void, std::string> step13_runtime_provider_overrides(PrepareState& state, BuildContext& ctx) {
     // Apply [runtime.<capability>] provider = "<pkg>" overrides. Canonical
     // identity wins; the old short spelling is accepted only when it denotes
     // exactly one provider.  A same-short-name collision is never guessed.
@@ -2055,7 +1999,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             return pr.capability.starts_with(capKey) && pr.provider == selected;
         });
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_abi_enforcement(PrepareState& state, BuildContext& ctx) {
     // Capability-driven ABI enforcement, dimensional (see src/toolchain/abi.cppm
     // and .agents/docs/2026-06-27-abi-compat-model-single-pr-design.md). Each
     // dependency may constrain specific toolchain dimensions via `abi:`
@@ -2090,235 +2037,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                 mm.need));
         }
     }
+    return {};
+}
 
-    // Per-build resolution manifest: the durable, provider-neutral facts that
-    // `mcpp why runtime` interprets without resolving again or probing the
-    // current host.  The post-link validator replaces `validation.pending`
-    // with the exact artifact verdict produced at the link seam.
-    {
-        const std::string tcAbi =
-            ctx.tc.targetTriple.find("musl") != std::string::npos ? "musl"
-            : ctx.tc.stdlibId == "libc++"                          ? "libc++"
-            : ctx.tc.compiler == mcpp::toolchain::CompilerId::MSVC ? "msvc"
-            :                                                         "glibc";
-        auto package_json = [](const mcpp::manifest::PackageId& id) {
-            return nlohmann::json{
-                {"canonical", id.canonical()},
-                {"namespace", id.namespace_},
-                {"name", id.name},
-                {"version", id.version},
-                {"source", id.sourceProvenance},
-            };
-        };
-        auto path_array = [](auto const& paths) {
-            nlohmann::json values = nlohmann::json::array();
-            for (auto const& path : paths)
-                values.push_back(path.lexically_normal().generic_string());
-            return values;
-        };
-        nlohmann::json j;
-        j["schema_version"] = 2;
-        j["toolchain"] = {
-            {"spec", ctx.tc.label()}, {"abi", tcAbi},
-            {"triple", ctx.tc.targetTriple}, {"stdlib", ctx.tc.stdlibId},
-        };
-        nlohmann::json dirs = nlohmann::json::array();
-        for (auto& d : ctx.plan.runtimeLibraryDirs) dirs.push_back(d.string());
-        nlohmann::json legacyCaps = nlohmann::json::array();
-        nlohmann::json providers = nlohmann::json::array();
-        for (auto& [cap, prov] : ctx.plan.runtimeProviders)
-        {
-            legacyCaps.push_back({{"capability", cap},
-                                  {"provider", prov.canonical()}});
-            providers.push_back({{"capability", cap},
-                                 {"provider", package_json(prov)}});
-        }
-        nlohmann::json requirements = nlohmann::json::array();
-        for (auto const& requirement : ctx.plan.runtimeRequirements) {
-            requirements.push_back({
-                {"kind", requirement.kind},
-                {"value", requirement.value},
-                {"phase", requirement.phase},
-                {"requester", package_json(requirement.requester)},
-                {"required", requirement.required},
-            });
-        }
-        nlohmann::json artifacts = nlohmann::json::array();
-        for (auto const& artifact : ctx.plan.runtimeArtifacts) {
-            artifacts.push_back({
-                {"role", artifact.role},
-                {"provider", package_json(artifact.provider)},
-                {"path", artifact.path.lexically_normal().generic_string()},
-                {"provenance", artifact.provenance},
-                {"abi", artifact.abi},
-                {"digest", artifact.digest},
-                {"host_fingerprint", artifact.hostFingerprint},
-                // A requirement must land on a THING, and the thing must be
-                // the one that was declared. mcpp already enforces this for
-                // the private libc; recording it per artifact makes a stale
-                // binding visible instead of leaving `providers:` naming
-                // something nobody checked.
-                {"identity", std::string(
-                    mcpp::build::runtime_validation::to_string(
-                        mcpp::build::runtime_validation
-                            ::artifact_identity_verdict(artifact)))},
-            });
-        }
-        nlohmann::json binding = nlohmann::json::parse(
-            mcpp::platform::runtime::serialize_runtime_binding(
-                ctx.plan.runtimeBinding), nullptr, false);
-        if (binding.is_discarded()) binding = nlohmann::json::object();
-
-        // ASKED OF THE PARSED TRIPLE, with the substring test kept only for a
-        // spelling `parse` rejects. This field is the SECOND copy of a
-        // derivation `mcpp.build.dist::format_for` already owns, and it had
-        // the same defect: mcpp's canonical `aarch64-macos` contains neither
-        // "apple" nor "darwin", so an explicit `--target aarch64-macos`
-        // recorded `"elf"` while the native build on the same machine recorded
-        // `"macho"` -- one report contradicting the other about one machine.
-        std::string format = "elf";
-        if (auto t = mcpp::toolchain::triple::parse(ctx.tc.targetTriple)) {
-            format = std::string(mcpp::toolchain::triple::to_string(t->object_format()));
-            std::ranges::transform(format, format.begin(),
-                [](unsigned char c) { return std::tolower(c); });
-            if (format == "mach-o") format = "macho";
-        } else {
-            auto triple = ctx.tc.targetTriple;
-            std::ranges::transform(triple, triple.begin(),
-                [](unsigned char c) { return std::tolower(c); });
-            const bool pe = triple.find("windows") != std::string::npos
-                         || triple.find("mingw") != std::string::npos;
-            const bool macho = triple.find("darwin") != std::string::npos
-                            || triple.find("apple") != std::string::npos;
-            format = pe ? "pe" : macho ? "macho" : "elf";
-        }
-        // The ORDERED run-time search closure with provenance. Order is
-        // semantics here, not presentation: it is what the loader will walk,
-        // and the mutable SubOS farm sitting last is the invariant that keeps
-        // libc resolving from the pinned payload. Recorded so "why does my GL
-        // program find its driver" is answerable without readelf, and so a
-        // regression in the ordering is visible to CI and to `mcpp why`.
-        nlohmann::json closure = nlohmann::json::array();
-        for (auto const& dir : ctx.plan.runtimeSearch) {
-            closure.push_back({
-                {"path", dir.path.generic_string()},
-                {"origin", std::string(
-                    mcpp::platform::search::to_string(dir.origin))},
-                {"machine_local",
-                    mcpp::platform::search::is_machine_local(dir.origin)},
-            });
-        }
-        nlohmann::json search = {
-            {"format", format},
-            {"link_library", format == "pe" ? "libpath" : "library_path"},
-            {"transitive_needed", format == "elf" ? "rpath_link" : "none"},
-            {"runtime", format == "pe" ? "deploy"
-                         : format == "macho" ? "loader_rpath" : "runpath"},
-            {"closure", closure},
-        };
-        // #418 — the contract each ROLE actually got, after any downgrade.
-        //
-        // `CompileFlags::contractByRole` was written and never read: a valuable
-        // observation with no way out of the process. Since #414 the shared
-        // library role can legitimately end up on a different contract from the
-        // binaries beside it, so "which one did my .so actually get?" is a
-        // question a user has, and the only answer available was to run
-        // `readelf` and infer.
-        //
-        // Recorded as the RESOLVED value, not the requested one — a request
-        // that was downgraded is exactly the case worth being able to see.
-        // `compute_flags` is pure in the plan; prepare does not otherwise hold
-        // the result, and threading it through just for this would widen a
-        // signature for one field.
-        const auto roleFlags = mcpp::build::compute_flags(ctx.plan);
-        nlohmann::json contracts = nlohmann::json::object();
-        for (std::size_t i = 0; i < mcpp::build::dist::kRoleCount; ++i) {
-            contracts[std::string(mcpp::build::dist::to_string(
-                          static_cast<mcpp::build::dist::Role>(i)))] =
-                std::string(mcpp::build::dist::to_string(roleFlags.contractByRole[i]));
-        }
-
-        // #634, X: the resolved dependency graph. One entry per package, the
-        // root first: its identity as `runtime` records identities, every
-        // request that reached it with the key as written and the table that
-        // declared it, and for a library the link form with its reason. It is
-        // what `mcpp why deps` prints, and what a test of a resolution rule
-        // reads instead of a warning's wording.
-        {
-            nlohmann::json graphPackages = nlohmann::json::array();
-            for (std::size_t i = 0; i < state.packages.size(); ++i)
-                graphPackages.push_back(state.graph_package_entry(i, /*forBuildProgram=*/false));
-            j["graph"] = { {"packages", std::move(graphPackages)} };
-        }
-
-        j["runtime"] = {
-            {"cxx_runtime_by_role", contracts},
-            {"library_dirs", dirs},
-            {"dlopen_libs", ctx.plan.runtimeDlopenLibs},
-            {"capabilities", legacyCaps},
-            {"binding", binding},
-            {"requirements", requirements},
-            {"artifacts", artifacts},
-            {"providers", providers},
-            {"link_intent", {
-                {"libraries", ctx.plan.linkIntent.libraries},
-                {"link_library_dirs",
-                    path_array(ctx.plan.linkIntent.linkLibraryDirs)},
-                {"transitive_needed_dirs",
-                    path_array(ctx.plan.linkIntent.transitiveNeededDirs)},
-                {"runtime_search_dirs",
-                    path_array(ctx.plan.linkIntent.runtimeSearchDirs)},
-                {"frameworks", ctx.plan.linkIntent.frameworks},
-                {"deploy_files", path_array(ctx.plan.linkIntent.deployFiles)},
-                {"deploy", [&] {
-                    auto a = nlohmann::json::array();
-                    for (auto const& d : ctx.plan.linkIntent.deploy)
-                        a.push_back({{"from", d.from.generic_string()},
-                                     {"to", d.to}});
-                    return a;
-                }()},
-            }},
-            {"search", search},
-            {"validation", {
-                {"status", format == "elf" ? "pending" : "not_exercised"},
-                {"source", "post_link"},
-                {"artifacts", nlohmann::json::array()},
-            }},
-        };
-        // THE MSVC SYSROOT OF THE CLANG ROW: which toolset and SDK the build
-        // compiled against, and where each came from. Absent on every other
-        // row, so a reader can tell "not this row" from "not recorded".
-        if (!ctx.plan.toolchain.msvcToolsDir.empty()) {
-            const auto& tcr = ctx.plan.toolchain;
-            j["msvc_toolset"] = {
-                {"version", tcr.msvcToolsVersion},
-                {"origin",  tcr.msvcOrigin},
-                {"product", tcr.msvcProduct},
-                {"root",    tcr.msvcToolsDir.generic_string()},
-            };
-            j["windows_sdk"] = {
-                {"version", tcr.windowsSdkVersion},
-                {"root",    tcr.windowsSdkRoot.generic_string()},
-            };
-        }
-        std::error_code ec;
-        std::filesystem::create_directories(ctx.plan.outputDir, ec);
-        auto path = ctx.plan.outputDir / "resolution.json";
-        auto tmp = path;
-        tmp += ".tmp";
-        if (std::ofstream js(tmp); js) {
-            js << j.dump(2) << "\n";
-            js.close();
-            std::filesystem::rename(tmp, path, ec);
-            if (ec) {
-                ec.clear();
-                std::filesystem::remove(path, ec);
-                ec.clear();
-                std::filesystem::rename(tmp, path, ec);
-            }
-        }
-    }
-
+static std::expected<void, std::string> step13_empty_link_check(PrepareState& state, BuildContext& ctx) {
     // ── A link unit with no inputs is not a build (mcpp#533) ────────────────
     //
     // Checked HERE, last, because objects arrive from three places and each
@@ -2365,6 +2087,44 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             lu.targetName, kindName, lu.output.generic_string(),
             lu.targetName));
     }
+    return {};
+}
+
+std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
+    BuildContext ctx;
+    ctx.strict      = state.overrides.strict;
+    ctx.manifest    = *state.m;
+    ctx.tc          = *state.tc;
+    ctx.fp          = state.fp;
+    ctx.runtimeSelection = state.runtimeSelection;
+    ctx.runtimeBinding = state.runtimeBindingSnapshot;
+    ctx.profile     = state.effectiveProfile;
+    ctx.activeFeatureRequest = state.overrides.features;
+    ctx.compilerChoice = { std::string(tc_origin_name(state.tcOrigin)),
+                           state.graphCompilerRequiredBy,
+                           state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
+                                                         : state.graphCompilerReplaced };
+    ctx.cacheMode   = state.cacheMode;
+    ctx.projectRoot= *state.root;
+    ctx.outputDir  = target_dir(*state.tc, state.fp, state.workRoot);
+
+    if (auto r = step13_source_packages(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_runner_and_xlings(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_prebuilt_check(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_link_forms(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_make_plan(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_cxx_private_runtime(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_cxx_process_runtime(state, ctx); !r) return std::unexpected(r.error());
+    step13_graph_and_schedule(state, ctx);
+    if (auto r = step13_build_graph_actions(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_assembly_units(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_windows_resources(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_dependency_cache(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_lockfile(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_runtime_provider_overrides(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_abi_enforcement(state, ctx); !r) return std::unexpected(r.error());
+    step13_resolution_json(state, ctx);
+    if (auto r = step13_empty_link_check(state, ctx); !r) return std::unexpected(r.error());
 
     ctx.planNotes = std::move(state.planNotes);
     return ctx;

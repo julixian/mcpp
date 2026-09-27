@@ -19,6 +19,7 @@ import mcpp.pm.index_contract;
 import mcpp.pm.index_snapshot;
 import mcpp.platform;
 import mcpp.log;
+import mcpp.ui;                 // closing notices of the refresh guard
 import mcpp.home;
 import mcpp.xpkg_version;
 import mcpp.libs.json;
@@ -111,7 +112,7 @@ namespace pinned {
     // no output (mcpp#693), and under an MCPP_HOME outside it the xlings mcpp
     // vendors could not initialise its sandbox. It now declares the UTF-8 code
     // page, as mcpp.exe does.
-    inline constexpr std::string_view kXlingsVersion   = "2026.9.27.1";
+    inline constexpr std::string_view kXlingsVersion   = "2026.9.28.1";
     inline constexpr std::string_view kNasmVersion     = "3.02";
 }
 
@@ -304,6 +305,18 @@ std::string shq_meta(std::string_view s);
 //     XLINGS_HOME='<home>' '<binary>'
 std::string build_command_prefix(const Env& env);
 
+// The Windows spelling of that prefix, compiled on every host so that it is
+// tested from any: `cd /d "<home>" && "<binary>"`. The variables are applied
+// by ScopedInvocationEnv instead.
+//
+// THE WORKING DIRECTORY IS THE HOME ON BOTH PLATFORMS (#726). xlings enters
+// project mode by walking up from its working directory to a `.xlings.json`.
+// Started from a project that has one -- a project whose own mcpp is pinned
+// there -- the registry's xlings adopted that project and wrote the shims of
+// mcpp's toolchain and payloads (`cl`, `link`, `cmake`, ...) into the
+// project's SubOS, whose `bin` is on PATH wherever the project's shell is.
+std::string windows_command_prefix(const Env& env);
+
 // THE ENVIRONMENT OF ONE XLINGS INVOCATION (#614), decided once. Each entry is
 // a variable, its value, and whether it is present at all. Global mode is an
 // absent XLINGS_PROJECT_DIR, because xlings resolves its subos scope from that
@@ -325,13 +338,19 @@ struct InvocationVar {
 };
 std::vector<InvocationVar> invocation_env(const Env& env);
 
-// Applies the scope half of `invocation_env` to this process for the guard's
-// lifetime on Windows, and restores the prior value when the guard ends. On
-// POSIX the command prefix carries it and the guard does nothing. Every
-// function that runs a command built by `build_command_prefix` holds one while
-// the command runs, so a project directory set for one invocation does not
-// reach the processes mcpp starts afterwards. XLINGS_HOME and the PATH prefix
-// keep their process-wide lifetime.
+// Applies `invocation_env` and the sandbox's `bin` in front of PATH to this
+// process for the guard's lifetime on Windows, and restores every prior value
+// when the guard ends. On POSIX the command prefix carries them and the guard
+// does nothing. Every function that runs a command built by
+// `build_command_prefix` holds one while the command runs.
+//
+// NOTHING OUTLIVES THE INVOCATION (#726). The process environment after an
+// xlings invocation is the one before it, so a build that installed a payload
+// starts ninja with the environment a build that installed nothing does. The
+// PATH prefix used to stay: the sandbox's `bin` holds the shims `xim:llvm`
+// registers on Windows (`cl`, `link`, `lib`, `rc`), and every action of a
+// first build then met them in front of MSVC's tools -- vcpkg's compiler
+// detection failed there while the second build passed.
 class ScopedInvocationEnv {
 public:
     explicit ScopedInvocationEnv(const Env& env);
@@ -1293,38 +1312,45 @@ std::vector<InvocationVar> invocation_env(const Env& env) {
 
 ScopedInvocationEnv::ScopedInvocationEnv(const Env& env) {
     if constexpr (mcpp::platform::is_windows) {
-        // Every variable but XLINGS_HOME is scope: applied for the guard's
-        // lifetime and restored after it. XLINGS_HOME keeps the process-wide
-        // lifetime `build_command_prefix` gives it.
-        for (auto const& var : invocation_env(env)) {
-            if (var.name == "XLINGS_HOME") continue;
+        auto save = [this](const std::string& name) {
             Saved s;
-            s.name = var.name;
-            if (auto prior = mcpp::platform::env::get(var.name)) {
+            s.name = name;
+            if (auto prior = mcpp::platform::env::get(name)) {
                 s.hadPrevious = true;
                 s.previous = *prior;
             }
             saved_.push_back(s);
+        };
+        for (auto const& var : invocation_env(env)) {
+            save(var.name);
             if (var.present) mcpp::platform::env::set(var.name, var.value);
             else             mcpp::platform::env::unset(var.name);
         }
+        save("PATH");
+        mcpp::platform::windows::prepend_path(paths::sandbox_bin(env).string());
     }
 }
 
 ScopedInvocationEnv::~ScopedInvocationEnv() {
-    for (auto const& s : saved_) {
-        if (s.hadPrevious) mcpp::platform::env::set(s.name, s.previous);
-        else               mcpp::platform::env::unset(s.name);
+    // Newest first, so a variable saved twice ends at its oldest value.
+    for (auto it = saved_.rbegin(); it != saved_.rend(); ++it) {
+        if (it->hadPrevious) mcpp::platform::env::set(it->name, it->previous);
+        else                 mcpp::platform::env::unset(it->name);
     }
+}
+
+std::string windows_command_prefix(const Env& env) {
+    return std::format("cd /d {} && {}",
+        mcpp::platform::shell::quote_windows(env.home.string()),
+        mcpp::platform::shell::quote_windows(env.binary.string()));
 }
 
 std::string build_command_prefix(const Env& env) {
     auto xvmBin = paths::sandbox_bin(env).string();
     if constexpr (mcpp::platform::is_windows) {
-        // The scope variable is applied by the caller's ScopedInvocationEnv.
-        mcpp::platform::env::set("XLINGS_HOME", env.home.string());
-        mcpp::platform::windows::prepend_path(xvmBin);
-        return env.binary.string();
+        // The environment is applied by the caller's ScopedInvocationEnv and
+        // restored after the command; building a command changes nothing.
+        return windows_command_prefix(env);
     } else {
         // `env` takes its `-u` operands before its assignments.
         std::string unset, assign;
@@ -1579,6 +1605,129 @@ std::vector<std::string> stderr_error_tail(std::string_view text, std::size_t li
     return {tail.begin(), tail.end()};
 }
 
+namespace {
+// The `files[]` of one NDJSON `download_progress` data event, in the order
+// xlings reports them; nullopt when the line carries none. Shared by the
+// sandbox bootstrap and the index refresh, which render the same event.
+std::optional<BootstrapProgress> download_progress_of(std::string_view line) {
+    LineScan ls{line};
+    auto p = line.find("\"files\":[");
+    if (p == std::string_view::npos) return std::nullopt;
+    p += 9;
+
+    BootstrapProgress prog;
+    prog.elapsedSec = ls.find_num("elapsedSec");
+
+    while (p < line.size()) {
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\n'
+                                   || line[p] == ',')) ++p;
+        if (p >= line.size() || line[p] == ']') break;
+        if (line[p] != '{') break;
+        int depth = 0;
+        auto start = p;
+        bool in_string = false;
+        for (; p < line.size(); ++p) {
+            char c = line[p];
+            if (in_string) {
+                if (c == '\\' && p + 1 < line.size()) { ++p; continue; }
+                if (c == '"') in_string = false;
+                continue;
+            }
+            if (c == '"')      in_string = true;
+            else if (c == '{') ++depth;
+            else if (c == '}') { if (--depth == 0) { ++p; break; } }
+        }
+        LineScan fl{line.substr(start, p - start)};
+        BootstrapFile f;
+        f.name            = fl.find_str("name");
+        f.downloadedBytes = fl.find_num("downloadedBytes");
+        f.totalBytes      = fl.find_num("totalBytes");
+        f.started         = fl.find_bool("started");
+        f.finished        = fl.find_bool("finished");
+        if (!f.name.empty()) prog.files.push_back(std::move(f));
+    }
+    if (prog.files.empty()) return std::nullopt;
+    return prog;
+}
+
+// The events of one `xlings interface update_packages` run, rendered with the
+// renderer every other acquisition uses (mcpp::ui::ProgressBar and
+// DownloadProgress). A `progress` event carries a phase and a percentage;
+// one bar is drawn per phase (xlings reports `index_sync`, one event per
+// repository, and `index_rebuild`, one event per descriptor file), so a
+// refresh prints a few lines off a terminal rather than one per file. A
+// `download_progress` data event is an index artifact being fetched. A line
+// that is not an event is not rendered: an xlings that predates structured
+// index progress printed its own terminal text on this stream, and the bar
+// is what replaces it.
+class IndexRefreshRenderer {
+public:
+    void line(std::string_view text) {
+        LineScan ls{text};
+        const auto kind = ls.find_str("kind");
+        if (kind == "result") {
+            resultExit_ = static_cast<int>(ls.find_num("exitCode"));
+        } else if (kind == "progress") {
+            const auto phase = ls.find_str("phase");
+            if (phase.empty()) return;
+            // A sync step names its repository at the end of its message
+            // (`syncing index repo 2/5: mcpplibs`); each repository is its
+            // own bar, labelled with that name.
+            std::string subject;
+            if (phase == "index_sync") {
+                const auto message = ls.find_str("message");
+                if (auto colon = message.rfind(": "); colon != std::string::npos)
+                    subject = message.substr(colon + 2);
+            }
+            const auto key = subject.empty() ? phase : phase + "/" + subject;
+            if (!bar_ || key != label_) {
+                if (bar_) bar_->finish();
+                shown_ = subject.empty() ? phase_label(phase)
+                                         : std::format("package index {}", subject);
+                bar_.emplace("Updating", shown_);
+                label_ = key;
+            }
+            const auto pct = std::clamp(ls.find_num("percent"), 0.0, 100.0);
+            bar_->update(static_cast<std::size_t>(pct));
+        } else if (kind == "data" && ls.find_str("dataKind") == "download_progress") {
+            auto prog = download_progress_of(text);
+            if (!prog) return;
+            if (bar_) { bar_->finish(); bar_.reset(); label_.clear(); }
+            std::vector<mcpp::ui::DownloadFile> files;
+            for (auto const& f : prog->files)
+                files.push_back({f.name,
+                                 static_cast<std::size_t>(f.downloadedBytes),
+                                 static_cast<std::size_t>(f.totalBytes),
+                                 f.started, f.finished});
+            download_.update(files, prog->elapsedSec);
+        }
+    }
+    // The exit code the result event carried, or -1 when none arrived.
+    int result_exit() const { return resultExit_; }
+    // The run failed or was stopped: the open bar says the step did not
+    // complete rather than reporting it done.
+    void fail() { failed_ = true; }
+    ~IndexRefreshRenderer() {
+        if (bar_) failed_ ? bar_->finish_failed(shown_) : bar_->finish();
+        failed_ ? download_.finish_failed() : download_.finish();
+    }
+
+private:
+    static std::string phase_label(std::string_view phase) {
+        if (phase == "index_sync")    return "package index (sync)";
+        if (phase == "index_rebuild") return "package index (rebuild)";
+        return std::format("package index ({})", phase);
+    }
+
+    std::optional<mcpp::ui::ProgressBar> bar_;
+    std::string                          label_;   // the phase (and repository) drawn
+    std::string                          shown_;   // the bar's label
+    bool                                 failed_ = false;
+    mcpp::ui::DownloadProgress           download_;
+    int                                  resultExit_ = -1;
+};
+} // namespace
+
 // ─── install_with_progress ──────────────────────────────────────────
 
 int install_with_progress(const Env& env, std::string_view target,
@@ -1615,10 +1764,11 @@ int install_with_progress(const Env& env, std::string_view target,
 
         // The direct install redirects all output to the null device, so it
         // produces zero feedback — on a slow/network-bound first run this
-        // looks frozen. Run the blocking std::system() on a worker thread and
-        // paint an in-place elapsed-time spinner on stderr while it runs.
-        // Only when interactive (not quiet, stderr/stdout is a TTY).
-        const bool showSpinner = !quiet && mcpp::platform::terminal::is_tty();
+        // looks frozen. Run the blocking command on a worker thread and draw
+        // an elapsed-time bar while it runs, with the renderer every other
+        // acquisition uses (W11): redrawn in place on a terminal, one start
+        // and one finish line otherwise, nothing under --quiet.
+        const bool showSpinner = !quiet;
 
         mcpp::platform::env::note_network_access();
         std::atomic<bool> done{false};
@@ -1637,29 +1787,21 @@ int install_with_progress(const Env& env, std::string_view target,
         });
 
         if (showSpinner) {
-            constexpr std::string_view frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-            // Each braille frame is 3 bytes in UTF-8.
-            constexpr std::size_t kFrameBytes = 3;
-            const std::size_t nFrames = frames.size() / kFrameBytes;
+            mcpp::ui::ProgressBar bar("Installing", target);
             const auto start = std::chrono::steady_clock::now();
-            std::size_t i = 0;
             while (!done.load(std::memory_order_acquire)) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - start).count();
-                std::print(stderr, "\r  {} installing {}  ({}s)\x1b[K",
-                    frames.substr((i % nFrames) * kFrameBytes, kFrameBytes),
-                    target, elapsed);
-                std::fflush(stderr);
-                ++i;
+                bar.update_indeterminate(0, std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count());
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
-            // Clear the spinner line.
-            std::print(stderr, "\r\x1b[K");
-            std::fflush(stderr);
+            worker.join();
+            if (directRc == 0) bar.finish();
+            else               bar.finish_failed(target);
+            if (directRc == 0) return 0;
+        } else {
+            worker.join();
+            if (directRc == 0) return 0;
         }
-
-        worker.join();
-        if (directRc == 0) return 0;
     }
 
     // Fallback: NDJSON interface path (provides progress callbacks).
@@ -1685,42 +1827,7 @@ int install_with_progress(const Env& env, std::string_view target,
         if (ls.find_str("dataKind") != "download_progress") return;
         if (!cb) return;
 
-        auto p = line.find("\"files\":[");
-        if (p == std::string_view::npos) return;
-        p += 9;
-
-        BootstrapProgress prog;
-        prog.elapsedSec = ls.find_num("elapsedSec");
-
-        while (p < line.size()) {
-            while (p < line.size() && (line[p] == ' ' || line[p] == '\n'
-                                       || line[p] == ',')) ++p;
-            if (p >= line.size() || line[p] == ']') break;
-            if (line[p] != '{') break;
-            int depth = 0;
-            auto start = p;
-            bool in_string = false;
-            for (; p < line.size(); ++p) {
-                char c = line[p];
-                if (in_string) {
-                    if (c == '\\' && p + 1 < line.size()) { ++p; continue; }
-                    if (c == '"') in_string = false;
-                    continue;
-                }
-                if (c == '"')      in_string = true;
-                else if (c == '{') ++depth;
-                else if (c == '}') { if (--depth == 0) { ++p; break; } }
-            }
-            LineScan fl{line.substr(start, p - start)};
-            BootstrapFile f;
-            f.name            = fl.find_str("name");
-            f.downloadedBytes = fl.find_num("downloadedBytes");
-            f.totalBytes      = fl.find_num("totalBytes");
-            f.started         = fl.find_bool("started");
-            f.finished        = fl.find_bool("finished");
-            if (!f.name.empty()) prog.files.push_back(std::move(f));
-        }
-        if (!prog.files.empty()) cb(prog);
+        if (auto prog = download_progress_of(line)) cb(*prog);
     };
 
     bool idleTimedOut = false;
@@ -2066,25 +2173,34 @@ int update_index(const Env& env, bool quiet) {
     // Report ONLY when the guard had to act. The common path — refresh keeps
     // the index readable — must stay silent, or the notice becomes noise that
     // users learn to skip past, which is the same as not printing it.
+    //
+    // A floor is not an error of the run (an index is data; mcpp is the
+    // program). Each case is one closing notice, printed after the command's
+    // own output (mcpp::ui::add_closing_notice), and only because this run
+    // refreshed the index. `quiet` governs the refresh's own narration, not
+    // these: they are the one thing the refresh has to say.
+    (void)quiet;
+    auto advice = [&](const std::filesystem::path& dir) {
+        auto it = out.requiredMcpp.find(dir);
+        return mcpp::pm::index_floor_upgrade_advice(
+            it == out.requiredMcpp.end() ? std::string_view{} : std::string_view{it->second});
+    };
     for (auto& dir : out.rolledBack) {
-        print_status("Kept", std::format(
-            "previous index for `{}` — the refreshed one requires a newer mcpp",
-            dir.filename().string()));
-        if (!quiet) {
-            std::println("      Your build continues to work with the packages "
-                         "it already describes.");
-            std::println("      Upgrade to pick up newer packages:  xlings update mcpp");
-        }
+        mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
+            "the refreshed package index `{}` requires a newer mcpp; this run "
+            "used the previous index. {}", dir.filename().string(), advice(dir)));
     }
     for (auto& dir : out.recovered) {
-        print_status("Restored", std::format(
-            "index `{}` from a local snapshot this mcpp can read",
-            dir.filename().string()));
+        mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
+            "the package index `{}` was restored from a local snapshot this mcpp "
+            "can read; the published index requires a newer mcpp. {}",
+            dir.filename().string(), advice(dir)));
     }
     for (auto& dir : out.stillUnusable) {
-        mcpp::log::verbose("index", std::format(
-            "index `{}` requires a newer mcpp and no local snapshot is usable",
-            dir.filename().string()));
+        mcpp::ui::add_closing_notice("MCPP_INDEX_REQUIRES_NEWER_MCPP", std::format(
+            "the package index `{}` requires a newer mcpp and no earlier copy is "
+            "usable; packages it serves cannot be resolved. {}",
+            dir.filename().string(), advice(dir)));
     }
     return rc;
 }
@@ -2119,7 +2235,15 @@ int update_index_unguarded(const Env& env, bool quiet) {
         return 0;
     }
 
-    std::string cmd = build_command_prefix(env) + " update 2>&1";
+    // Through the NDJSON interface, as installs are (W11): the refresh reports
+    // its steps as events and is drawn by the same renderer, instead of the
+    // bare CLI's terminal text, which was either reprinted verbatim or, for
+    // the automatic refresh, discarded, so a refresh of many seconds showed
+    // nothing. The interface's `update_packages` and the CLI's `update` are
+    // one function in xlings (xim::cmd_update).
+    std::string cmd = std::format("{} interface update_packages --args {} {} {}",
+        build_command_prefix(env), shq_meta("{}"), mcpp::platform::null_redirect,
+        mcpp::platform::is_windows ? "<NUL" : "</dev/null");
     mcpp::platform::env::note_network_access();
     // The index sync is a network git operation; a single transient blip (DNS,
     // TLS reset, a mirror hiccup) otherwise fails a cold `mcpp self env` /
@@ -2131,12 +2255,15 @@ int update_index_unguarded(const Env& env, bool quiet) {
     const auto refreshBound = index_refresh_timeout();
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
         bool timedOut = false;
-        rc = mcpp::platform::process::run_streaming_bounded(cmd,
-            [quiet](std::string_view line) {
-                if (!quiet) std::println("{}", line);
-            },
-            std::chrono::duration_cast<std::chrono::milliseconds>(refreshBound),
-            std::chrono::milliseconds{0}, &timedOut);
+        {
+            IndexRefreshRenderer renderer;
+            rc = mcpp::platform::process::run_streaming_bounded(cmd,
+                [&renderer](std::string_view line) { renderer.line(line); },
+                std::chrono::duration_cast<std::chrono::milliseconds>(refreshBound),
+                std::chrono::milliseconds{0}, &timedOut);
+            if (rc == 0 && renderer.result_exit() > 0) rc = renderer.result_exit();
+            if (rc != 0 || timedOut) renderer.fail();
+        }
         if (rc == 0 && !timedOut) { mark_known_indexes_refreshed(env); return 0; }
         // A refresh that exceeded its bound is not retried: the retries exist for
         // a transient failure that ends, and a connection that never answers
@@ -2158,8 +2285,13 @@ int update_index_unguarded(const Env& env, bool quiet) {
             std::this_thread::sleep_for(std::chrono::seconds(delay));
         }
     }
-    mcpp::log::verbose("index", std::format(
-        "index update failed after {} attempts (rc {})", kMaxAttempts, rc));
+    // Said, not only logged, to a caller that refreshes on its own (`quiet`:
+    // the TTL refresh before a build), which continues with the local index;
+    // `mcpp index update` reports the failure itself.
+    if (quiet)
+        std::println(stderr,
+            "warning: the package index refresh failed after {} attempts (exit {}); "
+            "continuing with the local index", kMaxAttempts, rc);
     return rc;
 }
 } // namespace

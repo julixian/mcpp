@@ -162,6 +162,48 @@ constexpr bool msvc_wants_static_crt(std::string_view linkage,
     return linkage == "static" || cxxRuntime == "self-contained";
 }
 
+// THE CRT MODEL WORD, SPELLED FOR WHICHEVER DRIVER `tc` IS.
+//
+// Every MSVC-ABI row now receives the model — cl and clang++ targeting
+// `*-windows-msvc` alike (#649 E10, #718) — because the CRT is a property of
+// the target ABI, not of the compiler. `dialect_for` still gives clang the
+// GNU dialect (its `-I`/`-D`/... spellings are unchanged), so this is NOT
+// `msvc_crt_flag(dialect_for(tc), ...)`: the GNU dialect's own
+// `staticRuntime` is `-static`, full static linking, a different axis this
+// function must not be confused with.
+//
+//   cl.exe                    /MT            | /MD
+//   clang++ *-windows-msvc    -fms-runtime-lib=static | -fms-runtime-lib=dll
+//   every other row           "" (MinGW links the MSVC CRT to no row at all)
+//
+// ONE HELPER, so the translation units (flags.cppm), the std and std.compat
+// BMIs (stdmod.cppm via clang.cppm/msvc.cppm) and the link command
+// (flags.cppm's `LinkShape::PeLld` branch) cannot spell three different
+// answers to the same question — which is exactly how E10 arose: a flag
+// given only at compile time does not reach clang's link step, which chooses
+// `-defaultlib:` on its own (measured, `2026-09-16-646-649-four-issues-by-
+// home.md` §4.5).
+std::string msvc_abi_crt_word(const Toolchain& tc, bool staticCrt);
+
+// A FREE-FORM CRT WORD IS ALWAYS A SECOND STATEMENT (D3, #718).
+//
+// Every MSVC-ABI build now states its own CRT model, so a literal spelling of
+// it in `[build] cxxflags` or `dialect_cxxflags` — cl's `/MT`/`/MD`(`d`) or
+// clang's `-fms-runtime-lib=*` (either dash) — can never be the only voice:
+// either it repeats what mcpp already resolved, or it contradicts it, and the
+// engine must never let the last word on the command line decide silently.
+//
+// `word` is one token already read out of a flags list (SPEC-004 §8's
+// per-word reading). `key` names where the caller found it, so the message
+// can point back at it. Returns nullopt for a spelling this function does not
+// recognise as a CRT word — it says nothing about flags outside this axis.
+struct CrtWordVerdict {
+    bool        contradicts;
+    std::string message;
+};
+std::optional<CrtWordVerdict> check_crt_word(std::string_view word,
+                                             bool staticCrt,
+                                             std::string_view key);
 
 // The two dialect rows, reachable without a Toolchain. Exposed so the MSVC
 // row — which no build reaches until the cl.exe backend lands — can still be
@@ -265,6 +307,14 @@ const CommandDialect& dialect_for(const Toolchain& tc) {
 const CommandDialect& gnu_dialect()  { return kGnuDialect; }
 const CommandDialect& msvc_dialect() { return kMsvcDialect; }
 
+std::string msvc_abi_crt_word(const Toolchain& tc, bool staticCrt) {
+    if (tc.compiler == CompilerId::MSVC)
+        return std::string(msvc_crt_flag(msvc_dialect(), staticCrt));
+    if (is_msvc_target(tc))
+        return staticCrt ? "-fms-runtime-lib=static" : "-fms-runtime-lib=dll";
+    return {};
+}
+
 std::string lib_flag_for(const CommandDialect& d, std::string_view name) {
     // Two shapes, one table entry: `{}` marks where the name goes, which is
     // a prefix position for GNU and a suffix position for MSVC.
@@ -281,6 +331,58 @@ std::string std_flag_for(const CommandDialect& d,
         return "/std:c++latest";
     }
     return std::format("{}{}", d.stdPrefix, canonical);
+}
+
+std::optional<CrtWordVerdict> check_crt_word(std::string_view word,
+                                             bool staticCrt,
+                                             std::string_view key) {
+    // Both dash conventions: cl.exe accepts `-MD` exactly as it does `/MD`,
+    // and a manifest that targets more than one driver from one list (SPEC-
+    // 004 §8) should not have to spell the word twice.
+    std::optional<bool> wantsStatic;
+    if (word == "/MT" || word == "-MT" || word == "/MTd" || word == "-MTd"
+        || word == "-fms-runtime-lib=static"
+        || word == "-fms-runtime-lib=static_dbg") {
+        wantsStatic = true;
+    } else if (word == "/MD" || word == "-MD" || word == "/MDd" || word == "-MDd"
+              || word == "-fms-runtime-lib=dll"
+              || word == "-fms-runtime-lib=dll_dbg") {
+        wantsStatic = false;
+    } else {
+        return std::nullopt;
+    }
+
+    // A DEBUG CRT WORD IS NEVER REDUNDANT. The model states static or dynamic
+    // and nothing about debug (that axis is deferred, docs/20), while the std
+    // module and the link are built against the release CRT it resolved. A
+    // debug word therefore compiles its units against a CRT nothing else uses.
+    const bool debugWord = word.ends_with("d") || word.ends_with("_dbg");
+    if (debugWord) {
+        return CrtWordVerdict{true, std::format(
+            "`{}` in {} asks for a debug CRT, which the CRT model does not "
+            "express; the standard library module and the link use {}. Remove "
+            "the flag",
+            word, key, staticCrt ? "the static CRT, /MT" : "the dynamic CRT, /MD")};
+    }
+    std::string_view wordValue =
+        *wantsStatic ? "the static CRT (/MT)" : "the dynamic CRT (/MD)";
+    if (*wantsStatic == staticCrt) {
+        return CrtWordVerdict{false, std::format(
+            "`{}` in {} agrees with the CRT model this build already "
+            "resolved and says nothing new. Write {} instead if {} should "
+            "stay an explicit statement, and drop the flag",
+            word, key,
+            staticCrt ? "`cxx_runtime = \"self-contained\"` (or `linkage = \"static\"`)"
+                      : "`cxx_runtime = \"toolchain-coupled\"` (or `\"host-coupled\"`)",
+            wordValue)};
+    }
+    return CrtWordVerdict{true, std::format(
+        "`{}` in {} asks for {}, which contradicts the CRT model this build "
+        "already resolved ({}). Every MSVC-ABI row now states its own CRT, "
+        "so the word can never be the only voice: remove it, or change "
+        "`cxx_runtime`/`linkage` to match",
+        word, key, wordValue,
+        staticCrt ? "the static CRT, /MT" : "the dynamic CRT, /MD")};
 }
 
 } // namespace mcpp::toolchain

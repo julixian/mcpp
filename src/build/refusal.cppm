@@ -149,6 +149,12 @@ enum class Code {
     // `[build] platform-dependencies = "refuse"` and a package in the graph
     // brings a platform SDK dependency (design §6).
     PlatformDependency,
+    // An explicit `cxx_runtime = "toolchain-coupled"` on an MSVC-ABI row
+    // whose resolved toolset carries no `VC\Redist\MSVC` directory (#718).
+    // Distinct from every other CRT-model message: the contract is not
+    // downgraded here, because an explicit statement a toolset cannot meet is
+    // an error, not a default to fall back from.
+    MsvcRedistUnavailable,
     Other,                 // a refusal that has not been given a code yet
 };
 
@@ -193,6 +199,8 @@ constexpr std::string_view name(Code c) {
                                          return "c-env-verification-mismatch";
         case Code::InterfaceNotProvided: return "interface-not-provided";
         case Code::PlatformDependency:   return "platform-dependency";
+        case Code::MsvcRedistUnavailable:
+            return "msvc-redist-unavailable";
         case Code::Other:                return "other";
     }
     return "other";

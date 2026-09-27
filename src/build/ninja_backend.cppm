@@ -1935,6 +1935,13 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         for (auto const& d : plan.linkIntent.runtimeSearchDirs)
             dirs += " " + ninja_command_word(d.string());
         append("rule place_dlls\n");
+        // One destination, one writer (SPEC-007 R4.2/R4.3, #723): `place-dlls`
+        // decides for itself which DLLs beside the program are another
+        // writer's (see cmd_place_dlls), so the command line carries no list.
+        // A list here changed whenever the plan's deploy set did -- and that
+        // set reads runtime search directories a `prepare` action fills, so it
+        // differs between the first plan and the second, and every build after
+        // the first re-ran the placement (e2e 797).
         append("  command = $mcpp place-dlls --output $out --depfile $out.d $in" + dirs + "\n");
         append("  depfile = $out.d\n");
         append("  deps = gcc\n");
@@ -2975,10 +2982,20 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     // previous `mcpp run` gets the skip-if-equivalent treatment instead of a
     // hard "cannot copy" failure.
     // Inert on RPATH platforms where the merged deploy list is empty.
+    //
+    // SPEC-007 R4.2 (#723): a destination with more than one source (two
+    // packages of this graph each generated the same file) becomes ONE edge
+    // with every source as an input, not one edge per source. `mcpp stage`
+    // is where they are checked against each other's bytes — planning cannot,
+    // because a generated source may not exist yet. A destination with
+    // exactly one source (every project before this feature, and most
+    // packages after it) emits the exact same line as always: the loop below
+    // reduces to the one-word case with no change in spelling.
     for (auto const& d : deployFiles) {
-        append(std::format("build {} : stage_file {}\n",
-            escape_ninja_path(d.dest),
-            escape_ninja_path(d.source)));
+        std::string ins;
+        for (auto const& s : d.sources) ins += " " + escape_ninja_path(s);
+        append(std::format("build {} : stage_file{}\n",
+            escape_ninja_path(d.dest), ins));
     }
     if (!deployFiles.empty())
         append("\n");

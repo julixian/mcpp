@@ -387,16 +387,26 @@ ClosureRead read_closure(const ClosureReadInput& in);
 // copy this function put beside the program is resolved again from its
 // directory rather than taken for a file of the program's own; `notes` names
 // each DLL that more than one directory offers, with the one the search order
-// chose.
+// chose; `warnings` names a DLL this function did NOT place because
+// `placedByOthers` already claims that name, together with the difference
+// found (SPEC-007 R4.2/R4.3: one destination, one writer, #723).
 struct RuntimeDllPlacement {
     std::vector<std::filesystem::path> sources;
     std::vector<std::string>           names;
     std::vector<std::string>           notes;
+    std::vector<std::string>           warnings;
 };
+// `placedByOthers` names the DLLs another writer already put directly beside
+// `program` (a declared deploy, or the toolchain's staged runtime; the caller
+// determines them from the directory, see cmd_place_dlls): a name in it is
+// never written here. When the resolved import differs from what is already
+// there, the difference is reported in `warnings` rather than silently kept
+// or silently overwritten.
 std::expected<RuntimeDllPlacement, Error>
 place_runtime_dlls(const std::filesystem::path& program,
                    const std::vector<std::filesystem::path>& searchDirs,
-                   const std::vector<std::string>& placedBefore = {});
+                   const std::vector<std::string>& placedBefore = {},
+                   const std::vector<std::string>& placedByOthers = {});
 
 // Build a Plan from already-resolved inputs. Caller is expected to have
 // already run `mcpp build` (or equivalent) and pass the resulting
@@ -1377,7 +1387,8 @@ make_tarball(const std::filesystem::path& stagingRoot,
 std::expected<RuntimeDllPlacement, Error>
 place_runtime_dlls(const std::filesystem::path& program,
                    const std::vector<std::filesystem::path>& searchDirs,
-                   const std::vector<std::string>& placedBefore)
+                   const std::vector<std::string>& placedBefore,
+                   const std::vector<std::string>& placedByOthers)
 {
     const auto programDir = program.parent_path();
     auto same_dir = [](const std::filesystem::path& a, const std::filesystem::path& b) {
@@ -1385,6 +1396,15 @@ place_runtime_dlls(const std::filesystem::path& program,
         if (std::filesystem::equivalent(a, b, ec)) return true;
         return a.lexically_normal() == b.lexically_normal();
     };
+    // PE names are case-insensitive, as the loader treats them.
+    auto lower = [](std::string_view s) {
+        std::string l(s);
+        std::ranges::transform(l, l.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+        return l;
+    };
+    std::set<std::string> deployedNames;
+    for (auto const& n : placedByOthers) deployedNames.insert(lower(n));
 
     ClosureReadInput in;
     in.object = program;
@@ -1392,7 +1412,18 @@ place_runtime_dlls(const std::filesystem::path& program,
     in.searchDirs.push_back(programDir.empty() ? std::filesystem::path(".") : programDir);
     for (auto const& d : searchDirs)
         if (!same_dir(d, in.searchDirs.front())) in.searchDirs.push_back(d);
+    // A name the deploy list places is, by the time this edge runs, already
+    // sitting in the program's own directory (that edge is an order-only
+    // dependency of the link this edge reads). Left alone, the closure
+    // resolution below would find that very copy in `searchDirs.front()` and
+    // treat the name as already resolved, so the runtime search directories'
+    // copy — the one to compare against — would never be looked at. Folding
+    // `placedByOthers` into `notInFirstDir` forces resolution from the OTHER
+    // search directories instead, exactly as it already does for a name THIS
+    // function placed on a previous run.
     in.notInFirstDir = placedBefore;
+    in.notInFirstDir.insert(in.notInFirstDir.end(),
+                           placedByOthers.begin(), placedByOthers.end());
     const auto read = read_closure(in);
 
     // The program itself is the one object the caller chose, so a program that
@@ -1406,6 +1437,25 @@ place_runtime_dlls(const std::filesystem::path& program,
     RuntimeDllPlacement out;
     for (auto const& m : read.members) {
         if (same_dir(m.source.parent_path(), in.searchDirs.front())) continue;
+
+        // SPEC-007 R4.2/R4.3: one destination, one writer. A name the merged
+        // deploy list already places beside this program is that list's
+        // file, not this mechanism's — `add_deploy`'s content check (`mcpp
+        // stage`) is the authority for it. This loop never writes over it; it
+        // only compares and, on a real difference, warns.
+        if (deployedNames.contains(lower(m.name))) {
+            const auto existing = programDir / m.name;
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(existing, ec)
+                && !mcpp::build::stage::same_content(m.source, existing)) {
+                out.warnings.push_back(std::format(
+                    "'{}' is placed by this project's deploy list; the runtime "
+                    "search directories also offer a different '{}', which was "
+                    "not used", existing.string(), m.source.string()));
+            }
+            continue;
+        }
+
         auto staged = mcpp::build::stage::stage_file(m.source, programDir / m.name);
         if (!staged)
             return std::unexpected(Error{std::format(

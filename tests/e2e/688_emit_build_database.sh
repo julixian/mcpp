@@ -110,8 +110,8 @@ assert e["kindVersion"] == 1, e["kindVersion"]
 assert "write-project" not in e["effects"], e["effects"]
 assert "read-project" in e["effects"], e["effects"]
 d = e["data"]
-assert d["spec"] == {"name": "s1", "version": "0.2.0"}, d["spec"]
-assert d["database"]["ide"]["profile-version"] == "0.2.0"
+assert d["spec"] == {"name": "s1", "version": "0.3.0"}, d["spec"]
+assert d["database"]["ide"]["profile-version"] == "0.3.0"
 assert d["inputs-fingerprint"].startswith("fnv1a:"), d["inputs-fingerprint"]
 EOF
 "$MCPP" --protocol-version > "$OUT/proto.json"

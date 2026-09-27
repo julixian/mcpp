@@ -59,29 +59,30 @@ import mcpp.wire;               // Severity, for PlanNote (#699 item 2, E3)
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase9_target_side(PrepareState& state) {
-    // ── THE TARGET SIDE, RESOLVED ONCE ───────────────────────────────────────
-    //
-    // HERE AND NOT EARLIER, AND THAT IS THE WHOLE POINT.
-    //
-    // mcpp serves two ways of supplying a target's platform interface, C
-    // library and C++ runtime, and the moment each becomes knowable is
-    // opposite: a prebuilt directory is known before dependency resolution, a
-    // set of packages only after it. Until now three separate derivations ran
-    // at the earlier moment and guessed the later answer — the family name in
-    // this file, `graphTargetSide` in flags, `graphCxxRuntime` in the contract
-    // — and they disagreed on the case none of them was written for. Measured:
-    //
-    //   ld64.lld: error: …/lib/x86_64-unknown-linux-gnu/libc++.so:
-    //                    unhandled file type
-    //
-    // for a pure C program crossed to macOS, whose graph supplies a C library
-    // and no C++ runtime at all.
-    //
-    // Placing the resolution after capability binding and before the root
-    // build.mcpp means every later consumer reads one value, and a build
-    // program can be told what was resolved rather than re-deriving it.
-    {
+// STEP FUNCTIONS (mcpp#722 / T6), one per section phase9's own banners
+// already named. Statements moved verbatim; two scoping braces that
+// wrapped several sections at once (no matching close inside any one
+// of them) are dropped as redundant, the same treatment graph.cpp and
+// features.cpp needed for their own such wrappers.
+
+// Hoisted from a local declaration inside phase9_target_side (mcpp#722 /
+// T6): `byLayer`'s element type, needed by the struct that now carries
+// gather state across step boundaries.
+struct TargetSideCandidate { mcpp::targetside::Provider p; bool direct; std::size_t index = 0; };
+
+// The locals phase9_target_side's first section (candidate gathering)
+// used to declare and every later section still reads: the PrepareState
+// pattern, one level deeper, for one phase's own steps.
+struct TargetSideGather {
+    mcpp::targetside::Inputs in;
+    std::map<int, std::vector<TargetSideCandidate>> byLayer;
+    std::vector<mcpp::targetside::Requirement> requirements;
+};
+
+static std::expected<TargetSideGather, std::string>
+step9_gather_target_side_candidates(PrepareState& state) {
+    namespace tsd = mcpp::targetside;
+    TargetSideGather gather;
         namespace tsd = mcpp::targetside;
 
         // Scan the graph once for every layer. A package declares the layer it
@@ -107,10 +108,8 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         // publishes an include set the WHOLE build must see (see
         // `targetSideUsage` below), and reaching that package by name would be
         // a second lookup of something already in hand.
-        struct Candidate { tsd::Provider p; bool direct; std::size_t index = 0; };
-        std::map<int, std::vector<Candidate>> byLayer;
-        std::vector<tsd::Requirement>         requirements;
-
+        using Candidate = TargetSideCandidate;
+                
         const auto& rootDeps = state.m->dependencies;
         auto is_direct = [&](std::string_view name) {
             for (auto const& [k, _] : rootDeps) {
@@ -180,7 +179,7 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 p.hasStdModule  = !pkg.manifest.stdModule.empty();
                 p.cAbiDecl      = pkg.manifest.cAbiDecl;
 
-                auto& slot = byLayer[static_cast<int>(decl->layer)];
+                auto& slot = gather.byLayer[static_cast<int>(decl->layer)];
                 // A package may carry both spellings during the transition, and
                 // the array order is the author's, not a preference. Two entries
                 // from the SAME package are one supplier; the current spelling
@@ -212,12 +211,12 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 // read — as an error for the root and a warning for a
                 // dependency — so it is skipped rather than refused twice.
                 if (!parsed || !*parsed) continue;
-                requirements.push_back({ pkgId, (*parsed)->layer,
+                gather.requirements.push_back({ pkgId, (*parsed)->layer,
                                          (*parsed)->interfaceName });
             }
         }
 
-        for (auto const& [layerInt, slot] : byLayer) {
+        for (auto const& [layerInt, slot] : gather.byLayer) {
             if (slot.size() < 2) continue;
             tsd::Conflict c;
             c.layer     = static_cast<tsd::CapLayer>(layerInt);
@@ -230,12 +229,12 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
 
         auto provider_of = [&](tsd::CapLayer want)
             -> std::optional<tsd::Provider> {
-            auto it = byLayer.find(static_cast<int>(want));
-            if (it == byLayer.end() || it->second.empty()) return std::nullopt;
+            auto it = gather.byLayer.find(static_cast<int>(want));
+            if (it == gather.byLayer.end() || it->second.empty()) return std::nullopt;
             return it->second.front().p;
         };
 
-        tsd::Inputs in;
+        auto& in = gather.in;
         if (state.tc) {
             if (auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple)) {
                 in.llvmTriple         = tt->llvm_triple(
@@ -367,6 +366,13 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
             }
         }
 
+    return gather;
+}
+
+static std::expected<void, std::string>
+step9_resolve_and_realise_cabi(PrepareState& state, TargetSideGather& gather) {
+    namespace tsd = mcpp::targetside;
+    auto& in = gather.in;
         state.resolvedTargetSide = tsd::resolve(in);
         state.targetSideResolved = true;
 
@@ -608,7 +614,12 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         // line is assembled after it. A std BMI built against a different C
         // library than its importers is what e2e 181 catches.
         if (state.tc) state.tc->cAbiPrebuilt = state.resolvedTargetSide.cAbi.prebuilt();
+    return {};
+}
 
+static std::expected<void, std::string>
+step9_target_side_include_broadcast(PrepareState& state, TargetSideGather& gather) {
+    namespace tsd = mcpp::targetside;
         // ── The target side's include set is a property of the BUILD ─────────
         //
         // IT WAS ALREADY COMPUTED, AND IT REACHED EXACTLY ONE TRANSLATION
@@ -651,8 +662,8 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
             std::set<std::size_t> layerProviderIndices;
             auto note_layer = [&](tsd::CapLayer which, const tsd::Layer& resolved) {
                 if (!resolved.fromGraph()) return;
-                auto it = byLayer.find(static_cast<int>(which));
-                if (it != byLayer.end() && !it->second.empty()) {
+                auto it = gather.byLayer.find(static_cast<int>(which));
+                if (it != gather.byLayer.end() && !it->second.empty()) {
                     layerProviderIndices.insert(it->second.front().index);
                     if (which == tsd::CapLayer::CxxAbi)
                         state.cxxLayerProviderIndex = it->second.front().index;
@@ -778,7 +789,11 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 state.appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvBuiltinsTokens);
             }
         }
+    return {};
+}
 
+static std::expected<void, std::string>
+step9_kernel_abi_interface_enumeration(PrepareState& state) {
         // INTERFACE ENUMERATION — THE RESOLUTION-TIME HALF OF THE CAPABILITY
         // MODEL (design 2026-09-20 §5.5; openkal SPEC 0.14 §3.3, §6.2).
         //
@@ -800,113 +815,116 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         // writes `[kernel-abi]` reaches neither loop below, so this addition
         // changes no command line and no diagnostic for every project built
         // before it.
-        {
-            // THE LIST COMES FROM THE PACKAGE THAT RESOLVED AS THE LAYER, NOT
-            // FROM THE FIRST ONE IN THE GRAPH THAT STATED ONE. A graph may
-            // carry more than one candidate for a layer — a workspace member
-            // beside a dependency, a second implementation reached through a
-            // feature that did not activate — and only one of them is the
-            // provider this build resolved. Reading whichever came first in
-            // `packages` would compare a consumer's requirements against an
-            // implementation the build is not using, which is a wrong answer
-            // rather than a missing one.
-            std::vector<std::string> providedInterfaces;
-            std::string providerId;
-            for (auto& pkg : state.packages) {
-                if (pkg.manifest.kernelAbiProvidesInterfaces.empty()) continue;
-                // `impl` is `name@version`; the name is what precedes the
-                // separator. A substring test would match `openkal` against
-                // `openkal-linux@0.15.0` and read one implementation's list
-                // as another's.
-                if (!state.resolvedTargetSide.kernelAbi.impl.empty()) {
-                    auto const& impl = state.resolvedTargetSide.kernelAbi.impl;
-                    const auto at = impl.find('@');
-                    const auto implName = at == std::string::npos
-                        ? impl : impl.substr(0, at);
-                    if (implName != pkg.manifest.package.name) continue;
-                }
-                providedInterfaces = pkg.manifest.kernelAbiProvidesInterfaces;
-                providerId = pkg.manifest.package.name;
-                break;
+        // THE LIST COMES FROM THE PACKAGE THAT RESOLVED AS THE LAYER, NOT
+        // FROM THE FIRST ONE IN THE GRAPH THAT STATED ONE. A graph may
+        // carry more than one candidate for a layer — a workspace member
+        // beside a dependency, a second implementation reached through a
+        // feature that did not activate — and only one of them is the
+        // provider this build resolved. Reading whichever came first in
+        // `packages` would compare a consumer's requirements against an
+        // implementation the build is not using, which is a wrong answer
+        // rather than a missing one.
+        std::vector<std::string> providedInterfaces;
+        std::string providerId;
+        for (auto& pkg : state.packages) {
+            if (pkg.manifest.kernelAbiProvidesInterfaces.empty()) continue;
+            // `impl` is `name@version`; the name is what precedes the
+            // separator. A substring test would match `openkal` against
+            // `openkal-linux@0.15.0` and read one implementation's list
+            // as another's.
+            if (!state.resolvedTargetSide.kernelAbi.impl.empty()) {
+                auto const& impl = state.resolvedTargetSide.kernelAbi.impl;
+                const auto at = impl.find('@');
+                const auto implName = at == std::string::npos
+                    ? impl : impl.substr(0, at);
+                if (implName != pkg.manifest.package.name) continue;
             }
-            // A REQUIREMENT NOBODY ANSWERED IS SAID SO, because otherwise
-            // "yes" and "never asked" are the same reading.
-            //
-            // Three situations exist and two of them build: the provider
-            // states a list and it contains the requirement (build); it
-            // states a list and does not (refuse, below); it states nothing
-            // at all (build, and until this note, in silence). The third is
-            // deliberate --- `provides-interfaces` is younger than the
-            // implementations that exist, and a graph that has not adopted it
-            // must keep building --- but a consumer reading a green build
-            // cannot tell it from the first. One line closes that, and it
-            // costs nothing to a graph where the provider does declare.
-            std::size_t uncheckedRequirements = 0;
-            for (auto& pkg : state.packages) {
-                const auto& need = pkg.manifest.kernelAbiRequiresInterfaces;
-                if (need.empty()) continue;
-                if (providerId.empty()) {
-                    uncheckedRequirements += need.size();
-                    continue;
-                }
-                auto missing = mcpp::targetside::interfaces_not_provided(
-                    need, providedInterfaces);
-                if (missing.empty()) continue;
-                refusal::record(refusal::Code::InterfaceNotProvided);
-                std::string names;
-                for (auto const& mI : missing) {
-                    names += "\n         ";
-                    names += mI;
-                }
-                // THE CODE IS PRINTED, THE WAY E0006 IS, BECAUSE SOMETHING
-                // READS THIS. A refusal that only a person can recognise
-                // forces every machine consumer to match prose --- and prose
-                // that a package's own compile error could coincidentally
-                // contain. The mcpp-index compatibility measurement
-                // distinguishes "this graph does not supply what the member
-                // asked for" from "the member did not build" on exactly this
-                // token, and that distinction decides whether a member counts
-                // against a compatibility figure.
-                // THE LABEL SAYS WHICH IMPLEMENTATION WAS RESOLVED, NOT
-                // "provided by". The missing names are listed immediately
-                // above it, and `provided by fakekernel` under `openkal.space`
-                // reads as the statement that fakekernel provides it --- the
-                // exact opposite of what this refusal is about. Read once,
-                // rendered, which is the only way that kind of defect is
-                // visible: every assertion on this message matches an
-                // identifier inside it, and an identifier is in the right
-                // place under either wording.
-                return std::unexpected(std::format(
-                    "'{}' requires interfaces the resolved implementation does "
-                    "not provide. [interface-not-provided]{}\n"
-                    "       the resolved implementation is {} ({} interface{}), "
-                    "and none of those listed above is among them.\n"
-                    "       This is refused before anything is compiled "
-                    "because dependency resolution is the earliest time the "
-                    "question can be answered. Select an implementation that "
-                    "provides them, or remove them from [kernel-abi] "
-                    "requires-interfaces in '{}'.",
-                    pkg.manifest.package.name, names, providerId,
-                    providedInterfaces.size(),
-                    providedInterfaces.size() == 1 ? "" : "s",
-                    pkg.manifest.package.name));
+            providedInterfaces = pkg.manifest.kernelAbiProvidesInterfaces;
+            providerId = pkg.manifest.package.name;
+            break;
+        }
+        // A REQUIREMENT NOBODY ANSWERED IS SAID SO, because otherwise
+        // "yes" and "never asked" are the same reading.
+        //
+        // Three situations exist and two of them build: the provider
+        // states a list and it contains the requirement (build); it
+        // states a list and does not (refuse, below); it states nothing
+        // at all (build, and until this note, in silence). The third is
+        // deliberate --- `provides-interfaces` is younger than the
+        // implementations that exist, and a graph that has not adopted it
+        // must keep building --- but a consumer reading a green build
+        // cannot tell it from the first. One line closes that, and it
+        // costs nothing to a graph where the provider does declare.
+        std::size_t uncheckedRequirements = 0;
+        for (auto& pkg : state.packages) {
+            const auto& need = pkg.manifest.kernelAbiRequiresInterfaces;
+            if (need.empty()) continue;
+            if (providerId.empty()) {
+                uncheckedRequirements += need.size();
+                continue;
             }
-
-            if (uncheckedRequirements > 0) {
-                // THE IMPLEMENTATION IS NAMED FROM THE RESOLVED LAYER, not
-                // from whichever package happened to be first: the note has
-                // to say WHOSE silence this is, or a reader cannot act on it.
-                const auto& impl = state.resolvedTargetSide.kernelAbi.impl;
-                mcpp::ui::info("note", std::format(
-                    "kernel-abi interfaces: {} states none, {} requirement{} "
-                    "unchecked",
-                    impl.empty() ? std::string("the resolved implementation")
-                                 : impl,
-                    uncheckedRequirements,
-                    uncheckedRequirements == 1 ? "" : "s"));
+            auto missing = mcpp::targetside::interfaces_not_provided(
+                need, providedInterfaces);
+            if (missing.empty()) continue;
+            refusal::record(refusal::Code::InterfaceNotProvided);
+            std::string names;
+            for (auto const& mI : missing) {
+                names += "\n         ";
+                names += mI;
             }
+            // THE CODE IS PRINTED, THE WAY E0006 IS, BECAUSE SOMETHING
+            // READS THIS. A refusal that only a person can recognise
+            // forces every machine consumer to match prose --- and prose
+            // that a package's own compile error could coincidentally
+            // contain. The mcpp-index compatibility measurement
+            // distinguishes "this graph does not supply what the member
+            // asked for" from "the member did not build" on exactly this
+            // token, and that distinction decides whether a member counts
+            // against a compatibility figure.
+            // THE LABEL SAYS WHICH IMPLEMENTATION WAS RESOLVED, NOT
+            // "provided by". The missing names are listed immediately
+            // above it, and `provided by fakekernel` under `openkal.space`
+            // reads as the statement that fakekernel provides it --- the
+            // exact opposite of what this refusal is about. Read once,
+            // rendered, which is the only way that kind of defect is
+            // visible: every assertion on this message matches an
+            // identifier inside it, and an identifier is in the right
+            // place under either wording.
+            return std::unexpected(std::format(
+                "'{}' requires interfaces the resolved implementation does "
+                "not provide. [interface-not-provided]{}\n"
+                "       the resolved implementation is {} ({} interface{}), "
+                "and none of those listed above is among them.\n"
+                "       This is refused before anything is compiled "
+                "because dependency resolution is the earliest time the "
+                "question can be answered. Select an implementation that "
+                "provides them, or remove them from [kernel-abi] "
+                "requires-interfaces in '{}'.",
+                pkg.manifest.package.name, names, providerId,
+                providedInterfaces.size(),
+                providedInterfaces.size() == 1 ? "" : "s",
+                pkg.manifest.package.name));
         }
 
+        if (uncheckedRequirements > 0) {
+            // THE IMPLEMENTATION IS NAMED FROM THE RESOLVED LAYER, not
+            // from whichever package happened to be first: the note has
+            // to say WHOSE silence this is, or a reader cannot act on it.
+            const auto& impl = state.resolvedTargetSide.kernelAbi.impl;
+            mcpp::ui::info("note", std::format(
+                "kernel-abi interfaces: {} states none, {} requirement{} "
+                "unchecked",
+                impl.empty() ? std::string("the resolved implementation")
+                             : impl,
+                uncheckedRequirements,
+                uncheckedRequirements == 1 ? "" : "s"));
+        }
+    return {};
+}
+
+static std::expected<void, std::string>
+step9_layering_and_requirement_checks(PrepareState& state, TargetSideGather& gather) {
+    namespace tsd = mcpp::targetside;
         if (auto why = tsd::check_layering(state.resolvedTargetSide)) {
             refusal::record(refusal::Code::LayerOrdering);
             return std::unexpected(*why);
@@ -920,7 +938,7 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         // now means the project stated its own compiler, and the remedy has to
         // name that statement rather than a global default it is not using.
         if (auto why = tsd::check_requirements(
-                state.resolvedTargetSide, requirements,
+                state.resolvedTargetSide, gather.requirements,
                 tc_origin_is_user_explicit(state.tcOrigin) ? tc_origin_name(state.tcOrigin)
                                                      : std::string_view{})) {
             refusal::record(refusal::Code::LayerRequirement);
@@ -943,7 +961,11 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
             refusal::record(refusal::Code::HostCannotServe);
             return std::unexpected(state.unservedTargetDiagnosis);
         }
+    return {};
+}
 
+static void
+step9_pin_and_linkage_diagnostics(PrepareState& state) {
         // THE TARGET AND THE COMPILER ARE NOT BOUND TOGETHER, AND THE
         // TARGET ROW'S CONVENTION IS A FALLBACK RATHER THAN A RULE.
         //
@@ -1035,7 +1057,11 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 "target's system comes from the dependency graph: those "
                 "packages are compiled into this build as objects, and there "
                 "is no shared object to link against. The artifact is static.");
+}
 
+static std::expected<void, std::string>
+step9_same_os_check_and_report(PrepareState& state) {
+    namespace tsd = mcpp::targetside;
         // Reported, and reported HERE rather than recorded in a manifest field.
         //
         // A line a project writes states an intention, and it goes stale the
@@ -1122,7 +1148,11 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         }
         mcpp::ui::info("Target", tsd::format_report(
             state.resolvedTargetSide, reportedTargetName, mcpp::log::is_verbose()));
+    return {};
+}
 
+static std::expected<void, std::string>
+step9_platform_sdk_closure_visibility(PrepareState& state) {
         // CLOSURE VISIBILITY — design §6. Distinct from the five-layer
         // report above: a platform dependency is not a LAYER (no engine
         // vocabulary names it, and `mcpp.targetside` — the pure, layer-only
@@ -1177,8 +1207,26 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                                          : "platform dependencies",
                 joined));
         }
-    }
+    return {};
+}
 
+static std::expected<void, std::string>
+step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGather& gather) {
+    if (auto r = step9_kernel_abi_interface_enumeration(state); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step9_layering_and_requirement_checks(state, gather); !r)
+        return std::unexpected(r.error());
+
+    step9_pin_and_linkage_diagnostics(state);
+
+    if (auto r = step9_same_os_check_and_report(state); !r)
+        return std::unexpected(r.error());
+
+    return step9_platform_sdk_closure_visibility(state);
+}
+
+static std::expected<void, std::string> step9_layer_conditional_config(PrepareState& state) {
     // ── L1b: conditional sections whose predicate names a target-side layer ──
     //
     // The second half of the conditional axis, and it runs HERE for the same
@@ -1255,6 +1303,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         }
     }
 
+    return {};
+}
+
+static std::expected<void, std::string> step9_dependency_link_forms(PrepareState& state) {
     // ── #519: which FORM does each dependency take in this build ────────────
     //
     // The decision itself lives in `mcpp.build.linkage_form`, which is a pure,
@@ -1368,6 +1420,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         }
     }
 
+    return {};
+}
+
+static void step9_define_graph_package_entry_closure(PrepareState& state) {
     // ── The resolved graph, one derivation for two readers (#634 X, #647 E1) ──
     //
     // `resolution.json`'s `graph` section and the document the root build
@@ -1441,6 +1497,9 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         return entry;
     };
 
+}
+
+static std::expected<void, std::string> step9_root_build_program(PrepareState& state) {
     // ── L3: ROOT build.mcpp (moved after dependency resolution, design §3.1
     // item 4) ────────────────────────────────────────────────────────────────
     // Runs HERE — after dep resolution + feature activation (so the contract
@@ -1622,6 +1681,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
             state.planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
                 bp.error(), mcpp::wire::Severity::Error,
                 (*state.root / "build.mcpp").string()});
+            // Named so the device-source check below (and anything else whose
+            // premise is this program's directives) can tell a package whose
+            // program failed apart from one that simply has no program.
+            state.programFailedPackages.insert(state.root->string());
         }
         if (bp) {
             // THE SAME RULE THE DEPENDENCIES ARE HELD TO, WITH THE ROOT AS A PARTY.
@@ -1737,7 +1800,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 state.m->runtimeConfig.linkIntent.runtimeSearchDirs.end());
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step9_device_sources_reach_an_action(PrepareState& state) {
     // ── Every device source must reach some action ─────────────────────────
     //
     // A device-kind file is the one source the engine has no compile rule for.
@@ -1764,8 +1830,18 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
     // condition an action needs anyway -- one that compiles a file it does not
     // declare as an input does not rerun when that file changes -- so a rule
     // that satisfies it is a rule that rebuilds correctly.
+    //
+    // THE PREMISE OF THIS CHECK IS THE BUILD PROGRAM'S DIRECTIVES: an action
+    // consuming a device source is one such directive. A package whose program
+    // failed in this pass (`plan_only`, above) applied none of them, so every
+    // device source would read as an orphan -- not a second defect, only the
+    // shape the first one takes here. Such a package already carries its one
+    // diagnostic, `MCPP_BUILD_DATABASE_PROGRAM_FAILED`; this check does not run
+    // for it, exactly as SPEC-005 R5.2 now states (design 2026-09-27 §4.2,
+    // mcpp#724 side finding A).
     for (std::size_t i = 0; i < state.packages.size(); ++i) {
         auto const& pkg = state.packages[i];
+        if (state.programFailedPackages.contains(pkg.root.string())) continue;
         auto dit = state.deviceSourcesByPackage.find(pkg.root.string());
         if (dit == state.deviceSourcesByPackage.end() || dit->second.empty()) continue;
         auto const& mm = (i == 0) ? *state.m : pkg.manifest;
@@ -1781,6 +1857,9 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 orphans += "         " + rel + "\n";
         if (orphans.empty()) continue;
         std::error_code hasEc;
+        // The `programFailedPackages` skip above means this package's program,
+        // if it has one, ran and succeeded — `exists(build.mcpp)` here can no
+        // longer be true of a program that merely started and failed.
         const bool hasProgram = std::filesystem::exists(pkg.root / "build.mcpp", hasEc)
                               || !pkg.manifest.buildConfig.ruleModules.empty();
         refusal::record(refusal::Code::DeviceSourceUnconsumed);
@@ -1804,6 +1883,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                   "       drop them from `[build] sources`."));
     }
 
+    return {};
+}
+
+static std::expected<void, std::string> step9_rerun_input_prepare_dir(PrepareState& state) {
     // ── R1.3: a re-run input inside a `prepare` directory (SPEC-007 §3) ─────
     //
     // A build program's re-run set is declared BEFORE anything is built
@@ -1926,6 +2009,26 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         state.stdFlagAndDialect += ' ';
         state.stdFlagAndDialect += f;
     }
+    return {};
+}
+
+std::expected<void, std::string> phase9_target_side(PrepareState& state) {
+    auto gather = step9_gather_target_side_candidates(state);
+    if (!gather) return std::unexpected(gather.error());
+    if (auto r = step9_resolve_and_realise_cabi(state, *gather); !r)
+        return std::unexpected(r.error());
+    if (auto r = step9_target_side_include_broadcast(state, *gather); !r)
+        return std::unexpected(r.error());
+    if (auto r = step9_kernel_abi_interfaces_and_requirements(state, *gather); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step9_layer_conditional_config(state); !r) return std::unexpected(r.error());
+    if (auto r = step9_dependency_link_forms(state); !r) return std::unexpected(r.error());
+    step9_define_graph_package_entry_closure(state);
+    if (auto r = step9_root_build_program(state); !r) return std::unexpected(r.error());
+    if (auto r = step9_device_sources_reach_an_action(state); !r) return std::unexpected(r.error());
+    if (auto r = step9_rerun_input_prepare_dir(state); !r) return std::unexpected(r.error());
+
     return {};
 }
 

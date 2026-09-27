@@ -54,7 +54,11 @@ import mcpp.log;
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state) {
+// STEP FUNCTION (mcpp#722 / T6 follow-on): materializing root
+// generated_files, the host-toolchain closures phase3 assigns onto
+// state, and the index-refresh section, extracted verbatim.
+static std::expected<void, std::string>
+step3_define_host_tc_closures_and_refresh_index(PrepareState& state) {
 
     // Sysroot comes from the toolchain payload itself (GCC -print-sysroot,
     // Clang clang++.cfg). mcpp does not override it — the payload is
@@ -348,6 +352,13 @@ std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state)
             }
         }
     }
+    return {};
+}
+
+std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state) {
+    if (auto r = step3_define_host_tc_closures_and_refresh_index(state); !r)
+        return std::unexpected(r.error());
+
 
     // Set up project-level .mcpp/ directory for custom indices and/or the
     // [xlings] build environment (L-1). This creates .mcpp/.xlings.json with
@@ -429,7 +440,17 @@ std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state)
                                 penv.workspace.emplace_back(entry.target, entry.pin());
                         }
             }
-            if (state.runtimeSelection.ownerRoot == state.workRoot) {
+            // Two halves, two roots. The custom-indices half belongs to
+            // `state.workRoot`, where this invocation writes. The runtime-
+            // environment half (`penv`: deps/subos/workspace) belongs to the
+            // runtime's owner, `runtimeSelection.ownerRoot`: the workspace
+            // root when a member builds (e2e 205), the project root otherwise.
+            // Under `plan_only` (`emit build-database`) nothing is written
+            // into the project (SPEC-005 R2.1, mcpp#724 side finding B, e2e
+            // 817), so the owner's half goes to the planning directory too.
+            const auto& runtimeRoot = state.overrides.plan_only
+                ? state.workRoot : state.runtimeSelection.ownerRoot;
+            if (runtimeRoot == state.workRoot) {
                 mcpp::config::ensure_project_index_dir(
                     **cfg2, state.workRoot, state.m->indices, penv);
             } else {
@@ -438,7 +459,7 @@ std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state)
                         **cfg2, state.workRoot, state.m->indices, {});
                 if (materializeRootRuntime)
                     mcpp::config::ensure_project_index_dir(
-                        **cfg2, state.runtimeSelection.ownerRoot, {}, penv);
+                        **cfg2, runtimeRoot, {}, penv);
             }
 
             // `[xlings] deps` are DECLARED above and, until now, nothing

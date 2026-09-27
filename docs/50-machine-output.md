@@ -420,6 +420,7 @@ a program classifying the outcome reads `reason`:
 | `lld-required-absent` | the target links through lld directly and the resolved toolchain payload ships none |
 | `host-tool-toolchain` | `build.mcpp` under a cross `--target` needs a resolvable HOST toolchain and none is set |
 | `std-module-precompile` | the standard library's module could not be precompiled for this configuration |
+| `msvc-redist-unavailable` | an explicit `cxx_runtime = "toolchain-coupled"` on an MSVC-ABI row whose toolset has no redistributable directory to stage *(2026.9.28.1+)* |
 | `other` | a refusal whose branch has not been given a token yet |
 
 **One token is also printed by `mcpp build` itself.**
@@ -453,7 +454,7 @@ writes nothing into the project. `data` is:
 
 | field | |
 |---|---|
-| `spec` | `{"name": "s1", "version": "0.2.0"}`, or `{"name": "compile-commands"}` with `--spec compile-commands` |
+| `spec` | `{"name": "s1", "version": "0.3.0"}` (0.2.0 before 2026.9.28.1), or `{"name": "compile-commands"}` with `--spec compile-commands` |
 | `database` | the document of that specification: an S1 build database, or the entries `mcpp build --configure-only` writes to `compile_commands.json` |
 | `watch` | the inputs whose change can change the document: paths and glob patterns relative to the workspace root, or absolute paths |
 | `inputs-fingerprint` | `fnv1a:<16 hex digits>`, a digest of those inputs, the mcpp version and the selectors |
@@ -462,6 +463,13 @@ Without `--format`, the command prints the document alone; `-o <file>` writes
 whatever it would print to `<file>` instead. The content of the document, the
 no-write guarantee and the `watch` rules are
 [SPEC-005](specs/build-database.md).
+
+Since 2026.9.28.1 an S1 set also names the files that its package's build
+program generates, in `ide.generated` (S1 0.3.0 section 7.2). The command runs no
+action, so such a file does not exist yet in the directory the document names.
+Each entry gives the path a `mcpp build` of the same selection writes
+(`build-path`) and the step that writes it, so that an editor can say "generated,
+build once" instead of reporting a missing header.
 
 `emit` plans every selected member on its own (#699 item 1): one member's
 planning failure does not cost its siblings'. Outside a project, or when
@@ -505,6 +513,7 @@ fails there still fails the build.
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | warning | no standard-library build command names its module source, so that unit is not listed |
 | `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | note | a requested host tool is not in the tool store and is not built by the command; the plan names the path it will be published at (2026.9.27.1+; replaces the 2026.9.26.2 warning `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`) |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | error | a build program failed; its package is described without its directives |
+| `MCPP_INDEX_REQUIRES_NEWER_MCPP` | note | an index refreshed by this run requires a newer mcpp; the previous copy was kept or restored, or none is usable (2026.9.28.1+; the same notice a terminal run prints as its closing `tip:` line) |
 
 `--protocol-version` declares `init-mcpp-home`, `read-project`, `network`,
 `write-global-cache` and `exec-build-script` for the command, and never

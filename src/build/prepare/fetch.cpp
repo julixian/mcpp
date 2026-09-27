@@ -126,11 +126,40 @@ std::string git_cache_head(const std::filesystem::path& gitRoot) {
 // directory" — a second, different error that says nothing about the first.
 mcpp::platform::process::RunResult run_with_network_retry(
         std::string_view command,
-        const std::function<void()>& between) {
+        const std::function<void()>& between,
+        std::string_view progressLabel) {
     mcpp::platform::process::RunResult r{};
     mcpp::platform::env::note_network_access();   // the envelope's `effects` (#648 A4)
+    // A clone runs for as long as the repository takes to arrive, and its
+    // output was captured whole, so a large one showed nothing until it
+    // finished. With a label, git's download phase is drawn with the renderer
+    // every other acquisition uses (W11), each redraw read as it happens; the
+    // output is still kept whole for the failure message. A clone that writes
+    // nothing for fifteen minutes is stopped as stalled.
+    auto run_once = [&]() -> mcpp::platform::process::RunResult {
+        if (progressLabel.empty()) return mcpp::platform::process::capture(command);
+        mcpp::platform::process::RunResult out;
+        std::optional<mcpp::ui::ProgressBar> bar;
+        bool timedOut = false;
+        out.exit_code = mcpp::platform::process::run_streaming_bounded(command,
+            [&](std::string_view line) {
+                out.output.append(line).push_back('\n');
+                auto g = mcpp::fetcher::parse_git_progress(line);
+                if (!g || g->phase != "Receiving objects") return;
+                if (!bar) bar.emplace("Fetching", progressLabel);
+                bar->update(g->percent);
+            },
+            std::chrono::milliseconds{0}, std::chrono::minutes{15}, &timedOut,
+            /*split_on_cr=*/true);
+        if (bar) {
+            if (out.exit_code == 0 && !timedOut) bar->finish();
+            else                                 bar->finish_failed(progressLabel);
+        }
+        if (timedOut && out.exit_code == 0) out.exit_code = 124;
+        return out;
+    };
     for (int attempt = 1; attempt <= 3; ++attempt) {
-        r = mcpp::platform::process::capture(command);
+        r = run_once();
         if (r.exit_code == 0) return r;
         if (between) between();
         if (attempt < 3)

@@ -194,6 +194,10 @@ bind_msvc_sysroot(mcpp::toolchain::Toolchain& tc,
     tc.msvcToolsVersion = choice->version;
     tc.msvcOrigin       = origin;
     tc.msvcProduct      = choice->product;
+    // The toolset's own redistributable CRT (#718), reached from the
+    // sysroot rather than from a cl.exe path — this row runs no cl.exe.
+    tc.msvcRedistDir    = msvc::vc_redist_dir_for_tools_dir(
+        choice->toolsDir, tt->arch);
     if (sdk.sdk) {
         tc.windowsSdkRoot    = sdk.sdk->root;
         tc.windowsSdkVersion = sdk.sdk->version;

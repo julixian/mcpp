@@ -50,7 +50,15 @@ import mcpp.project;
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
+// STEP FUNCTIONS (mcpp#722 / T6): the closures phase4a_graph_load
+// assigns onto `state` (each captures only `state`) are split into two
+// groups; `LoadedDep` is hoisted here so it stays visible to
+// `state.loadVersionDep`, which is defined further down, in the
+// orchestrator itself (see the file's own comment for why it is not
+// split further).
+using LoadedDep = std::pair<std::filesystem::path, mcpp::manifest::Manifest>;
+
+static void step4a_define_split_and_identity_closures(PrepareState& state) {
     // The features each package ends up built with, index-aligned with
     // `packages`. Recorded at activation because the passes that run after it
     // — `[feature-xlings]` provisioning among them — otherwise have no way to
@@ -250,12 +258,9 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
         s.version = std::move(*resolved);
         return {};
     };
+}
 
-    // Acquire a version-source dep at a specific pinned version. Used both
-    // by the first-time walk and by the SemVer merger when a re-fetch at a
-    // different version is needed. Returns the dep's effective root (where
-    // mcpp.toml lives) and a fully loaded manifest.
-    using LoadedDep = std::pair<std::filesystem::path, mcpp::manifest::Manifest>;
+static void step4a_define_candidate_selection_closures(PrepareState& state) {
     // Identity-first candidate probe. A candidate is DISAMBIGUATED by the
     // DECLARED (namespace, name) of whatever descriptor the index holds — never
     // by whether a canonically-named file `<ns>.<short>.lua` happens to exist on
@@ -594,67 +599,95 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
         spec.candidates = std::move(candidates);
         return {};
     };
+}
 
-    // 0.0.10+: loadVersionDep accepts structured (ns, shortName) for
-    // namespace-aware lookup. depName is the map key (qualified or bare),
-    // kept for install() target formatting and error messages.
+// A phase-local struct passed by reference to the steps of ONE
+// loadVersionDep call -- the same pattern WorklistItemCtx (graph.cpp) and
+// HostToolCtx (features.cpp) use for the steps of one worklist item / one
+// requested tool. loadVersionDep is recursive (a preinstall hook may call
+// state.loadVersionDep again for one of its own dependencies below), so this
+// struct is local to one call's stack frame, not shared across calls.
+struct LoadVersionDepCtx {
+    std::string depName;
+    std::string ns;
+    std::string shortName;
+    std::string version;
+    const mcpp::pm::IndexSpec* idxSpec = nullptr;
+    bool useProjectEnv = false;
+    std::optional<std::string> luaContent;
+    std::optional<std::filesystem::path> installed;
+};
 
-    state.loadVersionDep = [&](const std::string& depName,
-                         const std::string& ns,
-                         const std::string& shortName,
-                         const std::string& version)
-        -> std::expected<LoadedDep, std::string>
-    {
-        auto cfg = state.get_cfg(true);
-        if (!cfg) return std::unexpected(cfg.error());
-        mcpp::fetcher::Fetcher fetcher(**cfg);
+// The body of the `readLuaContent` closure the single-function version of
+// this step captured per call. Used at two points below (the initial read,
+// and the re-check after a fresh install), so it is a named helper rather
+// than a per-call closure. `state.get_cfg` is memoized (state.cfg_opt), so
+// reconstructing `fetcher` here costs nothing beyond the first call.
+static std::optional<std::string>
+step4a_read_lua_content(PrepareState& state, LoadVersionDepCtx& ctx) {
+    auto cfg = state.get_cfg(true);
+    if (!cfg) return std::nullopt; // already validated once at closure entry
+    mcpp::fetcher::Fetcher fetcher(**cfg);
+    if (ctx.idxSpec && ctx.idxSpec->is_local()) {
+        auto indexPath = mcpp::config::resolve_project_index_path(*state.root, *ctx.idxSpec);
+        return mcpp::fetcher::Fetcher::read_xpkg_lua_from_path(
+            indexPath, ctx.ns, ctx.shortName);
+    }
+    if (ctx.idxSpec && !ctx.idxSpec->is_builtin()) {
+        return mcpp::fetcher::Fetcher::read_xpkg_lua_from_project_data(
+            *state.root, ctx.ns, ctx.shortName);
+    }
+    return fetcher.read_xpkg_lua(ctx.ns, ctx.shortName);
+}
 
+// The body of the `findRawInstalled` closure. Used at two points below (the
+// initial completeness probe, and again after a fresh install), so it is a
+// named helper rather than a per-call closure.
+static std::optional<std::filesystem::path>
+step4a_find_raw_installed(PrepareState& state, LoadVersionDepCtx& ctx) {
+    auto cfg = state.get_cfg(true);
+    if (!cfg) return std::nullopt; // already validated once at closure entry
+    mcpp::fetcher::Fetcher fetcher(**cfg);
+    if (ctx.useProjectEnv) {
+        if (auto p = mcpp::fetcher::Fetcher::install_path_from_project_data(
+                *state.root, ctx.ns, ctx.shortName, ctx.version)) {
+            return p;
+        }
+    }
+    return fetcher.install_path(ctx.ns, ctx.shortName, ctx.version);
+}
+
+// The body of the `markInstalled` closure, called once below after a fresh
+// install completes.
+static void step4a_mark_installed(const std::filesystem::path& p) {
+    mcpp::fallback::mark_install_complete(p);
+}
+
+static std::expected<void, std::string>
+step4a_load_version_dep_locate(PrepareState& state, LoadVersionDepCtx& ctx) {
         // ─── Routing: check if this dep's namespace maps to a custom index ──
-        auto* idxSpec = state.findIndexForNs(ns);
+        ctx.idxSpec = state.findIndexForNs(ctx.ns);
 
-        const bool useProjectEnv = idxSpec && !idxSpec->is_builtin();
+        ctx.useProjectEnv = ctx.idxSpec && !ctx.idxSpec->is_builtin();
 
-        auto readLuaContent = [&]() -> std::optional<std::string> {
-            if (idxSpec && idxSpec->is_local()) {
-                auto indexPath = mcpp::config::resolve_project_index_path(*state.root, *idxSpec);
-                return mcpp::fetcher::Fetcher::read_xpkg_lua_from_path(
-                    indexPath, ns, shortName);
-            }
-            if (idxSpec && !idxSpec->is_builtin()) {
-                return mcpp::fetcher::Fetcher::read_xpkg_lua_from_project_data(
-                    *state.root, ns, shortName);
-            }
-            return fetcher.read_xpkg_lua(ns, shortName);
-        };
-
-        auto luaContent = readLuaContent();
-        if (idxSpec && idxSpec->is_local() && !luaContent) {
-            auto indexPath = mcpp::config::resolve_project_index_path(*state.root, *idxSpec);
+        ctx.luaContent = step4a_read_lua_content(state, ctx);
+        if (ctx.idxSpec && ctx.idxSpec->is_local() && !ctx.luaContent) {
+            auto indexPath = mcpp::config::resolve_project_index_path(*state.root, *ctx.idxSpec);
             return std::unexpected(with_index_cause(std::format(
                 "dependency '{}': not found in local index at '{}'",
-                depName, indexPath.string())));
+                ctx.depName, indexPath.string())));
         }
 
-        auto findRawInstalled = [&]() -> std::optional<std::filesystem::path> {
-            if (useProjectEnv) {
-                if (auto p = mcpp::fetcher::Fetcher::install_path_from_project_data(
-                        *state.root, ns, shortName, version)) {
-                    return p;
-                }
-            }
-            return fetcher.install_path(ns, shortName, version);
-        };
-
         auto installedLayoutMatchesIndex = [&](const std::filesystem::path& verRoot) -> bool {
-            if (!luaContent) return false;
+            if (!ctx.luaContent) return false;
 
-            auto field = mcpp::manifest::extract_mcpp_field(*luaContent);
+            auto field = mcpp::manifest::extract_mcpp_field(*ctx.luaContent);
             if (field.kind == mcpp::manifest::McppField::StringPath) {
                 return !mcpp::modgraph::expand_glob(verRoot, field.value).empty();
             }
             if (field.kind == mcpp::manifest::McppField::TableBody) {
                 auto dm = mcpp::manifest::synthesize_from_xpkg_lua(
-                    *luaContent, shortName, version, *state.targetPlatform);
+                    *ctx.luaContent, ctx.shortName, ctx.version, *state.targetPlatform);
                 if (!dm) return false;
                 for (auto const& [generatedPath, _] : dm->buildConfig.generatedFiles) {
                     if (!generatedPath.empty()) return true;
@@ -684,10 +717,10 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
         // and records the new revision. A payload with no xlings record at
         // all is judged by the marker alone, as before.
         const int recipeRevision = [&] {
-            if (!luaContent) return 0;
+            if (!ctx.luaContent) return 0;
             for (auto const& e : mcpp::manifest::list_xpkg_version_entries(
-                     *luaContent, *state.targetPlatform))
-                if (e.version == version) return e.revision;
+                     *ctx.luaContent, *state.targetPlatform))
+                if (e.version == ctx.version) return e.revision;
             return 0;
         }();
         auto revisionIsCurrent = [&](const std::filesystem::path& p) {
@@ -695,12 +728,12 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
             if (!installed || *installed == recipeRevision) return true;
             mcpp::log::verbose("fetcher", std::format(
                 "{}@{}: installed revision {}, descriptor revision {}; reinstalling",
-                depName, version, *installed, recipeRevision));
+                ctx.depName, ctx.version, *installed, recipeRevision));
             return false;
         };
 
         auto findCompleteInstalled = [&]() -> std::optional<std::filesystem::path> {
-            auto p = findRawInstalled();
+            auto p = step4a_find_raw_installed(state, ctx);
             if (!p) return std::nullopt;
             if (!revisionIsCurrent(*p)) return std::nullopt;
             if (mcpp::fallback::is_install_complete(*p)) return p;
@@ -712,23 +745,32 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
             return std::nullopt;
         };
 
-        auto markInstalled = [&](const std::filesystem::path& p) {
-            mcpp::fallback::mark_install_complete(p);
-        };
-
         // For custom indices, try project-level xlings data roots first.
         // Existing directories without the mcpp completion marker are treated
         // as stale/incomplete on this active resolve path and reinstalled.
-        std::optional<std::filesystem::path> installed = findCompleteInstalled();
+        ctx.installed = findCompleteInstalled();
+
+    return {};
+}
+
+static std::expected<void, std::string>
+step4a_load_version_dep_fetch(PrepareState& state, LoadVersionDepCtx& ctx) {
+        auto cfg = state.get_cfg(true);
+        if (!cfg) return std::unexpected(cfg.error());
+        mcpp::fetcher::Fetcher fetcher(**cfg);
+        auto const& depName = ctx.depName;
+        auto const& ns = ctx.ns;
+        auto const& shortName = ctx.shortName;
+        auto const& version = ctx.version;
 
         // #278 masking guard. The hard INV-NAME check lives on the install path
         // below, so a machine that already has the package from an older index
         // snapshot keeps building. That asymmetry is exactly the trap the issue
         // names — local green, clean CI red — so make it visible here instead of
         // letting it stay silent.
-        if (installed && luaContent) {
+        if (ctx.installed && ctx.luaContent) {
             if (auto violation = mcpp::manifest::
-                    xpkg_name_form_violation_from_lua(*luaContent)) {
+                    xpkg_name_form_violation_from_lua(*ctx.luaContent)) {
                 mcpp::ui::warning(std::format(
                     "dependency '{}': {}\n"
                     "       resolving from the already-installed copy; a clean "
@@ -737,12 +779,12 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
             }
         }
 
-        if (!installed) {
-            if (luaContent) {
-                auto field = mcpp::manifest::extract_mcpp_field(*luaContent);
+        if (!ctx.installed) {
+            if (ctx.luaContent) {
+                auto field = mcpp::manifest::extract_mcpp_field(*ctx.luaContent);
                 if (field.kind == mcpp::manifest::McppField::TableBody) {
                     auto depManifest = mcpp::manifest::synthesize_from_xpkg_lua(
-                        *luaContent, shortName, version, *state.targetPlatform);
+                        *ctx.luaContent, shortName, version, *state.targetPlatform);
                     if (!depManifest) {
                         return std::unexpected(std::format(
                             "dependency '{}': {}", depName, depManifest.error().format()));
@@ -802,11 +844,11 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
             // `mcpp::manifest::xpkg_wire_address` for why splitting the two
             // sources is the bug it is.
             auto wireAddr = mcpp::manifest::xpkg_wire_address(
-                luaContent ? std::string_view(*luaContent) : std::string_view{},
+                ctx.luaContent ? std::string_view(*ctx.luaContent) : std::string_view{},
                 ns, shortName);
-            if (luaContent) {
+            if (ctx.luaContent) {
                 if (auto violation = mcpp::manifest::
-                        xpkg_name_form_violation_from_lua(*luaContent)) {
+                        xpkg_name_form_violation_from_lua(*ctx.luaContent)) {
                     return std::unexpected(std::format(
                         "dependency '{}': {}", depName, *violation));
                 }
@@ -846,7 +888,7 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
                     into += (into.empty() ? "" : "\n  ") + std::string("xlings: ") + line;
             };
             auto install_one = [&](std::string target) -> std::expected<mcpp::xlings::CallResult, mcpp::pm::CallError> {
-                if (useProjectEnv) {
+                if (ctx.useProjectEnv) {
                     // Project/custom-index deps install into the project-local
                     // xlings data root (so a package's install hook can find
                     // sibling packages from the same index). The NDJSON
@@ -952,7 +994,7 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
                 // global xlings home), any child error text we captured, plus
                 // a hint about the known ≥2-repo xlings resolution gap. The
                 // real fix lives in openxlings/xlings; this only surfaces WHY.
-                auto xlingsJson = (useProjectEnv
+                auto xlingsJson = (ctx.useProjectEnv
                         ? (state.workRoot / ".mcpp")
                         : (*cfg)->xlingsHome())
                     / ".xlings.json";
@@ -975,23 +1017,32 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
                 return std::unexpected(std::move(diag));
             }
             // After install, check project data first for custom index packages.
-            installed = findRawInstalled();
-            if (!installed) return std::unexpected(std::format(
+            ctx.installed = step4a_find_raw_installed(state, ctx);
+            if (!ctx.installed) return std::unexpected(std::format(
                 "package '{}@{}' install path missing after fetch", depName, version));
-            markInstalled(*installed);
+            step4a_mark_installed(*ctx.installed);
         }
-        std::filesystem::path verRoot = *installed;
+
+    return {};
+}
+
+static std::expected<LoadedDep, std::string>
+step4a_load_version_dep_read_manifest(PrepareState& state, LoadVersionDepCtx& ctx) {
+        auto const& depName = ctx.depName;
+        auto const& shortName = ctx.shortName;
+        auto const& version = ctx.version;
+        std::filesystem::path verRoot = *ctx.installed;
 
         // Route xpkg.lua reading through the appropriate index.
-        if (!luaContent) {
-            luaContent = readLuaContent();
+        if (!ctx.luaContent) {
+            ctx.luaContent = step4a_read_lua_content(state, ctx);
         }
-        if (!luaContent) return std::unexpected(with_index_cause(std::format(
+        if (!ctx.luaContent) return std::unexpected(with_index_cause(std::format(
             "dependency '{}': index entry not found in local clone", depName)));
-        auto field = mcpp::manifest::extract_mcpp_field(*luaContent);
+        auto field = mcpp::manifest::extract_mcpp_field(*ctx.luaContent);
 
         // 0.0.6+: read explicit namespace from xpkg lua if present.
-        auto luaNs = mcpp::manifest::extract_xpkg_namespace(*luaContent);
+        auto luaNs = mcpp::manifest::extract_xpkg_namespace(*ctx.luaContent);
 
         std::optional<mcpp::manifest::Manifest> manifest;
         std::filesystem::path effRoot = verRoot;
@@ -1032,7 +1083,7 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
             if (auto r = loadFrom(matches.front()); !r) return std::unexpected(r.error());
         } else if (field.kind == mcpp::manifest::McppField::TableBody) {
             auto dm = mcpp::manifest::synthesize_from_xpkg_lua(
-                *luaContent, shortName, version, *state.targetPlatform);
+                *ctx.luaContent, shortName, version, *state.targetPlatform);
             if (!dm) return std::unexpected(std::format(
                 "dependency '{}': {}", depName, dm.error().format()));
             warn_unknown_xpkg_keys(*dm, depName);
@@ -1107,8 +1158,48 @@ std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
         if (state.abiThreadsRendered) state.add_once(manifest->buildConfig.cflags, "-pthread");
 
         return std::pair{effRoot, std::move(*manifest)};
+}
+
+std::expected<void, std::string> phase4a_graph_load(PrepareState& state) {
+    step4a_define_split_and_identity_closures(state);
+    step4a_define_candidate_selection_closures(state);
+
+    // 0.0.10+: loadVersionDep accepts structured (ns, shortName) for
+    // namespace-aware lookup. depName is the map key (qualified or bare),
+    // kept for install() target formatting and error messages.
+    //
+    // The body itself is split into the three steps a call passes through in
+    // sequence (locate an already-installed copy, fetch one if none is
+    // installed, then read its manifest) over a LoadVersionDepCtx that holds
+    // this call's parameters and the locals more than one step reads --
+    // step4a_load_version_dep_locate, step4a_load_version_dep_fetch and
+    // step4a_load_version_dep_read_manifest above. This lambda stays the
+    // entry point with the same signature, so `state.loadVersionDep`'s
+    // callers, including its own recursive call for a preinstall hook's
+    // dependencies, do not change.
+    state.loadVersionDep = [&](const std::string& depName,
+                         const std::string& ns,
+                         const std::string& shortName,
+                         const std::string& version)
+        -> std::expected<LoadedDep, std::string>
+    {
+        auto cfg = state.get_cfg(true);
+        if (!cfg) return std::unexpected(cfg.error());
+
+        LoadVersionDepCtx ctx;
+        ctx.depName   = depName;
+        ctx.ns        = ns;
+        ctx.shortName = shortName;
+        ctx.version   = version;
+
+        if (auto r = step4a_load_version_dep_locate(state, ctx); !r)
+            return std::unexpected(r.error());
+        if (auto r = step4a_load_version_dep_fetch(state, ctx); !r)
+            return std::unexpected(r.error());
+        return step4a_load_version_dep_read_manifest(state, ctx);
     };
     return {};
 }
+
 
 } // namespace mcpp::build

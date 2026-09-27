@@ -385,6 +385,17 @@ bool msvc_available_here(const std::filesystem::path& pkgsDir);
 std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
                                     std::string_view arch = "x64");
 
+// The same directory, reached from the row's SYSROOT rather than from a
+// cl.exe path: the LLVM row (clang++ targeting `*-windows-msvc`) runs no
+// cl.exe of its own, and its `Toolchain::linkRuntimeDirs` holds the LLVM
+// payload's own runtime directories, not this one (clang.cppm). `toolsDir`
+// is `Toolchain::msvcToolsDir` (`<VC>/Tools/MSVC/<v>`), the field
+// `bind_msvc_sysroot` already resolves for this row; `archGnu` is the
+// target triple's GNU-spelled architecture ("x86_64", "aarch64", "i686"),
+// mapped here to the "x64"/"arm64"/"x86" spelling `vc_redist_dir` takes.
+std::filesystem::path vc_redist_dir_for_tools_dir(
+    const std::filesystem::path& toolsDir, std::string_view archGnu);
+
 // Synthesize the environment cl.exe/link.exe need — what vcvars would set,
 // derived directly from the located VC tools + SDK (no vcvarsall.bat run):
 //   INCLUDE = <tools>\include; <sdk>\Include\<v>\{ucrt,um,shared,winrt}
@@ -1125,6 +1136,31 @@ constexpr std::string_view sdk_lib_arch = "x64";
 
 namespace {
 
+// Whether version directory name `a` is newer than `b`, compared by
+// dot-separated components, numerically where both are numbers (`14.9` is
+// older than `14.10`) and as text otherwise. An empty name is the oldest.
+bool newer_version(std::string_view a, std::string_view b) {
+    auto next = [](std::string_view& s) {
+        const auto dot = s.find('.');
+        const auto part = s.substr(0, dot);
+        s = dot == std::string_view::npos ? std::string_view{} : s.substr(dot + 1);
+        return part;
+    };
+    auto number = [](std::string_view p) -> std::optional<unsigned long long> {
+        unsigned long long n = 0;
+        const auto r = std::from_chars(p.data(), p.data() + p.size(), n);
+        if (p.empty() || r.ec != std::errc{} || r.ptr != p.data() + p.size()) return std::nullopt;
+        return n;
+    };
+    while (!a.empty() || !b.empty()) {
+        const auto pa = next(a), pb = next(b);
+        const auto na = number(pa), nb = number(pb);
+        if (na && nb) { if (*na != *nb) return *na > *nb; }
+        else if (pa != pb) return pa > pb;
+    }
+    return false;
+}
+
 // Highest version dir under `root/Include` that actually carries the UCRT
 // headers; `want` (from WindowsSdkVersion) wins if it is one of them.
 std::optional<WindowsSdk> pick_sdk_in(const std::filesystem::path& root,
@@ -1143,7 +1179,7 @@ std::optional<WindowsSdk> pick_sdk_in(const std::filesystem::path& root,
         auto v = e.path().filename().string();
         if (!usable(e.path(), v)) continue;
         if (!want.empty() && v == want) return WindowsSdk{root, v};
-        if (v > best) best = v;
+        if (newer_version(v, best)) best = v;
     }
     if (best.empty()) return std::nullopt;
     return WindowsSdk{root, best};
@@ -1460,11 +1496,13 @@ std::vector<std::string> std_compat_build_commands(
                               ref, crtFlag) };
 }
 
-std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
-                                    std::string_view arch) {
-    // <VC>/Tools/MSVC/<ver>/bin/Host<h>/<arch>/cl.exe → up 6 from the arch dir
-    auto vc = clPath.parent_path();
-    for (int i = 0; i < 6 && !vc.empty(); ++i) vc = vc.parent_path();
+namespace {
+
+// The scan shared by both spellings of "where is this toolset's redist":
+// given the `<VC>` root (the parent of `Tools` and `Redist` alike), the
+// newest `Redist\MSVC\<ver>\<arch>\Microsoft.VC*.CRT` directory.
+std::filesystem::path vc_redist_dir_under(const std::filesystem::path& vc,
+                                          std::string_view arch) {
     std::error_code ec;
     auto redist = vc / "Redist" / "MSVC";
     if (!std::filesystem::is_directory(redist, ec)) return {};
@@ -1485,13 +1523,36 @@ std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
                 continue;
             if (c.path().string().find("debug_nonredist") != std::string::npos)
                 continue;
-            if (auto ver = v.path().filename().string(); ver > bestVer) {
+            if (auto ver = v.path().filename().string(); newer_version(ver, bestVer)) {
                 bestVer = ver;
                 best = c.path();
             }
         }
     }
     return best;
+}
+
+} // namespace
+
+std::filesystem::path vc_redist_dir(const std::filesystem::path& clPath,
+                                    std::string_view arch) {
+    // <VC>/Tools/MSVC/<ver>/bin/Host<h>/<arch>/cl.exe → up 6 from the arch dir
+    auto vc = clPath.parent_path();
+    for (int i = 0; i < 6 && !vc.empty(); ++i) vc = vc.parent_path();
+    return vc_redist_dir_under(vc, arch);
+}
+
+std::filesystem::path vc_redist_dir_for_tools_dir(
+    const std::filesystem::path& toolsDir, std::string_view archGnu) {
+    // toolsDir = <VC>/Tools/MSVC/<ver> → up 3 reaches <VC>, the same root
+    // `vc_redist_dir` reaches by walking up from a cl.exe path.
+    auto vc = toolsDir.parent_path()   // Tools/MSVC
+                  .parent_path()      // Tools
+                  .parent_path();     // <VC>
+    std::string_view arch = "x64";
+    if (archGnu == "aarch64")                    arch = "arm64";
+    else if (archGnu == "i686" || archGnu == "x86") arch = "x86";
+    return vc_redist_dir_under(vc, arch);
 }
 
 std::expected<void, DetectError> enrich_toolchain_from_cl(Toolchain& tc) {
@@ -1571,6 +1632,11 @@ std::expected<void, DetectError> enrich_toolchain_from_cl(Toolchain& tc) {
     if (auto redist = vc_redist_dir(tc.binaryPath, parsed->second);
         !redist.empty()) {
         tc.linkRuntimeDirs.push_back(redist);
+        // Also its own field (#718): `msvc_abi_default_contract` and the
+        // staging gate read THIS rather than `linkRuntimeDirs`, which on the
+        // LLVM row holds LLVM's own directories instead — one name for "the
+        // toolset's redistributable" that means the same thing on both rows.
+        tc.msvcRedistDir = redist;
     }
     return {};
 }

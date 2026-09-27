@@ -45,6 +45,116 @@ import mcpp.project;
 
 namespace mcpp::build {
 
+// STEP FUNCTION (mcpp#722 / T6 follow-on): phase0's own "Workspace
+// handling" section, extracted verbatim.
+static std::expected<void, std::string> step0_workspace_handling(PrepareState& state) {
+    // ─── Workspace handling ────────────────────────────────────────────
+    // If the manifest has [workspace] and is a virtual workspace (no [package]),
+    // or if -p filter is set, switch to the target member's manifest.
+    if (state.m->workspace.present) {
+        std::string targetMember;
+
+        if (!state.overrides.package_filter.empty()) {
+            // `-p <name>`: the package identity first, the member's
+            // directory as a fallback -- one resolver shared with every
+            // other `-p`/`--package` command
+            // (mcpp::project::resolve_member_dir, #725).
+            auto matched = mcpp::project::resolve_member_dir(
+                *state.m, *state.root, state.overrides.package_filter);
+            if (!matched) return std::unexpected(matched.error());
+            targetMember = matched->lexically_relative(*state.root).generic_string();
+        } else if (state.m->package.name.empty()) {
+            // Virtual workspace: find a member with a program target ("is
+            // this the program", #622 A3's `is_program()`, so a member whose
+            // only target is `kind = "app"` is picked exactly as one whose
+            // target is `bin` is), or use last member.
+            for (auto& mp : state.m->workspace.members) {
+                auto memberDir = *state.root / mp;
+                auto mm = mcpp::manifest::load(memberDir / "mcpp.toml",
+                                               {.insideWorkspace = true});
+                if (!mm) continue;
+                for (auto& t : mm->targets) {
+                    if (t.is_program()) {
+                        targetMember = mp;
+                        break;
+                    }
+                }
+                if (!targetMember.empty()) break;
+            }
+            if (targetMember.empty() && !state.m->workspace.members.empty()) {
+                targetMember = state.m->workspace.members.back();
+            }
+        }
+        // else: rooted workspace with [package] — build root normally. Its own
+        // `x.workspace = true` entries name its own [workspace.dependencies].
+        // The workspace context is set here too (#725): it is a property of
+        // where the manifest lives, not of the branch that was taken, so a
+        // member this package reaches through its OWN `path` dependencies
+        // (`depIsMember`, graph.cpp) is recognised as a member and receives
+        // `[workspace.package]`, `[workspace.build]` and `x.workspace = true`
+        // the same way a sibling's `path` dependency does.
+        else if (state.m->workspace.present) {
+            state.runtimeWorkspaceRoot = *state.root;
+            state.wsManifest = *state.m;
+            mcpp::project::merge_workspace_deps(*state.m, *state.m, *state.root);
+        }
+
+        if (!targetMember.empty()) {
+            auto memberDir = *state.root / targetMember;
+            if (!std::filesystem::exists(memberDir / "mcpp.toml")) {
+                return std::unexpected(std::format(
+                    "workspace member '{}' has no mcpp.toml", targetMember));
+            }
+            state.runtimeWorkspaceRoot = *state.root;
+            state.wsManifest = std::move(*state.m);  // preserve workspace manifest
+            auto memberManifest = mcpp::manifest::load(memberDir / "mcpp.toml",
+                                                       {.insideWorkspace = true});
+            if (!memberManifest) return std::unexpected(std::format(
+                "workspace member '{}': {}", targetMember,
+                memberManifest.error().format()));
+            state.m = std::move(*memberManifest);
+
+            // ONE call, not a hand-copied list. `*root` is still the WORKSPACE
+            // root here (the `root = memberDir` reassignment below has not
+            // happened yet), which is what a relative `[indices].path` or
+            // `[workspace.dependencies] path` was written against (#224).
+            mcpp::project::inherit_workspace_config(*state.m, *state.wsManifest, *state.root);
+            if (auto bad = mcpp::project::workspace_inheritance_error(*state.m, memberDir))
+                return std::unexpected(*bad);
+
+            mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
+            state.root = memberDir;
+        }
+    } else {
+        // Not at workspace root: inside a member, the loader above has
+        // already inherited (#224 anchoring included). Only the workspace is
+        // recorded here, for the membership test of this member's own `path`
+        // dependencies.
+        if (state.effective && state.effective->member) {
+            state.runtimeWorkspaceRoot = state.effective->workspaceRoot;
+            state.wsManifest = std::move(*state.effective->workspace);
+        } else if (state.overrides.preloaded_manifest) {
+            auto wsRoot = mcpp::project::find_workspace_root(*state.root);
+            if (!wsRoot.empty()) {
+                if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
+                    wsm && wsm->workspace.present) {
+                    state.runtimeWorkspaceRoot = wsRoot;
+                    state.wsManifest = std::move(*wsm);
+                }
+            }
+            // A preloaded manifest was inherited at its dependency load site,
+            // which gives a member everything but the root-position keys. This
+            // build IS rooted at it (a host-tool sub-build), so it takes those
+            // too, from the workspace that lists it (#710).
+            if (state.wsManifest
+                && mcpp::project::is_workspace_member(*state.wsManifest, state.runtimeWorkspaceRoot, *state.root))
+                mcpp::project::inherit_workspace_root_position(
+                    *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
+        }
+    }
+    return {};
+}
+
 std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& state) {
     // A refusal decided early and released late. `host_can_serve` answers
     // "does a payload on this machine produce this target", which is knowable
@@ -221,106 +331,8 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
             state.root->string(), state.m->package.name, state.root->string()));
     }
 
-    // ─── Workspace handling ────────────────────────────────────────────
-    // If the manifest has [workspace] and is a virtual workspace (no [package]),
-    // or if -p filter is set, switch to the target member's manifest.
-    if (state.m->workspace.present) {
-        std::string targetMember;
+    if (auto r = step0_workspace_handling(state); !r) return std::unexpected(r.error());
 
-        if (!state.overrides.package_filter.empty()) {
-            // -p <name>: find matching member by directory basename or path
-            for (auto& mp : state.m->workspace.members) {
-                auto basename = std::filesystem::path(mp).filename().string();
-                if (basename == state.overrides.package_filter || mp == state.overrides.package_filter) {
-                    targetMember = mp;
-                    break;
-                }
-            }
-            if (targetMember.empty()) {
-                return std::unexpected(std::format(
-                    "workspace member '{}' not found in [workspace].members",
-                    state.overrides.package_filter));
-            }
-        } else if (state.m->package.name.empty()) {
-            // Virtual workspace: find a member with a program target ("is
-            // this the program", #622 A3's `is_program()`, so a member whose
-            // only target is `kind = "app"` is picked exactly as one whose
-            // target is `bin` is), or use last member.
-            for (auto& mp : state.m->workspace.members) {
-                auto memberDir = *state.root / mp;
-                auto mm = mcpp::manifest::load(memberDir / "mcpp.toml",
-                                               {.insideWorkspace = true});
-                if (!mm) continue;
-                for (auto& t : mm->targets) {
-                    if (t.is_program()) {
-                        targetMember = mp;
-                        break;
-                    }
-                }
-                if (!targetMember.empty()) break;
-            }
-            if (targetMember.empty() && !state.m->workspace.members.empty()) {
-                targetMember = state.m->workspace.members.back();
-            }
-        }
-        // else: rooted workspace with [package] — build root normally. Its own
-        // `x.workspace = true` entries name its own [workspace.dependencies].
-        else if (state.m->workspace.present)
-            mcpp::project::merge_workspace_deps(*state.m, *state.m, *state.root);
-
-        if (!targetMember.empty()) {
-            auto memberDir = *state.root / targetMember;
-            if (!std::filesystem::exists(memberDir / "mcpp.toml")) {
-                return std::unexpected(std::format(
-                    "workspace member '{}' has no mcpp.toml", targetMember));
-            }
-            state.runtimeWorkspaceRoot = *state.root;
-            state.wsManifest = std::move(*state.m);  // preserve workspace manifest
-            auto memberManifest = mcpp::manifest::load(memberDir / "mcpp.toml",
-                                                       {.insideWorkspace = true});
-            if (!memberManifest) return std::unexpected(std::format(
-                "workspace member '{}': {}", targetMember,
-                memberManifest.error().format()));
-            state.m = std::move(*memberManifest);
-
-            // ONE call, not a hand-copied list. `*root` is still the WORKSPACE
-            // root here (the `root = memberDir` reassignment below has not
-            // happened yet), which is what a relative `[indices].path` or
-            // `[workspace.dependencies] path` was written against (#224).
-            mcpp::project::inherit_workspace_config(*state.m, *state.wsManifest, *state.root);
-            if (auto bad = mcpp::project::workspace_inheritance_error(*state.m, memberDir))
-                return std::unexpected(*bad);
-
-            mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
-            state.root = memberDir;
-        }
-    } else {
-        // Not at workspace root: inside a member, the loader above has
-        // already inherited (#224 anchoring included). Only the workspace is
-        // recorded here, for the membership test of this member's own `path`
-        // dependencies.
-        if (state.effective && state.effective->member) {
-            state.runtimeWorkspaceRoot = state.effective->workspaceRoot;
-            state.wsManifest = std::move(*state.effective->workspace);
-        } else if (state.overrides.preloaded_manifest) {
-            auto wsRoot = mcpp::project::find_workspace_root(*state.root);
-            if (!wsRoot.empty()) {
-                if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
-                    wsm && wsm->workspace.present) {
-                    state.runtimeWorkspaceRoot = wsRoot;
-                    state.wsManifest = std::move(*wsm);
-                }
-            }
-            // A preloaded manifest was inherited at its dependency load site,
-            // which gives a member everything but the root-position keys. This
-            // build IS rooted at it (a host-tool sub-build), so it takes those
-            // too, from the workspace that lists it (#710).
-            if (state.wsManifest
-                && mcpp::project::is_workspace_member(*state.wsManifest, state.runtimeWorkspaceRoot, *state.root))
-                mcpp::project::inherit_workspace_root_position(
-                    *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
-        }
-    }
 
     if (auto bad = mcpp::project::unresolved_workspace_dependency_error(*state.m, *state.root))
         return std::unexpected(*bad);

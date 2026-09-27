@@ -350,13 +350,27 @@ mcpp searches upward from the current directory; if it finds an `mcpp.toml` cont
 
 ### 5.3 The `-p, --package` Option
 
-`-p` works with `build`, `test`, `run`, and other commands to select the target member. Its value is either the last path segment of a member's directory name or the full relative path:
+`-p` works with `build`, `test`, `run`, and other commands to select the target
+member. Its value is resolved in one order, because the option names a
+*package*:
+
+1. a member's qualified name, `<namespace>.<name>` (only meaningful for a
+   member that declares a namespace);
+2. otherwise, a member's bare `package.name` — refused, naming every match, if
+   two or more members share it;
+3. otherwise, a member's path as written in `[workspace] members`, or its
+   directory's last segment (the historical spellings, kept as a fallback).
 
 ```bash
-mcpp build -p server        # matches apps/server
+mcpp build -p server        # matches apps/server (by directory or package name)
 mcpp test -p core           # matches libs/core
 mcpp run -p server -- --port 8080
 ```
+
+A value that is one member's package name and a different member's directory
+selects the member named by the package, with a warning naming the other one —
+the option promises a package, so an exact package-name match outranks a
+directory that merely happens to share the spelling.
 
 `--workspace` (on `build` and `test`) is the fan-out form: it acts on **every**
 member. `mcpp test --workspace` reports each member separately and continues past a

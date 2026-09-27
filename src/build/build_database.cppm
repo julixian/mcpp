@@ -41,7 +41,8 @@ import mcpp.toolchain.stdmod;
 
 export namespace mcpp::build::database {
 
-inline constexpr std::string_view kProfileVersion = "0.2.0";
+// 0.3.0: a set carries `generated` (S1 section 7.2, mcpp#724).
+inline constexpr std::string_view kProfileVersion = "0.3.0";
 inline constexpr std::string_view kStdSetName      = "mcpp:std";
 
 // One planned member of the document.
@@ -271,6 +272,10 @@ struct SetData {
     std::string    familyName;
     std::string    kind;
     nlohmann::json units = nlohmann::json::array();
+    // S1 section 7.2: the files this plan generates and the set's units
+    // compile or include, and the generated include directories they name.
+    nlohmann::json          generated = nlohmann::json::array();
+    std::set<std::string>   generatedDirs;
 };
 
 } // namespace
@@ -365,6 +370,22 @@ Rendered render(std::span<const Member> members,
             return it->second;
         };
 
+        // GENERATED FILES (S1 0.3.0 section 7.2, mcpp#724). A planning pass
+        // runs no action (SPEC-005 R2.5), so a file a rule generates is absent
+        // from the directory this document names until a build writes it. The
+        // plan knows each generating step; the document states it, together
+        // with the path the build of the same configuration writes, so that a
+        // reader can tell "not built yet" from "missing" without knowing how
+        // the planning directory maps onto the project's own `target/`.
+        const auto planRoot = member.workDir.empty() ? ctx.projectRoot : member.workDir;
+        const auto generatedTree = (planRoot / "target" / ".build-mcpp").lexically_normal();
+        auto build_path = [&](const std::filesystem::path& p) {
+            if (!member.workDir.empty())
+                if (auto rel = relative_to(p, member.workDir); rel && !rel->empty())
+                    return native_string(ctx.projectRoot / std::filesystem::path(*rel));
+            return native_string(p);
+        };
+
         const auto flags = mcpp::build::compute_flags(ctx.plan);
         auto invocations = mcpp::build::unit_invocations(ctx.plan, flags);
         if (!toolchains.contains(tcId))
@@ -378,6 +399,10 @@ Rendered render(std::span<const Member> members,
                                    : "library";
             auto& set = set_for(member.setPrefix + package + (isTest ? ":test" : ""),
                                 package, kind);
+            for (auto const* dirs : {&cu.localIncludeDirs, &cu.localIncludeDirsAfter})
+                for (auto const& dir : *dirs)
+                    if (relative_to(dir, generatedTree))
+                        set.generatedDirs.insert(native_string(dir.lexically_normal()));
             nlohmann::json provides = nlohmann::json::object();
             if (!cu.providesModule.empty()) provides[cu.providesModule] = "";
             nlohmann::json requires_ = nlohmann::json::array();
@@ -443,6 +468,53 @@ Rendered render(std::span<const Member> members,
         // (prepare.cppm, onto BuildContext::planNotes) and reaches `r.notes`
         // through the unconditional copy below, with every other plan note.
 
+        {
+            using Role = mcpp::manifest::BuildAction::Role;
+            for (auto const& a : ctx.plan.actions) {
+                if (a.role != Role::Source || a.outputs.empty()) continue;
+                const std::string package = a.packageName.empty() ? rootName : a.packageName;
+                nlohmann::json inputs = nlohmann::json::array();
+                for (auto const& in : a.inputs)
+                    inputs.push_back(native_string(std::filesystem::path(in).lexically_normal()));
+                const nlohmann::json generator{
+                    {"id",             a.id},
+                    {"inputs",         std::move(inputs)},
+                    {"arguments",      a.command},
+                    {"work-directory", native_string(a.cwd.empty()
+                                           ? ctx.plan.outputDir
+                                           : std::filesystem::path(a.cwd))},
+                };
+                // SPEC-005 R3.12: every set of the package lists what its build
+                // program generates, its test set included, since the units
+                // that include a header are not known without preprocessing.
+                // `kind` is per set: `source` where a unit of that set is
+                // compiled from the file.
+                for (auto& [name, set] : groups) {
+                    if (set.familyName != package) continue;
+                    for (auto const& out : a.outputs) {
+                        const auto p = std::filesystem::path(out).lexically_normal();
+                        const auto path = native_string(p);
+                        const bool isUnit = std::ranges::any_of(set.units, [&](auto const& u) {
+                            return u.value("source", "") == path;
+                        });
+                        set.generated.push_back(nlohmann::json{
+                            {"path",       path},
+                            {"build-path", build_path(p)},
+                            {"kind",       isUnit ? "source" : "header"},
+                            {"generator",  generator},
+                        });
+                    }
+                }
+            }
+            for (auto& [name, set] : groups)
+                for (auto const& dir : set.generatedDirs)
+                    set.generated.push_back(nlohmann::json{
+                        {"path",       dir},
+                        {"build-path", build_path(std::filesystem::path(dir))},
+                        {"kind",       "directory"},
+                    });
+        }
+
         for (auto const& name : order) {
             auto& set = groups.at(name);
             nlohmann::json visible = nlohmann::json::array();
@@ -459,6 +531,8 @@ Rendered render(std::span<const Member> members,
                     {"kind",          set.kind},
                 }},
             };
+            if (!set.generated.empty())
+                setJson["ide"]["generated"] = std::move(set.generated);
             split_baseline(setJson);
             sets.push_back(std::move(setJson));
         }
