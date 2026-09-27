@@ -2406,6 +2406,34 @@ struct PrepareState {
     std::vector<mcpp::manifest::Target> extraTargets;
     BuildOverrides overrides;
     const ToolPurpose toolPurpose;
+
+    // ── P0: manifest and workspace resolution ───────────────────────────────
+    std::string unservedTargetDiagnosis;
+    std::optional<std::filesystem::path> appleSdkLocated;
+    bool iosFloorFromSdk = false;
+    std::string pinReplacedDefault;
+    std::optional<std::string> hostSpecBeforeRowPin;
+    std::string graphCompilerRequiredBy;
+    std::string graphCompilerFamily;
+    std::string graphCompilerReplaced;
+    std::string requestedCAbi;
+    std::string targetDisplayName;
+    std::string targetPinCandidate;
+    bool targetPinIsCapability = false;
+    std::string targetRowPin;
+    std::string targetRowName;
+    bool tcSpecIsMsvc = false;
+    std::optional<std::filesystem::path> root;
+    std::optional<mcpp::project::EffectiveManifest> effective;
+    std::expected<mcpp::manifest::Manifest, std::string> m = std::unexpected(std::string{});
+    std::optional<mcpp::manifest::Manifest> wsManifest;  // keep workspace manifest alive
+    std::filesystem::path runtimeWorkspaceRoot;
+    mcpp::xlings::runtime::RuntimeSelection runtimeSelection;
+    std::filesystem::path workRoot;
+    std::vector<PlanNote> planNotes;
+    std::map<std::string, mcpp::pm::LockedGitSource> gitLockAnchors;
+    std::map<std::string, std::string> packageIdentityLockAnchors;
+    CacheMode cacheMode{};
 };
 } // namespace
 
@@ -2424,7 +2452,6 @@ prepare_build(bool print_fingerprint,
     // before dependency resolution and is only half the question: a package in
     // the graph can supply the target's system, and the graph is not known
     // here. Held until it is, and released only if nothing supplies it.
-    std::string unservedTargetDiagnosis;
 
     // THE LOCATED APPLE SDK, RESOLVED ONCE AND READ ONCE.
     //
@@ -2432,17 +2459,15 @@ prepare_build(bool print_fingerprint,
     // the answer is stored would be two calls whose answers can differ -- the
     // developer directory can be switched between them -- and this repository
     // has a standing rule that a value crossing two sites is resolved at one.
-    std::optional<std::filesystem::path> appleSdkLocated;
     // The iOS floor was not written and was taken from the located SDK. The
     // refusal of a dependency's platform floor names where the value came
     // from, and after the fill below the manifest no longer says.
-    bool iosFloorFromSdk = false;
+    state.iosFloorFromSdk = false;
     // Non-empty when a target row's convention replaced a toolchain the user
     // had set with `mcpp toolchain default`. Reported on the status line,
     // because a substitution nobody is told about is a rule that can only be
     // learned by experiment — writing the same value a second time in
     // `[target.<triple>]` and observing that it works.
-    std::string pinReplacedDefault;
     // THE HOST SPEC AS IT STOOD BEFORE A TARGET ROW'S CONVENTION REPLACED IT,
     // whatever its origin. `build.mcpp` is compiled and run on this machine,
     // so its compiler is a host fact; the row's pin is a target fact. Before
@@ -2464,25 +2489,18 @@ prepare_build(bool print_fingerprint,
     // restore. `host_tc_for_build_program` resolves the platform's own
     // native default in that case instead (`native_first_run_spec()`), the
     // same one a plain `mcpp build` would have installed.
-    std::optional<std::string> hostSpecBeforeRowPin;
     // THE PACKAGE WHOSE `requires` CHOSE THE COMPILER, AND WHAT IT ASKED FOR.
     //
     // Non-empty only when the graph's requirement actually changed the answer.
     // Reported on the status line for the same reason `pinReplacedDefault` is:
     // a compiler the user did not name is a decision they did not make, and one
     // reported without its reason is a rule learned by experiment.
-    std::string graphCompilerRequiredBy;   // "openkal-llvm-runtime@0.1.3"
-    std::string graphCompilerFamily;       // "llvm"
-    std::string graphCompilerReplaced;     // the spec it displaced, for the line
     // The C library the target triple asked for, taken before the triple is
     // canonicalised. Empty when the project declined to name one.
-    std::string requestedCAbi;
     // The target as the project spelled it, when that differs from the
     // canonical identity. Report only; empty means they coincide.
-    std::string targetDisplayName;
     // The target row's toolchain convention, held until the graph is known.
     // Empty when the row names none or the project named its own.
-    std::string targetPinCandidate;
     // AND WHETHER THAT PIN IS A CONVENTION OR A CAPABILITY, RECORDED AT
     // THE SAME READ.
     //
@@ -2495,7 +2513,7 @@ prepare_build(bool print_fingerprint,
     //
     // Taken here rather than re-derived at the decision point, because the row
     // is read exactly once and both facts come out of that read.
-    bool targetPinIsCapability = false;
+    state.targetPinIsCapability = false;
     // THE ROW'S PIN, KEPT EVEN WHEN THE PROJECT NAMED ITS OWN COMPILER —
     // which is exactly when `targetPinCandidate` above is left empty.
     //
@@ -2503,17 +2521,15 @@ prepare_build(bool print_fingerprint,
     // "what does the convention SAY", and the two differ precisely in the case
     // that needs a diagnosis: a project that overrode the convention and has
     // nothing supplying what the convention was there to supply.
-    std::string targetRowPin;
-    std::string targetRowName;
     // Whether the resolved toolchain spec names the machine's own Visual
     // Studio. Decided inside `resolve_target_toolchain`, read by
     // `host_tc_for_build_program`, which is why it is declared out here.
-    bool tcSpecIsMsvc = false;
+    state.tcSpecIsMsvc = false;
 
-    auto root = state.overrides.project_root.empty()
+    state.root = state.overrides.project_root.empty()
         ? mcpp::project::find_manifest_root(std::filesystem::current_path())
         : std::optional<std::filesystem::path>(state.overrides.project_root);
-    if (!root) {
+    if (!state.root) {
         return std::unexpected("no mcpp.toml found in current directory or any parent");
     }
     // THE PROJECT'S PATH IS PART OF EVERY DOCUMENT A BUILD WRITES, and those
@@ -2522,13 +2538,13 @@ prepare_build(bool print_fingerprint,
     // with `internal: unhandled exception: [json.exception.type_error.316]`
     // (#693, measured on Linux with a Latin-1 name and on a Windows code page
     // 1252 host with a name that page can spell). It is refused here, by name.
-    if (!mcpp::modgraph::try_narrow(*root)) {
+    if (!mcpp::modgraph::try_narrow(*state.root)) {
         return std::unexpected(std::format(
             "the project directory '{}' has no UTF-8 spelling.\n"
             "       {}\n"
             "       Every file a build writes names this directory in UTF-8; "
             "rename or move it.",
-            mcpp::modgraph::escaped_spelling(*root),
+            mcpp::modgraph::escaped_spelling(*state.root),
             mcpp::modgraph::no_utf8_spelling_reason()));
     }
     // NOTE: `workRoot` is deliberately NOT derived here. `root` is not final
@@ -2559,16 +2575,15 @@ prepare_build(bool print_fingerprint,
     // inherits (see `inherit_as_workspace_member`). It is not inherited a second time; the
     // workspace it belongs to is still recorded below, so that its own sibling
     // dependencies inherit as members.
-    std::optional<mcpp::project::EffectiveManifest> effective;
-    std::expected<mcpp::manifest::Manifest, std::string> m =
+    state.m =
         std::unexpected(std::string{});
     if (state.overrides.preloaded_manifest) {
-        m = *state.overrides.preloaded_manifest;
+        state.m = *state.overrides.preloaded_manifest;
     } else {
-        auto loaded = mcpp::project::load_effective_manifest(*root);
+        auto loaded = mcpp::project::load_effective_manifest(*state.root);
         if (!loaded) return std::unexpected(loaded.error());
-        m = loaded->manifest;
-        effective = std::move(*loaded);
+        state.m = loaded->manifest;
+        state.effective = std::move(*loaded);
     }
 
     // AND ONLY FOR THE ROOT. A layer name this engine does not know is a
@@ -2577,11 +2592,11 @@ prepare_build(bool print_fingerprint,
     // rather than a silently disabled behaviour; refusing the second as well
     // meant the layer vocabulary could never be extended by a published package
     // (`warn_unknown_xpkg_keys` carries that half).
-    if (!m->unknownCapabilities.empty()) {
-        auto const& cap = m->unknownCapabilities.front();
+    if (!state.m->unknownCapabilities.empty()) {
+        auto const& cap = state.m->unknownCapabilities.front();
         auto why = mcpp::targetside::parse_capability(cap);
         return std::unexpected(std::format(
-            "{}: {}", (*root / "mcpp.toml").string(),
+            "{}: {}", (*state.root / "mcpp.toml").string(),
             why ? std::format("`{}` names no capability mcpp knows.", cap)
                 : why.error()));
     }
@@ -2595,7 +2610,7 @@ prepare_build(bool print_fingerprint,
     // Only the ROOT is refused. As a dependency this is exactly what the
     // package is for — the consumer compiles the interface and links the
     // artifact, which is the whole design.
-    if (!state.overrides.preloaded_manifest && mcpp::pack::is_distribution_package(*m)) {
+    if (!state.overrides.preloaded_manifest && mcpp::pack::is_distribution_package(*state.m)) {
         return std::unexpected(std::format(
             "'{}' is a distribution package produced by `mcpp pack`, not a source tree.\n"
             "  Its sources are interface declarations; the definitions are in the\n"
@@ -2604,20 +2619,18 @@ prepare_build(bool print_fingerprint,
             "  Use it: add it to a project as a dependency —\n"
             "      [dependencies]\n"
             "      {} = {{ path = \"{}\" }}",
-            root->string(), m->package.name, root->string()));
+            state.root->string(), state.m->package.name, state.root->string()));
     }
 
     // ─── Workspace handling ────────────────────────────────────────────
     // If the manifest has [workspace] and is a virtual workspace (no [package]),
     // or if -p filter is set, switch to the target member's manifest.
-    std::optional<mcpp::manifest::Manifest> wsManifest;  // keep workspace manifest alive
-    std::filesystem::path runtimeWorkspaceRoot;
-    if (m->workspace.present) {
+    if (state.m->workspace.present) {
         std::string targetMember;
 
         if (!state.overrides.package_filter.empty()) {
             // -p <name>: find matching member by directory basename or path
-            for (auto& mp : m->workspace.members) {
+            for (auto& mp : state.m->workspace.members) {
                 auto basename = std::filesystem::path(mp).filename().string();
                 if (basename == state.overrides.package_filter || mp == state.overrides.package_filter) {
                     targetMember = mp;
@@ -2629,13 +2642,13 @@ prepare_build(bool print_fingerprint,
                     "workspace member '{}' not found in [workspace].members",
                     state.overrides.package_filter));
             }
-        } else if (m->package.name.empty()) {
+        } else if (state.m->package.name.empty()) {
             // Virtual workspace: find a member with a program target ("is
             // this the program", #622 A3's `is_program()`, so a member whose
             // only target is `kind = "app"` is picked exactly as one whose
             // target is `bin` is), or use last member.
-            for (auto& mp : m->workspace.members) {
-                auto memberDir = *root / mp;
+            for (auto& mp : state.m->workspace.members) {
+                auto memberDir = *state.root / mp;
                 auto mm = mcpp::manifest::load(memberDir / "mcpp.toml",
                                                {.insideWorkspace = true});
                 if (!mm) continue;
@@ -2647,82 +2660,81 @@ prepare_build(bool print_fingerprint,
                 }
                 if (!targetMember.empty()) break;
             }
-            if (targetMember.empty() && !m->workspace.members.empty()) {
-                targetMember = m->workspace.members.back();
+            if (targetMember.empty() && !state.m->workspace.members.empty()) {
+                targetMember = state.m->workspace.members.back();
             }
         }
         // else: rooted workspace with [package] — build root normally. Its own
         // `x.workspace = true` entries name its own [workspace.dependencies].
-        else if (m->workspace.present)
-            mcpp::project::merge_workspace_deps(*m, *m, *root);
+        else if (state.m->workspace.present)
+            mcpp::project::merge_workspace_deps(*state.m, *state.m, *state.root);
 
         if (!targetMember.empty()) {
-            auto memberDir = *root / targetMember;
+            auto memberDir = *state.root / targetMember;
             if (!std::filesystem::exists(memberDir / "mcpp.toml")) {
                 return std::unexpected(std::format(
                     "workspace member '{}' has no mcpp.toml", targetMember));
             }
-            runtimeWorkspaceRoot = *root;
-            wsManifest = std::move(*m);  // preserve workspace manifest
+            state.runtimeWorkspaceRoot = *state.root;
+            state.wsManifest = std::move(*state.m);  // preserve workspace manifest
             auto memberManifest = mcpp::manifest::load(memberDir / "mcpp.toml",
                                                        {.insideWorkspace = true});
             if (!memberManifest) return std::unexpected(std::format(
                 "workspace member '{}': {}", targetMember,
                 memberManifest.error().format()));
-            m = std::move(*memberManifest);
+            state.m = std::move(*memberManifest);
 
             // ONE call, not a hand-copied list. `*root` is still the WORKSPACE
             // root here (the `root = memberDir` reassignment below has not
             // happened yet), which is what a relative `[indices].path` or
             // `[workspace.dependencies] path` was written against (#224).
-            mcpp::project::inherit_workspace_config(*m, *wsManifest, *root);
-            if (auto bad = mcpp::project::workspace_inheritance_error(*m, memberDir))
+            mcpp::project::inherit_workspace_config(*state.m, *state.wsManifest, *state.root);
+            if (auto bad = mcpp::project::workspace_inheritance_error(*state.m, memberDir))
                 return std::unexpected(*bad);
 
             mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
-            root = memberDir;
+            state.root = memberDir;
         }
     } else {
         // Not at workspace root: inside a member, the loader above has
         // already inherited (#224 anchoring included). Only the workspace is
         // recorded here, for the membership test of this member's own `path`
         // dependencies.
-        if (effective && effective->member) {
-            runtimeWorkspaceRoot = effective->workspaceRoot;
-            wsManifest = std::move(*effective->workspace);
+        if (state.effective && state.effective->member) {
+            state.runtimeWorkspaceRoot = state.effective->workspaceRoot;
+            state.wsManifest = std::move(*state.effective->workspace);
         } else if (state.overrides.preloaded_manifest) {
-            auto wsRoot = mcpp::project::find_workspace_root(*root);
+            auto wsRoot = mcpp::project::find_workspace_root(*state.root);
             if (!wsRoot.empty()) {
                 if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
                     wsm && wsm->workspace.present) {
-                    runtimeWorkspaceRoot = wsRoot;
-                    wsManifest = std::move(*wsm);
+                    state.runtimeWorkspaceRoot = wsRoot;
+                    state.wsManifest = std::move(*wsm);
                 }
             }
             // A preloaded manifest was inherited at its dependency load site,
             // which gives a member everything but the root-position keys. This
             // build IS rooted at it (a host-tool sub-build), so it takes those
             // too, from the workspace that lists it (#710).
-            if (wsManifest
-                && mcpp::project::is_workspace_member(*wsManifest, runtimeWorkspaceRoot, *root))
+            if (state.wsManifest
+                && mcpp::project::is_workspace_member(*state.wsManifest, state.runtimeWorkspaceRoot, *state.root))
                 mcpp::project::inherit_workspace_root_position(
-                    *m, *wsManifest, runtimeWorkspaceRoot);
+                    *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
         }
     }
 
-    if (auto bad = mcpp::project::unresolved_workspace_dependency_error(*m, *root))
+    if (auto bad = mcpp::project::unresolved_workspace_dependency_error(*state.m, *state.root))
         return std::unexpected(*bad);
 
-    mcpp::xlings::runtime::RuntimeSelection runtimeSelection;
     if (state.overrides.inherited_runtime_selection) {
-        runtimeSelection = *state.overrides.inherited_runtime_selection;
+        state.runtimeSelection = *state.overrides.inherited_runtime_selection;
     } else {
         std::optional<std::reference_wrapper<const mcpp::manifest::Manifest>> wsRef;
-        if (wsManifest) wsRef = std::cref(*wsManifest);
+        if (state.wsManifest) wsRef = std::cref(*state.wsManifest);
         auto selected = mcpp::xlings::runtime::select_runtime(
-            *m, wsRef, *root, runtimeWorkspaceRoot);
+            *state.m, wsRef, *state.root, state.runtimeWorkspaceRoot);
         if (!selected) return std::unexpected(selected.error());
-        runtimeSelection = std::move(*selected);
+        state.runtimeSelection = std::move(*selected);
     }
 
     // Where mcpp WRITES — derived here because `root` is only final now: the
@@ -2730,17 +2742,16 @@ prepare_build(bool print_fingerprint,
     // to the project root, so every existing invocation is byte-for-byte
     // unchanged; the tool-provisioning pass points it at the tool store
     // instead (BuildOverrides::work_dir).
-    const std::filesystem::path workRoot =
-        state.overrides.work_dir.empty() ? *root : state.overrides.work_dir;
+    state.workRoot =
+        state.overrides.work_dir.empty() ? *state.root : state.overrides.work_dir;
     {
         std::error_code wdEc;
-        std::filesystem::create_directories(workRoot, wdEc);
+        std::filesystem::create_directories(state.workRoot, wdEc);
     }
-    std::vector<PlanNote> planNotes;
 
-    if (m->package.sourceProvenance.empty()) {
-        m->package.sourceProvenance =
-            "path+" + root->lexically_normal().generic_string();
+    if (state.m->package.sourceProvenance.empty()) {
+        state.m->package.sourceProvenance =
+            "path+" + state.root->lexically_normal().generic_string();
     }
 
     // A `compat`-form (Form B) package's sources live under a wrap directory
@@ -2754,11 +2765,11 @@ prepare_build(bool print_fingerprint,
     // Nothing could reach that path before #355 (a dependency's bin targets
     // were never built), which is why it went unnoticed. Resolve it here, once
     // the manifest is final and before anything reads `t.main`.
-    for (auto& t : m->targets) {
+    for (auto& t : state.m->targets) {
         if (t.main.empty() || t.main.find('*') == std::string::npos) continue;
-        auto hits = mcpp::modgraph::expand_glob(*root, t.main);
+        auto hits = mcpp::modgraph::expand_glob(*state.root, t.main);
         if (hits.size() == 1) {
-            t.main = std::filesystem::relative(hits.front(), *root).generic_string();
+            t.main = std::filesystem::relative(hits.front(), *state.root).generic_string();
         } else {
             return std::unexpected(std::format(
                 "target '{}': `main = \"{}\"` matched {} files; it must name "
@@ -2768,7 +2779,7 @@ prepare_build(bool print_fingerprint,
     }
 
     // Inject synthetic targets (e.g. test binaries from `mcpp test`).
-    for (auto& t : state.extraTargets) m->targets.push_back(t);
+    for (auto& t : state.extraTargets) state.m->targets.push_back(t);
 
     // #540: a cfg() predicate mcpp cannot evaluate must say so.
     //
@@ -2786,7 +2797,7 @@ prepare_build(bool print_fingerprint,
     // Scoped to the root manifest by where it sits, which matches the existing
     // policy for every other schema warning: a dependency may adopt a predicate
     // a consumer's older mcpp does not know, and its build stays quiet.
-    for (auto const& cc : m->conditionalConfigs) {
+    for (auto const& cc : state.m->conditionalConfigs) {
         auto unknown = cfgpred::unknown_tokens(cc.predicate);
         if (!unknown.empty()) {
             std::string names;
@@ -2794,7 +2805,7 @@ prepare_build(bool print_fingerprint,
                 if (!names.empty()) names += ", ";
                 names += '\'' + u + '\'';
             }
-            m->schemaWarnings.push_back(std::format(
+            state.m->schemaWarnings.push_back(std::format(
                 "[target.'{}'] names {} in its cfg() predicate, which mcpp does "
                 "not know, so the section never applies (ignored). {}",
                 cc.predicate, names, cfgpred::vocabulary_sentence()));
@@ -2813,7 +2824,7 @@ prepare_build(bool print_fingerprint,
         if (cfgpred::uses_layer(cc.predicate)
             && !(cc.dependencies.empty() && cc.devDependencies.empty()
                  && cc.buildDependencies.empty() && cc.featureDeps.empty())) {
-            m->schemaWarnings.push_back(std::format(
+            state.m->schemaWarnings.push_back(std::format(
                 "[target.'{}'] conditions dependencies on a target-side layer "
                 "(ignored). A layer is resolved from the dependency graph, so a "
                 "dependency chosen by one would decide the answer it is asking "
@@ -2826,7 +2837,7 @@ prepare_build(bool print_fingerprint,
         // is linked shared is decided while the graph is resolved, before a
         // layer has an answer.
         if (cfgpred::uses_layer(cc.predicate) && !cc.targetKinds.empty()) {
-            m->schemaWarnings.push_back(std::format(
+            state.m->schemaWarnings.push_back(std::format(
                 "[target.'{}'] conditions a target's kind or linkage on a "
                 "target-side layer (ignored). A layer is resolved from the "
                 "dependency graph, and a library's form is decided while that "
@@ -2839,7 +2850,7 @@ prepare_build(bool print_fingerprint,
     // Surface non-fatal manifest schema warnings (e.g. unsupported [targets.*]
     // keys). Under --strict they become errors — same policy as the
     // feature/platform schema checks below.
-    for (auto const& w : m->schemaWarnings) {
+    for (auto const& w : state.m->schemaWarnings) {
         if (state.overrides.strict) return std::unexpected(w);
         mcpp::diag::warning("manifest/schema", w);
     }
@@ -2848,20 +2859,18 @@ prepare_build(bool print_fingerprint,
     // (#329), which decide the commit to build long before anything is
     // fetched. Keyed by package name — the same key the writer at the end of
     // this function emits, both taken from the root manifest's [dependencies].
-    std::map<std::string, mcpp::pm::LockedGitSource> gitLockAnchors;
-    std::map<std::string, std::string> packageIdentityLockAnchors;
     {
         // Read where the project keeps it. A planning pass that writes
         // elsewhere (plan_only) still resolves against the project's lock.
-        auto lockPath = (state.overrides.plan_only ? *root : workRoot) / "mcpp.lock";
+        auto lockPath = (state.overrides.plan_only ? *state.root : state.workRoot) / "mcpp.lock";
         if (std::filesystem::exists(lockPath)) {
             if (auto lock = mcpp::pm::load(lockPath); lock) {
                 for (auto const& p : lock->packages) {
                     if (!p.namespace_.empty())
-                        packageIdentityLockAnchors.emplace(
+                        state.packageIdentityLockAnchors.emplace(
                             p.name, p.namespace_);
                     if (auto parsed = mcpp::pm::parse_git_source(p.source); parsed)
-                        gitLockAnchors.emplace(p.name, std::move(*parsed));
+                        state.gitLockAnchors.emplace(p.name, std::move(*parsed));
                 }
             } else {
                 // Degraded, not a plain warning: the engine silently does less
@@ -2886,14 +2895,14 @@ prepare_build(bool print_fingerprint,
     // identically. This block only adds the diagnostics, which the fast paths
     // have no business emitting: an unparseable value must be reported once, by
     // the invocation that actually resolves the build.
-    const CacheMode cacheMode = resolve_cache_mode(*m, state.overrides.cache_mode);
+    state.cacheMode = resolve_cache_mode(*state.m, state.overrides.cache_mode);
     {
         const char* envMode = std::getenv("MCPP_BUILD_CACHE");
         for (auto [value, origin] : std::initializer_list<
                  std::pair<std::string_view, std::string_view>>{
                  {state.overrides.cache_mode,        "--cache"},
                  {envMode ? envMode : "",      "MCPP_BUILD_CACHE"},
-                 {m->buildConfig.cacheMode,    "[build] cache"}}) {
+                 {state.m->buildConfig.cacheMode,    "[build] cache"}}) {
             if (value.empty() || parse_cache_mode(value)) continue;
             auto msg = std::format(
                 "{} has unknown cache mode '{}' (expected: global | local | off)",
@@ -2979,7 +2988,7 @@ prepare_build(bool print_fingerprint,
         auto cfgRuntime = get_cfg();
         if (!cfgRuntime) return std::unexpected(cfgRuntime.error());
         auto resolved = mcpp::platform::runtime::resolve_runtime_binding(
-            runtimeSelection, {}, (**cfgRuntime).xlingsHome());
+            state.runtimeSelection, {}, (**cfgRuntime).xlingsHome());
         if (!resolved) return std::unexpected(resolved.error());
         runtimeBindingSnapshot = std::move(*resolved);
         // A degradation that nobody prints is indistinguishable from no
@@ -3081,29 +3090,29 @@ prepare_build(bool print_fingerprint,
         // wants its plain `mcpp build` optimized sets
         // [build].default-profile = "release" (mcpp's own mcpp.toml does this,
         // so the released binary stays -O2).
-        pname = resolve_profile_name(*m, state.overrides.profile, state.overrides.profile_fallback);
+        pname = resolve_profile_name(*state.m, state.overrides.profile, state.overrides.profile_fallback);
         mcpp::manifest::Profile pr;
         if (pname == "dev" || pname == "debug") { pr.optLevel = "0"; pr.debug = true; }
         else if (pname == "dist")               { pr.optLevel = "3"; pr.strip = true; }
         // (built-in dist intentionally leaves lto off: several packaged gcc
         //  payloads ship without the LTO plugin; enable via [profile.dist].)
         else                                    { pr.optLevel = "2"; } // release
-        if (auto it = m->profiles.find(pname); it != m->profiles.end()) pr = it->second;
+        if (auto it = state.m->profiles.find(pname); it != state.m->profiles.end()) pr = it->second;
         // #519 — a profile may override the whole-graph form. OPTIONAL, so a
         // profile that does not mention it leaves `[build]` standing; a plain
         // value would reset it, because the block above REPLACES `pr` wholesale
         // with the declared profile.
         if (pr.dependencyLinkageDeclared)
-            m->buildConfig.dependencyLinkage = pr.dependencyLinkage;
-        m->buildConfig.optLevel = pr.optLevel;
-        m->buildConfig.debug    = pr.debug;
-        m->buildConfig.lto      = pr.lto;
-        m->buildConfig.strip    = pr.strip;
-        m->buildConfig.cflags.insert(m->buildConfig.cflags.end(),
+            state.m->buildConfig.dependencyLinkage = pr.dependencyLinkage;
+        state.m->buildConfig.optLevel = pr.optLevel;
+        state.m->buildConfig.debug    = pr.debug;
+        state.m->buildConfig.lto      = pr.lto;
+        state.m->buildConfig.strip    = pr.strip;
+        state.m->buildConfig.cflags.insert(state.m->buildConfig.cflags.end(),
                                      pr.cflags.begin(), pr.cflags.end());
-        m->buildConfig.cxxflags.insert(m->buildConfig.cxxflags.end(),
+        state.m->buildConfig.cxxflags.insert(state.m->buildConfig.cxxflags.end(),
                                        pr.cxxflags.begin(), pr.cxxflags.end());
-        m->buildConfig.ldflags.insert(m->buildConfig.ldflags.end(),
+        state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
                                       pr.ldflags.begin(), pr.ldflags.end());
     }
 
@@ -3118,7 +3127,7 @@ prepare_build(bool print_fingerprint,
     const auto storeRoots = [&]() -> std::vector<std::filesystem::path> {
         std::vector<std::filesystem::path> roots;
         if (auto c = get_cfg()) roots.push_back((*c)->xlingsHome() / "data" / "xpkgs");
-        for (auto& d : mcpp::config::project_xlings_data_roots(workRoot))
+        for (auto& d : mcpp::config::project_xlings_data_roots(state.workRoot))
             roots.push_back(d / "xpkgs");
         return roots;
     }();
@@ -3127,7 +3136,7 @@ prepare_build(bool print_fingerprint,
     // target/triple system): the platform name of every row it has
     // (`platform_name`, beside `artifact_naming`). Unknown values: warning, or
     // error under --strict.
-    for (auto& pf : m->package.platforms) {
+    for (auto& pf : state.m->package.platforms) {
         if (!mcpp::toolchain::triple::is_platform_name(pf)) {
             auto msg = std::format(
                 "[package] platforms contains unknown platform '{}' "
@@ -3138,7 +3147,7 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    auto tcSpec = m->toolchain.for_platform(kCurrentPlatform);
+    auto tcSpec = state.m->toolchain.for_platform(kCurrentPlatform);
     // Where the spec came from decides whether mcpp may later revise it.
     // See TcOrigin: mcpp can rewrite a default it chose itself, but must not
     // silently overrule one the user wrote down.
@@ -3248,7 +3257,7 @@ prepare_build(bool print_fingerprint,
     bool windowsGnuFirstRun = false;
     if constexpr (mcpp::platform::is_windows) {
         if (!tcSpec.has_value() && state.overrides.target_triple.empty()
-            && m->buildConfig.target.empty()
+            && state.m->buildConfig.target.empty()
             && !msvc_usable_either_origin()) {
             auto cfgW = get_cfg();
             if (!cfgW || (*cfgW)->defaultTarget.empty()) {
@@ -3269,19 +3278,19 @@ prepare_build(bool print_fingerprint,
             tcSpec   = e.toolchain;
             tcOrigin = TcOrigin::TargetSection;
         }
-        if (!e.linkage.empty()) m->buildConfig.linkage = e.linkage;
+        if (!e.linkage.empty()) state.m->buildConfig.linkage = e.linkage;
         // #336: a per-target C++ runtime contract state.overrides the project
         // default, so "self-contained everywhere except this triple" is
         // expressible without touching the cfg() input channel.
-        if (!e.cxxRuntime.empty()) m->buildConfig.cxxRuntime = e.cxxRuntime;
+        if (!e.cxxRuntime.empty()) state.m->buildConfig.cxxRuntime = e.cxxRuntime;
     };
 
     // ─── --target / --static state.overrides ──────────────────────────────────
     // Target-axis default resolution when no --target flag was passed:
     // [build] target (project default, ≙ cargo build.target) >
     // [toolchain] default_target (global config) > host.
-    if (state.overrides.target_triple.empty() && !m->buildConfig.target.empty())
-        state.overrides.target_triple = m->buildConfig.target;
+    if (state.overrides.target_triple.empty() && !state.m->buildConfig.target.empty())
+        state.overrides.target_triple = state.m->buildConfig.target;
     // Remembered, not requested: this one came out of the global config, so
     // it must not outrank anything the user wrote down (see the pin below).
     bool targetFromGlobalDefault = false;
@@ -3328,15 +3337,15 @@ prepare_build(bool print_fingerprint,
         // [target.X] lookup is spelling-independent: a section keyed
         // `x86_64-w64-mingw32` matches `--target x86_64-windows-gnu` and
         // vice versa. Unparseable keys/inputs compare exactly (escape hatch).
-        auto it = m->targetOverrides.find(state.overrides.target_triple);
-        if (it == m->targetOverrides.end() && parsed) {
-            for (auto o = m->targetOverrides.begin();
-                 o != m->targetOverrides.end(); ++o) {
+        auto it = state.m->targetOverrides.find(state.overrides.target_triple);
+        if (it == state.m->targetOverrides.end() && parsed) {
+            for (auto o = state.m->targetOverrides.begin();
+                 o != state.m->targetOverrides.end(); ++o) {
                 if (auto k = triple::parse(o->first);
                     k && k->str() == parsed->str()) { it = o; break; }
             }
         }
-        bool hasExplicitSection   = it != m->targetOverrides.end();
+        bool hasExplicitSection   = it != state.m->targetOverrides.end();
         bool hasToolchainOverride = hasExplicitSection
                                  && !it->second.toolchain.empty();
 
@@ -3444,7 +3453,7 @@ prepare_build(bool print_fingerprint,
             const auto which = parsed->is_ios_simulator()
                 ? mcpp::platform::macos::sdk_iphonesim
                 : mcpp::platform::macos::sdk_iphoneos;
-            appleSdkLocated = mcpp::platform::macos::sdk_path(which);
+            state.appleSdkLocated = mcpp::platform::macos::sdk_path(which);
             // AN UNSET FLOOR IS THE LOCATED SDK'S VERSION, READ RATHER THAN
             // LEFT TO THE DRIVER. `docs/20` promised that an unversioned
             // triple meant the SDK's own default; measured on macos-15 with
@@ -3455,13 +3464,13 @@ prepare_build(bool print_fingerprint,
             // one the SDK was made for, and it enters the manifest here so
             // that the fingerprint slot, the effective triple and every
             // report read one value.
-            if (appleSdkLocated && m->buildConfig.iosDeploymentTarget.empty()) {
+            if (state.appleSdkLocated && state.m->buildConfig.iosDeploymentTarget.empty()) {
                 if (auto v = mcpp::platform::macos::sdk_version(which)) {
-                    m->buildConfig.iosDeploymentTarget = *v;
-                    iosFloorFromSdk = true;
+                    state.m->buildConfig.iosDeploymentTarget = *v;
+                    state.iosFloorFromSdk = true;
                 }
             }
-            if (!appleSdkLocated) {
+            if (!state.appleSdkLocated) {
                 // A CODE, BECAUSE THE MATRIX COMPARES REASONS AND NOT ONLY
                 // OUTCOMES. A refusal with no code is recorded as `other`,
                 // which `check_matrix_reasons.sh` refuses on the ground that
@@ -3498,7 +3507,7 @@ prepare_build(bool print_fingerprint,
         // sentence instead of downloading the SDK first.
         if (parsed && parsed->object_format()
                           == triple::ObjectFormat::Wasm) {
-            for (auto const& t : m->targets) {
+            for (auto const& t : state.m->targets) {
                 if (t.kind != mcpp::manifest::Target::SharedLibrary) continue;
                 return std::unexpected(std::format(
                     "[targets.{}] kind = \"shared\" is not supported on "
@@ -3558,7 +3567,7 @@ prepare_build(bool print_fingerprint,
                 if (!servable.empty()) servable += ", ";
                 servable += t->str();
             }
-            unservedTargetDiagnosis = std::format(
+            state.unservedTargetDiagnosis = std::format(
                 "target '{}' cannot be built on this host.\n"
                 "       No toolchain payload here produces it, and nothing in "
                 "the dependency graph\n"
@@ -3580,7 +3589,7 @@ prepare_build(bool print_fingerprint,
         // `x86_64-linux-gnu` here and every later `parse` of that string reports
         // an env segment the project never wrote. The request has to be taken
         // from the ONLY triple that still knows the difference: this one.
-        if (parsed && parsed->envExplicit) requestedCAbi = parsed->env;
+        if (parsed && parsed->envExplicit) state.requestedCAbi = parsed->env;
         // AND THE SPELLING THE PROJECT USED, FOR THE REPORT ONLY.
         //
         // The canonical form is the identity — the output directory, the cache
@@ -3592,7 +3601,7 @@ prepare_build(bool print_fingerprint,
         if (parsed && !parsed->envExplicit && !parsed->env.empty()) {
             auto asWritten = *parsed;
             asWritten.env.clear();
-            targetDisplayName = asWritten.str();
+            state.targetDisplayName = asWritten.str();
         }
 
         // Canonical from here on: cfg evaluation, spec attachment and the
@@ -3637,13 +3646,13 @@ prepare_build(bool print_fingerprint,
         // `resolve_target_toolchain` and only the candidate is kept here.
         if (known && !known->pin.empty() && parsed
             && !parsed->pin_is_capability()) {
-            targetRowPin  = std::string(known->pin);
-            targetRowName = parsed->str();
+            state.targetRowPin  = std::string(known->pin);
+            state.targetRowName = parsed->str();
         }
         if (known && !hasToolchainOverride && !known->pin.empty()
             && !tc_origin_is_user_explicit(tcOrigin)) {
-            targetPinCandidate = std::string(known->pin);
-            targetPinIsCapability = parsed && parsed->pin_is_capability();
+            state.targetPinCandidate = std::string(known->pin);
+            state.targetPinIsCapability = parsed && parsed->pin_is_capability();
         }
         // A USER'S EXPLICIT TOOLCHAIN OVERRIDES A CONVENTION, NOT A
         // CAPABILITY — AND UNTIL THIS LINE IT OVERRODE BOTH.
@@ -3756,8 +3765,8 @@ prepare_build(bool print_fingerprint,
                     known->pin.empty() ? std::string_view("llvm") : known->pin));
             }
         }
-        if (known && known->defaultStatic && m->buildConfig.linkage.empty())
-            m->buildConfig.linkage = "static";
+        if (known && known->defaultStatic && state.m->buildConfig.linkage.empty())
+            state.m->buildConfig.linkage = "static";
     }
     // A HOST BUILD READS ITS OWN ROW (#704). `[target.<triple>]` is looked up
     // by the triple the build produces, and a build without `--target`
@@ -3768,9 +3777,9 @@ prepare_build(bool print_fingerprint,
     // The triple is not written into `state.overrides.target_triple`: that would make
     // the host build a target build and turn the row's env segment into a
     // requested C library.
-    else if (auto* hostRow = find_target_entry(*m, mcpp::toolchain::triple::host_triple()))
+    else if (auto* hostRow = find_target_entry(*state.m, mcpp::toolchain::triple::host_triple()))
         apply_target_section(*hostRow);
-    if (state.overrides.force_static) m->buildConfig.linkage = "static";
+    if (state.overrides.force_static) state.m->buildConfig.linkage = "static";
 
     // #254: everything compiled INTO this build is resolved for the TARGET —
     // an xpkg descriptor's per-OS sections (sources, flags, deps) and its xpm
@@ -3807,7 +3816,7 @@ prepare_build(bool print_fingerprint,
     // only when it fails.
     auto resolvedAccel = [&]() -> std::string {
         const auto sets = mcpp::pack::parse_accel(
-            state.overrides.accel.empty() ? m->buildConfig.accel : state.overrides.accel);
+            state.overrides.accel.empty() ? state.m->buildConfig.accel : state.overrides.accel);
         return sets.empty() ? std::string{} : mcpp::pack::accel_str(sets);
     };
     // The cfg context, with the accelerator layer filled from the resolved
@@ -3836,8 +3845,8 @@ prepare_build(bool print_fingerprint,
     // dependency-manifest-acquisition block below. That makes this the root
     // package's half of the one funnel, not a special case: every package is
     // merged exactly once, immediately before it is captured into `packages[]`.
-    if (!m->conditionalConfigs.empty()) {
-        merge_conditional_config(*m, cfgCtx());
+    if (!state.m->conditionalConfigs.empty()) {
+        merge_conditional_config(*state.m, cfgCtx());
     }
     // `[target.<selector>.abi] threads` -- the ROOT's statement, rendered once,
     // into channels that already reach the whole artefact: the graph-global
@@ -3849,7 +3858,7 @@ prepare_build(bool print_fingerprint,
     // multithreaded and mingw-w64's threading model belongs to its payload; a
     // freestanding target has no thread library to select.
     const bool abiThreadsRendered = [&] {
-        if (!m->buildConfig.abiThreads) return false;
+        if (!state.m->buildConfig.abiThreads) return false;
         const auto abiTriple = mcpp::toolchain::triple::parse(
             state.overrides.target_triple.empty()
                 ? mcpp::toolchain::triple::host_triple().str()
@@ -3860,9 +3869,9 @@ prepare_build(bool print_fingerprint,
         if (std::ranges::find(v, flag) == v.end()) v.emplace_back(flag);
     };
     if (abiThreadsRendered) {
-        add_once(m->buildConfig.dialectCxxflags, "-pthread");
-        add_once(m->buildConfig.cflags, "-pthread");
-        add_once(m->buildConfig.ldflags, "-pthread");
+        add_once(state.m->buildConfig.dialectCxxflags, "-pthread");
+        add_once(state.m->buildConfig.cflags, "-pthread");
+        add_once(state.m->buildConfig.ldflags, "-pthread");
     }
     // `[target.<selector>.abi] exceptions` -- design 2026-09-12 (the UI
     // framework record), section 2.1, A1: the second `abi` member, the
@@ -3877,17 +3886,17 @@ prepare_build(bool print_fingerprint,
     // already link with exceptions on, so a host build with the member
     // declared is byte-identical to one without -- the same property
     // `threads` has on PE.
-    const bool abiExceptionsRendered = m->buildConfig.abiExceptions
+    const bool abiExceptionsRendered = state.m->buildConfig.abiExceptions
                                      && cfgCtx().os == "emscripten";
     if (abiExceptionsRendered) {
-        add_once(m->buildConfig.dialectCxxflags, "-fexceptions");
-        add_once(m->buildConfig.ldflags, "-fexceptions");
+        add_once(state.m->buildConfig.dialectCxxflags, "-fexceptions");
+        add_once(state.m->buildConfig.ldflags, "-fexceptions");
     }
     // `[build].defines` must reach the scanner (P1689) and the compile edge,
     // and must participate in the fingerprint. Fold before dependency
     // resolution / fingerprinting.
-    report_flag_words_changes(*m);
-    fold_build_defines_into_flags(m->buildConfig);
+    report_flag_words_changes(*state.m);
+    fold_build_defines_into_flags(state.m->buildConfig);
 
     // ORIGIN, RESOLVED ONCE.
     //
@@ -3952,7 +3961,7 @@ prepare_build(bool print_fingerprint,
       // ASSIGNED, NOT DECLARED. `host_tc_for_build_program` reads it and is
       // defined outside this lambda, so the declaration lives in the enclosing
       // scope; the value is still decided here, where the spec is parsed.
-      tcSpecIsMsvc =
+      state.tcSpecIsMsvc =
         parsedSpec && tcOriginAxis == mcpp::toolchain::Origin::SystemMsvc;
 
       // A PINNED TOOLSET THIS MACHINE ALREADY HAS IS USED WHERE IT IS.
@@ -3964,7 +3973,7 @@ prepare_build(bool print_fingerprint,
       std::optional<mcpp::toolchain::msvc::MsvcInstallation> installedPin;
       std::vector<std::string> installedPinNotes;
       if constexpr (mcpp::platform::is_windows) {
-          if (parsedSpec && !tcSpecIsMsvc
+          if (parsedSpec && !state.tcSpecIsMsvc
               && parsedSpec->family == mcpp::toolchain::Family::Msvc
               && !parsedSpec->ecosystemOnly && !parsedSpec->version.empty())
               installedPin = mcpp::toolchain::msvc::system_installation_matching(
@@ -3978,7 +3987,7 @@ prepare_build(bool print_fingerprint,
         mcpp::ui::info("Resolved", std::format(
             "{} → msvc {} (installed: {})", parsedSpec->display(),
             installedPin->display_version(), installedPin->clPath.string()));
-      } else if (tcSpecIsMsvc) {
+      } else if (state.tcSpecIsMsvc) {
         if (!mcpp::platform::is_windows) {
             return std::unexpected(std::format(
                 "toolchain '{}' is only available on Windows hosts", *tcSpec));
@@ -4031,7 +4040,7 @@ prepare_build(bool print_fingerprint,
         // Skipping leaves BOTH later paths intact; attempting cannot help
         // either of them.
         const bool targetPayloadUnservable =
-            !unservedTargetDiagnosis.empty() && !spec->target.empty();
+            !state.unservedTargetDiagnosis.empty() && !spec->target.empty();
 
         auto cfg = get_cfg();
         if (!cfg) return std::unexpected(cfg.error());
@@ -4045,7 +4054,7 @@ prepare_build(bool print_fingerprint,
             // The held diagnosis is already the right words for this; releasing
             // it here rather than at its usual site keeps one sentence per cause.
             refusal::record(refusal::Code::HostCannotServe);
-            return std::unexpected(unservedTargetDiagnosis);
+            return std::unexpected(state.unservedTargetDiagnosis);
         }
         if (!payload) {
             // `windows = "msvc@19.44"` in a manifest is the retired
@@ -4118,20 +4127,20 @@ prepare_build(bool print_fingerprint,
             // user's default; with it, it reads as the dependency it is.
             // The second line appears only when something was displaced —
             // "replacing nothing" is not worth a line.
-            if (!graphCompilerRequiredBy.empty())
+            if (!state.graphCompilerRequiredBy.empty())
                 chosenBy = std::format(
                     "\n             required by {} (`requires = "
                     "[\"mcpp:compiler={}\"]`){}",
-                    graphCompilerRequiredBy, graphCompilerFamily,
-                    graphCompilerReplaced.empty()
+                    state.graphCompilerRequiredBy, state.graphCompilerFamily,
+                    state.graphCompilerReplaced.empty()
                         ? std::string{}
                         : std::format(", not your {} — this project only",
-                                      graphCompilerReplaced));
-            else if (!pinReplacedDefault.empty())
+                                      state.graphCompilerReplaced));
+            else if (!state.pinReplacedDefault.empty())
                 chosenBy = std::format(
                     "\n             target default for {}, replacing your "
                     "{} — override with `[target.{}] toolchain`",
-                    state.overrides.target_triple, pinReplacedDefault,
+                    state.overrides.target_triple, state.pinReplacedDefault,
                     state.overrides.target_triple);
             else if (tcOrigin == TcOrigin::TargetPin
                   || tcOrigin == TcOrigin::FirstRun)
@@ -4139,7 +4148,7 @@ prepare_build(bool print_fingerprint,
             mcpp::ui::info("Resolved",
                 std::format("{} → {}{}", spec->display(),
                     mcpp::ui::shorten_path(explicit_compiler,
-                        mcpp::fetcher::make_path_ctx(&**get_cfg(), *root)),
+                        mcpp::fetcher::make_path_ctx(&**get_cfg(), *state.root)),
                     chosenBy));
         }
       } else if (tcSpec.has_value() && *tcSpec == "system") {
@@ -4544,7 +4553,7 @@ prepare_build(bool print_fingerprint,
                   && tc->compiler == mcpp::toolchain::CompilerId::Clang) {
                   tc->crossTargetFlag =
                       "--target=" + want->llvm_triple(
-                          min_platform_version(*m, *want, tc->binaryPath));
+                          min_platform_version(*state.m, *want, tc->binaryPath));
 
                   // AND THE SAME FLAG ON THE std MODULE'S OWN COMMANDS, FOR A
                   // PAYLOAD THAT SERVES MORE THAN ONE TARGET.
@@ -4649,15 +4658,15 @@ prepare_build(bool print_fingerprint,
                       // row could be reached one day by a route that skipped
                       // the gate, and an iOS build with no `-isysroot` is a
                       // macOS artefact with an iOS triple on it.
-                      if (!appleSdkLocated) {
+                      if (!state.appleSdkLocated) {
                           return std::unexpected(std::format(
                               "internal: target {} reached toolchain "
                               "resolution without its SDK being located; the "
                               "gate that locates it did not run for this "
                               "request", want->str()));
                       }
-                      tc->appleSdkRoot = *appleSdkLocated;
-                      auto sdk = appleSdkLocated;
+                      tc->appleSdkRoot = *state.appleSdkLocated;
+                      auto sdk = state.appleSdkLocated;
                       // AND THE std MODULE'S OWN COMMAND, WHICH IS A SEPARATE
                       // CHANNEL. Same reason the Android rows set it: the
                       // module is precompiled by `clang.cppm`'s own assembly
@@ -4718,7 +4727,7 @@ prepare_build(bool print_fingerprint,
               // truthful message either way.
               if (const std::string want_sysroot =
                       mcpp::toolchain::triple::effective_sysroot(
-                          *want, sysroot_override(*m, *want));
+                          *want, sysroot_override(*state.m, *want));
                   !want_sysroot.empty()) {
                   if (auto cfg3 = get_cfg(); cfg3) {
                       auto ref = mcpp::xlings::paths::parse_xpkg_ref(want_sysroot);
@@ -4781,10 +4790,10 @@ prepare_build(bool print_fingerprint,
       // runtime identity below reads its SDK version. See bind_msvc_sysroot.
       if (tc->compiler == mcpp::toolchain::CompilerId::Clang
           && mcpp::toolchain::is_msvc_target(*tc)) {
-          auto bound = bind_msvc_sysroot(*tc, *m, [&] { return get_cfg(); });
+          auto bound = bind_msvc_sysroot(*tc, *state.m, [&] { return get_cfg(); });
           if (!bound) return std::unexpected(bound.error());
       } else if (tc->compiler == mcpp::toolchain::CompilerId::MSVC) {
-          if (auto ok = check_cl_row_sysroot(*tc, *m); !ok)
+          if (auto ok = check_cl_row_sysroot(*tc, *state.m); !ok)
               return std::unexpected(ok.error());
       }
 
@@ -4866,7 +4875,7 @@ prepare_build(bool print_fingerprint,
           state.overrides.target_triple = std::string(pins::kFirstRunWinGnuTarget);
           // The x86_64-windows-gnu row is defaultStatic; the target block that
           // normally applies that already ran, so mirror just this one field.
-          if (m->buildConfig.linkage.empty()) m->buildConfig.linkage = "static";
+          if (state.m->buildConfig.linkage.empty()) state.m->buildConfig.linkage = "static";
 
           auto gnuSpec = mcpp::toolchain::parse_toolchain_spec(
               std::string(pins::kFirstRunWinGnu));
@@ -4933,8 +4942,8 @@ prepare_build(bool print_fingerprint,
       // the resolved toolchain is musl, unless the user has already opted
       // out via `--static` or [target.<triple>].linkage. (There is no
       // [build].linkage — the parser only reads it under a target section.)
-      if (isMuslTc && m->buildConfig.linkage.empty()) {
-          m->buildConfig.linkage = "static";
+      if (isMuslTc && state.m->buildConfig.linkage.empty()) {
+          state.m->buildConfig.linkage = "static";
       }
     return {};
     };
@@ -4962,14 +4971,14 @@ prepare_build(bool print_fingerprint,
     // BEFORE dependency resolution, since generated_files may produce
     // build.mcpp itself. (The per-dependency call sits in the dep resolution
     // loop below; the root manifest needs its own.)
-    if (!m->buildConfig.generatedFiles.empty()) {
+    if (!state.m->buildConfig.generatedFiles.empty()) {
         std::vector<std::filesystem::path> staleGenerated;
         if (auto r = materialize_generated_files(
-                *root, *m, state.overrides.plan_only ? &staleGenerated : nullptr); !r) {
+                *state.root, *state.m, state.overrides.plan_only ? &staleGenerated : nullptr); !r) {
             return std::unexpected(r.error());
         }
         for (auto const& path : staleGenerated)
-            planNotes.push_back({"MCPP_GENERATED_FILE_NOT_MATERIALIZED",
+            state.planNotes.push_back({"MCPP_GENERATED_FILE_NOT_MATERIALIZED",
                 std::format("'{}' is declared in [build] generated_files and its "
                             "content on disk differs from the declaration; this "
                             "command does not write the project, and `mcpp build` "
@@ -4998,9 +5007,9 @@ prepare_build(bool print_fingerprint,
     auto host_spec_for_build_program = [&]() -> std::string {
         if (!tcSpec) return {};
         if (state.overrides.target_triple.empty()) return *tcSpec;
-        return (tcOrigin == TcOrigin::TargetPin && hostSpecBeforeRowPin.has_value()
-                && !hostSpecBeforeRowPin->empty() && *hostSpecBeforeRowPin != "system")
-            ? *hostSpecBeforeRowPin
+        return (tcOrigin == TcOrigin::TargetPin && state.hostSpecBeforeRowPin.has_value()
+                && !state.hostSpecBeforeRowPin->empty() && *state.hostSpecBeforeRowPin != "system")
+            ? *state.hostSpecBeforeRowPin
             : (tcOrigin == TcOrigin::TargetPin ? native_first_run_spec() : *tcSpec);
     };
     auto host_tc_for_build_program = [&]() -> std::expected<
@@ -5067,7 +5076,7 @@ prepare_build(bool print_fingerprint,
                 as_host(*tc)};
         if (hostTcCache)
             return std::pair{hostTcCache->first, as_host(hostTcCache->second)};
-        if (!tcSpec || *tcSpec == "system" || tcSpecIsMsvc) {
+        if (!tcSpec || *tcSpec == "system" || state.tcSpecIsMsvc) {
             // A READABLE REFUSAL THAT HAD NO CODE, so the target matrix
             // recorded four identical `other` cells for it. The sentence was
             // right; the classification was missing. Measured on windows-2022
@@ -5205,14 +5214,14 @@ prepare_build(bool print_fingerprint,
     //
     // Nothing here decides anything itself — in particular the "a miss proves
     // nothing for this namespace" rule must not be re-derived; see that module.
-    if (!m->dependencies.empty()) {
+    if (!state.m->dependencies.empty()) {
         if (auto cfg2 = get_cfg()) {
             auto xlEnv  = mcpp::config::make_xlings_env(**cfg2);
             auto policy = mcpp::pm::policy_for(**cfg2);
             // Same routing the dependency walk below uses (the `index_route`
             // lambda is declared further down; this is the identical value).
-            mcpp::pm::IndexRoute route{ &m->indices, *root, *cfg2 };
-            for (auto& [depName, spec] : m->dependencies) {
+            mcpp::pm::IndexRoute route{ &state.m->indices, *state.root, *cfg2 };
+            for (auto& [depName, spec] : state.m->dependencies) {
                 auto decision = mcpp::pm::decide_for_dependency(
                     route, depName, spec, xlEnv, targetPlatform, policy);
                 if (!decision.shouldRefresh) {
@@ -5238,7 +5247,7 @@ prepare_build(bool print_fingerprint,
     // [xlings] build environment (L-1). This creates .mcpp/.xlings.json with
     // custom non-builtin index entries (so xlings can clone them) plus the
     // [xlings] deps/workspace/subos/envs materialized verbatim.
-    const auto& runtimeOwnerManifest = wsManifest ? *wsManifest : *m;
+    const auto& runtimeOwnerManifest = state.wsManifest ? *state.wsManifest : *state.m;
     // The TARGET's C library, if this target has one. Resolved here and not by
     // any package, for the same reason the compiler pin is: it is a property
     // of the target.
@@ -5268,12 +5277,12 @@ prepare_build(bool print_fingerprint,
         // `msvc@system` is not a package at all.
         if (tt && !tt->is_msvc_env())
             targetSysroot = mcpp::toolchain::triple::effective_sysroot(
-                *tt, sysroot_override(*m, *tt));
+                *tt, sysroot_override(*state.m, *tt));
     }
     const bool materializeRootRuntime =
         !state.overrides.inherited_runtime_binding
         && (!runtimeOwnerManifest.xlings.empty() || !targetSysroot.empty());
-    if (!m->indices.empty() || materializeRootRuntime) {
+    if (!state.m->indices.empty() || materializeRootRuntime) {
         auto cfg2 = get_cfg();
         if (cfg2) {
             mcpp::xlings::ProjectEnv penv;
@@ -5311,16 +5320,16 @@ prepare_build(bool print_fingerprint,
                                 penv.workspace.emplace_back(entry.target, entry.pin());
                         }
             }
-            if (runtimeSelection.ownerRoot == workRoot) {
+            if (state.runtimeSelection.ownerRoot == state.workRoot) {
                 mcpp::config::ensure_project_index_dir(
-                    **cfg2, workRoot, m->indices, penv);
+                    **cfg2, state.workRoot, state.m->indices, penv);
             } else {
-                if (!m->indices.empty())
+                if (!state.m->indices.empty())
                     mcpp::config::ensure_project_index_dir(
-                        **cfg2, workRoot, m->indices, {});
+                        **cfg2, state.workRoot, state.m->indices, {});
                 if (materializeRootRuntime)
                     mcpp::config::ensure_project_index_dir(
-                        **cfg2, runtimeSelection.ownerRoot, {}, penv);
+                        **cfg2, state.runtimeSelection.ownerRoot, {}, penv);
             }
 
             // `[xlings] deps` are DECLARED above and, until now, nothing
@@ -5388,7 +5397,7 @@ prepare_build(bool print_fingerprint,
                 declaredDeps.push_back(w.address);
             if (materializeRootRuntime && !declaredDeps.empty()) {
                 if (auto pv = provision_xlings_addresses(
-                        **cfg2, declaredDeps, runtimeSelection.ownerRoot,
+                        **cfg2, declaredDeps, state.runtimeSelection.ownerRoot,
                         "[xlings.workspace] entries");
                     !pv) return std::unexpected(pv.error());
             }
@@ -5398,17 +5407,17 @@ prepare_build(bool print_fingerprint,
             // trigger clone/link creation. Local path indices are read directly;
             // remote custom indices are synced quietly before dependency resolution.
             bool hasCustomIndices = false;
-            for (auto& [idxName, spec] : m->indices) {
+            for (auto& [idxName, spec] : state.m->indices) {
                 if (!spec.is_builtin()) {
                     hasCustomIndices = true;
                     break;
                 }
             }
             if (hasCustomIndices) {
-                bool needsClone = !mcpp::config::project_index_data_initialized(*root);
+                bool needsClone = !mcpp::config::project_index_data_initialized(*state.root);
                 if (needsClone) {
                     bool needsRemoteUpdate = false;
-                    for (auto& [idxName, spec] : m->indices) {
+                    for (auto& [idxName, spec] : state.m->indices) {
                         if (spec.is_builtin() || spec.is_local()) continue;
                         needsRemoteUpdate = true;
                         break;
@@ -5438,7 +5447,7 @@ prepare_build(bool print_fingerprint,
                     }
                     if (needsRemoteUpdate && !refreshPolicy.offline) {
                         mcpp::ui::status("Fetching", "custom index repos (first use)");
-                        auto projEnv = mcpp::config::make_project_xlings_env(**cfg2, *root);
+                        auto projEnv = mcpp::config::make_project_xlings_env(**cfg2, *state.root);
                         int rc = mcpp::xlings::update_index(projEnv, /*quiet=*/true);
                         if (rc != 0) {
                             return std::unexpected(
@@ -5525,7 +5534,7 @@ prepare_build(bool print_fingerprint,
             mcpp::diag::warning("xlings/version-override", note);
         return std::pair{std::move(rootSpecs), std::move(fromGraph)};
     };
-    packages.push_back({*root, *m});
+    packages.push_back({*state.root, *state.m});
 
     // dep_manifests is kept around purely so the build plan can move it
     // out at the end (PackageRoot stores a `Manifest` by value, so the
@@ -5686,7 +5695,7 @@ prepare_build(bool print_fingerprint,
     // (the build banner, the resolution record) sees.
     auto stateAdoptedIdentity = [&](const WorkItem& item, const ResolvedKey& declared) {
         if (item.consumerDepIndex != kMainConsumer) return;
-        if (auto it = m->dependencies.find(item.name); it != m->dependencies.end()) {
+        if (auto it = state.m->dependencies.find(item.name); it != state.m->dependencies.end()) {
             it->second.namespace_ = declared.ns;
             it->second.shortName = declared.shortName;
         }
@@ -5714,7 +5723,7 @@ prepare_build(bool print_fingerprint,
     // rebuilt on demand because `root` moves when a workspace member is
     // selected above.
     auto index_route = [&](mcpp::config::GlobalConfig* cfg = nullptr) {
-        return mcpp::pm::IndexRoute{ &m->indices, *root, cfg };
+        return mcpp::pm::IndexRoute{ &state.m->indices, *state.root, cfg };
     };
     auto findIndexForNs = [&](const std::string& ns)
         -> const mcpp::pm::IndexSpec*
@@ -5839,8 +5848,8 @@ prepare_build(bool print_fingerprint,
         if (spec.legacyCandidateSearch) {
             const auto exact = candidates.front();
             bool lockExpressesIntent = false;
-            if (auto locked = packageIdentityLockAnchors.find(depName);
-                locked != packageIdentityLockAnchors.end()) {
+            if (auto locked = state.packageIdentityLockAnchors.find(depName);
+                locked != state.packageIdentityLockAnchors.end()) {
                 lockExpressesIntent = true;
                 if (locked->second != exact.namespace_) {
                     mcpp::pm::DependencyCoordinate lockedCoordinate{
@@ -6120,20 +6129,20 @@ prepare_build(bool print_fingerprint,
 
         auto readLuaContent = [&]() -> std::optional<std::string> {
             if (idxSpec && idxSpec->is_local()) {
-                auto indexPath = mcpp::config::resolve_project_index_path(*root, *idxSpec);
+                auto indexPath = mcpp::config::resolve_project_index_path(*state.root, *idxSpec);
                 return mcpp::fetcher::Fetcher::read_xpkg_lua_from_path(
                     indexPath, ns, shortName);
             }
             if (idxSpec && !idxSpec->is_builtin()) {
                 return mcpp::fetcher::Fetcher::read_xpkg_lua_from_project_data(
-                    *root, ns, shortName);
+                    *state.root, ns, shortName);
             }
             return fetcher.read_xpkg_lua(ns, shortName);
         };
 
         auto luaContent = readLuaContent();
         if (idxSpec && idxSpec->is_local() && !luaContent) {
-            auto indexPath = mcpp::config::resolve_project_index_path(*root, *idxSpec);
+            auto indexPath = mcpp::config::resolve_project_index_path(*state.root, *idxSpec);
             return std::unexpected(with_index_cause(std::format(
                 "dependency '{}': not found in local index at '{}'",
                 depName, indexPath.string())));
@@ -6142,7 +6151,7 @@ prepare_build(bool print_fingerprint,
         auto findRawInstalled = [&]() -> std::optional<std::filesystem::path> {
             if (useProjectEnv) {
                 if (auto p = mcpp::fetcher::Fetcher::install_path_from_project_data(
-                        *root, ns, shortName, version)) {
+                        *state.root, ns, shortName, version)) {
                     return p;
                 }
             }
@@ -6361,7 +6370,7 @@ prepare_build(bool print_fingerprint,
                     // Using the interface (rather than the silenced direct CLI)
                     // restores the live `Downloading … [bar] X/Y Z/s` UI here,
                     // matching the toolchain and builtin-index paths.
-                    auto projEnv = mcpp::config::make_project_xlings_env(**cfg, *root);
+                    auto projEnv = mcpp::config::make_project_xlings_env(**cfg, *state.root);
                     auto argsJson = std::format(
                         R"({{"targets":["{}"],"yes":true}})", target);
                     mcpp::fetcher::InstallProgressHandler progress;
@@ -6415,7 +6424,7 @@ prepare_build(bool print_fingerprint,
             // version. Scoped: restored when this dependency's install returns,
             // compat retries below included.
             mcpp::build::BuildProgramEnv hookEnv;
-            fill_target_build_env(hookEnv, *m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
+            fill_target_build_env(hookEnv, *state.m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
             hookEnv.targetTriple = state.overrides.target_triple;
             // Six names, fixed by install_hook_env; one guard each.
             const auto hookVars = mcpp::build::install_hook_env(hookEnv);
@@ -6457,7 +6466,7 @@ prepare_build(bool print_fingerprint,
                 // a hint about the known ≥2-repo xlings resolution gap. The
                 // real fix lives in openxlings/xlings; this only surfaces WHY.
                 auto xlingsJson = (useProjectEnv
-                        ? (workRoot / ".mcpp")
+                        ? (state.workRoot / ".mcpp")
                         : (*cfg)->xlingsHome())
                     / ".xlings.json";
                 auto indexRepos = mcpp::pm::read_seeded_index_repos(xlingsJson);
@@ -7181,7 +7190,7 @@ prepare_build(bool print_fingerprint,
     };
 
     {
-        auto rootPackage = makePackageRoot(*root, *m);
+        auto rootPackage = makePackageRoot(*state.root, *state.m);
         if (!rootPackage) return std::unexpected(rootPackage.error());
         packages[0] = std::move(*rootPackage);
     }
@@ -7373,14 +7382,14 @@ prepare_build(bool print_fingerprint,
         std::vector<std::string> added;
         for (auto const& word : mcpp::manifest::flag_words(depManifest.buildConfig.ldflags)) {
             auto normalized = mcpp::manifest::flag_element(normalizeDepLdflag(depRoot, word));
-            m->buildConfig.ldflags.push_back(normalized);
+            state.m->buildConfig.ldflags.push_back(normalized);
             added.push_back(std::move(normalized));
         }
         return added;
     };
 
     auto removeLinkFlags = [&](const std::vector<std::string>& flags) {
-        auto& ldflags = m->buildConfig.ldflags;
+        auto& ldflags = state.m->buildConfig.ldflags;
         for (auto const& flag : flags) {
             auto pos = std::find(ldflags.begin(), ldflags.end(), flag);
             if (pos != ldflags.end()) ldflags.erase(pos);
@@ -7722,11 +7731,11 @@ prepare_build(bool print_fingerprint,
     // Pull the root package's active feature-deps into its dependency set before
     // seeding, so `mcpp build --features X` resolves X's optional deps.
     std::vector<std::string> rootReq = parse_feature_request(state.overrides.features);
-    if (auto fm = mergeActiveFeatureDeps(*m, rootReq); !fm)
+    if (auto fm = mergeActiveFeatureDeps(*state.m, rootReq); !fm)
         return std::unexpected(fm.error());
     // #243: the root's active features may forward features to its direct deps.
-    std::vector<std::string> rootActive = feature_closure(*m, rootReq, true);
-    if (auto fe = validateForwards(*m, rootActive, m->package.name); !fe)
+    std::vector<std::string> rootActive = feature_closure(*state.m, rootReq, true);
+    if (auto fe = validateForwards(*state.m, rootActive, state.m->package.name); !fe)
         return std::unexpected(fe.error());
     activeFeaturesByPackage.assign(1, rootActive);
 
@@ -7742,9 +7751,9 @@ prepare_build(bool print_fingerprint,
         if (!fwd)
             msg = std::format("--features requests '{}', which names neither a "
                               "feature nor `<dependency>/<feature>`", tok);
-        else if (!declaresDependencyKey(*m, fwd->first))
+        else if (!declaresDependencyKey(*state.m, fwd->first))
             msg = std::format("--features requests '{}', and no dependency table "
-                              "of '{}' declares '{}'", tok, m->package.name,
+                              "of '{}' declares '{}'", tok, state.m->package.name,
                               fwd->first);
         if (!msg.empty()) {
             if (state.overrides.strict) return std::unexpected(msg);
@@ -7764,17 +7773,17 @@ prepare_build(bool print_fingerprint,
 
     // Seed the worklist from the main manifest. Dev-deps only when the
     // caller wants them; they're never propagated transitively.
-    const std::string mainPkgLabel = m->package.name;
-    for (auto& [n, s] : m->dependencies) {
+    const std::string mainPkgLabel = state.m->package.name;
+    for (auto& [n, s] : state.m->dependencies) {
         auto req = s;
-        injectForwards(*m, rootActive, n, req);
+        injectForwards(*state.m, rootActive, n, req);
         injectCliForwards(n, req);
         worklist.push_back({n, req, mainPkgLabel, req.version, kMainConsumer, {}});
     }
     if (state.includeDevDeps) {
-        for (auto& [n, s] : m->devDependencies) {
+        for (auto& [n, s] : state.m->devDependencies) {
             auto req = s;
-            injectForwards(*m, rootActive, n, req);
+            injectForwards(*state.m, rootActive, n, req);
             injectCliForwards(n, req);
             worklist.push_back({n, req, mainPkgLabel + " (dev-dep)",
                                 req.version, kMainConsumer, {}, /*devOnly=*/true});
@@ -7786,9 +7795,9 @@ prepare_build(bool print_fingerprint,
     // loaded, no diagnostic, and no effect. Seeded here, and unlike dev-deps
     // it IS walked transitively: a build dependency's own dependencies are
     // what make it work, and they inherit its build-only nature.
-    for (auto& [n, s] : m->buildDependencies) {
+    for (auto& [n, s] : state.m->buildDependencies) {
         auto req = s;
-        injectForwards(*m, rootActive, n, req);
+        injectForwards(*state.m, rootActive, n, req);
         injectCliForwards(n, req);
         worklist.push_back({n, req, mainPkgLabel + " (build-dep)",
                             req.version, kMainConsumer, {}, /*devOnly=*/false,
@@ -7809,7 +7818,7 @@ prepare_build(bool print_fingerprint,
         }
         if (kind == "path") {
             std::filesystem::path p = s.path;
-            auto base = resolveRoot.empty() ? *root : resolveRoot;
+            auto base = resolveRoot.empty() ? *state.root : resolveRoot;
             if (p.is_relative()) p = base / p;
             std::error_code ec;
             auto canon = std::filesystem::weakly_canonical(p, ec);
@@ -7840,7 +7849,7 @@ prepare_build(bool print_fingerprint,
             return std::unexpected(r.error());
         }
         if (item.consumerDepIndex == kMainConsumer) {
-            if (auto it = m->dependencies.find(name); it != m->dependencies.end()) {
+            if (auto it = state.m->dependencies.find(name); it != state.m->dependencies.end()) {
                 it->second.namespace_ = spec.namespace_;
                 it->second.shortName = spec.shortName;
                 it->second.candidates = spec.candidates;
@@ -7856,7 +7865,7 @@ prepare_build(bool print_fingerprint,
         // being an ordinary path.
         if (spec.isPath() && !gitCloneBySource.empty()) {
             std::filesystem::path p = spec.path;
-            auto base = item.resolveRoot.empty() ? *root : item.resolveRoot;
+            auto base = item.resolveRoot.empty() ? *state.root : item.resolveRoot;
             if (p.is_relative()) p = base / p;
             std::error_code ec;
             auto canon = std::filesystem::weakly_canonical(p, ec);
@@ -7959,7 +7968,7 @@ prepare_build(bool print_fingerprint,
                     return std::unexpected(std::format(
                         "dependency '{}{}{}' is requested as both a {} dep "
                         "(by '{}') and a {} dep (by '{}'). Pick one.\n"
-                        "       declare '{}{}{}' in the root to settle it.",
+                        "       declare '{}{}{}' in the state.root to settle it.",
                         key.ns, key.ns.empty() ? "" : ".", key.shortName,
                         it->second.source, it->second.requestedBy,
                         sourceKind, item.requestedBy,
@@ -7979,7 +7988,7 @@ prepare_build(bool print_fingerprint,
                     // invariant is safer than silently letting whichever side
                     // arrived first win, which is the accident #630 reports.
                     return std::unexpected(std::format(
-                        "internal: dependency '{}{}{}': the root's "
+                        "internal: dependency '{}{}{}': the state.root's "
                         "declaration arrived after '{}' had already resolved "
                         "it. This is unreachable under first-in-first-out "
                         "worklist seeding; please report this as an mcpp "
@@ -8026,7 +8035,7 @@ prepare_build(bool print_fingerprint,
 
                 mcpp::diag::warning("dependency/source-override", std::format(
                     "'{}{}{}' is declared as a {} dep (by '{}', {}) and as a "
-                    "{} dep (by '{}', {}); the root's declaration wins.",
+                    "{} dep (by '{}', {}); the state.root's declaration wins.",
                     key.ns, key.ns.empty() ? "" : ".", key.shortName,
                     it->second.source, it->second.requestedBy, it->second.sourceRef,
                     sourceKind, item.requestedBy,
@@ -8034,7 +8043,7 @@ prepare_build(bool print_fingerprint,
                                             : sourceRefOf(sourceKind, spec,
                                                           item.resolveRoot,
                                                           item.originalConstraint)),
-                    std::format("declare '{}{}{}' in the root to choose the other.",
+                    std::format("declare '{}{}{}' in the state.root to choose the other.",
                         key.ns, key.ns.empty() ? "" : ".", key.shortName));
 
                 if (it->second.depIndex + 1 < packages.size()) {
@@ -8156,7 +8165,7 @@ prepare_build(bool print_fingerprint,
                     // Under the write root, not the source root: the stage
                     // is build output, and BuildOverrides::work_dir promises
                     // that everything the build writes moves with it.
-                    auto stageBase         = workRoot / "target" / ".mangled"
+                    auto stageBase         = state.workRoot / "target" / ".mangled"
                                              / consumerManifest.package.name;
                     auto secStage          = stageBase
                                              / std::format("{}__{}", key.shortName, spec.version);
@@ -8354,7 +8363,7 @@ prepare_build(bool print_fingerprint,
                         // above: unreachable under FIFO seeding, and refused
                         // by name rather than silently swapped in.
                         return std::unexpected(std::format(
-                            "internal: dependency '{}{}{}': the root's "
+                            "internal: dependency '{}{}{}': the state.root's "
                             "declaration arrived after '{}' had already "
                             "resolved it. This is unreachable under "
                             "first-in-first-out worklist seeding; please "
@@ -8376,10 +8385,10 @@ prepare_build(bool print_fingerprint,
                         key.ns, key.ns.empty() ? "" : ".", key.shortName,
                         sourceKind, it->second.sourceRef, it->second.requestedBy,
                         sourceKind, incomingRef, item.requestedBy,
-                        existingIsRoot ? "the root's declaration"
+                        existingIsRoot ? "the state.root's declaration"
                                        : std::format("'{}', declared first",
                                                      it->second.requestedBy)),
-                        std::format("declare '{}{}{}' in the root to choose "
+                        std::format("declare '{}{}{}' in the state.root to choose "
                                     "the other.",
                             key.ns, key.ns.empty() ? "" : ".", key.shortName));
                 }
@@ -8404,7 +8413,7 @@ prepare_build(bool print_fingerprint,
             // For top-level deps this is the project root; for transitive
             // deps it's the parent dep's directory (stored in resolveRoot).
             dep_root = spec.path;
-            auto base = item.resolveRoot.empty() ? *root : item.resolveRoot;
+            auto base = item.resolveRoot.empty() ? *state.root : item.resolveRoot;
             if (dep_root.is_relative()) dep_root = base / dep_root;
             dep_root = std::filesystem::weakly_canonical(dep_root);
         } else if (spec.isGit()) {
@@ -8444,8 +8453,8 @@ prepare_build(bool print_fingerprint,
             std::string resolvedGitRev = spec.gitRev;
             bool fromLock = false;
             if (spec.gitRefKind == "branch") {
-                auto it = gitLockAnchors.find(name);
-                if (it != gitLockAnchors.end()
+                auto it = state.gitLockAnchors.find(name);
+                if (it != state.gitLockAnchors.end()
                     && it->second.url     == spec.git
                     && it->second.refKind == spec.gitRefKind
                     && it->second.ref     == spec.gitRev
@@ -8612,9 +8621,9 @@ prepare_build(bool print_fingerprint,
             // a vendored copy or an example living inside the tree is still
             // refused for a missing version, exactly as before.
             const bool depIsMember =
-                wsManifest && !runtimeWorkspaceRoot.empty()
+                state.wsManifest && !state.runtimeWorkspaceRoot.empty()
                 && mcpp::project::is_workspace_member(
-                       *wsManifest, runtimeWorkspaceRoot, dep_root);
+                       *state.wsManifest, state.runtimeWorkspaceRoot, dep_root);
             auto dm = mcpp::manifest::load(
                 dep_root / "mcpp.toml",
                 {.insideWorkspace = depIsMember || !gitMember.empty()});
@@ -8633,7 +8642,7 @@ prepare_build(bool print_fingerprint,
                 return inherit_as_workspace_member(*dep_manifest, ws, wsRoot, dep_root);
             };
             if (depIsMember) {
-                if (auto bad = inheritAsMember(*wsManifest, runtimeWorkspaceRoot))
+                if (auto bad = inheritAsMember(*state.wsManifest, state.runtimeWorkspaceRoot))
                     return std::unexpected(*bad);
             } else if (!gitMember.empty()) {
                 if (auto rm = mcpp::manifest::load(gitMemberCloneRoot / "mcpp.toml")) {
@@ -9097,18 +9106,18 @@ prepare_build(bool print_fingerprint,
         // chosen for a target it cannot produce. Same shape as the four
         // defects 2026.8.25.1 fixed: a predicate spanning two layers deciding
         // something that does not depend on either of them.
-        if (!targetPinCandidate.empty()
-            && (!graphSuppliesSystem || targetPinIsCapability)) {
+        if (!state.targetPinCandidate.empty()
+            && (!graphSuppliesSystem || state.targetPinIsCapability)) {
             if (tcOrigin == TcOrigin::GlobalDefault && tcSpec.has_value()
-                && *tcSpec != targetPinCandidate)
-                pinReplacedDefault = *tcSpec;
+                && *tcSpec != state.targetPinCandidate)
+                state.pinReplacedDefault = *tcSpec;
             // Kept for the build program's host resolution; see the
             // declaration. Taken from every origin, not only the global
             // default, because a `[toolchain]` the manifest named is just as
             // much the host's compiler as a remembered default is.
-            if (tcSpec.has_value() && *tcSpec != targetPinCandidate)
-                hostSpecBeforeRowPin = *tcSpec;
-            tcSpec   = targetPinCandidate;
+            if (tcSpec.has_value() && *tcSpec != state.targetPinCandidate)
+                state.hostSpecBeforeRowPin = *tcSpec;
+            tcSpec   = state.targetPinCandidate;
             tcOrigin = TcOrigin::TargetPin;
         }
 
@@ -9189,18 +9198,18 @@ prepare_build(bool print_fingerprint,
                     // directly above it has already ruled out — the failure
                     // this release removes from `check_requirements`, reproduced
                     // three screens away.
-                    std::string_view why = targetPinIsCapability
+                    std::string_view why = state.targetPinIsCapability
                         ? "The row names its compiler as a capability: no other "
                           "family emits this target."
                         : "The row's payload is what supplies this target's "
                           "headers and C library,\n       and nothing in the "
                           "dependency graph supplies them instead.";
-                    std::string remedy = targetPinIsCapability
+                    std::string remedy = state.targetPinIsCapability
                         ? std::format(
                               "       Drop the package that requires `{}`, or "
                               "take a version of it built\n"
                               "       for `{}`.",
-                              reqCompiler, targetPinCandidate)
+                              reqCompiler, state.targetPinCandidate)
                         : std::format(
                               "       Depend on a package that supplies this "
                               "target's system (its kernel\n"
@@ -9216,10 +9225,10 @@ prepare_build(bool print_fingerprint,
                         "         required         {:<14} (required by {})\n"
                         "       {}\n{}",
                         reqCompilerBy, reqCompiler,
-                        targetRowName.empty() ? state.overrides.target_triple
-                                              : targetRowName,
-                        targetPinCandidate,
-                        targetPinIsCapability ? "capability" : "convention",
+                        state.targetRowName.empty() ? state.overrides.target_triple
+                                              : state.targetRowName,
+                        state.targetPinCandidate,
+                        state.targetPinIsCapability ? "capability" : "convention",
                         reqCompiler, reqCompilerBy,
                         why, remedy));
                 }
@@ -9229,9 +9238,9 @@ prepare_build(bool print_fingerprint,
                     auto pickedSpec = resolve_required_family(reqCompiler);
                     if (!pickedSpec)
                         return std::unexpected(pickedSpec.error());
-                    graphCompilerReplaced   = tcSpec.value_or("");
-                    graphCompilerRequiredBy = reqCompilerBy;
-                    graphCompilerFamily     = reqCompiler;
+                    state.graphCompilerReplaced   = tcSpec.value_or("");
+                    state.graphCompilerRequiredBy = reqCompilerBy;
+                    state.graphCompilerFamily     = reqCompiler;
                     tcSpec   = *pickedSpec;
                     tcOrigin = TcOrigin::GraphRequirement;
                 }
@@ -9270,10 +9279,10 @@ prepare_build(bool print_fingerprint,
         // "yes, some payload here produces it" — the same shape as the family
         // this release is about, a predicate answering a question narrower than
         // the one it is asked.
-        if (!targetRowPin.empty() && !graphSuppliesSystem
+        if (!state.targetRowPin.empty() && !graphSuppliesSystem
             && tc_origin_is_user_explicit(tcOrigin) && tcSpec.has_value()) {
             auto declared = mcpp::toolchain::parse_toolchain_spec(*tcSpec);
-            auto rowTc    = mcpp::toolchain::parse_toolchain_spec(targetRowPin);
+            auto rowTc    = mcpp::toolchain::parse_toolchain_spec(state.targetRowPin);
             if (declared && rowTc && declared->family != rowTc->family) {
                 refusal::record(refusal::Code::ConventionUnreplaced);
                 return std::unexpected(std::format(
@@ -9290,7 +9299,7 @@ prepare_build(bool print_fingerprint,
                     "       openkal-llvm-runtime are the ones in the index), or "
                     "remove the `[toolchain]`\n"
                     "       line so `{}` is used for this target.",
-                    targetRowName, targetRowPin, *tcSpec, targetRowPin));
+                    state.targetRowName, state.targetRowPin, *tcSpec, state.targetRowPin));
             }
         }
         if (auto r = resolve_target_toolchain(); !r)
@@ -9350,24 +9359,24 @@ prepare_build(bool print_fingerprint,
         if (tc) {
             if (auto t = mcpp::toolchain::triple::parse(tc->targetTriple);
                 t && (t->is_android() || t->is_apple())) {
-                const auto value = min_platform_version(*m, *t, tc->binaryPath);
+                const auto value = min_platform_version(*state.m, *t, tc->binaryPath);
                 std::string name, origin;
                 if (t->is_android()) {
-                    auto row = m->targetOverrides.find(t->str());
+                    auto row = state.m->targetOverrides.find(t->str());
                     name = "android.api-level";
-                    origin = row != m->targetOverrides.end() && row->second.minApiLevel > 0
+                    origin = row != state.m->targetOverrides.end() && row->second.minApiLevel > 0
                         ? std::format("[target.{}] min_api_level", t->str())
                         : std::format("the toolchain's lowest supported level, because "
                                       "[target.{}] min_api_level is not set", t->str());
                 } else if (t->is_ios()) {
                     name = "ios.deployment-target";
-                    origin = iosFloorFromSdk
+                    origin = state.iosFloorFromSdk
                         ? std::string("the located SDK's version, because [build] "
                                       "ios_deployment_target is not set")
                         : std::string("[build] ios_deployment_target");
                 } else {
                     name = "macos.deployment-target";
-                    origin = m->buildConfig.macosDeploymentTarget.empty()
+                    origin = state.m->buildConfig.macosDeploymentTarget.empty()
                         ? std::string("mcpp's default for macOS, because [build] "
                                       "macos_deployment_target is not set")
                         : std::string("[build] macos_deployment_target");
@@ -9381,7 +9390,7 @@ prepare_build(bool print_fingerprint,
         for (std::size_t pi = 0; pi < packages.size(); ++pi) {
             // The root's claims live in *m: its build program mutates
             // *m, and packages[0] is a snapshot taken before it ran.
-            const auto& mf  = pi == 0 ? *m : packages[pi].manifest;
+            const auto& mf  = pi == 0 ? *state.m : packages[pi].manifest;
             const auto who = mf.package.name;
             for (auto const& entry : mf.runtimeConfig.provides) {
                 auto fact = mcpp::build::parse_version_fact(entry);
@@ -9391,7 +9400,7 @@ prepare_build(bool print_fingerprint,
         for (std::size_t pi = 0; pi < packages.size(); ++pi) {
             // The root's claims live in *m: its build program mutates
             // *m, and packages[0] is a snapshot taken before it ran.
-            const auto& mf  = pi == 0 ? *m : packages[pi].manifest;
+            const auto& mf  = pi == 0 ? *state.m : packages[pi].manifest;
             const auto who = mf.package.name;
             for (auto const& req : mf.runtimeConfig.requirements) {
                 if (req.kind != "version-floor") continue;
@@ -9500,11 +9509,11 @@ prepare_build(bool print_fingerprint,
             // ignored, and points at the key a dependency does have. Covers
             // BOTH members: a dependency that declares only `exceptions` must
             // be reported exactly as one that declares only `threads`.
-            if (pcap != m->package.name
+            if (pcap != state.m->package.name
                 && (pkg.manifest.buildConfig.abiThreadsDeclared
                     || pkg.manifest.buildConfig.abiExceptionsDeclared))
                 mcpp::diag::warning("abi/dependency-table", std::format(
-                    "`{}` declares [target.<selector>.abi], which only the root "
+                    "`{}` declares [target.<selector>.abi], which only the state.root "
                     "manifest decides; a dependency states what it needs with "
                     "`requires_abi = {{ threads = true }}` or "
                     "`requires_abi = {{ exceptions = true }}`", pcap));
@@ -9756,7 +9765,7 @@ prepare_build(bool print_fingerprint,
                 mcpp::diag::warning("features/request", msg);
             }
             apply(packages[0], rootReq);
-            for (auto& f : activate(*m, rootReq)) activeRootFeatures.insert(f);
+            for (auto& f : activate(*state.m, rootReq)) activeRootFeatures.insert(f);
         }
         // #242/#243: the feature request for a dependency PACKAGE, aggregated
         // over ALL its incoming edges (a package may be depended on by several
@@ -9872,7 +9881,7 @@ prepare_build(bool print_fingerprint,
                 }
             }
             if (!collected.empty()) {
-                if (ci == 0) m->buildConfig.deviceExtensions = collected;
+                if (ci == 0) state.m->buildConfig.deviceExtensions = collected;
                 packages[ci].manifest.buildConfig.deviceExtensions = std::move(collected);
             }
             if (!ruleModules.empty()) {
@@ -9881,7 +9890,7 @@ prepare_build(bool print_fingerprint,
                 // root reads `*m`. Writing only the copy left the synthesis with
                 // an empty list and the shaders uncompiled, with a refusal that
                 // named the missing build program rather than the missing write.
-                if (ci == 0) m->buildConfig.ruleModules = ruleModules;
+                if (ci == 0) state.m->buildConfig.ruleModules = ruleModules;
                 packages[ci].manifest.buildConfig.ruleModules = std::move(ruleModules);
             }
         }
@@ -10056,7 +10065,7 @@ prepare_build(bool print_fingerprint,
                 // came to.
                 mcpp::ui::info("Rules", std::format("{} ({})", claim.module, claim.provider));
             }
-            if (ci == 0) m->buildConfig.ruleModules = applies;
+            if (ci == 0) state.m->buildConfig.ruleModules = applies;
             bc.ruleModules = std::move(applies);
         }
         activeFeaturesByPackage.resize(packages.size());
@@ -10106,7 +10115,7 @@ prepare_build(bool print_fingerprint,
             if (!fromGraph.empty()) {
                 if (auto cfg = get_cfg()) {
                     if (auto pv = provision_xlings_addresses(
-                            **cfg, fromGraph, *root,
+                            **cfg, fromGraph, *state.root,
                             "[xlings.workspace] entries declared by dependencies");
                         !pv) return std::unexpected(pv.error());
                 }
@@ -10565,7 +10574,7 @@ prepare_build(bool print_fingerprint,
                     // option. Deliberately not part of the store key — see
                     // tool_store.cppm.
                     if (auto ovr = mcpp::build::tool_store::find_override(
-                            *m, depName, depShort, toolName)) {
+                            *state.m, depName, depShort, toolName)) {
                         if (!std::filesystem::exists(*ovr)) {
                             return std::unexpected(std::format(
                                 "tool override for '{}:{}' points at '{}', which "
@@ -10723,7 +10732,7 @@ prepare_build(bool print_fingerprint,
                     // meets the same missing file it meets when the tool fails
                     // to build (SPEC-007 R5.3), so no new contract follows.
                     if (state.overrides.plan_only) {
-                        planNotes.push_back({"MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED",
+                        state.planNotes.push_back({"MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED",
                             std::format("host tool '{}' of package '{}' is not in "
                                         "the tool store and is not built while "
                                         "planning; the plan names the path it will "
@@ -10761,7 +10770,7 @@ prepare_build(bool print_fingerprint,
                     // path the sub-build writes, and on Windows those paths
                     // crossed the 260-character limit (mcpp#641, item 3).
                     sub.work_dir     = mcpp::build::tool_store::scratch_dir(
-                        cacheRoot, entry, workRoot);
+                        cacheRoot, entry, state.workRoot);
                     sub.target_triple = "";            // HOST — the whole point
                     sub.toolchain     = toolTcSpec;
                     sub.profile       = "release";
@@ -10790,7 +10799,7 @@ prepare_build(bool print_fingerprint,
                     }
                     sub.inherited_runtime_selection = std::make_shared<
                         const mcpp::xlings::runtime::RuntimeSelection>(
-                            runtimeSelection);
+                            state.runtimeSelection);
                     sub.inherited_runtime_binding = std::make_shared<
                         const mcpp::platform::runtime::RuntimeBinding>(
                             runtimeBindingSnapshot);
@@ -10947,7 +10956,7 @@ prepare_build(bool print_fingerprint,
             // library resolved, and the three answers that keep a board
             // package from naming a toolchain. One call, so a new answer
             // reaches every build program at once — see fill_target_build_env.
-            fill_target_build_env(bpEnv, *m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
+            fill_target_build_env(bpEnv, *state.m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
             bpEnv.toolsBin = projectSubosBin;
             bpEnv.profile      = effectiveProfile;
             bpEnv.accel        = resolvedAccel();
@@ -10964,7 +10973,7 @@ prepare_build(bool print_fingerprint,
             if (auto dit = deviceSourcesByPackage.find(pkg.root.string()); dit != deviceSourcesByPackage.end())
                 bpEnv.deviceSources = dit->second;
             bpEnv.features     = feature_closure(pkg.manifest, req, depDefaultFeatures);
-            bpEnv.artifactsDir = workRoot / "target" / ".build-mcpp" / "deps"
+            bpEnv.artifactsDir = state.workRoot / "target" / ".build-mcpp" / "deps"
                 / (dirSafe(pkg.manifest.package.name) + "@" + pkg.manifest.package.version);
             bpEnv.genBase      = bpEnv.artifactsDir / "out";
             // mcpp#241: this package's resolved dependencies as
@@ -11005,7 +11014,7 @@ prepare_build(bool print_fingerprint,
                 // program would have added, say) fails the member under the
                 // ordinary rule (E1).
                 if (state.overrides.plan_only) {
-                    planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
+                    state.planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
                         std::format("dependency '{}': {}",
                                     pkg.manifest.package.name, r.error()),
                         mcpp::wire::Severity::Error,
@@ -11053,7 +11062,7 @@ prepare_build(bool print_fingerprint,
                 std::vector<std::string> supplied(
                     bcDep.runner.begin() + static_cast<std::ptrdiff_t>(runnerN),
                     bcDep.runner.end());
-                if (!m->buildConfig.runner.empty() && !runnerProvider.empty()) {
+                if (!state.m->buildConfig.runner.empty() && !runnerProvider.empty()) {
                     return std::unexpected(std::format(
                         "two dependencies both supply a runner for this target: "
                         "'{}' and '{}'.\n"
@@ -11063,7 +11072,7 @@ prepare_build(bool print_fingerprint,
                         "explicit [target.<triple>].runner.",
                         runnerProvider, pkg.manifest.package.name));
                 }
-                m->buildConfig.runner = std::move(supplied);
+                state.m->buildConfig.runner = std::move(supplied);
                 runnerProvider = pkg.manifest.package.name;
             }
             for (auto const& [name, nr] : bcDep.namedRunners) {
@@ -11072,7 +11081,7 @@ prepare_build(bool print_fingerprint,
                                || nr.argv.size() > before->second.argv.size()
                                || (nr.longLived && !before->second.longLived);
                 if (!grew) continue;
-                auto& slot = m->buildConfig.namedRunners[name];
+                auto& slot = state.m->buildConfig.namedRunners[name];
                 auto& who  = namedRunnerProvider[name];
                 if (!slot.argv.empty() && !who.empty()) {
                     return std::unexpected(std::format(
@@ -11087,8 +11096,8 @@ prepare_build(bool print_fingerprint,
             }
             // A CLAIM THAT ONLY EVER TIGHTENS.
             if (bcDep.runExclusive && !exclusiveBefore)
-                m->buildConfig.runExclusive = true;
-            m->buildConfig.ldflags.insert(m->buildConfig.ldflags.end(),
+                state.m->buildConfig.runExclusive = true;
+            state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
                 bcDep.ldflags.begin() + ldN, bcDep.ldflags.end());
         }
 
@@ -11113,7 +11122,7 @@ prepare_build(bool print_fingerprint,
             auto tok = state.overrides.capabilities.substr(
                 p, c == std::string::npos ? std::string::npos : c - p);
             if (auto eq = tok.find('='); eq != std::string::npos)
-                m->capabilityPins[tok.substr(0, eq)] = tok.substr(eq + 1);
+                state.m->capabilityPins[tok.substr(0, eq)] = tok.substr(eq + 1);
             if (c == std::string::npos) break;
             p = c + 1;
         }
@@ -11184,22 +11193,22 @@ prepare_build(bool print_fingerprint,
             return std::format(
                 "`{}` requires the artefact's ABI to have {} ({}), and this "
                 "build does not state it.\n"
-                "       Add to the root manifest, for the targets that need it:\n"
+                "       Add to the state.root manifest, for the targets that need it:\n"
                 "\n"
                 "           [target.'cfg(os = \"<os>\")'.abi]\n"
                 "           {} = true", requirer, member, what, member);
         };
         if (auto err = checkAbiRequirement(
-                "threads", m->buildConfig.abiThreads, abiRequires))
+                "threads", state.m->buildConfig.abiThreads, abiRequires))
             return std::unexpected(*err);
         if (auto err = checkAbiRequirement(
-                "exceptions", m->buildConfig.abiExceptions, abiRequiresExceptions))
+                "exceptions", state.m->buildConfig.abiExceptions, abiRequiresExceptions))
             return std::unexpected(*err);
 
         std::set<std::string> boundCaps;
         for (auto& [cap, requirer] : capRequires) {
             if (!boundCaps.insert(cap).second) continue;   // one diagnosis per cap
-            auto& pins = m->capabilityPins;
+            auto& pins = state.m->capabilityPins;
             // Dedup candidates, preserve first-seen order.
             std::vector<std::string> cands;
             if (auto it = capProviders.find(cap); it != capProviders.end())
@@ -11308,7 +11317,7 @@ prepare_build(bool print_fingerprint,
         std::map<int, std::vector<Candidate>> byLayer;
         std::vector<tsd::Requirement>         requirements;
 
-        const auto& rootDeps = m->dependencies;
+        const auto& rootDeps = state.m->dependencies;
         auto is_direct = [&](std::string_view name) {
             for (auto const& [k, _] : rootDeps) {
                 if (k == name) return true;
@@ -11436,7 +11445,7 @@ prepare_build(bool print_fingerprint,
         if (tc) {
             if (auto tt = mcpp::toolchain::triple::parse(tc->targetTriple)) {
                 in.llvmTriple         = tt->llvm_triple(
-                    min_platform_version(*m, *tt, tc->binaryPath));
+                    min_platform_version(*state.m, *tt, tc->binaryPath));
                 in.targetOs           = tt->os;
                 in.targetEnv          = tt->env;
                 in.freestandingTarget = tt->is_freestanding();
@@ -11445,8 +11454,8 @@ prepare_build(bool print_fingerprint,
                 // `x86_64-linux-gnu` — re-parsing it reports a segment the
                 // project never wrote. The request was captured upstream, where
                 // the distinction still existed.
-                in.requestedCAbi = requestedCAbi;
-                if (!requestedCAbi.empty()) {
+                in.requestedCAbi = state.requestedCAbi;
+                if (!state.requestedCAbi.empty()) {
                     auto bare = *tt; bare.env.clear();
                     in.requestFreeTarget = bare.str();
                 }
@@ -11469,11 +11478,11 @@ prepare_build(bool print_fingerprint,
                 // C library package for this model to report as one.
                 if (tt->is_msvc_env())
                     ;
-                else if (auto const* ovr = sysroot_override(*m, *tt); ovr && ovr->empty())
+                else if (auto const* ovr = sysroot_override(*state.m, *tt); ovr && ovr->empty())
                     in.sysrootDeclaredEmpty = true;
                 else
                     in.sysrootXpkg = mcpp::toolchain::triple::effective_sysroot(
-                        *tt, sysroot_override(*m, *tt));
+                        *tt, sysroot_override(*state.m, *tt));
             }
             in.payloadLibcRef      = tc->targetSysrootPkg;
             in.payloadCxxInterface = tc->stdlibId;
@@ -12135,10 +12144,10 @@ prepare_build(bool print_fingerprint,
         // other half of its question has an answer. A payload on this machine
         // does not produce this target; if the graph does not supply the
         // target's system either, then nothing does and the diagnosis stands.
-        if (!unservedTargetDiagnosis.empty()
+        if (!state.unservedTargetDiagnosis.empty()
             && !resolvedTargetSide.system_from_graph()) {
             refusal::record(refusal::Code::HostCannotServe);
-            return std::unexpected(unservedTargetDiagnosis);
+            return std::unexpected(state.unservedTargetDiagnosis);
         }
 
         // THE TARGET AND THE COMPILER ARE NOT BOUND TOGETHER, AND THE
@@ -12188,7 +12197,7 @@ prepare_build(bool print_fingerprint,
             auto tt = mcpp::toolchain::triple::parse(resolvedTargetCanonical);
             return tt && tt->pin_is_capability();
         }();
-        if (!pinReplacedDefault.empty()
+        if (!state.pinReplacedDefault.empty()
             && resolvedTargetSide.system_from_graph()
             && !pinIsCapability) {
             mcpp::diag::warning("toolchain", std::format(
@@ -12200,8 +12209,8 @@ prepare_build(bool print_fingerprint,
                 "target to skip the substitution:\n"
                 "           [target.{}]\n"
                 "           toolchain = \"{}\"",
-                pinReplacedDefault, resolvedTargetCanonical,
-                resolvedTargetCanonical, pinReplacedDefault));
+                state.pinReplacedDefault, resolvedTargetCanonical,
+                resolvedTargetCanonical, state.pinReplacedDefault));
         }
 
         // A request that cannot be honoured is said so rather than dropped.
@@ -12226,7 +12235,7 @@ prepare_build(bool print_fingerprint,
         // there is nothing to warn about. Same shape as the three defects this
         // release fixes — see `TargetSide::system_from_graph`'s own note.
         if (resolvedTargetSide.cAbi.fromGraph()
-            && m->buildConfig.linkage == "dynamic")
+            && state.m->buildConfig.linkage == "dynamic")
             mcpp::ui::warning(
                 "`linkage = \"dynamic\"` has no effect when the "
                 "target's system comes from the dependency graph: those "
@@ -12283,8 +12292,8 @@ prepare_build(bool print_fingerprint,
         // guard, asking a different variable, saw nothing to refuse. One fact,
         // derived twice: the shape this whole release exists to remove.
         const std::string reportedTargetName =
-            !targetDisplayName.empty()
-                ? targetDisplayName
+            !state.targetDisplayName.empty()
+                ? state.targetDisplayName
                 : (resolvedTargetCanonical.empty()
                        ? (tc ? tc->targetTriple : std::string{})
                        : resolvedTargetCanonical);
@@ -12355,7 +12364,7 @@ prepare_build(bool print_fingerprint,
                 joined.empty() ? std::string("—") : joined));
         }
         if (!platformDeps.empty()
-            && m->buildConfig.platformDependencies == "refuse") {
+            && state.m->buildConfig.platformDependencies == "refuse") {
             refusal::record(refusal::Code::PlatformDependency);
             std::string joined;
             for (auto& d : platformDeps) {
@@ -12414,7 +12423,7 @@ prepare_build(bool print_fingerprint,
         // fingerprint: a contribution reaching the snapshots but not `*m` would
         // compile with flags the fingerprint does not describe, and the next
         // build would call that a cache hit.
-        merge_layer_conditional_config(*m, layerCtx);
+        merge_layer_conditional_config(*state.m, layerCtx);
         for (auto& pkg : packages) {
             const auto mark  = markDirectiveTail(pkg.manifest);
             const auto ldN   = pkg.manifest.buildConfig.ldflags.size();
@@ -12475,13 +12484,13 @@ prepare_build(bool print_fingerprint,
         namespace lf = mcpp::build::linkage_form;
 
         lf::Request request;
-        if (auto parsed = lf::parse(m->buildConfig.dependencyLinkage))
+        if (auto parsed = lf::parse(state.m->buildConfig.dependencyLinkage))
             request.whole = *parsed;
-        request.wholeIsExplicit = !m->buildConfig.dependencyLinkage.empty();
+        request.wholeIsExplicit = !state.m->buildConfig.dependencyLinkage.empty();
         // ONLY THE ROOT MANIFEST'S EDGES. See DependencySpec::linkage — a
         // package deep in the graph imposing a whole-image layout on its
         // consumer is a supply-chain property, not a convenience.
-        for (auto const& [depName, spec] : m->dependencies) {
+        for (auto const& [depName, spec] : state.m->dependencies) {
             if (spec.linkage.empty()) continue;
             if (auto parsed = lf::parse(spec.linkage)) {
                 request.perPackage[depName] = *parsed;
@@ -12498,7 +12507,7 @@ prepare_build(bool print_fingerprint,
         // way has no interpreter, so no shared object can ever be loaded into
         // it. Two keys with `linkage` in the name, and they are NOT independent.
         targetFacts.fullStaticLibc =
-            m->buildConfig.linkage == "static"
+            state.m->buildConfig.linkage == "static"
             && mcpp::toolchain::target_supports_full_static(
                    tc->targetTriple, mcpp::platform::supports_full_static);
 
@@ -12660,8 +12669,8 @@ prepare_build(bool print_fingerprint,
     // and a guard that asked only about the file left the synthesis unreachable
     // -- the shaders went uncompiled and the refusal named the missing program
     // rather than the guard. Measured.
-    if (std::filesystem::exists(*root / "build.mcpp")
-        || !m->buildConfig.ruleModules.empty()) {
+    if (std::filesystem::exists(*state.root / "build.mcpp")
+        || !state.m->buildConfig.ruleModules.empty()) {
         auto host = host_tc_for_build_program();
         if (!host) return std::unexpected(host.error());
         mcpp::build::BuildProgramEnv bpEnv;
@@ -12671,30 +12680,30 @@ prepare_build(bool print_fingerprint,
         // C library, which compiler and which C++ standard library resolved,
         // and the three answers that keep a board package from naming a
         // toolchain. One call — see fill_target_build_env.
-        fill_target_build_env(bpEnv, *m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
+        fill_target_build_env(bpEnv, *state.m, tc ? &*tc : nullptr, cfg_opt ? &*cfg_opt : nullptr);
         bpEnv.toolsBin = projectSubosBin;
         bpEnv.profile      = effectiveProfile;
         bpEnv.accel        = resolvedAccel();
-        fill_package_build_env(bpEnv, *m);
+        fill_package_build_env(bpEnv, *state.m);
         bpEnv.packFormat   = state.overrides.pack_format;
         bpEnv.packStageDir = state.overrides.pack_stage_dir;
-        bpEnv.languageModules = m->language.modules;
-        bpEnv.ruleModules  = m->buildConfig.ruleModules;
-        if (auto dit = deviceSourcesByPackage.find(root->string()); dit != deviceSourcesByPackage.end())
+        bpEnv.languageModules = state.m->language.modules;
+        bpEnv.ruleModules  = state.m->buildConfig.ruleModules;
+        if (auto dit = deviceSourcesByPackage.find(state.root->string()); dit != deviceSourcesByPackage.end())
             bpEnv.deviceSources = dit->second;
         // Set explicitly rather than relying on build_dir()'s root-relative
         // default: under BuildOverrides::work_dir the package root is shared
         // and may be read-only, and the default would write the compiled
         // helper straight into it. Same value as the default when work_dir is
         // unset, so an ordinary build is unchanged.
-        bpEnv.artifactsDir = workRoot / "target" / ".build-mcpp";
+        bpEnv.artifactsDir = state.workRoot / "target" / ".build-mcpp";
         // Root mode keeps genBase empty: a relative `generated=` from the ROOT
         // package resolves against the package root (the documented contract),
         // not against OUT_DIR.
         // Same expression as the pre-move call site (and same order), so the
         // contract hash — and therefore the build.mcpp cache — is unchanged
         // across the move for feature-identical builds.
-        bpEnv.features     = feature_closure(*m, parse_feature_request(state.overrides.features));
+        bpEnv.features     = feature_closure(*state.m, parse_feature_request(state.overrides.features));
         // mcpp#241 (root): consumer index 0, same owner as the dep loop.
         //
         // AND THE LINK FORM OF EACH DEPENDENCY (#642 E2), to this program only.
@@ -12713,7 +12722,7 @@ prepare_build(bool print_fingerprint,
                         mcpp::build::linkage_form::to_string(form.answer.linkage)));
             fillDepDirs(bpEnv, 0, &rootLinkForms);
         }
-        fillXpkgDirs(bpEnv, *m, 0);
+        fillXpkgDirs(bpEnv, *state.m, 0);
         // #355: the host tools the ROOT package requested (consumer index 0).
         if (auto tit = toolEnvByConsumer.find(0u); tit != toolEnvByConsumer.end())
             bpEnv.toolPaths = tit->second;
@@ -12782,20 +12791,20 @@ prepare_build(bool print_fingerprint,
             bpEnv.graphFile   = graphPath;
             bpEnv.graphDigest = mcpp::toolchain::hash_string(text);
         }
-        auto& bcRoot = m->buildConfig;
-        const auto mark = markDirectiveTail(*m);
+        auto& bcRoot = state.m->buildConfig;
+        const auto mark = markDirectiveTail(*state.m);
         const auto rldN = bcRoot.ldflags.size(), rsrcN = bcRoot.sources.size(),
-                   rmodN = m->modules.sources.size();
+                   rmodN = state.m->modules.sources.size();
         const auto ractN = bcRoot.actions.size();
         // #622 A4: how many `[runtime] deploy` entries existed before this
         // program ran — the manifest-sourced ones, already in `packages[0]`'s
         // snapshot. Anything past this index is a `mcpp::deploy()` residue
         // that needs the same mirror the flag/source tails get below.
-        const auto rdeployN = m->runtimeConfig.linkIntent.deploy.size();
+        const auto rdeployN = state.m->runtimeConfig.linkIntent.deploy.size();
         // Same reason, one field wide: `mcpp::runtime_search_dir()` residue
         // needs the same mirror `deploy` does, or `resolve_runtime_contract`
         // (which reads `packages[0]`'s snapshot, not `*m`) never sees it.
-        const auto rsearchDirN = m->runtimeConfig.linkIntent.runtimeSearchDirs.size();
+        const auto rsearchDirN = state.m->runtimeConfig.linkIntent.runtimeSearchDirs.size();
         // What the dependencies supplied as runners, before the root's program
         // speaks. The root's emissions are appended to the same slots, so a
         // name both supply becomes one argv joining the two (#634, §9 item 8,
@@ -12803,8 +12812,8 @@ prepare_build(bool print_fingerprint,
         const auto runnerBeforeRoot = bcRoot.runner;
         const auto namedBeforeRoot  = bcRoot.namedRunners;
         auto bp = mcpp::build::run_build_program(
-            *m, *root, host->first, host->second,
-            m->cppStandard, bpEnv);
+            *state.m, *state.root, host->first, host->second,
+            state.m->cppStandard, bpEnv);
         if (!bp && !state.overrides.plan_only) {
             return std::unexpected(bp.error());
         }
@@ -12816,9 +12825,9 @@ prepare_build(bool print_fingerprint,
         // directives" means; a later failure that follows from the gap
         // fails the member under the ordinary rule (E1).
         if (!bp) {
-            planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
+            state.planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
                 bp.error(), mcpp::wire::Severity::Error,
-                (*root / "build.mcpp").string()});
+                (*state.root / "build.mcpp").string()});
         }
         if (bp) {
             // THE SAME RULE THE DEPENDENCIES ARE HELD TO, WITH THE ROOT AS A PARTY.
@@ -12832,9 +12841,9 @@ prepare_build(bool print_fingerprint,
                     auto t = mcpp::toolchain::triple::parse(tc->targetTriple);
                     return t ? t->str() : tc->targetTriple;
                 }();
-                const auto row = m->targetOverrides.find(rowKey);
+                const auto row = state.m->targetOverrides.find(rowKey);
                 const auto manifestNames = [&](std::string_view name) {
-                    if (row == m->targetOverrides.end()) return false;
+                    if (row == state.m->targetOverrides.end()) return false;
                     if (name.empty()) return !row->second.runner.empty();
                     return row->second.namedRunners.contains(std::string(name));
                 };
@@ -12869,11 +12878,11 @@ prepare_build(bool print_fingerprint,
             auto& pkg0 = packages[0];
             // Compile-visible tail → privateBuild: the shared fold (same owner
             // as the dep loop; the root's TUs read privateBuild).
-            foldDirectiveTailIntoPrivateBuild(pkg0, *m, mark);
+            foldDirectiveTailIntoPrivateBuild(pkg0, *state.m, mark);
             // Before the source residues are mirrored below: adopting an action's
             // outputs APPENDS to bcRoot.sources, and those appends must be inside
             // the tail that gets copied into the packages[0] snapshot the scan reads.
-            adoptActionOutputs(*m, *root, ractN);
+            adoptActionOutputs(*state.m, *state.root, ractN);
             // The root's build program has spoken; a floor it stated is checked
             // now, with the facts every package (it included) established.
             if (auto err = checkVersionFloors(); err) return std::unexpected(*err);
@@ -12886,7 +12895,7 @@ prepare_build(bool print_fingerprint,
                 bcRoot.sources.begin() + rsrcN, bcRoot.sources.end());
             pkg0.manifest.modules.sources.insert(
                 pkg0.manifest.modules.sources.end(),
-                m->modules.sources.begin() + rmodN, m->modules.sources.end());
+                state.m->modules.sources.begin() + rmodN, state.m->modules.sources.end());
             // Fingerprint metadata (canonical_package_build_metadata folds
             // packages[].manifest.buildConfig) — mirror the flag/include tails,
             // as the old pre-snapshot ordering implicitly did.
@@ -12921,17 +12930,17 @@ prepare_build(bool print_fingerprint,
             // closes for sources/flags, one more field wide.
             pkg0.manifest.runtimeConfig.linkIntent.deploy.insert(
                 pkg0.manifest.runtimeConfig.linkIntent.deploy.end(),
-                m->runtimeConfig.linkIntent.deploy.begin() + static_cast<std::ptrdiff_t>(rdeployN),
-                m->runtimeConfig.linkIntent.deploy.end());
+                state.m->runtimeConfig.linkIntent.deploy.begin() + static_cast<std::ptrdiff_t>(rdeployN),
+                state.m->runtimeConfig.linkIntent.deploy.end());
             // `mcpp::runtime_search_dir()` residue → `packages[0].manifest`, the
             // same object and the same reason as the `deploy` mirror above: without
             // it a directive-sourced entry lands in `*m` and `resolve_runtime_contract`
             // never looks there.
             pkg0.manifest.runtimeConfig.linkIntent.runtimeSearchDirs.insert(
                 pkg0.manifest.runtimeConfig.linkIntent.runtimeSearchDirs.end(),
-                m->runtimeConfig.linkIntent.runtimeSearchDirs.begin()
+                state.m->runtimeConfig.linkIntent.runtimeSearchDirs.begin()
                     + static_cast<std::ptrdiff_t>(rsearchDirN),
-                m->runtimeConfig.linkIntent.runtimeSearchDirs.end());
+                state.m->runtimeConfig.linkIntent.runtimeSearchDirs.end());
         }
     }
 
@@ -12965,7 +12974,7 @@ prepare_build(bool print_fingerprint,
         auto const& pkg = packages[i];
         auto dit = deviceSourcesByPackage.find(pkg.root.string());
         if (dit == deviceSourcesByPackage.end() || dit->second.empty()) continue;
-        auto const& mm = (i == 0) ? *m : pkg.manifest;
+        auto const& mm = (i == 0) ? *state.m : pkg.manifest;
         std::set<std::filesystem::path> consumed;
         for (auto const& a : mm.buildConfig.actions)
             for (auto const& in : a.inputs) {
@@ -13029,7 +13038,7 @@ prepare_build(bool print_fingerprint,
         std::map<std::filesystem::path, std::string> ownerName;
         std::vector<std::pair<std::string, std::filesystem::path>> prepareDirs;
         for (std::size_t i = 0; i < packages.size(); ++i) {
-            auto const& mm = (i == 0) ? *m : packages[i].manifest;
+            auto const& mm = (i == 0) ? *state.m : packages[i].manifest;
             ownerName.emplace(packages[i].root.lexically_normal(), mm.package.name);
             for (auto const& a : mm.buildConfig.actions) {
                 if (a.role != mcpp::manifest::BuildAction::Role::Prepare) continue;
@@ -13049,7 +13058,7 @@ prepare_build(bool print_fingerprint,
                 auto s = rel.generic_string();
                 return s != "." && s.compare(0, 2, "..") != 0;
             };
-            for (auto const& decl : mcpp::build::declared_program_inputs(workRoot)) {
+            for (auto const& decl : mcpp::build::declared_program_inputs(state.workRoot)) {
                 std::vector<std::filesystem::path> watched(decl.files);
                 for (auto const& pattern : decl.globs) {
                     // The glob's fixed prefix — everything before its first
@@ -13086,7 +13095,7 @@ prepare_build(bool print_fingerprint,
     // required features are active in this build; otherwise it is silently
     // skipped. A pure build-selection knob — it runs before the modgraph/plan
     // so gated-out targets cost nothing.
-    std::erase_if(m->targets, [&](const mcpp::manifest::Target& t) {
+    std::erase_if(state.m->targets, [&](const mcpp::manifest::Target& t) {
         for (auto const& rf : t.requiredFeatures)
             if (!activeRootFeatures.contains(rf)) return true;
         return false;
@@ -13099,8 +13108,8 @@ prepare_build(bool print_fingerprint,
     // through the same cppfly merge, so the c++fly gates (and the
     // c++latest/c++fly per-toolchain std spelling) stay graph-consistent.
     std::string stdFlagAndDialect = mcpp::toolchain::cppfly::std_flag(
-        *tc, m->cppStandard.canonical, m->cppStandard.level);
-    if (m->cppStandard.experimental) {
+        *tc, state.m->cppStandard.canonical, state.m->cppStandard.level);
+    if (state.m->cppStandard.experimental) {
         // c++fly is best-effort by design: say exactly what this toolchain
         // got and what it lacks (the value's contract, design §5.4).
         auto fly = mcpp::toolchain::cppfly::resolve(*tc);
@@ -13118,8 +13127,8 @@ prepare_build(bool print_fingerprint,
                      skipped.empty() ? "(none)" : skipped);
     }
     for (auto& f : mcpp::toolchain::cppfly::effective_dialect_flags(
-             *tc, m->cppStandard.experimental,
-             mcpp::manifest::dialect_flags(m->buildConfig))) {
+             *tc, state.m->cppStandard.experimental,
+             mcpp::manifest::dialect_flags(state.m->buildConfig))) {
         stdFlagAndDialect += ' ';
         stdFlagAndDialect += f;
     }
@@ -13162,7 +13171,7 @@ prepare_build(bool print_fingerprint,
         mcpp::diag::warning("modgraph/scan", w.format());
     }
 
-    auto report = mcpp::modgraph::validate(scan.graph, *m, *root);
+    auto report = mcpp::modgraph::validate(scan.graph, *state.m, *state.root);
     for (auto& w : report.warnings) {
         if (w.path.empty()) mcpp::diag::warning("modgraph/validate", w.message);
         else mcpp::diag::warning("modgraph/validate",
@@ -13177,7 +13186,7 @@ prepare_build(bool print_fingerprint,
         return std::unexpected(msg);
     }
 
-    bool needsStdModule = graph_or_targets_import_std(scan.graph, *m, *root);
+    bool needsStdModule = graph_or_targets_import_std(scan.graph, *state.m, *state.root);
 
     // A DEPENDENCY THAT DECLARED A HIGHER STANDARD THAN THE GRAPH IS BUILT AT.
     //
@@ -13206,7 +13215,7 @@ prepare_build(bool print_fingerprint,
     // to use a C++26 construct, and that is a working configuration today for
     // anyone who wrote the key aspirationally. `--strict` promotes it.
     {
-        const auto graphLevel = m->cppStandard.level;
+        const auto graphLevel = state.m->cppStandard.level;
         for (std::size_t i = 1; i < packages.size(); ++i) {
             auto const& pkg = packages[i];
             if (!pkg.manifest.package.standardDeclared) continue;
@@ -13230,7 +13239,7 @@ prepare_build(bool print_fingerprint,
                 std::format("dependency `{}` declares standard = \"{}\", and "
                             "this graph is built at {}",
                             pkg.manifest.package.name,
-                            declared->canonical, m->cppStandard.canonical),
+                            declared->canonical, state.m->cppStandard.canonical),
                 "a C++ module graph has one standard, so the dependency's "
                 "declaration is not applied and its sources are compiled at the "
                 "graph's level",
@@ -13269,8 +13278,8 @@ prepare_build(bool print_fingerprint,
     // stopped testing the condition it claims to test.
     if (needsStdModule) {
         const auto prebuilt = mcpp::toolchain::cppfly::effective_dialect_flags(
-            *tc, m->cppStandard.experimental,
-            mcpp::manifest::dialect_flags(m->buildConfig));
+            *tc, state.m->cppStandard.experimental,
+            mcpp::manifest::dialect_flags(state.m->buildConfig));
         // THE ROOT PACKAGE ONLY, and the narrowing is a correctness bound
         // rather than a shortcut.
         //
@@ -13512,7 +13521,7 @@ prepare_build(bool print_fingerprint,
                 return cAbiTt && cAbiTt->os == "macos";
             }();
             hopt.macosDeploymentTarget = mcpp::platform::macos::deployment_target(
-                cAbiTargetIsMacos, m->buildConfig.macosDeploymentTarget);
+                cAbiTargetIsMacos, state.m->buildConfig.macosDeploymentTarget);
             for (auto& t : mcpp::toolchain::host_compile_tokens(
                      *tc, hopt, mcpp::toolchain::no_escape)) {
                 const auto q = " " + mcpp::xlings::shq(t);
@@ -13661,20 +13670,20 @@ prepare_build(bool print_fingerprint,
     // STL older than microsoft/STL#3977 answers 23, and those users would
     // otherwise get an error from inside std.ixx.
     if (needsStdModule && tc->importStdMinLevel > 0
-        && m->cppStandard.level < tc->importStdMinLevel) {
+        && state.m->cppStandard.level < tc->importStdMinLevel) {
         return std::unexpected(std::format(
             "source imports std but toolchain '{}' provides the std module only "
             "from {} up, while [package].standard resolves to '{}'; raise the "
             "standard or drop `import std;`",
             tc->label(),
             mcpp::manifest::cpp_standard_level_name(tc->importStdMinLevel),
-            m->package.standard));
+            state.m->package.standard));
     }
 
     // Compute fingerprint (no lockfile in M1 → empty hash)
     mcpp::toolchain::FingerprintInputs fpi;
     fpi.toolchain            = *tc;
-    fpi.cppStandard         = m->package.standard;
+    fpi.cppStandard         = state.m->package.standard;
     // Target-keyed, not host-keyed (#685): the fingerprint must fold
     // `macos_deployment_target` whenever THIS BUILD's resolved toolchain
     // targets macOS, whether mcpp itself is running on Linux, Windows or
@@ -13684,7 +13693,7 @@ prepare_build(bool print_fingerprint,
         auto fpTt = mcpp::toolchain::triple::parse(tc->targetTriple);
         return fpTt && fpTt->os == "macos";
     }();
-    fpi.compileFlags        = canonical_compile_flags(*m, fpTargetIsMacos)
+    fpi.compileFlags        = canonical_compile_flags(*state.m, fpTargetIsMacos)
                               + canonical_package_build_metadata(packages, fpTargetIsMacos);
     // [c-abi] REALISATION AND `__OPENKAL__` PARTICIPATE IN THE FINGERPRINT
     // (design 2026-09-18 §3.4, gap #4 of the design's own self-review). Two
@@ -13730,7 +13739,7 @@ prepare_build(bool print_fingerprint,
     // different directory, which makes replaying the wrong shape structurally
     // impossible instead of merely guarded. Only appended when non-default, so
     // existing build directories keep their identity.
-    if (const auto sched = mcpp::build::schedule::requested_switch(*m);
+    if (const auto sched = mcpp::build::schedule::requested_switch(*state.m);
         sched != "auto") {
         fpi.compileFlags += " #schedule=";
         fpi.compileFlags += sched;
@@ -13743,7 +13752,7 @@ prepare_build(bool print_fingerprint,
         fpi.compileFlags += " #accel=";
         fpi.compileFlags += accel;
     }
-    if (m->cppStandard.experimental) {
+    if (state.m->cppStandard.experimental) {
         // c++fly gate flags are derived (not manifest-declared): fold them in
         // so a cppfly table change across mcpp versions re-fingerprints.
         for (auto& f : mcpp::toolchain::cppfly::resolve(*tc).flags) {
@@ -13776,7 +13785,7 @@ prepare_build(bool print_fingerprint,
         const auto& stdDialect = mcpp::toolchain::dialect_for(*tc);
         const auto stdCrt = mcpp::toolchain::msvc_crt_flag(
             stdDialect, mcpp::toolchain::msvc_wants_static_crt(
-                            m->buildConfig.linkage, m->buildConfig.cxxRuntime));
+                            state.m->buildConfig.linkage, state.m->buildConfig.cxxRuntime));
         // Whether THIS build's resolved toolchain targets macOS — the same
         // target-not-host discriminator `min_platform_version` uses, parsed
         // locally because `tc` (not a `triple::Triple`) is what is in scope
@@ -13789,9 +13798,9 @@ prepare_build(bool print_fingerprint,
             // Described, not compiled: the paths and commands are the ones
             // ensure_built would use, from the one derivation in stdmod.cppm.
             auto described = mcpp::toolchain::describe_std_module(
-                *tc, m->package.standard, stdFlagAndDialect,
+                *tc, state.m->package.standard, stdFlagAndDialect,
                 mcpp::platform::macos::deployment_target(
-                    stdTargetIsMacos, m->buildConfig.macosDeploymentTarget),
+                    stdTargetIsMacos, state.m->buildConfig.macosDeploymentTarget),
                 mcpp::toolchain::default_cache_root(), stdCrt);
             if (!described) {
                 refusal::record(refusal::Code::StdModulePrecompile);
@@ -13804,9 +13813,9 @@ prepare_build(bool print_fingerprint,
             describedStdModule  = std::move(*described);
         } else {
             auto sm = mcpp::toolchain::ensure_built(
-                *tc, m->package.standard, stdFlagAndDialect,
+                *tc, state.m->package.standard, stdFlagAndDialect,
                 mcpp::platform::macos::deployment_target(
-                    stdTargetIsMacos, m->buildConfig.macosDeploymentTarget),
+                    stdTargetIsMacos, state.m->buildConfig.macosDeploymentTarget),
                 mcpp::toolchain::default_cache_root(), stdCrt);
             if (!sm) {
                 // THE ONE CODE IN THE TAXONOMY THAT NOTHING WROTE.
@@ -13841,9 +13850,9 @@ prepare_build(bool print_fingerprint,
             // above already succeeded with the same inputs -- so it only
             // means the description is unavailable for the plan, silently.
             auto described = mcpp::toolchain::describe_std_module(
-                *tc, m->package.standard, stdFlagAndDialect,
+                *tc, state.m->package.standard, stdFlagAndDialect,
                 mcpp::platform::macos::deployment_target(
-                    stdTargetIsMacos, m->buildConfig.macosDeploymentTarget),
+                    stdTargetIsMacos, state.m->buildConfig.macosDeploymentTarget),
                 mcpp::toolchain::default_cache_root(), stdCrt);
             if (described) describedStdModule = std::move(*described);
         }
@@ -13859,20 +13868,20 @@ prepare_build(bool print_fingerprint,
 
     BuildContext ctx;
     ctx.strict      = state.overrides.strict;
-    ctx.manifest    = *m;
+    ctx.manifest    = *state.m;
     ctx.tc          = *tc;
     ctx.fp          = fp;
-    ctx.runtimeSelection = runtimeSelection;
+    ctx.runtimeSelection = state.runtimeSelection;
     ctx.runtimeBinding = runtimeBindingSnapshot;
     ctx.profile     = effectiveProfile;
     ctx.activeFeatureRequest = state.overrides.features;
     ctx.compilerChoice = { std::string(tc_origin_name(tcOrigin)),
-                           graphCompilerRequiredBy,
-                           graphCompilerReplaced.empty() ? pinReplacedDefault
-                                                         : graphCompilerReplaced };
-    ctx.cacheMode   = cacheMode;
-    ctx.projectRoot= *root;
-    ctx.outputDir  = target_dir(*tc, fp, workRoot);
+                           state.graphCompilerRequiredBy,
+                           state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
+                                                         : state.graphCompilerReplaced };
+    ctx.cacheMode   = state.cacheMode;
+    ctx.projectRoot= *state.root;
+    ctx.outputDir  = target_dir(*tc, fp, state.workRoot);
     {
         std::error_code ec;
         const bool firstPlan = !std::filesystem::exists(ctx.outputDir / "build.ninja", ec);
@@ -13941,7 +13950,7 @@ prepare_build(bool print_fingerprint,
                 ctx.sourcePackages.push_back({qualified(packages[i].manifest),
                                               normalized,
                                               packages[i].manifest.modules.sources});
-            if (i == 0 || normalized == root->lexically_normal()) continue;
+            if (i == 0 || normalized == state.root->lexically_normal()) continue;
             if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
                 roots.push_back(std::move(normalized));
         }
@@ -14000,7 +14009,7 @@ prepare_build(bool print_fingerprint,
         if (!fromGraph.empty()) {
             if (auto cfg = get_cfg()) {
                 if (auto pv = provision_xlings_addresses(
-                        **cfg, fromGraph, *root,
+                        **cfg, fromGraph, *state.root,
                         "[xlings.workspace] entries declared by dependencies");
                     !pv) return std::unexpected(pv.error());
             }
@@ -14059,7 +14068,7 @@ prepare_build(bool print_fingerprint,
                   return t ? t->str() : tc->targetTriple;
               }();
         auto currentTag = mcpp::pack::cxx_surface_tag(
-            *tc, canonicalTriple, m->cppStandard.level);
+            *tc, canonicalTriple, state.m->cppStandard.level);
         // What THIS build targets on the device axis. Absent means it asks for
         // no accelerator, and every artifact then satisfies it vacuously —
         // which is correct, and is why a descriptor lists its CPU-only variant
@@ -14099,7 +14108,7 @@ prepare_build(bool print_fingerprint,
                 if (!spec.linkage.empty())
                     mcpp::diag::warning("build/dependency-linkage", std::format(
                         "'{}' asks for dependency '{}' to be linked as '{}'; only "
-                        "the root project decides link forms, so this is ignored",
+                        "the state.root project decides link forms, so this is ignored",
                         packages[i].manifest.package.name, depName, spec.linkage));
 
         for (auto const& [i, form] : dependencyLinkForms) {
@@ -14133,8 +14142,8 @@ prepare_build(bool print_fingerprint,
         }
     }
 
-    auto planResult = mcpp::build::make_plan(*m, *tc, fp, scan.graph, report.topoOrder,
-                                             packages, *root, ctx.outputDir,
+    auto planResult = mcpp::build::make_plan(*state.m, *tc, fp, scan.graph, report.topoOrder,
+                                             packages, *state.root, ctx.outputDir,
                                              stdBmiPath, stdObjectPath, storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
@@ -14164,7 +14173,7 @@ prepare_build(bool print_fingerprint,
                 commands, source, tc->binaryPath, sm.cacheDir,
                 mcpp::platform::is_windows);
             if (!inv) {
-                planNotes.push_back({"MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED",
+                state.planNotes.push_back({"MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED",
                     std::format("no command that builds the {} module names its "
                                 "source '{}'; the unit is not listed",
                                 module, source.string())});
@@ -14491,11 +14500,11 @@ prepare_build(bool print_fingerprint,
             // same switch a few hundred lines earlier: both get the normalised
             // value, only one of them says anything, so a typo produces exactly
             // one warning rather than two identical ones.
-            mcpp::build::schedule::requested_switch(*m, [](std::string_view bad) {
+            mcpp::build::schedule::requested_switch(*state.m, [](std::string_view bad) {
                 mcpp::ui::warning(std::format(
                     "ignoring invalid bmi_schedule '{}' (expected \"auto\", \"on\" or \"off\")", bad));
             }),
-            mcpp::build::schedule::resolve_jobs(*m, [](std::string_view bad) {
+            mcpp::build::schedule::resolve_jobs(*state.m, [](std::string_view bad) {
                 mcpp::ui::warning(std::format(
                     "ignoring invalid job count '{}' (expected a positive number or 'auto')", bad));
             }, globalDefaultJobs),
@@ -14516,7 +14525,7 @@ prepare_build(bool print_fingerprint,
     ctx.plan.runtimeBinding = runtimeBindingSnapshot;
     mcpp::build::merge_runtime_binding_contract(
         ctx.plan, runtimeBindingSnapshot);
-    ctx.plan.compileDbPath = workRoot / "compile_commands.json";
+    ctx.plan.compileDbPath = state.workRoot / "compile_commands.json";
     // GCC: a clean `*link:` for this build, so the payload's specs cannot
     // inject other homes' rpath entries into the artifact. AFTER the plan is
     // moved in — an earlier assignment was silently overwritten by that move,
@@ -14701,7 +14710,7 @@ prepare_build(bool print_fingerprint,
             for (auto const& f : mm.buildConfig.packFormats)
                 ctx.plan.providedPackFormats.push_back(f);
         };
-        collect(*m);
+        collect(*state.m);
         for (std::size_t i = 1; i < packages.size(); ++i)
             collect(packages[i].manifest);
         std::ranges::sort(ctx.plan.providedPackFormats);
@@ -15008,20 +15017,20 @@ prepare_build(bool print_fingerprint,
     // A DECLARED `utf-8` beside such a manifest is refused below instead.
     const bool hostToolBuild = state.overrides.tool_depth > 0;
     const bool ownManifest = hostToolBuild
-        && std::ranges::any_of(m->resources.files, [&](const auto& f) {
-               const auto abs = (f.is_absolute() ? f : (*root / f)).lexically_normal();
+        && std::ranges::any_of(state.m->resources.files, [&](const auto& f) {
+               const auto abs = (f.is_absolute() ? f : (*state.root / f)).lexically_normal();
                return mcpp::build::resources::scan_rc(abs).declaresManifest;
            });
     auto codePageOf = [&](const mcpp::manifest::Target& t) -> std::string_view {
         if (!t.windowsCodePage.empty()) return t.windowsCodePage;
         return (hostToolBuild && t.is_program() && !ownManifest) ? "utf-8" : "legacy";
     };
-    const bool anyUtf8Image = std::ranges::any_of(m->targets, [&](const auto& t) {
+    const bool anyUtf8Image = std::ranges::any_of(state.m->targets, [&](const auto& t) {
         return t.is_program() && codePageOf(t) == "utf-8";
     });
-    if (m->resources.declared() || anyUtf8Image) {
+    if (state.m->resources.declared() || anyUtf8Image) {
         namespace rsrc = mcpp::build::resources;
-        const auto& R = m->resources;
+        const auto& R = state.m->resources;
 
         // Rule 2 — target-independent, so it runs before the is_pe() gate.
         auto resolve_declared = [&](const std::filesystem::path& p,
@@ -15032,7 +15041,7 @@ prepare_build(bool print_fingerprint,
             // and a symlinked source tree would then bake a different path into
             // the generated script than the one the user wrote. (Same reason
             // mcpp#344 made the cache anchor lexical.)
-            auto abs = (p.is_absolute() ? p : (*root / p)).lexically_normal();
+            auto abs = (p.is_absolute() ? p : (*state.root / p)).lexically_normal();
             std::error_code ec;
             if (!std::filesystem::is_regular_file(abs, ec))
                 return std::unexpected(std::format(
@@ -15100,7 +15109,7 @@ prepare_build(bool print_fingerprint,
             if (peUnits.empty()) {
                 mcpp::diag::degraded("resources/no-image", std::format(
                     "[resources] is declared but '{}' produces no executable or "
-                    "shared library for {}", m->package.name, trip.str()),
+                    "shared library for {}", state.m->package.name, trip.str()),
                     "nothing embeds the icon or the version metadata",
                     "add a [targets.<name>] with kind = \"bin\" or \"shared\", "
                     "or drop the [resources] section");
@@ -15190,7 +15199,7 @@ prepare_build(bool print_fingerprint,
             auto wantsUtf8 = [&](const mcpp::build::LinkUnit& lu) {
                 if (lu.kind != mcpp::build::LinkUnit::Binary) return false;
                 if (!lu.artifactOf.empty()) return false;
-                for (auto const& t : m->targets)
+                for (auto const& t : state.m->targets)
                     if (t.name == lu.targetName)
                         return t.is_program() && codePageOf(t) == "utf-8";
                 return false;
@@ -15201,11 +15210,11 @@ prepare_build(bool print_fingerprint,
                 // string fields keep the real text. Say so — the properties
                 // dialog will disagree with `[package].version` and nothing
                 // else would explain why.
-                if (synthVersion && !m->package.version.empty()
-                    && !mcpp::version_req::parse_version(m->package.version)) {
+                if (synthVersion && !state.m->package.version.empty()
+                    && !mcpp::version_req::parse_version(state.m->package.version)) {
                     mcpp::diag::degraded("resources/version",
                         std::format("[package].version = \"{}\" has no numeric "
-                                    "form", m->package.version),
+                                    "form", state.m->package.version),
                         "the embedded FILEVERSION / PRODUCTVERSION fields are "
                         "0,0,0,0 (the string fields keep the real version)",
                         "set [resources.version-info] explicitly, or use a "
@@ -15236,7 +15245,7 @@ prepare_build(bool print_fingerprint,
                     mcpp::manifest::Resources forScript = R;
                     if (!synthVersion) forScript.versionInfo = false;
                     auto text = rsrc::synthesize_rc(
-                        m->package, forScript, lu.output.filename().string(),
+                        state.m->package, forScript, lu.output.filename().string(),
                         iconAbs, manifestAbs);
                     if (!text) return std::unexpected(text.error());
                     // A stable path, so `cp` + `files = [...]` reproduces the
@@ -15296,9 +15305,9 @@ prepare_build(bool print_fingerprint,
             // that is what makes `#include <windows.h>` work, and it is the
             // supported way to get VS_VERSION_INFO defined.
             const std::string ip = msvcStyle ? "/I" : "-I";
-            ctx.plan.rcFlags.push_back(ip + root->string());
-            for (auto const& d : m->buildConfig.includeDirs) {
-                auto abs = d.is_absolute() ? d : (*root / d);
+            ctx.plan.rcFlags.push_back(ip + state.root->string());
+            for (auto const& d : state.m->buildConfig.includeDirs) {
+                auto abs = d.is_absolute() ? d : (*state.root / d);
                 ctx.plan.rcFlags.push_back(ip + abs.string());
             }
             if (msvcStyle && tool->name().find("llvm-rc") != std::string::npos) {
@@ -15352,17 +15361,17 @@ prepare_build(bool print_fingerprint,
         // fails loudly instead of recursing until the stack dies.
         namespace ck = mcpp::build::cache_key;
         auto axes = ck::build_axes(
-            *tc, *m, stdFlagAndDialect,
+            *tc, *state.m, stdFlagAndDialect,
             mcpp::toolchain::cppfly::effective_dialect_flags(
-                *tc, m->cppStandard.experimental,
-                mcpp::manifest::dialect_flags(m->buildConfig)),
+                *tc, state.m->cppStandard.experimental,
+                mcpp::manifest::dialect_flags(state.m->buildConfig)),
             // ONE SLOT, BOTH PLATFORMS. See `min_platform_version`: a target
             // is either Apple or Android, and the level selects which bionic
             // symbols are visible, so two levels must be two build
             // directories.
             [&] {
                 auto tt = mcpp::toolchain::triple::parse(tc->targetTriple);
-                return tt ? min_platform_version(*m, *tt, tc->binaryPath)
+                return tt ? min_platform_version(*state.m, *tt, tc->binaryPath)
                           : std::string{};
             }(),
             // The GLOBAL registry root — the same one `fill_package_config`
@@ -15667,7 +15676,7 @@ prepare_build(bool print_fingerprint,
         // A dep reached only transitively has no such key, so it is written
         // under its fully-qualified identity.
         auto lock_name_for = [&](const ResolvedKey& k) -> std::string {
-            for (auto const& [n, s] : m->dependencies) {
+            for (auto const& [n, s] : state.m->dependencies) {
                 const std::string sn = s.shortName.empty() ? n : s.shortName;
                 if (s.namespace_ == k.ns && sn == k.shortName) return n;
             }
@@ -15675,7 +15684,7 @@ prepare_build(bool print_fingerprint,
         };
 
         // Lock custom index shas from manifest [indices] section.
-        for (auto const& [idxName, spec] : m->indices) {
+        for (auto const& [idxName, spec] : state.m->indices) {
             if (spec.is_local() || spec.is_builtin()) continue;
             mcpp::lockfile::LockedIndex li;
             li.name = idxName;
@@ -15685,7 +15694,7 @@ prepare_build(bool print_fingerprint,
         }
 
         // Git deps: root-declared only, unchanged (see the note above).
-        for (auto const& [name, spec] : m->dependencies) {
+        for (auto const& [name, spec] : state.m->dependencies) {
             if (!spec.isGit()) continue;
             mcpp::lockfile::LockedPackage lp;
             lp.name    = name;
@@ -15734,7 +15743,7 @@ prepare_build(bool print_fingerprint,
             lock.packages.push_back(std::move(lp));
         }
         if (!lock.packages.empty() || !lock.indices.empty()) {
-            auto lockPath = workRoot / "mcpp.lock";
+            auto lockPath = state.workRoot / "mcpp.lock";
             // `--locked` ASSERTS THAT THIS RESOLUTION IS THE RECORDED ONE.
             //
             // The file has always been written after the walk and never read
@@ -16146,7 +16155,7 @@ prepare_build(bool print_fingerprint,
             lu.targetName));
     }
 
-    ctx.planNotes = std::move(planNotes);
+    ctx.planNotes = std::move(state.planNotes);
     return ctx;
 }
 
