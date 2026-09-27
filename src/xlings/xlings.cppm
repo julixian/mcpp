@@ -1670,10 +1670,22 @@ public:
         } else if (kind == "progress") {
             const auto phase = ls.find_str("phase");
             if (phase.empty()) return;
-            if (!bar_ || phase != label_) {
+            // A sync step names its repository at the end of its message
+            // (`syncing index repo 2/5: mcpplibs`); each repository is its
+            // own bar, labelled with that name.
+            std::string subject;
+            if (phase == "index_sync") {
+                const auto message = ls.find_str("message");
+                if (auto colon = message.rfind(": "); colon != std::string::npos)
+                    subject = message.substr(colon + 2);
+            }
+            const auto key = subject.empty() ? phase : phase + "/" + subject;
+            if (!bar_ || key != label_) {
                 if (bar_) bar_->finish();
-                bar_.emplace("Updating", phase_label(phase));
-                label_ = phase;
+                bar_.emplace("Updating", subject.empty()
+                    ? phase_label(phase)
+                    : std::format("package index {}", subject));
+                label_ = key;
             }
             const auto pct = std::clamp(ls.find_num("percent"), 0.0, 100.0);
             bar_->update(static_cast<std::size_t>(pct));
@@ -1705,7 +1717,7 @@ private:
     }
 
     std::optional<mcpp::ui::ProgressBar> bar_;
-    std::string                          label_;   // the phase being drawn
+    std::string                          label_;   // the phase (and repository) drawn
     mcpp::ui::DownloadProgress           download_;
     int                                  resultExit_ = -1;
 };
