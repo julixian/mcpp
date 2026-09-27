@@ -264,6 +264,26 @@ constexpr std::size_t kMainConsumer = static_cast<std::size_t>(-1);
         std::string url, refKind, ref;
     };
 
+// PrepareState carries prepare_build's working state across the phases it
+// decomposes into (see the layout comment at the top of prepare.cppm). Each
+// phase is an ordinary function taking `PrepareState&`; the state itself is
+// constructed once, in driver.cpp's prepare_build(), and lives for the
+// whole call — including across a phase that stores a closure for a LATER
+// phase to call (resolve_target_toolchain, defined in toolchain.cpp's P2 and
+// called from its own P5): such a closure captures `state` itself rather
+// than individual locals, so it stays valid no matter which phase's stack
+// frame created it.
+//
+// A member exists here because some phase after the one that computes it
+// still reads it, or because a stored closure needs it to remain valid past
+// its own phase — several members exist ONLY for that second reason and are
+// never read by name from another phase (bootstrap_checked, kMainConsumer's
+// siblings). A value read and written within a single phase stays an
+// ordinary local in that phase's function body; it does not move here.
+//
+// Not copied: copying this by value would copy every dependency-graph and
+// plan structure prepare_build ever builds, silently, at whichever call
+// happened to pass it by value instead of by reference.
 struct PrepareState {
     PrepareState(bool print_fingerprint_, bool includeDevDeps_,
                  std::vector<mcpp::manifest::Target> extraTargets_,
@@ -486,8 +506,8 @@ struct PrepareState {
     bool targetSideResolved = false;
     mcpp::modgraph::UsageRequirements targetSideUsage;
 
-    // ── computed inside resolve_target_toolchain (P2's closure), read by P9
-    // and P13 well after that closure returns ───────────────────────────────
+    // ── P9/P11: the module scan, its validation, and the fingerprint they
+    // feed; read again by P13 (the plan, resolution.json) ───────────────────
     mcpp::toolchain::Fingerprint fp;
     std::filesystem::path stdBmiPath;
     std::filesystem::path stdObjectPath;
