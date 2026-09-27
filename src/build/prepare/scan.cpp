@@ -51,7 +51,11 @@ import mcpp.log;
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase11_scan(PrepareState& state) {
+// Scans this graph's sources and validates the result, returning whether the
+// graph (or one of its extra targets) imports `std` -- the single value
+// several of the steps below need, computed here because it depends on the
+// scan this step performs.
+static std::expected<bool, std::string> step11_scan_sources(PrepareState& state) {
 
     // mcpp#225 (E2): observability marker for the source-discovery phase —
     // `mcpp run`'s fast path (build_run_target/try_fast_run in execute.cppm)
@@ -106,8 +110,11 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
         return std::unexpected(msg);
     }
 
-    bool needsStdModule = graph_or_targets_import_std(state.scan.graph, *state.m, *state.root);
+    return graph_or_targets_import_std(state.scan.graph, *state.m, *state.root);
+}
 
+static std::expected<void, std::string>
+step11_dependency_standard_scope_check(PrepareState& state) {
     // A DEPENDENCY THAT DECLARED A HIGHER STANDARD THAN THE GRAPH IS BUILT AT.
     //
     // A C++ module graph has ONE standard — cross-level BMIs are hard
@@ -134,42 +141,44 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
     // declaring c++26 compiles perfectly well at c++23 whenever it happens not
     // to use a C++26 construct, and that is a working configuration today for
     // anyone who wrote the key aspirationally. `--strict` promotes it.
-    {
-        const auto graphLevel = state.m->cppStandard.level;
-        for (std::size_t i = 1; i < state.packages.size(); ++i) {
-            auto const& pkg = state.packages[i];
-            if (!pkg.manifest.package.standardDeclared) continue;
-            // A C++-layer provider's declaration IS applied, to every unit of
-            // it that neither provides nor imports a module (`make_plan`), so
-            // "is not applied" would be false for exactly the package whose
-            // sources need the level. Its module units stay at the graph's
-            // level, as every module unit does.
-            if (mcpp::manifest::cxx_layer_implementation_standard(pkg.manifest))
-                continue;
-            // The scope gate. A package whose root is under a store directory
-            // arrived from an index and its declaration was written by a
-            // descriptor generator, not by the person reading this diagnostic.
-            if (mcpp::build::path_is_under_any(pkg.root, state.storeRoots))
-                continue;
-            auto declared = mcpp::manifest::normalize_cpp_standard(
-                pkg.manifest.package.standard);
-            if (!declared || declared->level <= graphLevel) continue;
-            mcpp::diag::degraded(
-                "build/standard",
-                std::format("dependency `{}` declares standard = \"{}\", and "
-                            "this graph is built at {}",
-                            pkg.manifest.package.name,
-                            declared->canonical, state.m->cppStandard.canonical),
-                "a C++ module graph has one standard, so the dependency's "
-                "declaration is not applied and its sources are compiled at the "
-                "graph's level",
-                std::format(
-                    "raise the consumer's standard to \"{}\", or declare it "
-                    "once for every member:\n\n  [workspace.package]\n  "
-                    "standard = \"{}\"", declared->canonical, declared->canonical));
-        }
+    const auto graphLevel = state.m->cppStandard.level;
+    for (std::size_t i = 1; i < state.packages.size(); ++i) {
+        auto const& pkg = state.packages[i];
+        if (!pkg.manifest.package.standardDeclared) continue;
+        // A C++-layer provider's declaration IS applied, to every unit of
+        // it that neither provides nor imports a module (`make_plan`), so
+        // "is not applied" would be false for exactly the package whose
+        // sources need the level. Its module units stay at the graph's
+        // level, as every module unit does.
+        if (mcpp::manifest::cxx_layer_implementation_standard(pkg.manifest))
+            continue;
+        // The scope gate. A package whose root is under a store directory
+        // arrived from an index and its declaration was written by a
+        // descriptor generator, not by the person reading this diagnostic.
+        if (mcpp::build::path_is_under_any(pkg.root, state.storeRoots))
+            continue;
+        auto declared = mcpp::manifest::normalize_cpp_standard(
+            pkg.manifest.package.standard);
+        if (!declared || declared->level <= graphLevel) continue;
+        mcpp::diag::degraded(
+            "build/standard",
+            std::format("dependency `{}` declares standard = \"{}\", and "
+                        "this graph is built at {}",
+                        pkg.manifest.package.name,
+                        declared->canonical, state.m->cppStandard.canonical),
+            "a C++ module graph has one standard, so the dependency's "
+            "declaration is not applied and its sources are compiled at the "
+            "graph's level",
+            std::format(
+                "raise the consumer's standard to \"{}\", or declare it "
+                "once for every member:\n\n  [workspace.package]\n  "
+                "standard = \"{}\"", declared->canonical, declared->canonical));
     }
+    return {};
+}
 
+static std::expected<void, std::string>
+step11_dialect_flag_reaches_std_prebuild(PrepareState& state, bool needsStdModule) {
     // A DIALECT FLAG THAT REACHES EVERY TU AND NOT THE `import std` PREBUILD
     // IS A BUILD THAT CANNOT SUCCEED, AND MCPP KNOWS IT BEFORE COMPILING.
     //
@@ -254,7 +263,11 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
                 }()));
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string>
+step11_msvc_crt_word_check(PrepareState& state) {
     // A FREE-FORM CRT WORD IS ALWAYS A SECOND STATEMENT ON THE MSVC ABI (D3,
     // #718). Every MSVC-ABI build now states its own CRT model, so a literal
     // `/MT`/`/MD`(`d`) or `-fms-runtime-lib=*` in `[build] cxxflags` or
@@ -310,7 +323,11 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
                     return std::unexpected(r.error());
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string>
+step11_package_std_module_source(PrepareState& state) {
     // A standard library that came from a PACKAGE brings its own module
     // source, because the compiler cannot be asked for one it does not have.
     //
@@ -515,7 +532,11 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
         state.tc->stdModuleFlags = flags;
         break;
     }
+    return {};
+}
 
+static std::expected<void, std::string>
+step11_apple_sdk_cxx_runtime(PrepareState& state, bool needsStdModule) {
     // AN APPLE CROSS TARGET WITHOUT A GRAPH C++ RUNTIME LINKS THE SDK'S
     // libc++ (the Mach-O cell in distribution.cppm), AND THE HEADERS FOLLOW
     // THE RUNTIME. The payload's `std.cppm` and headers describe libc++ 22;
@@ -558,7 +579,11 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
                 "llvm.compiler-rt-builtins = \"22.1.8.5\" beside it)");
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string>
+step11_std_module_availability_gate(PrepareState& state, bool needsStdModule) {
     if (needsStdModule && !state.tc->hasImportStd) {
         // A freestanding target reaches here for a reason the generic message
         // gets wrong. Nothing is missing from the toolchain — libc++'s std
@@ -655,7 +680,10 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
             mcpp::manifest::cpp_standard_level_name(state.tc->importStdMinLevel),
             state.m->package.standard));
     }
+    return {};
+}
 
+static void step11_compute_fingerprint(PrepareState& state) {
     // Compute fingerprint (no lockfile in M1 → empty hash)
     mcpp::toolchain::FingerprintInputs fpi;
     fpi.toolchain            = *state.tc;
@@ -739,7 +767,10 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
     fpi.dependencyLockHash = "";    // M2
     fpi.stdBmiHash         = "";    // updated after stdmod build (chicken/egg ok for M1)
     state.fp = mcpp::toolchain::compute_fingerprint(fpi);
+}
 
+static std::expected<void, std::string>
+step11_prebuild_std_module(PrepareState& state, bool needsStdModule) {
     // Pre-build std module only when the source graph actually imports it.
     if (needsStdModule) {
         // The std BMI must be compiled with the SAME dialect set its
@@ -826,6 +857,35 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
             if (described) state.describedStdModule = std::move(*described);
         }
     }
+    return {};
+}
+
+std::expected<void, std::string> phase11_scan(PrepareState& state) {
+    auto needsStdModule = step11_scan_sources(state);
+    if (!needsStdModule) return std::unexpected(needsStdModule.error());
+
+    if (auto r = step11_dependency_standard_scope_check(state); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step11_dialect_flag_reaches_std_prebuild(state, *needsStdModule); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step11_msvc_crt_word_check(state); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step11_package_std_module_source(state); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step11_apple_sdk_cxx_runtime(state, *needsStdModule); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step11_std_module_availability_gate(state, *needsStdModule); !r)
+        return std::unexpected(r.error());
+
+    step11_compute_fingerprint(state);
+
+    if (auto r = step11_prebuild_std_module(state, *needsStdModule); !r)
+        return std::unexpected(r.error());
 
     if (state.print_fingerprint) {
         std::println("Toolchain: {}", state.tc->label());
@@ -837,6 +897,5 @@ std::expected<void, std::string> phase11_scan(PrepareState& state) {
 
     return {};
 }
-
 
 } // namespace mcpp::build
