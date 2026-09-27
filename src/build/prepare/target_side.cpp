@@ -59,29 +59,30 @@ import mcpp.wire;               // Severity, for PlanNote (#699 item 2, E3)
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase9_target_side(PrepareState& state) {
-    // ── THE TARGET SIDE, RESOLVED ONCE ───────────────────────────────────────
-    //
-    // HERE AND NOT EARLIER, AND THAT IS THE WHOLE POINT.
-    //
-    // mcpp serves two ways of supplying a target's platform interface, C
-    // library and C++ runtime, and the moment each becomes knowable is
-    // opposite: a prebuilt directory is known before dependency resolution, a
-    // set of packages only after it. Until now three separate derivations ran
-    // at the earlier moment and guessed the later answer — the family name in
-    // this file, `graphTargetSide` in flags, `graphCxxRuntime` in the contract
-    // — and they disagreed on the case none of them was written for. Measured:
-    //
-    //   ld64.lld: error: …/lib/x86_64-unknown-linux-gnu/libc++.so:
-    //                    unhandled file type
-    //
-    // for a pure C program crossed to macOS, whose graph supplies a C library
-    // and no C++ runtime at all.
-    //
-    // Placing the resolution after capability binding and before the root
-    // build.mcpp means every later consumer reads one value, and a build
-    // program can be told what was resolved rather than re-deriving it.
-    {
+// STEP FUNCTIONS (mcpp#722 / T6), one per section phase9's own banners
+// already named. Statements moved verbatim; two scoping braces that
+// wrapped several sections at once (no matching close inside any one
+// of them) are dropped as redundant, the same treatment graph.cpp and
+// features.cpp needed for their own such wrappers.
+
+// Hoisted from a local declaration inside phase9_target_side (mcpp#722 /
+// T6): `byLayer`'s element type, needed by the struct that now carries
+// gather state across step boundaries.
+struct TargetSideCandidate { mcpp::targetside::Provider p; bool direct; std::size_t index = 0; };
+
+// The locals phase9_target_side's first section (candidate gathering)
+// used to declare and every later section still reads: the PrepareState
+// pattern, one level deeper, for one phase's own steps.
+struct TargetSideGather {
+    mcpp::targetside::Inputs in;
+    std::map<int, std::vector<TargetSideCandidate>> byLayer;
+    std::vector<mcpp::targetside::Requirement> requirements;
+};
+
+static std::expected<TargetSideGather, std::string>
+step9_gather_target_side_candidates(PrepareState& state) {
+    namespace tsd = mcpp::targetside;
+    TargetSideGather gather;
         namespace tsd = mcpp::targetside;
 
         // Scan the graph once for every layer. A package declares the layer it
@@ -107,10 +108,8 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         // publishes an include set the WHOLE build must see (see
         // `targetSideUsage` below), and reaching that package by name would be
         // a second lookup of something already in hand.
-        struct Candidate { tsd::Provider p; bool direct; std::size_t index = 0; };
-        std::map<int, std::vector<Candidate>> byLayer;
-        std::vector<tsd::Requirement>         requirements;
-
+        using Candidate = TargetSideCandidate;
+                
         const auto& rootDeps = state.m->dependencies;
         auto is_direct = [&](std::string_view name) {
             for (auto const& [k, _] : rootDeps) {
@@ -180,7 +179,7 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 p.hasStdModule  = !pkg.manifest.stdModule.empty();
                 p.cAbiDecl      = pkg.manifest.cAbiDecl;
 
-                auto& slot = byLayer[static_cast<int>(decl->layer)];
+                auto& slot = gather.byLayer[static_cast<int>(decl->layer)];
                 // A package may carry both spellings during the transition, and
                 // the array order is the author's, not a preference. Two entries
                 // from the SAME package are one supplier; the current spelling
@@ -212,12 +211,12 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 // read — as an error for the root and a warning for a
                 // dependency — so it is skipped rather than refused twice.
                 if (!parsed || !*parsed) continue;
-                requirements.push_back({ pkgId, (*parsed)->layer,
+                gather.requirements.push_back({ pkgId, (*parsed)->layer,
                                          (*parsed)->interfaceName });
             }
         }
 
-        for (auto const& [layerInt, slot] : byLayer) {
+        for (auto const& [layerInt, slot] : gather.byLayer) {
             if (slot.size() < 2) continue;
             tsd::Conflict c;
             c.layer     = static_cast<tsd::CapLayer>(layerInt);
@@ -230,12 +229,12 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
 
         auto provider_of = [&](tsd::CapLayer want)
             -> std::optional<tsd::Provider> {
-            auto it = byLayer.find(static_cast<int>(want));
-            if (it == byLayer.end() || it->second.empty()) return std::nullopt;
+            auto it = gather.byLayer.find(static_cast<int>(want));
+            if (it == gather.byLayer.end() || it->second.empty()) return std::nullopt;
             return it->second.front().p;
         };
 
-        tsd::Inputs in;
+        auto& in = gather.in;
         if (state.tc) {
             if (auto tt = mcpp::toolchain::triple::parse(state.tc->targetTriple)) {
                 in.llvmTriple         = tt->llvm_triple(
@@ -367,6 +366,13 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
             }
         }
 
+    return gather;
+}
+
+static std::expected<void, std::string>
+step9_resolve_and_realise_cabi(PrepareState& state, TargetSideGather& gather) {
+    namespace tsd = mcpp::targetside;
+    auto& in = gather.in;
         state.resolvedTargetSide = tsd::resolve(in);
         state.targetSideResolved = true;
 
@@ -608,7 +614,12 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         // line is assembled after it. A std BMI built against a different C
         // library than its importers is what e2e 181 catches.
         if (state.tc) state.tc->cAbiPrebuilt = state.resolvedTargetSide.cAbi.prebuilt();
+    return {};
+}
 
+static std::expected<void, std::string>
+step9_target_side_include_broadcast(PrepareState& state, TargetSideGather& gather) {
+    namespace tsd = mcpp::targetside;
         // ── The target side's include set is a property of the BUILD ─────────
         //
         // IT WAS ALREADY COMPUTED, AND IT REACHED EXACTLY ONE TRANSLATION
@@ -651,8 +662,8 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
             std::set<std::size_t> layerProviderIndices;
             auto note_layer = [&](tsd::CapLayer which, const tsd::Layer& resolved) {
                 if (!resolved.fromGraph()) return;
-                auto it = byLayer.find(static_cast<int>(which));
-                if (it != byLayer.end() && !it->second.empty()) {
+                auto it = gather.byLayer.find(static_cast<int>(which));
+                if (it != gather.byLayer.end() && !it->second.empty()) {
                     layerProviderIndices.insert(it->second.front().index);
                     if (which == tsd::CapLayer::CxxAbi)
                         state.cxxLayerProviderIndex = it->second.front().index;
@@ -778,7 +789,12 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 state.appendUniqueFlags(p.privateBuild.asmflags, state.tc->cEnvBuiltinsTokens);
             }
         }
+    return {};
+}
 
+static std::expected<void, std::string>
+step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGather& gather) {
+    namespace tsd = mcpp::targetside;
         // INTERFACE ENUMERATION — THE RESOLUTION-TIME HALF OF THE CAPABILITY
         // MODEL (design 2026-09-20 §5.5; openkal SPEC 0.14 §3.3, §6.2).
         //
@@ -920,7 +936,7 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         // now means the project stated its own compiler, and the remedy has to
         // name that statement rather than a global default it is not using.
         if (auto why = tsd::check_requirements(
-                state.resolvedTargetSide, requirements,
+                state.resolvedTargetSide, gather.requirements,
                 tc_origin_is_user_explicit(state.tcOrigin) ? tc_origin_name(state.tcOrigin)
                                                      : std::string_view{})) {
             refusal::record(refusal::Code::LayerRequirement);
@@ -1177,8 +1193,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                                          : "platform dependencies",
                 joined));
         }
-    }
+    return {};
+}
 
+static std::expected<void, std::string> step9_layer_conditional_config(PrepareState& state) {
     // ── L1b: conditional sections whose predicate names a target-side layer ──
     //
     // The second half of the conditional axis, and it runs HERE for the same
@@ -1255,6 +1273,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         }
     }
 
+    return {};
+}
+
+static std::expected<void, std::string> step9_dependency_link_forms(PrepareState& state) {
     // ── #519: which FORM does each dependency take in this build ────────────
     //
     // The decision itself lives in `mcpp.build.linkage_form`, which is a pure,
@@ -1368,6 +1390,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         }
     }
 
+    return {};
+}
+
+static void step9_define_graph_package_entry_closure(PrepareState& state) {
     // ── The resolved graph, one derivation for two readers (#634 X, #647 E1) ──
     //
     // `resolution.json`'s `graph` section and the document the root build
@@ -1441,6 +1467,9 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         return entry;
     };
 
+}
+
+static std::expected<void, std::string> step9_root_build_program(PrepareState& state) {
     // ── L3: ROOT build.mcpp (moved after dependency resolution, design §3.1
     // item 4) ────────────────────────────────────────────────────────────────
     // Runs HERE — after dep resolution + feature activation (so the contract
@@ -1741,7 +1770,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                 state.m->runtimeConfig.linkIntent.runtimeSearchDirs.end());
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step9_device_sources_reach_an_action(PrepareState& state) {
     // ── Every device source must reach some action ─────────────────────────
     //
     // A device-kind file is the one source the engine has no compile rule for.
@@ -1821,6 +1853,10 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
                   "       drop them from `[build] sources`."));
     }
 
+    return {};
+}
+
+static std::expected<void, std::string> step9_rerun_input_prepare_dir(PrepareState& state) {
     // ── R1.3: a re-run input inside a `prepare` directory (SPEC-007 §3) ─────
     //
     // A build program's re-run set is declared BEFORE anything is built
@@ -1943,6 +1979,26 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
         state.stdFlagAndDialect += ' ';
         state.stdFlagAndDialect += f;
     }
+    return {};
+}
+
+std::expected<void, std::string> phase9_target_side(PrepareState& state) {
+    auto gather = step9_gather_target_side_candidates(state);
+    if (!gather) return std::unexpected(gather.error());
+    if (auto r = step9_resolve_and_realise_cabi(state, *gather); !r)
+        return std::unexpected(r.error());
+    if (auto r = step9_target_side_include_broadcast(state, *gather); !r)
+        return std::unexpected(r.error());
+    if (auto r = step9_kernel_abi_interfaces_and_requirements(state, *gather); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step9_layer_conditional_config(state); !r) return std::unexpected(r.error());
+    if (auto r = step9_dependency_link_forms(state); !r) return std::unexpected(r.error());
+    step9_define_graph_package_entry_closure(state);
+    if (auto r = step9_root_build_program(state); !r) return std::unexpected(r.error());
+    if (auto r = step9_device_sources_reach_an_action(state); !r) return std::unexpected(r.error());
+    if (auto r = step9_rerun_input_prepare_dir(state); !r) return std::unexpected(r.error());
+
     return {};
 }
 
