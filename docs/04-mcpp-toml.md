@@ -138,6 +138,26 @@ The check reads the **effective** flags, so it fires for the same flag written i
 `[profile.<name>] cxxflags` or in a `[target.…]` block. It does not fire when nothing in the
 graph imports `std`, where the flag is an ordinary per-unit option that works.
 
+`dialect_cxxflags` also accepts the conditional form `[target.<selector>.build]
+dialect_cxxflags` *(mcpp 2026.9.28.1+)*, for a dialect switch that exists only on some targets:
+
+```toml
+[build]
+dialect_cxxflags = ["-fno-exceptions"]
+
+[target.windows.build]
+dialect_cxxflags = ["-D_HAS_EXCEPTIONS=0"]
+```
+
+Unlike an ordinary build input, `dialect_cxxflags` is graph-wide (SPEC-004 §9 item 10), so only
+the root of the build contributes it: the command's own package, or the member `-p` selects.
+Entries are appended in this order — `[workspace.build]`, the root's own `[build]`, then each
+matching `[target.<selector>.build]` in manifest order — and the resolved list is what reaches
+the std BMI prebuild, the module scan and every translation unit, on the root and on every
+dependency alike. A dependency's own `dialect_cxxflags`, conditional or not, reaches no command:
+a package legitimately declares it for the build it does when it is the root of one, which is why
+it is not warned about.
+
 ### 2.2 `[targets.<name>]` — Build Targets
 
 ```toml

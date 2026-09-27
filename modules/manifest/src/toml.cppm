@@ -3712,6 +3712,11 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                                 "belongs in [build].sources"));
                         }
                 read_list("sources",  cc.inputs.sources);
+                // #717: a GRAPH-WIDE switch, not a per-package build input --
+                // read into `cc.dialectCxxflags` (a ConditionalConfig member of
+                // its own), never into `cc.inputs`. See that member's comment
+                // for why it is kept apart from BuildInputs.
+                read_list("dialect_cxxflags", cc.dialectCxxflags);
                 // #296: package-level macros are a build input like any other,
                 // so the cfg axis carries them too — a platform-only macro
                 // (`[target.'cfg(windows)'.build] defines = ["USE_WIN32"]`)
@@ -3746,14 +3751,15 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                             cc.inputs.globFlags))
                         return std::unexpected(error(origin, *err));
                 }
-                // The conditional axis carries BuildInputs and nothing else, so
-                // its vocabulary is exactly that struct's members — a key
-                // outside it (`static_stdlib`, `target`, a profile knob) is not
-                // conditionable and would otherwise vanish without a word, the
-                // #296 failure mode. MUST stay in sync with the reads above and
-                // with types.cppm's BuildInputs.
+                // The conditional axis carries BuildInputs, plus the one
+                // graph-wide member `dialect_cxxflags` (#717; ConditionalConfig,
+                // not BuildInputs), so its vocabulary is exactly those members —
+                // a key outside them (`static_stdlib`, `target`, a profile knob)
+                // is not conditionable and would otherwise vanish without a
+                // word, the #296 failure mode. MUST stay in sync with the reads
+                // above and with types.cppm's BuildInputs and ConditionalConfig.
                 static constexpr std::string_view kKnownConditionalBuildKeys[] = {
-                    "cflags", "cxxflags", "defines", "flags",
+                    "cflags", "cxxflags", "defines", "dialect_cxxflags", "flags",
                     "include_dirs", "include_dirs_after", "ldflags",
                     "private_include_dirs", "sources", "std-module-flags",
                 };

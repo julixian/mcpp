@@ -517,8 +517,16 @@ std::filesystem::path target_dir(const mcpp::toolchain::Toolchain& tc,
 // Exported so the "every build-variant knob is in here" invariant is machine-
 // checkable: the profile knobs were absent for a long time precisely because
 // nothing could assert on this string.
+// `includeDialectFlags`: false when this call serves the PER-PACKAGE
+// fingerprint loop (`canonical_package_build_metadata` below) for a package
+// that is not necessarily this build's root. `dialectCxxflags` is graph-wide
+// (types.cppm's BuildConfig::dialectCxxflags): only the root's value reaches
+// any command, so only the root's value may enter the fingerprint, and only
+// once (#717 design 2026-09-27 §6.2). The default keeps this the SAME call
+// the direct root-only call site below already makes.
 std::string canonical_compile_flags(const mcpp::manifest::Manifest& m,
-                                    bool targetIsMacos = false) {
+                                    bool targetIsMacos = false,
+                                    bool includeDialectFlags = true) {
     std::string s;
     s += "-std="; s += m.package.standard;
     s += " -fmodules";
@@ -565,9 +573,19 @@ std::string canonical_compile_flags(const mcpp::manifest::Manifest& m,
     }
     // Explicit [build] dialect_cxxflags (auto-promoted ones are already in
     // cxxflags above) — they change every BMI in the graph.
-    for (auto const& flag : m.buildConfig.dialectCxxflags) {
-        s += " dialect:";
-        s += flag;
+    //
+    // GATED: this is graph-wide (only the root's value reaches a command,
+    // BuildConfig::dialectCxxflags's own comment), so it belongs in the
+    // fingerprint only where `m` is known to be the root -- the direct call
+    // below, not the per-package loop of `canonical_package_build_metadata`,
+    // which calls this for every dependency too (#717 design §6.2, finding 7:
+    // a dependency's own value used to enter ITS fingerprint although it
+    // reaches no command).
+    if (includeDialectFlags) {
+        for (auto const& flag : m.buildConfig.dialectCxxflags) {
+            s += " dialect:";
+            s += flag;
+        }
     }
     for (auto const& flag : m.buildConfig.ldflags) {
         s += " ldflag:";
@@ -663,8 +681,18 @@ std::string canonical_package_build_metadata(
         // packages[0] is the root, whose flags `canonical_compile_flags`
         // already folds; serialising it twice is harmless and keeps this loop
         // one rule rather than one rule and an exception.
+        //
+        // EXCEPT for `dialect_cxxflags` (#717 design §6.2, finding 7): that
+        // key is graph-wide, so a dependency's own value must not enter ITS
+        // fingerprint contribution, and the root's must enter the fingerprint
+        // exactly once -- through the DIRECT root-only call this function's
+        // caller already makes on the root manifest (`canonical_compile_flags
+        // (*state.m, ...)`, scan.cpp), not through this per-package loop,
+        // where `includeDialectFlags = false` for every entry including the
+        // root.
         s += ' ';
-        s += canonical_compile_flags(pkg.manifest, targetIsMacos);
+        s += canonical_compile_flags(pkg.manifest, targetIsMacos,
+                                     /*includeDialectFlags=*/false);
         // The level a C++-layer provider compiles its implementation units at
         // (`make_plan`). Appended only when there is one, so every other
         // output directory keeps its identity.

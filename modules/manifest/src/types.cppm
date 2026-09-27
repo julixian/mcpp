@@ -1441,6 +1441,23 @@ struct ConditionalConfig {
     // `[target.<sel>.abi] exceptions` -- see BuildConfig::abiExceptions.
     bool                                abiExceptions = false;
     bool                                abiExceptionsDeclared = false;
+    // `[target.<sel>.build] dialect_cxxflags` -- a GRAPH-WIDE switch under a
+    // target condition (issue #717, design 2026-09-27 §6). Like `abiThreads`/
+    // `abiExceptions` above, only the ROOT's value is rendered; unlike them it
+    // is ADDITIVE rather than scalar, so there is no "declared" pair -- an
+    // absent section contributes nothing, exactly as an absent entry in a list
+    // does everywhere else.
+    //
+    // Deliberately NOT a member of `inputs` (BuildInputs): that type is the
+    // additive, PER-PACKAGE surface a condition may carry (types.cppm's
+    // BuildInputs comment), and this key is graph-wide -- a dependency's own
+    // conditional row must reach no command, the same rule its unconditional
+    // `[build] dialect_cxxflags` already follows. Recorded here for EVERY
+    // package (merge_conditional_config runs for each one), and merged into
+    // `BuildConfig::dialectCxxflags` -- the one variable every consumer (the
+    // scan, the std BMI prebuild, every TU, the fingerprint) already reads --
+    // only for the package that is the root of this build.
+    std::vector<std::string>            dialectCxxflags;
     // `[target.<sel>] requires_abi = { ... }` -- design 2026-09-12 (the UI
     // framework record) section 2.6, A6: a requirement can sit on the target
     // axis, because the sources it gates (`[target.<sel>.build] sources`) are
@@ -1534,7 +1551,12 @@ inline bool is_empty(const ConditionalConfig& c) {
         && c.targetKinds.empty()
         && c.xlings.empty() && !c.abiThreadsDeclared && !c.abiExceptionsDeclared
         && !c.requiresAbiThreads && !c.requiresAbiExceptions
-        && c.featureRequiresAbiThreads.empty() && c.featureRequiresAbiExceptions.empty();
+        && c.featureRequiresAbiThreads.empty() && c.featureRequiresAbiExceptions.empty()
+        // #717: `dialect_cxxflags` is a member of ConditionalConfig, not of
+        // `c.inputs` (BuildInputs), so `is_empty(c.inputs)` above does not see
+        // it -- a section carrying only this key would otherwise be dropped
+        // before it is ever evaluated, the same failure #296 was filed for.
+        && c.dialectCxxflags.empty();
 }
 
 // `[lib]` — library "root" interface convention.

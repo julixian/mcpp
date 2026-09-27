@@ -764,6 +764,136 @@ static_stdlib = true
         << "the message must be generated from the same list the check uses";
 }
 
+// #717: `dialect_cxxflags` under `[target.<selector>.build]` used to be
+// reported as "unsupported key 'dialect_cxxflags' (ignored)" and reached no
+// command (measured on 2026.9.27.1). It is now accepted, without a warning,
+// and parsed into `ConditionalConfig::dialectCxxflags` -- a member of its own,
+// NOT of `BuildInputs` (`.inputs`), because the key is graph-wide rather than
+// a per-package additive input (design 2026-09-27 §6.2).
+TEST(Manifest, ConditionalDialectCxxflagsAcceptedAndKeptOffBuildInputs) {
+    constexpr auto src = R"(
+[package]
+name = "x"
+version = "0.1.0"
+[target.'cfg(linux)'.build]
+cxxflags         = ["-DORDINARY"]
+dialect_cxxflags = ["-DDIALECT_A", "-DDIALECT_B"]
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    EXPECT_TRUE(m->schemaWarnings.empty())
+        << (m->schemaWarnings.empty() ? "" : m->schemaWarnings[0]);
+    ASSERT_EQ(m->conditionalConfigs.size(), 1u);
+    auto const& cc = m->conditionalConfigs[0];
+    ASSERT_EQ(cc.dialectCxxflags.size(), 2u);
+    EXPECT_EQ(cc.dialectCxxflags[0], "-DDIALECT_A");
+    EXPECT_EQ(cc.dialectCxxflags[1], "-DDIALECT_B");
+    // An ordinary per-package build input written in the SAME section still
+    // lands on BuildInputs, as always -- only `dialect_cxxflags` is diverted.
+    ASSERT_EQ(cc.inputs.cxxflags.size(), 1u);
+    EXPECT_EQ(cc.inputs.cxxflags[0], "-DORDINARY");
+}
+
+// The negative control for the positive test above: a section carrying ONLY
+// `dialect_cxxflags` must still be recorded, the same emptiness-gate rule
+// `ConditionalSectionWithOnlyDefinesIsRecorded` states for `defines`.
+TEST(Manifest, ConditionalSectionWithOnlyDialectCxxflagsIsRecorded) {
+    constexpr auto src = R"(
+[package]
+name = "x"
+version = "0.1.0"
+[target.linux.build]
+dialect_cxxflags = ["-DONLY_DIALECT"]
+)";
+    auto m = mcpp::manifest::parse_string(src);
+    ASSERT_TRUE(m.has_value()) << m.error().format();
+    EXPECT_TRUE(m->schemaWarnings.empty());
+    ASSERT_EQ(m->conditionalConfigs.size(), 1u);
+    ASSERT_EQ(m->conditionalConfigs[0].dialectCxxflags.size(), 1u);
+    EXPECT_EQ(m->conditionalConfigs[0].dialectCxxflags[0], "-DONLY_DIALECT");
+}
+
+// The resolution rules: only a matching row contributes, a non-matching one
+// contributes nothing, and the order is the root's own `[build]` first, then
+// each matching `[target.<selector>.build]` in manifest order -- the same
+// technique `tests/unit/test_abi.cpp`'s `RequiresAbiOnTargetAxis` tests use
+// (`merge_conditional_config` against a resolved triple, no toolchain needed).
+namespace manifest_dialect {
+
+mcpp::manifest::Manifest merged_for(std::string_view src, std::string_view triple) {
+    auto m = mcpp::manifest::parse_string(src);
+    EXPECT_TRUE(m.has_value()) << (m.has_value() ? "" : m.error().format());
+    if (!m) return {};
+    mcpp::build::merge_conditional_config(*m, mcpp::build::cfgpred::context_for(triple));
+    return *m;
+}
+
+}  // namespace manifest_dialect
+
+TEST(ConditionalDialectCxxflags, RootBuildPrecedesTheMatchingRow) {
+    constexpr auto src = R"(
+[package]
+name = "x"
+version = "0.1.0"
+[build]
+dialect_cxxflags = ["-DBASE"]
+[target.linux.build]
+dialect_cxxflags = ["-DLINUX_ONE"]
+[target.windows.build]
+dialect_cxxflags = ["-DWINDOWS_ONLY"]
+)";
+    auto lin = manifest_dialect::merged_for(src, "x86_64-unknown-linux-gnu");
+    ASSERT_EQ(lin.buildConfig.dialectCxxflags.size(), 2u);
+    EXPECT_EQ(lin.buildConfig.dialectCxxflags[0], "-DBASE");
+    EXPECT_EQ(lin.buildConfig.dialectCxxflags[1], "-DLINUX_ONE");
+}
+
+// Two DIFFERENT selectors that both match the same resolved triple both
+// contribute -- this is not "last matching wins" (that rule belongs to a
+// conditional REPLACING a scalar or a dependency identity, §3.1.1); every
+// matching row is APPENDED, as `cxxflags` already is. The relative order
+// between two conditional rows is not asserted here: `m.conditionalConfigs`
+// is populated from the underlying `Table` (`std::map`, ordered by selector
+// text), not by source position, which is a property of the parser this
+// feature inherits rather than one it introduces or could change.
+TEST(ConditionalDialectCxxflags, TwoMatchingSelectorsBothContribute) {
+    constexpr auto src = R"(
+[package]
+name = "x"
+version = "0.1.0"
+[build]
+dialect_cxxflags = ["-DBASE"]
+[target.linux.build]
+dialect_cxxflags = ["-DLINUX_ONE"]
+[target.'cfg(arch = "x86_64")'.build]
+dialect_cxxflags = ["-DX86"]
+)";
+    auto lin = manifest_dialect::merged_for(src, "x86_64-unknown-linux-gnu");
+    ASSERT_EQ(lin.buildConfig.dialectCxxflags.size(), 3u);
+    EXPECT_EQ(lin.buildConfig.dialectCxxflags[0], "-DBASE")
+        << "the root's own unconditional [build] value always leads: it is "
+           "set before the conditional-merge loop runs, regardless of which "
+           "matching row the loop visits first";
+    auto const& flags = lin.buildConfig.dialectCxxflags;
+    EXPECT_NE(std::find(flags.begin(), flags.end(), "-DLINUX_ONE"), flags.end());
+    EXPECT_NE(std::find(flags.begin(), flags.end(), "-DX86"), flags.end());
+}
+
+TEST(ConditionalDialectCxxflags, ASelectorThatDoesNotMatchContributesNothing) {
+    constexpr auto src = R"(
+[package]
+name = "x"
+version = "0.1.0"
+[build]
+dialect_cxxflags = ["-DBASE"]
+[target.windows.build]
+dialect_cxxflags = ["-DWINDOWS_ONLY"]
+)";
+    auto lin = manifest_dialect::merged_for(src, "x86_64-unknown-linux-gnu");
+    ASSERT_EQ(lin.buildConfig.dialectCxxflags.size(), 1u);
+    EXPECT_EQ(lin.buildConfig.dialectCxxflags[0], "-DBASE");
+}
+
 // #540: `[features]` was the one structured section with no schema check at
 // all, so a misplaced `include_dirs` inside a feature built successfully with
 // zero diagnostics — while the identical misplacement in `[build]` or
