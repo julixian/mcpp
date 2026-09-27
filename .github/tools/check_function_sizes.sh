@@ -29,10 +29,10 @@
 #
 # A compile database that names BMIs explicitly (-fmodule-file=...), which
 # only a build actually produces: `mcpp build --toolchain llvm@22.1.8` writes
-# compile_commands.json at the project root. This script does not build it --
-# the caller (a developer, or the CI step beside this one) runs that build
-# first, the same division check_file_lengths.sh has none of because it reads
-# the tree directly.
+# compile_commands.json at the project root. This script does not build it:
+# the caller runs that build first (a developer, or ci-linux.yml's LLVM
+# toolchain job, which builds mcpp with llvm@20.1.7 before this step).
+# check_file_lengths.sh needs no such division because it reads the tree.
 #
 # clang-tidy itself is not part of the plain xim:llvm payload mcpp resolves
 # for `--toolchain llvm@...` (measured: xim-x-llvm/22.1.8/bin has clang,
@@ -70,43 +70,37 @@ EOF
 fi
 
 # Locate clang-tidy. It is not in the plain xim:llvm payload (see the header
-# comment); look for the sibling xim:llvm-tools payload under either xlings
-# store layout this machine may use, preferring a version that matches an
-# xim:llvm payload actually installed (compile_commands.json was built with
-# one of those), and falling back to any clang-tidy the store has.
-find_clang_tidy() {
-    local roots=(
-        "$HOME/.mcpp/registry/data/xpkgs"
-        "$HOME/.xlings/data/xpkgs"
-    )
-    local llvm_versions=()
-    for root in "${roots[@]}"; do
-        [ -d "$root/xim-x-llvm" ] || continue
-        while IFS= read -r v; do llvm_versions+=("$v"); done \
-            < <(find "$root/xim-x-llvm" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null)
-    done
-    for root in "${roots[@]}"; do
-        for v in "${llvm_versions[@]}"; do
-            local cand="$root/xim-x-llvm-tools/$v/bin/clang-tidy"
-            [ -x "$cand" ] && { echo "$cand"; return 0; }
-        done
-    done
-    for root in "${roots[@]}"; do
-        local cand
-        cand=$(find "$root/xim-x-llvm-tools" -maxdepth 3 -type f -name clang-tidy 2>/dev/null | sort -V | tail -1)
-        [ -n "$cand" ] && [ -x "$cand" ] && { echo "$cand"; return 0; }
+# comment); it is the sibling xim:llvm-tools payload, and it must be the
+# version of the clang that wrote compile_commands.json, because it reads the
+# BMIs that clang wrote. `CLANG_TIDY` may name it explicitly; otherwise
+# the version is read from the compiler path the database names
+# (`.../xim-x-llvm/<version>/bin/clang++`) and looked up in either xlings store.
+cdb_llvm_version() {
+    grep -o 'xim-x-llvm/[0-9][0-9.]*/bin/clang' "$CDB" 2>/dev/null | head -1 \
+        | sed 's|xim-x-llvm/\([0-9.]*\)/bin/clang|\1|'
+}
+find_clang_tidy() {   # $1 = the llvm version
+    local root
+    for root in "${MCPP_HOME:-$HOME/.mcpp}/registry/data/xpkgs" "$HOME/.xlings/data/xpkgs"; do
+        [ -x "$root/xim-x-llvm-tools/$1/bin/clang-tidy" ] \
+            && { echo "$root/xim-x-llvm-tools/$1/bin/clang-tidy"; return 0; }
     done
     return 1
 }
 
-CLANG_TIDY="$(find_clang_tidy)" || {
-    cat >&2 <<EOF
-FAIL: no clang-tidy found under an xlings package store.
-  Install the sibling of your llvm toolchain, e.g.:
-      xlings install xim:llvm-tools@22.1.8
+if [ -n "${CLANG_TIDY:-}" ]; then
+    [ -x "$CLANG_TIDY" ] || { echo "FAIL: CLANG_TIDY=$CLANG_TIDY is not executable" >&2; exit 1; }
+else
+    LLVM_VERSION="$(cdb_llvm_version)"
+    CLANG_TIDY="$( [ -n "$LLVM_VERSION" ] && find_clang_tidy "$LLVM_VERSION" )" || {
+        cat >&2 <<EOF
+FAIL: no clang-tidy of the llvm version that wrote $CDB (${LLVM_VERSION:-unknown})
+      was found under an xlings package store. Install that toolchain's sibling:
+          xlings install xim:llvm-tools@${LLVM_VERSION:-<version>}
 EOF
-    exit 1
-}
+        exit 1
+    }
+fi
 
 # The files this database actually has entries for, restricted to the
 # decomposition's own directory (plus the primary interface, if it is ever
