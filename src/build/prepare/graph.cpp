@@ -2256,10 +2256,8 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
     // refused by default and built under `--cache=local`. Every edge counts,
     // build-only ones included, as the key walk counts them.
     {
-        // Named visitState, not state: this block's own local shadows the
-        // PrepareState reference of the same name, which the rename pass that
-        // promoted `packages`/`dependencyEdges` to state members cannot see
-        // (a name introduced after that pass, not by it).
+        // Named visitState, not state: `state` is this function's PrepareState
+        // parameter, which the loop below also reads.
         std::vector<int> visitState(state.packages.size(), 0);   // 0 new / 1 on stack / 2 done
         std::vector<std::size_t> stack, cycle;
         auto visit = [&](auto&& self, std::size_t u) -> bool {

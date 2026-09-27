@@ -775,7 +775,7 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         // Section 2 of the design record measured that shape: a valid, empty,
         // 52 KB installer with nothing said about it.
         std::set<std::string> stageDirNoPass, stageDirWrongRole;
-        // Carried from the state.overrides so the refusal below can say WHY there is
+        // Carried from `state.overrides` so the refusal below can say WHY there is
         // no tree, which is a different sentence from "you are not packaging".
         std::string stageDirWhy;
         // WHETHER *THIS* ACTION REFERENCED THE STAGED TREE, and deliberately a
