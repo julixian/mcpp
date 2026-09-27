@@ -1289,6 +1289,510 @@ step6_host_module_registration(PrepareState& state) {
     return toolRequests;
 }
 
+// A phase-local struct passed by reference to the steps of ONE requested
+// host tool, the same way WorklistItemCtx (graph.cpp) is passed to the steps
+// of one worklist item and TargetSideGather (target_side.cpp) to the steps
+// of one target. Each field is a local the original single-function loop
+// body declared once and read again in a later part of the same tool's
+// provisioning.
+struct HostToolCtx {
+    std::size_t depIdx = 0;
+    std::string toolName;
+    std::string depName;
+    std::string depShort;
+    const mcpp::manifest::Target* tgt = nullptr;
+    prov::Provision want{};
+    std::string toolSource;
+    std::vector<std::string> closure;
+    std::string toolTcSpec;
+    mcpp::build::tool_store::Key key;
+    std::filesystem::path cacheRoot;
+    std::filesystem::path entry;
+    std::filesystem::path binOut;
+    BuildOverrides sub;
+    std::filesystem::path goal;
+    std::filesystem::path subOutputDir;
+};
+
+// The body of the `record` closure the single-function version of this step
+// captured per requested tool. It is called from four sites below (an
+// override, a store cache hit, a deferred plan-only tool, and a freshly
+// built one), so it is a named helper taking the context rather than a
+// per-tool closure.
+static void step6_record_tool_provision(PrepareState& state, HostToolCtx& ctx,
+                                         const std::filesystem::path& p) {
+    for (std::size_t c = 0; c < state.provisionGraph.visible.size(); ++c) {
+        if (!state.provisionGraph.visible[c].contains(ctx.want)) continue;
+        auto& v = state.toolEnvByConsumer[c];
+        std::vector<std::string> vars;
+        for (auto const& n : state.publishedNamesFor(ctx.depIdx, state.bareBindingsFor(c))) {
+            auto var = mcpp::build::tool_store::env_var_name(n, ctx.toolName);
+            if (std::ranges::find(vars, var) != vars.end()) continue;
+            vars.push_back(var);
+            v.emplace_back(std::move(var), p.string());
+        }
+    }
+}
+
+static std::expected<void, std::string>
+step6_resolve_tool_target(PrepareState& state, HostToolCtx& ctx) {
+    auto& depPkg = state.packages[ctx.depIdx];
+    // The target must exist and be a binary. Naming the
+    // alternatives matters: the consumer wrote a string, and a
+    // typo is the likeliest cause.
+    //
+    // #622 A3: deliberately still `Binary`, not `is_program()`.
+    // A host tool is exec'd directly ON THE BUILD MACHINE
+    // during THIS build, so it is "literally an executable
+    // link" — the question this site was already asking — and
+    // an `app` whose row form happened to be a library (never
+    // the host row in practice, but the check would be a
+    // silent trap if the host itself were ever Android) could
+    // not stand in for it. A build-time tool is declared
+    // `kind = "bin"`; that is what the word means here.
+    std::string binList;
+    for (auto const& t : depPkg.manifest.targets) {
+        if (t.kind != mcpp::manifest::Target::Binary) continue;
+        if (!binList.empty()) binList += ", ";
+        binList += t.name;
+        if (t.name == ctx.toolName) ctx.tgt = &t;
+    }
+    if (!ctx.tgt) {
+        // A package may declare a bin target on some platforms
+        // only. When the request came from a LIBRARY rather
+        // than from the user, the user cannot edit it away, so
+        // point at the knob that library needs (#359 D3a).
+        return std::unexpected(std::format(
+            "dependency '{}' has no `kind = \"bin\"` target named "
+            "'{}' (requested via tools = [...]).\n"
+            "  available bin targets: [{}]\n"
+            "  If the requesting package is a library, it can "
+            "scope the request per platform with\n"
+            "  [target.'cfg(...)'.feature-deps.<feature>].",
+            ctx.depName, ctx.toolName,
+            binList.empty() ? std::string("none") : binList));
+    }
+    return {};
+}
+
+// Returns true when the tool is already resolved (an escape-hatch override
+// found and recorded), in which case the caller's per-tool work is done.
+static std::expected<bool, std::string>
+step6_check_tool_override(PrepareState& state, HostToolCtx& ctx) {
+    // Escape hatch first: it is the cheapest resolution and the
+    // one a user reaches for precisely when building is not an
+    // option. Deliberately not part of the store key — see
+    // tool_store.cppm.
+    if (auto ovr = mcpp::build::tool_store::find_override(
+            *state.m, ctx.depName, ctx.depShort, ctx.toolName)) {
+        if (!std::filesystem::exists(*ovr)) {
+            return std::unexpected(std::format(
+                "tool override for '{}:{}' points at '{}', which "
+                "does not exist", ctx.depName, ctx.toolName, ovr->string()));
+        }
+        mcpp::ui::info("Tool", std::format(
+            "{}:{} → {} (override)", ctx.depName, ctx.toolName, ovr->string()));
+        step6_record_tool_provision(state, ctx, *ovr);
+        return true;
+    }
+    return false;
+}
+
+static std::expected<void, std::string>
+step6_check_tool_self_request(PrepareState& state, HostToolCtx& ctx) {
+    auto& depPkg = state.packages[ctx.depIdx];
+    // A TOOL WHOSE OWN BUILD REQUESTS IT AGAIN IS REFUSED AT
+    // THE FIRST REPETITION (#649 E6). The depth bound below
+    // caught it only after four nested sub-builds, with the
+    // same prefix repeated four times and no word about which
+    // edge asked. The edge is the one whose request reached
+    // this package in THIS graph.
+    ctx.toolSource = std::format(
+        "{}|{}", depPkg.root.lexically_normal().generic_string(), ctx.toolName);
+    if (std::ranges::find(state.overrides.tool_chain_sources, ctx.toolSource)
+        != state.overrides.tool_chain_sources.end()) {
+        std::string askedBy;
+        for (auto const& edge : state.dependencyEdges) {
+            if (edge.dependencyPackageIndex != ctx.depIdx) continue;
+            if (std::ranges::find(edge.requestedTools, ctx.toolName)
+                == edge.requestedTools.end()) continue;
+            if (edge.consumerPackageIndex < state.packages.size()) {
+                askedBy = mcpp::build::qualified_package_name(
+                    state.packages[edge.consumerPackageIndex].manifest);
+                break;
+            }
+        }
+        return std::unexpected(std::format(
+            "the host tool '{}:{}' is requested by its own build: "
+            "{} -> {}:{}.\n"
+            "       The request comes from '{}', which the tool's "
+            "sub-build resolves with the feature or dependency that "
+            "asks for the tool.\n"
+            "       fix: the tool's own graph must not activate "
+            "that request (a feature it does not enable, or a "
+            "`[target.<sel>.feature-deps]` row it does not match).",
+            ctx.depName, ctx.toolName,
+            state.overrides.tool_chain.empty() ? "root" : state.overrides.tool_chain,
+            ctx.depName, ctx.toolName,
+            askedBy.empty() ? std::string("a package of its graph") : askedBy));
+    }
+    return {};
+}
+
+// Returns true when the tool is already resolved (a valid store entry, or a
+// plan-only deferral), in which case the caller's per-tool work is done.
+static std::expected<bool, std::string>
+step6_resolve_tool_key(PrepareState& state, HostToolCtx& ctx) {
+    auto& depPkg = state.packages[ctx.depIdx];
+    // Build it. The feature set is the tool package's own
+    // defaults PLUS the target's required_features — in a tool
+    // sub-build the target is what was ASKED FOR, so its
+    // requirements are inputs rather than a gate. (Same field,
+    // opposite resolution direction; docs/05 says so.)
+    std::vector<std::string> feats = ctx.tgt->requiredFeatures;
+    ctx.closure = feature_closure(depPkg.manifest, feats, true);
+
+    // WHICH COMPILER BUILDS THE TOOL IS DECIDED HERE, ONCE
+    // (#710). The key used to record this build's host
+    // toolchain while the sub-build chose its own -- the tool
+    // package's `[toolchain]`, else the global default -- so an
+    // entry could name gcc 15.1 over a binary gcc 16.1 had
+    // produced, and a member tool built for a consumer used a
+    // different compiler than `mcpp build -p <tool>`. The
+    // choice is `--toolchain` when given, else the tool
+    // package's own (its workspace's, for a member), else the
+    // compiler this build compiles its build programs with. It
+    // is handed to the sub-build as an override and recorded in
+    // the key, so the two cannot disagree.
+    if (const char* e = std::getenv("MCPP_TOOLCHAIN"); e && *e)
+        ctx.toolTcSpec = e;
+    else if (auto own = host_tool_declared_toolchain(
+                 depPkg.manifest, depPkg.root, kCurrentPlatform))
+        ctx.toolTcSpec = *own;
+    std::string compilerIdentity;
+    if (ctx.toolTcSpec.empty()) {
+        auto hostTc = state.host_tc_for_build_program();
+        if (!hostTc) return std::unexpected(hostTc.error());
+        ctx.toolTcSpec = state.host_spec_for_build_program();
+        compilerIdentity = std::format("{}|{}|{}",
+            hostTc->second.label(), hostTc->second.version,
+            hostTc->first.string());
+    } else {
+        compilerIdentity = "spec|" + ctx.toolTcSpec;
+    }
+
+    ctx.key.indexName = ctx.depIdx >= 1 && ctx.depIdx - 1 < state.dep_cache_identities.size()
+                  ? state.dep_cache_identities[ctx.depIdx - 1].indexName
+                  : std::string(mcpp::pm::kDefaultNamespace);
+    ctx.key.packageName      = ctx.depName;
+    // THE VERSION IDENTIFIES THE SOURCES ONLY FOR AN INDEX
+    // PACKAGE. A `git` package is keyed by its commit and a
+    // `path` package by a stamp of its tree, because both
+    // change under an unchanged version and the store then
+    // serves a binary built from sources that no longer exist
+    // (#630, item 6; measured 2026-09-08 with examples/12).
+    // The same rule applies to every upstream below.
+    auto source_keyed_version = [&](std::size_t pkgIdx) {
+        const auto& man = state.packages[pkgIdx].manifest.package;
+        std::string v = man.version;
+        if (pkgIdx >= 1 && pkgIdx - 1 < state.dep_cache_identities.size()) {
+            const auto& id = state.dep_cache_identities[pkgIdx - 1];
+            if (id.sourceKind == "git" && !id.sourceRef.empty())
+                v += "+git." + id.sourceRef;
+            else if (id.sourceKind == "path")
+                v += "+path." + mcpp::build::tool_store::tree_stamp(
+                    id.sourceRef.empty() ? state.packages[pkgIdx].root
+                                         : std::filesystem::path(id.sourceRef));
+        }
+        return v;
+    };
+    ctx.key.version          = source_keyed_version(ctx.depIdx);
+    ctx.key.targetName       = ctx.toolName;
+    ctx.key.hostTriple       = mcpp::toolchain::triple::host_triple().str();
+    ctx.key.compilerIdentity = compilerIdentity;
+    ctx.key.profile          = "release";
+    ctx.key.features         = ctx.closure;
+    std::ranges::sort(ctx.key.features);
+    // The tool package's TRANSITIVE dependency closure, not just
+    // its direct edges. Direct-only would be enough for index
+    // packages (a frozen version cannot change its own deps),
+    // but a path dependency can: bump something two levels down
+    // and the tool's direct list is unchanged, so a stale binary
+    // stays in the store — a silently wrong artifact.
+    for (auto up : dg::transitive_dependencies(state.dependencyEdges, ctx.depIdx))
+        ctx.key.upstreamKeys.push_back(std::format("{}@{}",
+            state.packages[up].manifest.package.name,
+            source_keyed_version(up)));
+    std::ranges::sort(ctx.key.upstreamKeys);
+
+    ctx.cacheRoot = mcpp::home::cache_root();
+    ctx.entry     = mcpp::build::tool_store::entry_dir(ctx.cacheRoot, ctx.key);
+    const auto exeSuffix = std::string(mcpp::platform::exe_suffix);
+    ctx.binOut    = mcpp::build::tool_store::bin_path(
+        ctx.entry, ctx.toolName, exeSuffix);
+
+    if (mcpp::build::tool_store::entry_valid(ctx.entry, ctx.key, ctx.toolName,
+                                             exeSuffix)) {
+        step6_record_tool_provision(state, ctx, ctx.binOut);
+        return true;
+    }
+
+    // PLANNING BUILDS NO TOOL (SPEC-005 R2.5, v1.4; #707).
+    // `emit build-database` describes a build; it does not
+    // perform one (R2.2), and a tool sub-build is a whole
+    // compile of another package, with its own prepare
+    // actions -- measured on a fresh store, a single `emit`
+    // compiled the tool and ran the tool package's `prepare`
+    // action. A tool already in the store is used as above. One
+    // that is not is deferred: the build program receives the
+    // path the tool will be published at (`binOut`, fixed
+    // before anything is built), which is the answer it gets
+    // after a successful build, and a note names the tool. A
+    // build program that must RUN the tool while configuring
+    // meets the same missing file it meets when the tool fails
+    // to build (SPEC-007 R5.3), so no new contract follows.
+    if (state.overrides.plan_only) {
+        state.planNotes.push_back({"MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED",
+            std::format("host tool '{}' of package '{}' is not in "
+                        "the tool store and is not built while "
+                        "planning; the plan names the path it will "
+                        "be published at: {}",
+                        ctx.toolName, ctx.depName, ctx.binOut.string()),
+            mcpp::wire::Severity::Note});
+        step6_record_tool_provision(state, ctx, ctx.binOut);
+        return true;
+    }
+
+    return false;
+}
+
+static std::expected<void, std::string>
+step6_build_tool(PrepareState& state, HostToolCtx& ctx) {
+    auto& depPkg = state.packages[ctx.depIdx];
+    mcpp::ui::status("Building", std::format(
+        "host tool {}:{} from {} v{} (once per package source and "
+        "host toolchain)", ctx.depName, ctx.toolName, ctx.depName,
+        depPkg.manifest.package.version));
+
+    auto& sub = ctx.sub;
+    sub.project_root = depPkg.root;
+    // Never the package root: it is shared across projects and
+    // may be read-only. This is the reason work_dir exists.
+    //
+    // Scratch is keyed on the CONSUMING project, not shared:
+    // the store is GLOBAL, so two projects can want the same
+    // tool at once. A single `<entry>/build` would have them
+    // writing one ninja tree concurrently, and whichever
+    // finished first would `remove_all` it out from under the
+    // other. The published binary is what gets shared; the
+    // scratch is not.
+    //
+    // Hashed rather than random so a re-run reuses its own
+    // scratch (ninja stays incremental if the publish step
+    // never got to delete it).
+    //
+    // Beside the entries rather than inside one: every
+    // directory name of the entry is repeated in each object
+    // path the sub-build writes, and on Windows those paths
+    // crossed the 260-character limit (mcpp#641, item 3).
+    sub.work_dir     = mcpp::build::tool_store::scratch_dir(
+        ctx.cacheRoot, ctx.entry, state.workRoot);
+    sub.target_triple = "";            // HOST — the whole point
+    sub.toolchain     = ctx.toolTcSpec;
+    sub.profile       = "release";
+    sub.cache_mode    = state.overrides.cache_mode;
+    sub.tool_depth    = state.overrides.tool_depth + 1;
+    sub.tool_chain_sources = state.overrides.tool_chain_sources;
+    sub.tool_chain_sources.push_back(ctx.toolSource);
+    // The PRISTINE manifest the resolver produced for this
+    // package — `packages[depIdx].manifest` is a copy that
+    // feature activation has already mutated, and re-activating
+    // on top of it would fold the same feature sources in
+    // twice. A `compat` (Form B) package has no mcpp.toml on
+    // disk at all, so without this the sub-build could not read
+    // a manifest for it in the first place.
+    //
+    // UNMERGED, because the sub-build targets the HOST: the
+    // resolver merged this manifest's conditional sections for
+    // the consumer's target, and the sub-build merges them for
+    // its own (#690, F12).
+    if (ctx.depIdx >= 1 && ctx.depIdx - 1 < state.dep_manifests.size()
+        && state.dep_manifests[ctx.depIdx - 1]) {
+        auto const& dep = *state.dep_manifests[ctx.depIdx - 1];
+        sub.preloaded_manifest = dep.beforeConditionalMerge
+            ? dep.beforeConditionalMerge
+            : std::make_shared<const mcpp::manifest::Manifest>(dep);
+    }
+    sub.inherited_runtime_selection = std::make_shared<
+        const mcpp::xlings::runtime::RuntimeSelection>(
+            state.runtimeSelection);
+    sub.inherited_runtime_binding = std::make_shared<
+        const mcpp::platform::runtime::RuntimeBinding>(
+            state.runtimeBindingSnapshot);
+    sub.tool_chain    = state.overrides.tool_chain.empty()
+        ? std::format("root → {}:{}", ctx.depName, ctx.toolName)
+        : std::format("{} → {}:{}", state.overrides.tool_chain, ctx.depName,
+                      ctx.toolName);
+    for (auto const& f : ctx.closure) {
+        if (!sub.features.empty()) sub.features += ",";
+        sub.features += f;
+    }
+
+    // #359 (D3b): a sub-build failure must be attributable and
+    // REPRODUCIBLE. The Windows tool sub-build has been failing
+    // on three abseil TUs since #355 and is still unlocated,
+    // because what reached the log was a one-line summary with
+    // no scratch path, no chain, and — on the ninja branch below
+    // — a filtered view of the inner output. Naming the scratch
+    // directory is what lets a maintainer re-run the exact inner
+    // build; MCPP_TOOL_BUILD_VERBOSE turns off the filtering.
+    auto subContext = [&] {
+        return std::format(
+            "\n  chain: {}\n  sub-build scratch: {}\n"
+            "  re-run it directly:  mcpp build -p {} --release\n"
+            "  (set MCPP_TOOL_BUILD_VERBOSE=1 for the inner "
+            "build's unfiltered output)",
+            sub.tool_chain, sub.work_dir.string(),
+            depPkg.root.string());
+    };
+    auto subCtx = prepare_build(/*print_fingerprint=*/false,
+                                /*includeDevDeps=*/false,
+                                /*extraTargets=*/{}, sub);
+    if (!subCtx) {
+        return std::unexpected(std::format(
+            "building host tool '{}:{}' failed: {}{}",
+            ctx.depName, ctx.toolName, subCtx.error(), subContext()));
+    }
+
+    // Build ONLY the requested target (#274 gave the backend
+    // explicit goals) — a tool request must not drag the whole
+    // package's other artifacts along.
+    std::filesystem::path goal;
+    for (auto const& lu : subCtx->plan.linkUnits) {
+        if (lu.targetName == ctx.toolName) { goal = lu.output; break; }
+    }
+    if (goal.empty()) {
+        return std::unexpected(std::format(
+            "host tool '{}:{}' produced no link unit — its "
+            "required_features may not be satisfiable on this "
+            "platform", ctx.depName, ctx.toolName));
+    }
+
+    auto be = mcpp::build::make_ninja_backend();
+    mcpp::build::BuildOptions bopt;
+    bopt.ninjaTargets = { goal.generic_string() };
+    // Unfiltered inner output on demand: the filter drops
+    // ninja's own progress and command echoes, which is right
+    // for a normal build and wrong when the question is "what
+    // did the inner build actually do".
+    if (const char* v = std::getenv("MCPP_TOOL_BUILD_VERBOSE");
+        v && *v && std::string_view(v) != "0")
+        bopt.verbose = true;
+    auto br = be->build(subCtx->plan, bopt);
+    if (!br) {
+        auto diag = br.error().diagnosticOutput;
+        if (diag.empty())
+            diag = "(the inner build produced no diagnostic "
+                   "output; re-run with MCPP_TOOL_BUILD_VERBOSE=1)";
+        return std::unexpected(std::format(
+            "building host tool '{}:{}' failed: {}{}\n{}",
+            ctx.depName, ctx.toolName, br.error().message,
+            subContext(), diag));
+    }
+    if (br->exitCode != 0) {
+        return std::unexpected(std::format(
+            "building host tool '{}:{}' failed (exit {}){}",
+            ctx.depName, ctx.toolName, br->exitCode, subContext()));
+    }
+
+    // `goal` and the sub-build's output directory outlive this step: the
+    // publish step below re-derives `produced` from them, the same way this
+    // function derived it the first time in the single-function version.
+    ctx.goal = goal;
+    ctx.subOutputDir = subCtx->plan.outputDir;
+    return {};
+}
+
+static std::expected<void, std::string>
+step6_publish_tool(PrepareState& state, HostToolCtx& ctx) {
+    // Publish into the store: build out of place, then move —
+    // the same discipline mcpp.build.stage follows, so a
+    // concurrent consumer never observes a half-written entry.
+    std::error_code cpEc;
+    auto produced = ctx.subOutputDir / ctx.goal;
+    if (!std::filesystem::exists(produced, cpEc)) {
+        return std::unexpected(std::format(
+            "host tool '{}:{}' built but '{}' is missing",
+            ctx.depName, ctx.toolName, produced.string()));
+    }
+    std::filesystem::create_directories(ctx.binOut.parent_path(), cpEc);
+    auto tmp = ctx.binOut;
+    tmp += ".tmp";
+    std::filesystem::remove(tmp, cpEc);
+    std::filesystem::copy_file(produced, tmp,
+        std::filesystem::copy_options::overwrite_existing, cpEc);
+    if (cpEc) {
+        return std::unexpected(std::format(
+            "staging host tool '{}:{}' failed: {}",
+            ctx.depName, ctx.toolName, cpEc.message()));
+    }
+    std::filesystem::permissions(tmp,
+        std::filesystem::perms::owner_exec
+        | std::filesystem::perms::group_exec
+        | std::filesystem::perms::others_exec,
+        std::filesystem::perm_options::add, cpEc);
+    std::filesystem::rename(tmp, ctx.binOut, cpEc);
+    if (cpEc) {
+        return std::unexpected(std::format(
+            "publishing host tool '{}:{}' failed: {}",
+            ctx.depName, ctx.toolName, cpEc.message()));
+    }
+    mcpp::build::tool_store::write_entry(ctx.entry, ctx.key);
+    // The sub-build tree is large (protoc is several hundred
+    // objects) and the key covers every input, so a hit never
+    // needs it again. Removes only THIS consumer's scratch.
+    std::filesystem::remove_all(ctx.sub.work_dir, cpEc);
+    step6_record_tool_provision(state, ctx, ctx.binOut);
+    return {};
+}
+
+// Drives one requested tool through resolution, override/cycle checks,
+// store lookup, sub-build and publish -- the sequence the single-function
+// version ran as one pass down its loop body, with each `continue` above
+// becoming an early `return {}` here (there is no next iteration inside a
+// per-tool function; the outer loop in step6_provision_host_tools moves on
+// on its own).
+static std::expected<void, std::string>
+step6_provision_one_tool(PrepareState& state, HostToolCtx& ctx) {
+    if (auto r = step6_resolve_tool_target(state, ctx); !r)
+        return std::unexpected(r.error());
+
+    // #359: every consumer that can SEE this tool gets it, not
+    // just the one whose edge asked for it. The bare spelling
+    // is emitted only where the namespace ladder binds the tail
+    // to this package — otherwise two libraries re-exporting a
+    // same-tailed tool would decide the winner by append order.
+    // The spellings are `publishedNamesFor`'s, so a tool is
+    // addressed by exactly the names its directory is.
+    ctx.want = prov::Provision{ prov::Kind::Tool, ctx.depIdx, ctx.toolName };
+
+    auto overridden = step6_check_tool_override(state, ctx);
+    if (!overridden) return std::unexpected(overridden.error());
+    if (*overridden) return {};
+
+    if (auto r = step6_check_tool_self_request(state, ctx); !r)
+        return std::unexpected(r.error());
+
+    auto resolved = step6_resolve_tool_key(state, ctx);
+    if (!resolved) return std::unexpected(resolved.error());
+    if (*resolved) return {};
+
+    if (auto r = step6_build_tool(state, ctx); !r)
+        return std::unexpected(r.error());
+
+    return step6_publish_tool(state, ctx);
+}
+
 static std::expected<void, std::string>
 step6_provision_host_tools(PrepareState& state,
                            const std::map<std::size_t, std::set<std::string>>& toolRequests) {
@@ -1301,413 +1805,13 @@ step6_provision_host_tools(PrepareState& state,
                     depShort = depName.substr(dot + 1);
 
                 for (auto const& toolName : wanted) {
-                    // The target must exist and be a binary. Naming the
-                    // alternatives matters: the consumer wrote a string, and a
-                    // typo is the likeliest cause.
-                    //
-                    // #622 A3: deliberately still `Binary`, not `is_program()`.
-                    // A host tool is exec'd directly ON THE BUILD MACHINE
-                    // during THIS build, so it is "literally an executable
-                    // link" — the question this site was already asking — and
-                    // an `app` whose row form happened to be a library (never
-                    // the host row in practice, but the check would be a
-                    // silent trap if the host itself were ever Android) could
-                    // not stand in for it. A build-time tool is declared
-                    // `kind = "bin"`; that is what the word means here.
-                    const mcpp::manifest::Target* tgt = nullptr;
-                    std::string binList;
-                    for (auto const& t : depPkg.manifest.targets) {
-                        if (t.kind != mcpp::manifest::Target::Binary) continue;
-                        if (!binList.empty()) binList += ", ";
-                        binList += t.name;
-                        if (t.name == toolName) tgt = &t;
-                    }
-                    if (!tgt) {
-                        // A package may declare a bin target on some platforms
-                        // only. When the request came from a LIBRARY rather
-                        // than from the user, the user cannot edit it away, so
-                        // point at the knob that library needs (#359 D3a).
-                        return std::unexpected(std::format(
-                            "dependency '{}' has no `kind = \"bin\"` target named "
-                            "'{}' (requested via tools = [...]).\n"
-                            "  available bin targets: [{}]\n"
-                            "  If the requesting package is a library, it can "
-                            "scope the request per platform with\n"
-                            "  [target.'cfg(...)'.feature-deps.<feature>].",
-                            depName, toolName,
-                            binList.empty() ? std::string("none") : binList));
-                    }
-
-                    // #359: every consumer that can SEE this tool gets it, not
-                    // just the one whose edge asked for it. The bare spelling
-                    // is emitted only where the namespace ladder binds the tail
-                    // to this package — otherwise two libraries re-exporting a
-                    // same-tailed tool would decide the winner by append order.
-                    // The spellings are `publishedNamesFor`'s, so a tool is
-                    // addressed by exactly the names its directory is.
-                    const prov::Provision want{ prov::Kind::Tool, depIdx, toolName };
-                    auto record = [&](const std::filesystem::path& p) {
-                        for (std::size_t c = 0; c < state.provisionGraph.visible.size(); ++c) {
-                            if (!state.provisionGraph.visible[c].contains(want)) continue;
-                            auto& v = state.toolEnvByConsumer[c];
-                            std::vector<std::string> vars;
-                            for (auto const& n : state.publishedNamesFor(depIdx, state.bareBindingsFor(c))) {
-                                auto var = mcpp::build::tool_store::env_var_name(n, toolName);
-                                if (std::ranges::find(vars, var) != vars.end()) continue;
-                                vars.push_back(var);
-                                v.emplace_back(std::move(var), p.string());
-                            }
-                        }
-                    };
-
-                    // Escape hatch first: it is the cheapest resolution and the
-                    // one a user reaches for precisely when building is not an
-                    // option. Deliberately not part of the store key — see
-                    // tool_store.cppm.
-                    if (auto ovr = mcpp::build::tool_store::find_override(
-                            *state.m, depName, depShort, toolName)) {
-                        if (!std::filesystem::exists(*ovr)) {
-                            return std::unexpected(std::format(
-                                "tool override for '{}:{}' points at '{}', which "
-                                "does not exist", depName, toolName, ovr->string()));
-                        }
-                        mcpp::ui::info("Tool", std::format(
-                            "{}:{} → {} (override)", depName, toolName, ovr->string()));
-                        record(*ovr);
-                        continue;
-                    }
-
-                    // A TOOL WHOSE OWN BUILD REQUESTS IT AGAIN IS REFUSED AT
-                    // THE FIRST REPETITION (#649 E6). The depth bound below
-                    // caught it only after four nested sub-builds, with the
-                    // same prefix repeated four times and no word about which
-                    // edge asked. The edge is the one whose request reached
-                    // this package in THIS graph.
-                    const std::string toolSource = std::format(
-                        "{}|{}", depPkg.root.lexically_normal().generic_string(), toolName);
-                    if (std::ranges::find(state.overrides.tool_chain_sources, toolSource)
-                        != state.overrides.tool_chain_sources.end()) {
-                        std::string askedBy;
-                        for (auto const& edge : state.dependencyEdges) {
-                            if (edge.dependencyPackageIndex != depIdx) continue;
-                            if (std::ranges::find(edge.requestedTools, toolName)
-                                == edge.requestedTools.end()) continue;
-                            if (edge.consumerPackageIndex < state.packages.size()) {
-                                askedBy = mcpp::build::qualified_package_name(
-                                    state.packages[edge.consumerPackageIndex].manifest);
-                                break;
-                            }
-                        }
-                        return std::unexpected(std::format(
-                            "the host tool '{}:{}' is requested by its own build: "
-                            "{} -> {}:{}.\n"
-                            "       The request comes from '{}', which the tool's "
-                            "sub-build resolves with the feature or dependency that "
-                            "asks for the tool.\n"
-                            "       fix: the tool's own graph must not activate "
-                            "that request (a feature it does not enable, or a "
-                            "`[target.<sel>.feature-deps]` row it does not match).",
-                            depName, toolName,
-                            state.overrides.tool_chain.empty() ? "root" : state.overrides.tool_chain,
-                            depName, toolName,
-                            askedBy.empty() ? std::string("a package of its graph") : askedBy));
-                    }
-
-                    // Build it. The feature set is the tool package's own
-                    // defaults PLUS the target's required_features — in a tool
-                    // sub-build the target is what was ASKED FOR, so its
-                    // requirements are inputs rather than a gate. (Same field,
-                    // opposite resolution direction; docs/05 says so.)
-                    std::vector<std::string> feats = tgt->requiredFeatures;
-                    auto closure = feature_closure(depPkg.manifest, feats, true);
-
-                    // WHICH COMPILER BUILDS THE TOOL IS DECIDED HERE, ONCE
-                    // (#710). The key used to record this build's host
-                    // toolchain while the sub-build chose its own -- the tool
-                    // package's `[toolchain]`, else the global default -- so an
-                    // entry could name gcc 15.1 over a binary gcc 16.1 had
-                    // produced, and a member tool built for a consumer used a
-                    // different compiler than `mcpp build -p <tool>`. The
-                    // choice is `--toolchain` when given, else the tool
-                    // package's own (its workspace's, for a member), else the
-                    // compiler this build compiles its build programs with. It
-                    // is handed to the sub-build as an override and recorded in
-                    // the key, so the two cannot disagree.
-                    std::string toolTcSpec;
-                    if (const char* e = std::getenv("MCPP_TOOLCHAIN"); e && *e)
-                        toolTcSpec = e;
-                    else if (auto own = host_tool_declared_toolchain(
-                                 depPkg.manifest, depPkg.root, kCurrentPlatform))
-                        toolTcSpec = *own;
-                    std::string compilerIdentity;
-                    if (toolTcSpec.empty()) {
-                        auto hostTc = state.host_tc_for_build_program();
-                        if (!hostTc) return std::unexpected(hostTc.error());
-                        toolTcSpec = state.host_spec_for_build_program();
-                        compilerIdentity = std::format("{}|{}|{}",
-                            hostTc->second.label(), hostTc->second.version,
-                            hostTc->first.string());
-                    } else {
-                        compilerIdentity = "spec|" + toolTcSpec;
-                    }
-
-                    mcpp::build::tool_store::Key key;
-                    key.indexName = depIdx >= 1 && depIdx - 1 < state.dep_cache_identities.size()
-                                  ? state.dep_cache_identities[depIdx - 1].indexName
-                                  : std::string(mcpp::pm::kDefaultNamespace);
-                    key.packageName      = depName;
-                    // THE VERSION IDENTIFIES THE SOURCES ONLY FOR AN INDEX
-                    // PACKAGE. A `git` package is keyed by its commit and a
-                    // `path` package by a stamp of its tree, because both
-                    // change under an unchanged version and the store then
-                    // serves a binary built from sources that no longer exist
-                    // (#630, item 6; measured 2026-09-08 with examples/12).
-                    // The same rule applies to every upstream below.
-                    auto source_keyed_version = [&](std::size_t pkgIdx) {
-                        const auto& man = state.packages[pkgIdx].manifest.package;
-                        std::string v = man.version;
-                        if (pkgIdx >= 1 && pkgIdx - 1 < state.dep_cache_identities.size()) {
-                            const auto& id = state.dep_cache_identities[pkgIdx - 1];
-                            if (id.sourceKind == "git" && !id.sourceRef.empty())
-                                v += "+git." + id.sourceRef;
-                            else if (id.sourceKind == "path")
-                                v += "+path." + mcpp::build::tool_store::tree_stamp(
-                                    id.sourceRef.empty() ? state.packages[pkgIdx].root
-                                                         : std::filesystem::path(id.sourceRef));
-                        }
-                        return v;
-                    };
-                    key.version          = source_keyed_version(depIdx);
-                    key.targetName       = toolName;
-                    key.hostTriple       = mcpp::toolchain::triple::host_triple().str();
-                    key.compilerIdentity = compilerIdentity;
-                    key.profile          = "release";
-                    key.features         = closure;
-                    std::ranges::sort(key.features);
-                    // The tool package's TRANSITIVE dependency closure, not just
-                    // its direct edges. Direct-only would be enough for index
-                    // packages (a frozen version cannot change its own deps),
-                    // but a path dependency can: bump something two levels down
-                    // and the tool's direct list is unchanged, so a stale binary
-                    // stays in the store — a silently wrong artifact.
-                    for (auto up : dg::transitive_dependencies(state.dependencyEdges, depIdx))
-                        key.upstreamKeys.push_back(std::format("{}@{}",
-                            state.packages[up].manifest.package.name,
-                            source_keyed_version(up)));
-                    std::ranges::sort(key.upstreamKeys);
-
-                    const auto cacheRoot = mcpp::home::cache_root();
-                    const auto entry     = mcpp::build::tool_store::entry_dir(cacheRoot, key);
-                    const auto exeSuffix = std::string(mcpp::platform::exe_suffix);
-                    const auto binOut    = mcpp::build::tool_store::bin_path(
-                        entry, toolName, exeSuffix);
-
-                    if (mcpp::build::tool_store::entry_valid(entry, key, toolName,
-                                                             exeSuffix)) {
-                        record(binOut);
-                        continue;
-                    }
-
-                    // PLANNING BUILDS NO TOOL (SPEC-005 R2.5, v1.4; #707).
-                    // `emit build-database` describes a build; it does not
-                    // perform one (R2.2), and a tool sub-build is a whole
-                    // compile of another package, with its own prepare
-                    // actions -- measured on a fresh store, a single `emit`
-                    // compiled the tool and ran the tool package's `prepare`
-                    // action. A tool already in the store is used as above. One
-                    // that is not is deferred: the build program receives the
-                    // path the tool will be published at (`binOut`, fixed
-                    // before anything is built), which is the answer it gets
-                    // after a successful build, and a note names the tool. A
-                    // build program that must RUN the tool while configuring
-                    // meets the same missing file it meets when the tool fails
-                    // to build (SPEC-007 R5.3), so no new contract follows.
-                    if (state.overrides.plan_only) {
-                        state.planNotes.push_back({"MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED",
-                            std::format("host tool '{}' of package '{}' is not in "
-                                        "the tool store and is not built while "
-                                        "planning; the plan names the path it will "
-                                        "be published at: {}",
-                                        toolName, depName, binOut.string()),
-                            mcpp::wire::Severity::Note});
-                        record(binOut);
-                        continue;
-                    }
-
-                    mcpp::ui::status("Building", std::format(
-                        "host tool {}:{} from {} v{} (once per package source and "
-                        "host toolchain)", depName, toolName, depName,
-                        depPkg.manifest.package.version));
-
-                    BuildOverrides sub;
-                    sub.project_root = depPkg.root;
-                    // Never the package root: it is shared across projects and
-                    // may be read-only. This is the reason work_dir exists.
-                    //
-                    // Scratch is keyed on the CONSUMING project, not shared:
-                    // the store is GLOBAL, so two projects can want the same
-                    // tool at once. A single `<entry>/build` would have them
-                    // writing one ninja tree concurrently, and whichever
-                    // finished first would `remove_all` it out from under the
-                    // other. The published binary is what gets shared; the
-                    // scratch is not.
-                    //
-                    // Hashed rather than random so a re-run reuses its own
-                    // scratch (ninja stays incremental if the publish step
-                    // never got to delete it).
-                    //
-                    // Beside the entries rather than inside one: every
-                    // directory name of the entry is repeated in each object
-                    // path the sub-build writes, and on Windows those paths
-                    // crossed the 260-character limit (mcpp#641, item 3).
-                    sub.work_dir     = mcpp::build::tool_store::scratch_dir(
-                        cacheRoot, entry, state.workRoot);
-                    sub.target_triple = "";            // HOST — the whole point
-                    sub.toolchain     = toolTcSpec;
-                    sub.profile       = "release";
-                    sub.cache_mode    = state.overrides.cache_mode;
-                    sub.tool_depth    = state.overrides.tool_depth + 1;
-                    sub.tool_chain_sources = state.overrides.tool_chain_sources;
-                    sub.tool_chain_sources.push_back(toolSource);
-                    // The PRISTINE manifest the resolver produced for this
-                    // package — `packages[depIdx].manifest` is a copy that
-                    // feature activation has already mutated, and re-activating
-                    // on top of it would fold the same feature sources in
-                    // twice. A `compat` (Form B) package has no mcpp.toml on
-                    // disk at all, so without this the sub-build could not read
-                    // a manifest for it in the first place.
-                    //
-                    // UNMERGED, because the sub-build targets the HOST: the
-                    // resolver merged this manifest's conditional sections for
-                    // the consumer's target, and the sub-build merges them for
-                    // its own (#690, F12).
-                    if (depIdx >= 1 && depIdx - 1 < state.dep_manifests.size()
-                        && state.dep_manifests[depIdx - 1]) {
-                        auto const& dep = *state.dep_manifests[depIdx - 1];
-                        sub.preloaded_manifest = dep.beforeConditionalMerge
-                            ? dep.beforeConditionalMerge
-                            : std::make_shared<const mcpp::manifest::Manifest>(dep);
-                    }
-                    sub.inherited_runtime_selection = std::make_shared<
-                        const mcpp::xlings::runtime::RuntimeSelection>(
-                            state.runtimeSelection);
-                    sub.inherited_runtime_binding = std::make_shared<
-                        const mcpp::platform::runtime::RuntimeBinding>(
-                            state.runtimeBindingSnapshot);
-                    sub.tool_chain    = state.overrides.tool_chain.empty()
-                        ? std::format("root → {}:{}", depName, toolName)
-                        : std::format("{} → {}:{}", state.overrides.tool_chain, depName,
-                                      toolName);
-                    for (auto const& f : closure) {
-                        if (!sub.features.empty()) sub.features += ",";
-                        sub.features += f;
-                    }
-
-                    // #359 (D3b): a sub-build failure must be attributable and
-                    // REPRODUCIBLE. The Windows tool sub-build has been failing
-                    // on three abseil TUs since #355 and is still unlocated,
-                    // because what reached the log was a one-line summary with
-                    // no scratch path, no chain, and — on the ninja branch below
-                    // — a filtered view of the inner output. Naming the scratch
-                    // directory is what lets a maintainer re-run the exact inner
-                    // build; MCPP_TOOL_BUILD_VERBOSE turns off the filtering.
-                    auto subContext = [&] {
-                        return std::format(
-                            "\n  chain: {}\n  sub-build scratch: {}\n"
-                            "  re-run it directly:  mcpp build -p {} --release\n"
-                            "  (set MCPP_TOOL_BUILD_VERBOSE=1 for the inner "
-                            "build's unfiltered output)",
-                            sub.tool_chain, sub.work_dir.string(),
-                            depPkg.root.string());
-                    };
-                    auto subCtx = prepare_build(/*print_fingerprint=*/false,
-                                                /*includeDevDeps=*/false,
-                                                /*extraTargets=*/{}, sub);
-                    if (!subCtx) {
-                        return std::unexpected(std::format(
-                            "building host tool '{}:{}' failed: {}{}",
-                            depName, toolName, subCtx.error(), subContext()));
-                    }
-
-                    // Build ONLY the requested target (#274 gave the backend
-                    // explicit goals) — a tool request must not drag the whole
-                    // package's other artifacts along.
-                    std::filesystem::path goal;
-                    for (auto const& lu : subCtx->plan.linkUnits) {
-                        if (lu.targetName == toolName) { goal = lu.output; break; }
-                    }
-                    if (goal.empty()) {
-                        return std::unexpected(std::format(
-                            "host tool '{}:{}' produced no link unit — its "
-                            "required_features may not be satisfiable on this "
-                            "platform", depName, toolName));
-                    }
-
-                    auto be = mcpp::build::make_ninja_backend();
-                    mcpp::build::BuildOptions bopt;
-                    bopt.ninjaTargets = { goal.generic_string() };
-                    // Unfiltered inner output on demand: the filter drops
-                    // ninja's own progress and command echoes, which is right
-                    // for a normal build and wrong when the question is "what
-                    // did the inner build actually do".
-                    if (const char* v = std::getenv("MCPP_TOOL_BUILD_VERBOSE");
-                        v && *v && std::string_view(v) != "0")
-                        bopt.verbose = true;
-                    auto br = be->build(subCtx->plan, bopt);
-                    if (!br) {
-                        auto diag = br.error().diagnosticOutput;
-                        if (diag.empty())
-                            diag = "(the inner build produced no diagnostic "
-                                   "output; re-run with MCPP_TOOL_BUILD_VERBOSE=1)";
-                        return std::unexpected(std::format(
-                            "building host tool '{}:{}' failed: {}{}\n{}",
-                            depName, toolName, br.error().message,
-                            subContext(), diag));
-                    }
-                    if (br->exitCode != 0) {
-                        return std::unexpected(std::format(
-                            "building host tool '{}:{}' failed (exit {}){}",
-                            depName, toolName, br->exitCode, subContext()));
-                    }
-
-                    // Publish into the store: build out of place, then move —
-                    // the same discipline mcpp.build.stage follows, so a
-                    // concurrent consumer never observes a half-written entry.
-                    std::error_code cpEc;
-                    auto produced = subCtx->plan.outputDir / goal;
-                    if (!std::filesystem::exists(produced, cpEc)) {
-                        return std::unexpected(std::format(
-                            "host tool '{}:{}' built but '{}' is missing",
-                            depName, toolName, produced.string()));
-                    }
-                    std::filesystem::create_directories(binOut.parent_path(), cpEc);
-                    auto tmp = binOut;
-                    tmp += ".tmp";
-                    std::filesystem::remove(tmp, cpEc);
-                    std::filesystem::copy_file(produced, tmp,
-                        std::filesystem::copy_options::overwrite_existing, cpEc);
-                    if (cpEc) {
-                        return std::unexpected(std::format(
-                            "staging host tool '{}:{}' failed: {}",
-                            depName, toolName, cpEc.message()));
-                    }
-                    std::filesystem::permissions(tmp,
-                        std::filesystem::perms::owner_exec
-                        | std::filesystem::perms::group_exec
-                        | std::filesystem::perms::others_exec,
-                        std::filesystem::perm_options::add, cpEc);
-                    std::filesystem::rename(tmp, binOut, cpEc);
-                    if (cpEc) {
-                        return std::unexpected(std::format(
-                            "publishing host tool '{}:{}' failed: {}",
-                            depName, toolName, cpEc.message()));
-                    }
-                    mcpp::build::tool_store::write_entry(entry, key);
-                    // The sub-build tree is large (protoc is several hundred
-                    // objects) and the key covers every input, so a hit never
-                    // needs it again. Removes only THIS consumer's scratch.
-                    std::filesystem::remove_all(sub.work_dir, cpEc);
-                    record(binOut);
+                    HostToolCtx ctx;
+                    ctx.depIdx = depIdx;
+                    ctx.toolName = toolName;
+                    ctx.depName = depName;
+                    ctx.depShort = depShort;
+                    if (auto r = step6_provision_one_tool(state, ctx); !r)
+                        return std::unexpected(r.error());
                 }
             }
 
