@@ -100,7 +100,11 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 
 ### 3.3 翻译单元
 
-- **R3.7** 除 NASM 单元外,构建计划中的每个编译单元是一个翻译单元。`source`、
+- **R3.7** 除 NASM 单元与规则声明的设备源文件(`SourceKind::Device`)外,构建计划中
+  的每个编译单元是一个翻译单元;两者都不在 S1 文档与 `compile_commands.json` 中
+  出现,但原因不同——NASM 单元是构建计划的编译单元,只是被逐出翻译单元的集合;
+  设备源文件从不是构建计划的编译单元(引擎对其扩展名没有编译规则,能编译它的只有
+  包自己的构建程序,通过一个动作),因而也从不进入这一集合。`source`、
   `work-directory`、`arguments`、`object` 与 `compile_commands.json` 中对应条目的
   `file`、`directory`、`arguments`、`output` 取自同一条记录,因而逐字相同。
   `work-directory` 是编译器实际运行的目录——即输出目录
@@ -170,7 +174,10 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
   的成员中,构建程序失败的包被描述为不含该程序产生的指令(清单自身的配置、工具链、
   模块图与标准库单元仍照常描述),`diagnostics` 另有一条 `error`,
   `MCPP_BUILD_DATABASE_PROGRAM_FAILED`,`path` 为该包的 `build.mcpp`;后续失败若是
-  由缺失的指令引起,则按前一条规则使整个成员失败。只要 `diagnostics` 中有一条
+  由缺失的指令引起,则按前一条规则使整个成员失败。一项检查若以构建程序的指令为
+  前提(例如"每个设备源文件都被某个动作消费"),对本轮构建程序失败的包不运行:
+  该包已经带着这一条 `PROGRAM_FAILED` 诊断被描述,不应因指令缺失这一后果本身被
+  判成第二个失败,把真正的诊断挤出信封。只要 `diagnostics` 中有一条
   `error`,退出码就是 1,无论 `data` 是否出现。**已实现**(离线诊断码:
   mcpp >= 2026.9.16.1;成员独立规划、`path` 与构建程序失败的描述:mcpp >= 2026.9.26.2)
 - **R5.3** 信封的 `effects` 为 `read-project` 与 `write-global-cache`,运行了构建程序时

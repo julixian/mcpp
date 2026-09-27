@@ -1768,6 +1768,12 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
                                     pkg.manifest.package.name, r.error()),
                         mcpp::wire::Severity::Error,
                         (pkg.root / "build.mcpp").string()});
+                    // Same reason as the root's mirror of this in
+                    // target_side.cpp: a later check whose premise is this
+                    // program's directives (the device-source check) must be
+                    // able to tell this package apart from one with no program
+                    // at all.
+                    state.programFailedPackages.insert(pkg.root.string());
                     continue;
                 }
                 return std::unexpected(std::format(
