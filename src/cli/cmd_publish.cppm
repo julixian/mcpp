@@ -36,19 +36,18 @@ export int cmd_publish(const mcpplibs::cmdline::ParsedArgs& parsed) {
         parsed.is_flag_set("dry-run"), parsed.is_flag_set("allow-dirty"));
 }
 
-// `mcpp place-dlls --output <stamp> --depfile <d> <program> <placed> <dir>...`
+// `mcpp place-dlls --output <stamp> --depfile <d> <program> <dir>...`
 // -- the edge that follows a Windows program's link when its plan has runtime
 // search directories (mcpp.pack's `place_runtime_dlls`, SPEC-007 R4.3).
 // Internal: only a generated build.ninja names it, and it runs on whatever
 // host builds, because it reads the program's import table rather than asking
 // a loader.
 //
-// `<placed>` is always present, comma-joining the DLL names the merged deploy
-// list already places directly beside this program (empty when there are
-// none: `ninja_backend.cppm` writes it as one `ninja_command_word`, never as
-// nothing, so this argument position never shifts). SPEC-007 R4.2/R4.3: the
-// deploy list is the single authority for a destination, so this mechanism
-// skips those names instead of writing a second, competing copy.
+// The command line names no DLL. Which DLLs beside the program belong to
+// another writer (a declared deploy, the toolchain's staged runtime) is
+// decided below, from the program's directory, the stamp and the search
+// directories, so that the command does not change when the plan's deploy set
+// does (SPEC-007 R4.2/R4.3).
 //
 // The depfile names every DLL placed, so ninja runs the edge again when one of
 // them changes in its directory; the stamp is the edge's only declared output,

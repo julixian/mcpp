@@ -156,7 +156,8 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 
 - **R3.12** 一个集合的 `ide.generated`(S1 0.3.0 §7.2)列出该集合所属包的构建程序以
   `role = "source"` 的 action 生成的每一个输出,以及该集合的单元以 `-I` 命名、位于规划
-  目录的 `target/.build-mcpp` 之下的每一个目录。每一项给出 `path`(本文档中的路径)、
+  目录的 `target/.build-mcpp` 之下的每一个目录;包的测试集合与其普通集合一样列出这些输出,
+  因为不经预处理无法知道哪些单元包含一个头文件。每一项给出 `path`(本文档中的路径)、
   `build-path`(同一组选择器下 `mcpp build` 写入的路径:把规划目录换成工程根,文件存在
   与否都给出)与 `kind`。一个输出同时是该集合某个单元的 `source` 时 `kind` 为 `source`,
   否则为 `header`;目录为 `directory`。文件一项另有 `generator`:action 的 `id`、`inputs`、

@@ -1170,10 +1170,10 @@ profile 表达的是调试信息，不是另一个 CRT。这根轴留待有消�
 把 `toolchain-coupled` 或 `host-coupled` 和 `/MT`(`linkage = "static"`,
 或 `self-contained`)一起写是一处**矛盾**，而不是缺功能——一份静态 CRT
 根本没有 DLL 可以耦合——所以它会被报出来，并落回 `self-contained`。
-`mcpp pack` 兜底另一半:一个什么都不打包的模式(`--mode static`)配上一个
-**显式**的 `toolchain-coupled` 兑现不了，会直接拒绝；而 `--mode system`
-用在一个从未声明契约的工程上，会把默认值解析为 `host-coupled`——一个
-显式的 mode 胜过一个默认值。
+`mcpp pack` 兜底另一半:一个什么都不打包的模式(`--mode static` 或
+`--mode system`)配上一个**显式**的 `toolchain-coupled` 兑现不了，会直接
+拒绝；而 `--mode system` 用在一个从未声明契约的工程上，会把默认值解析为
+`host-coupled`——一个显式的 mode 胜过一个默认值。
 
 **自由拼写的 CRT 词永远是第二次声明。** 每个 MSVC ABI 构建现在都会声明
 自己的 CRT,所以 `[build] cxxflags` 或 `dialect_cxxflags` 里出现的字面

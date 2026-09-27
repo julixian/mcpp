@@ -10,6 +10,8 @@
 # configuration writes. Criteria:
 #   A. the package's set carries `ide.generated` entries: the header, with its
 #      generator (id, inputs, arguments), and the generated include directory;
+#      the package's test set, whose unit includes the same header, carries
+#      the header too (SPEC-005 R3.12: every set of the package);
 #   B. each entry's `build-path` is under the project's own `target/`, and a
 #      following `mcpp build` writes the header at exactly that path;
 #   C. compile_commands.json carries no such field.
@@ -19,7 +21,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $1"; [ -n "${2:-}" ] && cat "$2"; exit 1; }
 cd "$TMP"
-mkdir -p proj/src proj/templates
+mkdir -p proj/src proj/templates proj/tests
 cd proj
 
 cat > mcpp.toml <<'EOF'
@@ -32,6 +34,10 @@ cat > templates/answer.h.in <<'EOF'
 inline int generated_answer() { return 42; }
 EOF
 cat > src/main.cpp <<'EOF'
+#include "answer.h"
+int main() { return generated_answer() == 42 ? 0 : 1; }
+EOF
+cat > tests/test_answer.cpp <<'EOF'
 #include "answer.h"
 int main() { return generated_answer() == 42 ? 0 : 1; }
 EOF
@@ -69,6 +75,11 @@ assert h["generator"]["id"] == "gen:answer", h
 assert any(i.endswith("answer.h.in") for i in h["generator"]["inputs"]), h
 assert h["generator"]["arguments"][0] == "cp", h
 assert dirs and dirs[0]["path"].endswith("gen"), f"A: no generated directory entry in {gen}"
+by_set = {s["name"]: s.get("ide", {}).get("generated", []) for s in sets}
+assert "gendb:test" in by_set, f"A: no test set among {sorted(by_set)}"
+for name in ("gendb", "gendb:test"):
+    assert any(g["kind"] == "header" and g["generator"]["id"] == "gen:answer" for g in by_set[name]), \
+        f"A: set {name} does not name the generated header: {by_set[name]}"
 for g in (h, dirs[0]):
     bp = os.path.realpath(g["build-path"])
     assert bp.startswith(os.path.join(root, "target") + os.sep), f"B: {g['build-path']} is not under {root}/target"

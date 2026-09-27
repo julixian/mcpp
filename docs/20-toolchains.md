@@ -1259,10 +1259,10 @@ Combining `toolchain-coupled` or `host-coupled` with `/MT` (`linkage =
 "static"`, or `self-contained`) is a contradiction rather than a missing
 feature — a static CRT leaves no DLL to couple to — so it is reported and
 resolved to `self-contained`. `mcpp pack` enforces the other half: a mode
-that bundles nothing (`--mode static`) together with an *explicit*
-`toolchain-coupled` cannot deliver it and refuses; `--mode system` on a
-project that never stated a contract resolves the default to `host-coupled`
-instead, since an explicit mode outranks a default.
+that bundles nothing (`--mode static` or `--mode system`) together with an
+*explicit* `toolchain-coupled` cannot deliver it and refuses; `--mode system`
+on a project that never stated a contract resolves the default to
+`host-coupled` instead, since an explicit mode outranks a default.
 
 **A free-form CRT word is always a second statement.** Every MSVC-ABI build
 now states its own CRT, so a literal `/MT`, `/MD`, `/MTd`, `/MDd` or

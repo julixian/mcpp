@@ -469,15 +469,10 @@ Rendered render(std::span<const Member> members,
         // through the unconditional copy below, with every other plan note.
 
         {
-            std::set<std::string> unitSources;
-            for (auto const& [name, set] : groups)
-                for (auto const& u : set.units) unitSources.insert(u.value("source", ""));
             using Role = mcpp::manifest::BuildAction::Role;
             for (auto const& a : ctx.plan.actions) {
                 if (a.role != Role::Source || a.outputs.empty()) continue;
                 const std::string package = a.packageName.empty() ? rootName : a.packageName;
-                auto it = groups.find(member.setPrefix + package);
-                if (it == groups.end()) continue;
                 nlohmann::json inputs = nlohmann::json::array();
                 for (auto const& in : a.inputs)
                     inputs.push_back(native_string(std::filesystem::path(in).lexically_normal()));
@@ -489,15 +484,26 @@ Rendered render(std::span<const Member> members,
                                            ? ctx.plan.outputDir
                                            : std::filesystem::path(a.cwd))},
                 };
-                for (auto const& out : a.outputs) {
-                    const auto p = std::filesystem::path(out).lexically_normal();
-                    const auto path = native_string(p);
-                    it->second.generated.push_back(nlohmann::json{
-                        {"path",       path},
-                        {"build-path", build_path(p)},
-                        {"kind",       unitSources.contains(path) ? "source" : "header"},
-                        {"generator",  generator},
-                    });
+                // SPEC-005 R3.12: every set of the package lists what its build
+                // program generates, its test set included, since the units
+                // that include a header are not known without preprocessing.
+                // `kind` is per set: `source` where a unit of that set is
+                // compiled from the file.
+                for (auto& [name, set] : groups) {
+                    if (set.familyName != package) continue;
+                    for (auto const& out : a.outputs) {
+                        const auto p = std::filesystem::path(out).lexically_normal();
+                        const auto path = native_string(p);
+                        const bool isUnit = std::ranges::any_of(set.units, [&](auto const& u) {
+                            return u.value("source", "") == path;
+                        });
+                        set.generated.push_back(nlohmann::json{
+                            {"path",       path},
+                            {"build-path", build_path(p)},
+                            {"kind",       isUnit ? "source" : "header"},
+                            {"generator",  generator},
+                        });
+                    }
                 }
             }
             for (auto& [name, set] : groups)
