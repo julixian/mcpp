@@ -4,10 +4,10 @@
 |---|---|
 | 规范编号 | SPEC-005 |
 | 标题 | mcpp 输出的构建数据库:内容、取值规则与不写工程目录的保证 |
-| 状态 | 评审中 v1.4 |
-| 版本 | 1.4 |
-| 最后修改 | 2026-09-26 |
-| 对应实现 | mcpp >= 2026.9.15.1;v1.3 修改的 R2.5、R3.7、R3.8、R4.1、R5.2 为 mcpp >= 2026.9.26.2;v1.4 修改的 R2.5 为 mcpp >= 2026.9.27.1 |
+| 状态 | 评审中 v1.5 |
+| 版本 | 1.5 |
+| 最后修改 | 2026-09-28 |
+| 对应实现 | mcpp >= 2026.9.15.1;v1.3 修改的 R2.5、R3.7、R3.8、R4.1、R5.2 为 mcpp >= 2026.9.26.2;v1.4 修改的 R2.5 为 mcpp >= 2026.9.27.1;v1.5 修改的 R3.7、R3.12、R5.1、R5.2 为 mcpp >= 2026.9.28.1 |
 | 相关设计文档 | `.agents/docs/2026-09-14-636-build-database-and-the-latest-xlings.md`<br>`.agents/docs/2026-09-26-compile-database-and-issue-699-design.md` |
 | 相关 issue | #636, #648, #655, #699, #702, #707 |
 | 依据的外部规范 | S1「C++ Build Database: IDE Profile」profile 0.3.0(§7.2 的 `generated`,Sunrisepeak/mcpp-language-server#28;此前为 0.2.0)与 S2 0.2.0 §3.4,取自 https://github.com/Sunrisepeak/lsp-mcpp-private 提交 `b82859d`(schema 自提交 `28ecd6e` 起未变);S2 0.3.0 §3.4 的部分回答(S2-3.4-12、S2-3.4-13,Sunrisepeak/mcpp-language-server#25);JSON Compilation Database |
@@ -224,3 +224,4 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 | 1.2 | 2026-09-17 | R3.7 陈述 `arguments` 的每一项是编译器收到的参数,单元 flag 按 SPEC-004 §8 的词列出(#655)。 |
 | 1.3 | 2026-09-26 | R2.5:`emit` 下构建失败的宿主工具是警告。R3.7:`work-directory` 是输出目录,模块接口单元的 `arguments` 带语言 flag。R3.8:标准库单元的 `provides` 指向 std 缓存中的 BMI,工具链带 `build-id`。R4.1:compile-commands 文档包含标准库单元(S1-12-1)。R5.2:成员各自规划,构建程序失败的包不带其指令地被描述(#699,#702)。 |
 | 1.4 | 2026-09-26 | R2.5:命令不构建宿主工具;工具库中没有的工具被推迟,输出说明 `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED`,取代 1.3 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`(#707)。 |
+| 1.5 | 2026-09-28 | R3.7:规则声明的设备源不是编译单元,不进入 S1 与 `compile_commands.json`(#724)。新增 R3.12:集合的 `ide.generated` 列出规则生成的文件与目录,给出构建写入的路径与生成它的步骤,S1 0.3.0(#724,Sunrisepeak/mcpp-language-server#28)。R5.1:S1 版本为 0.3.0。R5.2:以构建程序的指令为前提的检查不对其构建程序已失败的包运行,失败路径保留已记录的说明(#724)。 |

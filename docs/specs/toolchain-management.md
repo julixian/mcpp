@@ -4,11 +4,11 @@
 |---|---|
 | 规范编号 | SPEC-006 |
 | 标题 | 工具链管理:身份、来源、选择与载荷契约 |
-| 状态 | 草案 v0.2 |
-| 最后修改 | 2026-09-24 |
+| 状态 | 草案 v0.3 |
+| 最后修改 | 2026-09-28 |
 | 对应实现 | 逐条标注;标为「已实现」的条款对应 mcpp >= 2026.9.24.1。标为「未实现」的条款计划与下一批 LLVM 工具链一同落地,届时按实测修订本规范 |
 | 相关设计文档 | `.agents/docs/2026-09-24-toolchain-selection-and-payload-trust-design.md`、`.agents/docs/2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md` |
-| 相关 issue | mcpp#685、mcpp#687 |
+| 相关 issue | mcpp#685、mcpp#687、mcpp#718 |
 | 使用文档 | [docs/20 - 工具链](../zh/20-toolchains.md)、[docs/32 - 编写载荷](../zh/32-authoring-a-payload.md)、[docs/91 - 工具链内部](../zh/91-toolchain-internals.md) |
 
 本规范定义 mcpp 对工具链的命名、选择和使用方式,以及一个工具链载荷在发布前必须满足的条件。
@@ -245,3 +245,4 @@ xim-pkgindex 的准入脚本 `verify-toolchain.sh` 对一个载荷归档做一�
 |---|---|---|
 | v0.1 | 2026-09-24 | 初版草案:身份与写法、来源与选择(含 MSVC ABI 目标的 sysroot)、载荷契约、构建、验收、发布顺序 |
 | v0.2 | 2026-09-24 | 随 mcpp 2026.9.24.1 更新实现状态:§2.3、§2.4、§3.1 至 §3.6 已实现;§4.2、§6.4 部分实现;§2.2 更正:不带族的 `system` 被拒绝 |
+| v0.3 | 2026-09-28 | 随 mcpp 2026.9.28.1:新增 §3.7,MSVC ABI 的 CRT 模型是目标 ABI 的性质,cl 与 clang++ 同样收到,默认 `toolchain-coupled`(mcpp#718)。 |

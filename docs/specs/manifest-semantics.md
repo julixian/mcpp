@@ -5,11 +5,11 @@
 | **规范编号** | SPEC-004 |
 | **标题** | `mcpp.toml` 的平面划分、条件化形状、解析轴与命名规约 |
 | **状态** | **草案(Draft)** |
-| **版本** | 1.8 |
-| **最后修改** | 2026-09-27 |
+| **版本** | 1.9 |
+| **最后修改** | 2026-09-28 |
 | **最低实现版本** | 条件化形状:mcpp **2026.8.29.1**(`[target.<selector>.build-dependencies]` 起齐备);目标轴:mcpp **2026.9.6.4** |
 | **作者/维护** | mcpp-community |
-| **相关设计文档** | `.agents/docs/2026-09-07-mcpp-toml-unified-semantics-design.md`<br>`.agents/docs/2026-06-04-manifest-schema-ownership.md`<br>`.agents/docs/2026-09-03-xlings-workspace-as-the-one-table.md`<br>`.agents/docs/2026-09-25-issue-690-workspace-build-inheritance-consistency.md` |
+| **相关设计文档** | `.agents/docs/2026-09-07-mcpp-toml-unified-semantics-design.md`<br>`.agents/docs/2026-06-04-manifest-schema-ownership.md`<br>`.agents/docs/2026-09-03-xlings-workspace-as-the-one-table.md`<br>`.agents/docs/2026-09-25-issue-690-workspace-build-inheritance-consistency.md`<br>`.agents/docs/2026-09-27-eight-reports-by-home-and-one-optimisation-plan.md` |
 | **相关使用文档** | [docs/04 —— mcpp.toml 字段参考](../04-mcpp-toml.md) |
 
 ## 规范用语
@@ -113,7 +113,7 @@ Principle)规定,本规范不重复它,只在 §6 引用并补充一条。
 与 `linkage` 并存、一行同时陈述 `kind` 与 `linkage`、`linkage` 写在程序目标上,均**必须**
 被拒绝;按行合并时后命中的陈述替换先前的陈述,无论两者各是 `kind` 还是 `linkage`。
 
-**状态:已实现**(mcpp 2026.9.14.2;`linkage` 为 2026.9.15.2)。
+**状态:部分实现**(mcpp 2026.9.14.2;`linkage` 为 2026.9.15.2)。多个命中的条件表的先后:实现按选择器文本的字典序合并,而不是按清单中的位置,因为 TOML 的表不带键的顺序;该条款待 mcpp#728 修订。
 
 ### 3.2 门可以嵌进条件
 
@@ -538,3 +538,4 @@ mcpp 2026.9.26.2,#703)。**
 | 1.6 | 2026-09-25 | 工作空间继承与构建需求的作用域(mcpp 2026.9.25.1,#690):§8 补 `defines` 的集合语义;新增 §9 与 §7 第 11 至 14 条判据。 |
 | 1.7 | 2026-09-26 | §8 的读法扩展到 `ldflags` 与构建程序的链接指令(mcpp 2026.9.26.2,#703):`$ORIGIN` 原样到达链接器;§7 补第 15 条判据。 |
 | 1.8 | 2026-09-27 | mcpp 2026.9.27.1:§4.5 的版本位按 xlings 文法回答(#712);新增 §4.6 宿主构建读取宿主三元组的行(#704);§9 补第 8 至 10 条(#713、#714、#710);新增 §10 依赖的程序:`tools`、特性的 `tools`、`artifacts`(#709、#711);§7 补第 16 至 20 条判据。 |
+| 1.9 | 2026-09-28 | mcpp 2026.9.28.1:§9 第 1 条补上带 `[package]` 的工作空间根自己的 `path` 依赖所到达的成员,`-p` 先按包的身份解析(#725);§3.1 接受 `[target.<selector>.build] dialect_cxxflags`,§9 第 10 条把它列为根位置的键(#717);§3.1.1 的状态改为部分实现,多个命中的条件表的先后见 mcpp#728。 |
