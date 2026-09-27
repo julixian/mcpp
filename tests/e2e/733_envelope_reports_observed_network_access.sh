@@ -50,7 +50,7 @@ effects() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("
 
 STUB_LOG="$TMP/online.log" "$MCPP" emit build-database --format json > online.json 2> online.err || true
 [ -s online.json ] || fail "A: no envelope" online.err
-grep -q '^update' "$TMP/online.log" 2>/dev/null || fail "A: the plan did not refresh the index" online.err
+grep -qE '^update|^interface update_packages' "$TMP/online.log" 2>/dev/null || fail "A: the plan did not refresh the index" online.err
 effects online.json > online.txt
 head -1 online.txt | grep -qw network || fail "A: a plan that refreshed the index reports no network effect" online.txt
 

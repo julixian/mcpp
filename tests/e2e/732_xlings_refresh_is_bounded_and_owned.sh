@@ -33,8 +33,8 @@ bounded() {   # <seconds> <command...>
 mkdir -p "$TMP/bin" "$TMP/home"
 cat > "$TMP/bin/xlings" <<'EOF'
 #!/usr/bin/env bash
-case "${1:-}" in
-  update) echo "$$" > "${STUB_PID:?}"; exec sleep 1000 ;;
+case "${1:-}:${2:-}" in
+  update:*|interface:update_packages) echo "$$" > "${STUB_PID:?}"; exec sleep 1000 ;;
 esac
 exit 0
 EOF

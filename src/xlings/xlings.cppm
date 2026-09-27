@@ -1605,6 +1605,105 @@ std::vector<std::string> stderr_error_tail(std::string_view text, std::size_t li
     return {tail.begin(), tail.end()};
 }
 
+namespace {
+// The `files[]` of one NDJSON `download_progress` data event, in the order
+// xlings reports them; nullopt when the line carries none. Shared by the
+// sandbox bootstrap and the index refresh, which render the same event.
+std::optional<BootstrapProgress> download_progress_of(std::string_view line) {
+    LineScan ls{line};
+    auto p = line.find("\"files\":[");
+    if (p == std::string_view::npos) return std::nullopt;
+    p += 9;
+
+    BootstrapProgress prog;
+    prog.elapsedSec = ls.find_num("elapsedSec");
+
+    while (p < line.size()) {
+        while (p < line.size() && (line[p] == ' ' || line[p] == '\n'
+                                   || line[p] == ',')) ++p;
+        if (p >= line.size() || line[p] == ']') break;
+        if (line[p] != '{') break;
+        int depth = 0;
+        auto start = p;
+        bool in_string = false;
+        for (; p < line.size(); ++p) {
+            char c = line[p];
+            if (in_string) {
+                if (c == '\\' && p + 1 < line.size()) { ++p; continue; }
+                if (c == '"') in_string = false;
+                continue;
+            }
+            if (c == '"')      in_string = true;
+            else if (c == '{') ++depth;
+            else if (c == '}') { if (--depth == 0) { ++p; break; } }
+        }
+        LineScan fl{line.substr(start, p - start)};
+        BootstrapFile f;
+        f.name            = fl.find_str("name");
+        f.downloadedBytes = fl.find_num("downloadedBytes");
+        f.totalBytes      = fl.find_num("totalBytes");
+        f.started         = fl.find_bool("started");
+        f.finished        = fl.find_bool("finished");
+        if (!f.name.empty()) prog.files.push_back(std::move(f));
+    }
+    if (prog.files.empty()) return std::nullopt;
+    return prog;
+}
+
+// The events of one `xlings interface update_packages` run, rendered with the
+// renderer every other acquisition uses (mcpp::ui::ProgressBar and
+// DownloadProgress). A `progress` event names a step (its `message`, or its
+// `phase`) and a percentage; a step that changes finishes the previous bar.
+// A `download_progress` data event is an index artifact being fetched. A line
+// that is not an event is not rendered: an xlings that predates structured
+// index progress printed its own terminal text on this stream, and the bar
+// is what replaces it.
+class IndexRefreshRenderer {
+public:
+    void line(std::string_view text) {
+        LineScan ls{text};
+        const auto kind = ls.find_str("kind");
+        if (kind == "result") {
+            resultExit_ = static_cast<int>(ls.find_num("exitCode"));
+        } else if (kind == "progress") {
+            auto label = ls.find_str("message");
+            if (label.empty()) label = ls.find_str("phase");
+            if (label.empty()) return;
+            if (!bar_ || label != label_) {
+                if (bar_) bar_->finish();
+                bar_.emplace("Updating", std::format("package index: {}", label));
+                label_ = label;
+            }
+            const auto pct = std::clamp(ls.find_num("percent"), 0.0, 100.0);
+            bar_->update(static_cast<std::size_t>(pct));
+        } else if (kind == "data" && ls.find_str("dataKind") == "download_progress") {
+            auto prog = download_progress_of(text);
+            if (!prog) return;
+            if (bar_) { bar_->finish(); bar_.reset(); label_.clear(); }
+            std::vector<mcpp::ui::DownloadFile> files;
+            for (auto const& f : prog->files)
+                files.push_back({f.name,
+                                 static_cast<std::size_t>(f.downloadedBytes),
+                                 static_cast<std::size_t>(f.totalBytes),
+                                 f.started, f.finished});
+            download_.update(files, prog->elapsedSec);
+        }
+    }
+    // The exit code the result event carried, or -1 when none arrived.
+    int result_exit() const { return resultExit_; }
+    ~IndexRefreshRenderer() {
+        if (bar_) bar_->finish();
+        download_.finish();
+    }
+
+private:
+    std::optional<mcpp::ui::ProgressBar> bar_;
+    std::string                          label_;
+    mcpp::ui::DownloadProgress           download_;
+    int                                  resultExit_ = -1;
+};
+} // namespace
+
 // ─── install_with_progress ──────────────────────────────────────────
 
 int install_with_progress(const Env& env, std::string_view target,
@@ -1641,10 +1740,11 @@ int install_with_progress(const Env& env, std::string_view target,
 
         // The direct install redirects all output to the null device, so it
         // produces zero feedback — on a slow/network-bound first run this
-        // looks frozen. Run the blocking std::system() on a worker thread and
-        // paint an in-place elapsed-time spinner on stderr while it runs.
-        // Only when interactive (not quiet, stderr/stdout is a TTY).
-        const bool showSpinner = !quiet && mcpp::platform::terminal::is_tty();
+        // looks frozen. Run the blocking command on a worker thread and draw
+        // an elapsed-time bar while it runs, with the renderer every other
+        // acquisition uses (W11): redrawn in place on a terminal, one start
+        // and one finish line otherwise, nothing under --quiet.
+        const bool showSpinner = !quiet;
 
         mcpp::platform::env::note_network_access();
         std::atomic<bool> done{false};
@@ -1663,29 +1763,21 @@ int install_with_progress(const Env& env, std::string_view target,
         });
 
         if (showSpinner) {
-            constexpr std::string_view frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-            // Each braille frame is 3 bytes in UTF-8.
-            constexpr std::size_t kFrameBytes = 3;
-            const std::size_t nFrames = frames.size() / kFrameBytes;
+            mcpp::ui::ProgressBar bar("Installing", target);
             const auto start = std::chrono::steady_clock::now();
-            std::size_t i = 0;
             while (!done.load(std::memory_order_acquire)) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - start).count();
-                std::print(stderr, "\r  {} installing {}  ({}s)\x1b[K",
-                    frames.substr((i % nFrames) * kFrameBytes, kFrameBytes),
-                    target, elapsed);
-                std::fflush(stderr);
-                ++i;
+                bar.update_indeterminate(0, std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count());
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
-            // Clear the spinner line.
-            std::print(stderr, "\r\x1b[K");
-            std::fflush(stderr);
+            worker.join();
+            if (directRc == 0) bar.finish();
+            else               bar.finish_failed(target);
+            if (directRc == 0) return 0;
+        } else {
+            worker.join();
+            if (directRc == 0) return 0;
         }
-
-        worker.join();
-        if (directRc == 0) return 0;
     }
 
     // Fallback: NDJSON interface path (provides progress callbacks).
@@ -1711,42 +1803,7 @@ int install_with_progress(const Env& env, std::string_view target,
         if (ls.find_str("dataKind") != "download_progress") return;
         if (!cb) return;
 
-        auto p = line.find("\"files\":[");
-        if (p == std::string_view::npos) return;
-        p += 9;
-
-        BootstrapProgress prog;
-        prog.elapsedSec = ls.find_num("elapsedSec");
-
-        while (p < line.size()) {
-            while (p < line.size() && (line[p] == ' ' || line[p] == '\n'
-                                       || line[p] == ',')) ++p;
-            if (p >= line.size() || line[p] == ']') break;
-            if (line[p] != '{') break;
-            int depth = 0;
-            auto start = p;
-            bool in_string = false;
-            for (; p < line.size(); ++p) {
-                char c = line[p];
-                if (in_string) {
-                    if (c == '\\' && p + 1 < line.size()) { ++p; continue; }
-                    if (c == '"') in_string = false;
-                    continue;
-                }
-                if (c == '"')      in_string = true;
-                else if (c == '{') ++depth;
-                else if (c == '}') { if (--depth == 0) { ++p; break; } }
-            }
-            LineScan fl{line.substr(start, p - start)};
-            BootstrapFile f;
-            f.name            = fl.find_str("name");
-            f.downloadedBytes = fl.find_num("downloadedBytes");
-            f.totalBytes      = fl.find_num("totalBytes");
-            f.started         = fl.find_bool("started");
-            f.finished        = fl.find_bool("finished");
-            if (!f.name.empty()) prog.files.push_back(std::move(f));
-        }
-        if (!prog.files.empty()) cb(prog);
+        if (auto prog = download_progress_of(line)) cb(*prog);
     };
 
     bool idleTimedOut = false;
@@ -2150,7 +2207,16 @@ int update_index_unguarded(const Env& env, bool quiet) {
         return 0;
     }
 
-    std::string cmd = build_command_prefix(env) + " update 2>&1";
+    // Through the NDJSON interface, as installs are (W11): the refresh reports
+    // its steps as events and is drawn by the same renderer, instead of the
+    // bare CLI's terminal text, which was either reprinted verbatim or, for
+    // the automatic refresh, discarded, so a refresh of many seconds showed
+    // nothing. The interface's `update_packages` and the CLI's `update` are
+    // one function in xlings (xim::cmd_update).
+    std::string cmd = std::format("{} interface update_packages --args {} {} {}",
+        build_command_prefix(env), shq_meta("{}"), mcpp::platform::null_redirect,
+        mcpp::platform::is_windows ? "<NUL" : "</dev/null");
+    (void)quiet;
     mcpp::platform::env::note_network_access();
     // The index sync is a network git operation; a single transient blip (DNS,
     // TLS reset, a mirror hiccup) otherwise fails a cold `mcpp self env` /
@@ -2162,12 +2228,14 @@ int update_index_unguarded(const Env& env, bool quiet) {
     const auto refreshBound = index_refresh_timeout();
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
         bool timedOut = false;
-        rc = mcpp::platform::process::run_streaming_bounded(cmd,
-            [quiet](std::string_view line) {
-                if (!quiet) std::println("{}", line);
-            },
-            std::chrono::duration_cast<std::chrono::milliseconds>(refreshBound),
-            std::chrono::milliseconds{0}, &timedOut);
+        {
+            IndexRefreshRenderer renderer;
+            rc = mcpp::platform::process::run_streaming_bounded(cmd,
+                [&renderer](std::string_view line) { renderer.line(line); },
+                std::chrono::duration_cast<std::chrono::milliseconds>(refreshBound),
+                std::chrono::milliseconds{0}, &timedOut);
+            if (rc == 0 && renderer.result_exit() > 0) rc = renderer.result_exit();
+        }
         if (rc == 0 && !timedOut) { mark_known_indexes_refreshed(env); return 0; }
         // A refresh that exceeded its bound is not retried: the retries exist for
         // a transient failure that ends, and a connection that never answers

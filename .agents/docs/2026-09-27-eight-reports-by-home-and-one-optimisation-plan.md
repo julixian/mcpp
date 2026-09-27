@@ -937,8 +937,8 @@ bytes done and bytes total, or a phase percentage when bytes are unknown.
 | Path | Producer | Home |
 |---|---|---|
 | Index refresh | the `update_packages` capability of `xlings interface`, which exists (`src/capabilities.cpp:182`), in place of the bare CLI. Whether it emits `download_progress` for an index sync is to be measured. If it emits none, xlings emits it for the index artifact and the git sync. | mcpp; xlings if the events are missing |
-| `git` dependencies | git's own `--progress` phases (`Receiving objects: 45% ...`, with bytes and rate), parsed into the same event shape | mcpp |
-| Sandbox bootstrap | the NDJSON path first, and the direct CLI only as the fallback, which is the reverse of today's order | mcpp |
+| `git` dependencies | git's own `--progress` download phase (`Receiving objects: 45% ...`), read as it is redrawn: the streaming runner gains an opt-in rule that a lone carriage return also ends a line | mcpp |
+| Sandbox bootstrap | the shared bar, in indeterminate form, in place of the hand-drawn terminal-only spinner. The direct CLI stays first: its comment records that it is the more reliable path for large payloads, and the order is not what hid the progress | mcpp |
 | A payload whose install emits no events | the payload's install uses xlings's downloader, which emits them | ecosystem data (the payload's recipe) or xlings, per case |
 
 Rendering follows one rule per output mode:

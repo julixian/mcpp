@@ -104,6 +104,15 @@ void flush();
 void set_line_buffered();
 
 // --- progress bar (single-line, \r-rewritten) ---
+//
+// ONE RENDERER, TWO OUTPUT MODES. On a terminal the bar is redrawn in place.
+// When stdout is not a terminal (a CI log, a pipe, a file) it prints one line
+// when the item starts, with its size when known, and one line when it
+// finishes, with its duration: no `\r`, no erase sequence, no repaint per
+// frame. The mode follows stdout; `set_live_progress` overrides it for tests.
+void set_live_progress(bool live);
+bool live_progress();
+
 class ProgressBar {
 public:
     ProgressBar(std::string_view verb, std::string_view label);
@@ -129,15 +138,25 @@ public:
     // Finish: replaces progress with final-state line.
     void finish();
     void finish_with(std::string_view final_message);
+    // Finish an item that did not complete: the line says so rather than
+    // reporting it done.
+    void finish_failed(std::string_view final_message);
 
 private:
     void render_line(std::size_t percent, const std::string& info_text);
     void render_line_swept(std::size_t frame, const std::string& info_text);
 
+    // Not a terminal: one start line, then one finish line.
+    void announce(std::size_t total_bytes);
+    void finish_plain(std::string_view final_message);
+
     std::string verb_;
     std::string label_;
     std::chrono::steady_clock::time_point lastDraw_;
-    bool finished_ = false;
+    std::chrono::steady_clock::time_point start_;
+    bool finished_  = false;
+    bool announced_ = false;
+    std::size_t lastBytes_ = 0;
 };
 
 // --- download progress (centralized) ---
@@ -210,6 +229,8 @@ namespace {
 bool g_color  = false;
 bool g_quiet  = false;
 bool g_inited = false;
+// -1: follow stdout; 0 / 1: set by set_live_progress.
+int  g_liveOverride = -1;
 
 constexpr std::string_view kReset      = "\033[0m";
 constexpr std::string_view kBold       = "\033[1m";
@@ -255,6 +276,14 @@ void disable_color() { g_color = false; }
 bool is_color_enabled() { return g_color; }
 
 void set_quiet(bool q) { g_quiet = q; }
+
+void set_live_progress(bool live) { g_liveOverride = live ? 1 : 0; }
+
+bool live_progress() {
+    if (g_liveOverride >= 0) return g_liveOverride == 1;
+    static const bool tty = mcpp::platform::terminal::is_tty();
+    return tty;
+}
 bool is_quiet()        { return g_quiet; }
 
 void flush() { std::fflush(stdout); }
@@ -558,8 +587,28 @@ void draw_status_line(std::string_view verb, const std::string& label,
 
 ProgressBar::ProgressBar(std::string_view verb, std::string_view label)
     : verb_(verb), label_(label),
-      lastDraw_(std::chrono::steady_clock::now() - std::chrono::seconds(1))
+      lastDraw_(std::chrono::steady_clock::now() - std::chrono::seconds(1)),
+      start_(std::chrono::steady_clock::now())
 {}
+
+void ProgressBar::announce(std::size_t total_bytes) {
+    if (announced_) return;
+    announced_ = true;
+    if (total_bytes > 0)
+        info(verb_, std::format("{} ({})", label_, fmt_bytes(total_bytes)));
+    else
+        info(verb_, label_);
+}
+
+void ProgressBar::finish_plain(std::string_view final_message) {
+    const auto secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_).count();
+    if (lastBytes_ > 0)
+        info(verb_, std::format("{} done, {} in {:.1f}s", final_message,
+                                fmt_bytes(lastBytes_), secs));
+    else
+        info(verb_, std::format("{} done in {:.1f}s", final_message, secs));
+}
 
 ProgressBar::~ProgressBar() {
     if (!finished_) finish();
@@ -599,6 +648,7 @@ void ProgressBar::render_line_swept(std::size_t frame, const std::string& info_t
 
 void ProgressBar::update(std::size_t percent) {
     if (g_quiet || finished_) return;
+    if (!live_progress()) { announce(0); return; }
     auto now = std::chrono::steady_clock::now();
     if (now - lastDraw_ < std::chrono::milliseconds(80) && percent < 100) return;
     lastDraw_ = now;
@@ -608,6 +658,7 @@ void ProgressBar::update(std::size_t percent) {
 void ProgressBar::update_bytes(std::size_t current, std::size_t total,
                                double elapsed_sec) {
     if (g_quiet || finished_) return;
+    if (!live_progress()) { announce(total); lastBytes_ = current; return; }
     auto now = std::chrono::steady_clock::now();
     auto pct = total ? (current * 100 / total) : 0;
     if (pct > 100) pct = 100;
@@ -630,6 +681,7 @@ void ProgressBar::update_bytes(std::size_t current, std::size_t total,
 void ProgressBar::update_indeterminate(std::size_t current_bytes,
                                        double elapsed_sec) {
     if (g_quiet || finished_) return;
+    if (!live_progress()) { announce(0); lastBytes_ = current_bytes; return; }
     auto now = std::chrono::steady_clock::now();
     // Same ~80ms throttle as update_bytes(); there is no "100%" early-out here
     // because there is no known total.
@@ -652,6 +704,11 @@ void ProgressBar::finish() {
     if (finished_) return;
     finished_ = true;
     if (g_quiet) return;
+    if (!live_progress()) {
+        announce(0);
+        finish_plain(label_);
+        return;
+    }
     // Clear the line and re-emit as a static info line.
     std::print("\r\033[2K");
     info(verb_, label_);
@@ -661,8 +718,24 @@ void ProgressBar::finish_with(std::string_view final_message) {
     if (finished_) return;
     finished_ = true;
     if (g_quiet) return;
+    if (!live_progress()) {
+        announce(0);
+        finish_plain(final_message);
+        return;
+    }
     std::print("\r\033[2K");
     info(verb_, final_message);
+}
+
+void ProgressBar::finish_failed(std::string_view final_message) {
+    if (finished_) return;
+    finished_ = true;
+    if (g_quiet) return;
+    if (live_progress()) std::print("\r\033[2K");
+    else announce(0);
+    const auto secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_).count();
+    info(verb_, std::format("{} did not complete ({:.1f}s)", final_message, secs));
 }
 
 // --- DownloadProgress ---

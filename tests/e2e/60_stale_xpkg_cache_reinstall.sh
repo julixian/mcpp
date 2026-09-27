@@ -53,7 +53,8 @@ if [[ "${1:-}" == "self" && "${2:-}" == "init" ]]; then
     exit 0
 fi
 
-if [[ "${1:-}" == "update" ]]; then
+# The index refresh: the bare CLI before 2026.9.28.1, the NDJSON interface since.
+if [[ "${1:-}" == "update" || ( "${1:-}" == "interface" && "${2:-}" == "update_packages" ) ]]; then
     exit 0
 fi
 

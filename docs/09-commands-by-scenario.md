@@ -207,6 +207,26 @@ fails rather than fetch. `--locked` fails when resolution differs from
 `mcpp index pin <name> <rev>` records a commit for a custom index in
 `mcpp.toml`; `mcpp index unpin` removes it.
 
+## Download progress
+
+Every acquisition is reported by one renderer (2026.9.28.1+):
+
+- a toolchain or payload install;
+- a library package from an index;
+- an `[xlings]` payload;
+- an index refresh;
+- the clone of a `git` dependency;
+- the sandbox's first-run tools.
+
+On a terminal each item is a bar drawn in place. When stdout is not a terminal,
+as in a CI log or a pipe, each item prints one line when it starts, with its
+size when known, and one line when it finishes, with its duration. That output
+carries no carriage return and no erase sequence. `--quiet` prints neither.
+
+An index refresh is reported step by step when the xlings that mcpp drives
+emits progress events for it (xlings 2026.9.28.1+). With an older xlings it
+shows its status line and finishes silently, as before.
+
 ## Validating a descriptor before publishing
 
 `mcpp xpkg parse` reads a descriptor with the resolver's own grammar, so what

@@ -1920,7 +1920,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 // on a different one than the project.
                 auto cloneCmd = (spec.gitRefKind == "branch" && !fromLock)
                     ? std::format(
-                        "git clone --depth 1 --branch {} {} {} && "
+                        "git clone --progress --depth 1 --branch {} {} {} && "
                         "git -C {} checkout --quiet {} 2>&1",
                         mcpp::platform::shell::quote(spec.gitRev),
                         mcpp::platform::shell::quote(spec.git),
@@ -1928,7 +1928,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                         mcpp::platform::shell::quote(gitRoot.string()),
                         mcpp::platform::shell::quote(resolvedGitRev))
                     : std::format(
-                        "git clone {} {} && git -C {} checkout --quiet {} 2>&1",
+                        "git clone --progress {} {} && git -C {} checkout --quiet {} 2>&1",
                         mcpp::platform::shell::quote(spec.git),
                         mcpp::platform::shell::quote(gitRoot.string()),
                         mcpp::platform::shell::quote(gitRoot.string()),
@@ -1937,7 +1937,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 // callback is removing between attempts.
                 auto r = run_with_network_retry(cloneCmd, [&] {
                     std::filesystem::remove_all(gitRoot, ec);
-                });
+                }, spec.git);
                 if (r.exit_code != 0) {
                     std::filesystem::remove_all(gitRoot, ec);
                     return std::unexpected(std::format(

@@ -571,9 +571,12 @@ std::string min_platform_version(const mcpp::manifest::Manifest& m,
 
 // fetch.cpp: git remotes, network retries, xlings addresses and their provisioning
 std::string git_cache_head(const std::filesystem::path& gitRoot);
+// `progressLabel`, when given, draws git's `--progress` download phase as
+// one bar labelled with it (W11); the command must pass `--progress`.
 mcpp::platform::process::RunResult run_with_network_retry(
         std::string_view command,
-        const std::function<void()>& between = {});
+        const std::function<void()>& between = {},
+        std::string_view progressLabel = {});
 std::vector<std::string>
 applicable_xlings_addresses(const mcpp::manifest::Manifest& man,
                             const std::vector<std::string>& activeFeatures,
