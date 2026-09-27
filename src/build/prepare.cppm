@@ -2508,6 +2508,34 @@ namespace dg = mcpp::build::dep_graph;
         std::vector<std::string> linkFlagsAdded;  // entries appended to m->buildConfig.ldflags by this dep
     };
 
+    struct WorkItem {
+        std::string                          name;                // dep map key as written
+        mcpp::manifest::DependencySpec       spec;                // copy (we may mutate version)
+        std::string                          requestedBy;         // who asked for it
+        std::string                          originalConstraint;  // spec.version BEFORE pinning (for SemVer merge)
+        std::size_t                          consumerDepIndex;    // dep_manifests slot of who pushed this child; kMainConsumer for main
+        std::filesystem::path                resolveRoot;         // base dir for relative path deps (empty = use project root)
+        bool                                 devOnly = false;     // seeded from [dev-dependencies]; inherited by children
+        // Seeded from `[build-dependencies]`, and inherited by children the
+        // same way `devOnly` is. It answers "does this serve the build or the
+        // target", which is a different question from "which build-time
+        // product do I want" — that one is answered per edge by `tools` and
+        // `host-module`, and the two are orthogonal. A package linked into the
+        // target that also provides a tool is written once, in
+        // `[dependencies]`, with a `tools` request on it.
+        bool                                 buildOnly = false;
+    };
+
+    struct DeclaringManifest {
+        std::string path;
+        bool        namespaceDeclared = false;
+    };
+
+    struct GitClone {
+        std::filesystem::path root;
+        std::string url, refKind, ref;
+    };
+
 struct PrepareState {
     PrepareState(bool print_fingerprint_, bool includeDevDeps_,
                  std::vector<mcpp::manifest::Target> extraTargets_,
@@ -2668,6 +2696,44 @@ struct PrepareState {
     std::function<std::vector<std::string>(std::size_t,
         const std::map<std::string, mcpp::build::provisions::BareBinding>&)>
         publishedNamesFor;
+
+    // ── the graph-loading half of P4 (graph_load.cpp), called from the
+    // worklist engine (graph.cpp): the same escaping-closure pattern as
+    // everything above, one level deeper. loadVersionDep is defined once
+    // (with these helpers as its own captures) and called repeatedly from
+    // the worklist loop, well after its defining call returns. ────────────
+    std::deque<WorkItem> worklist;
+    std::map<std::string, ResolvedKey> identityBySource;
+    std::map<ResolvedKey, DeclaringManifest> declaringManifest;
+    std::set<std::pair<std::string, std::string>> adoptionsReported;
+    std::map<std::string, GitClone> gitCloneBySource;
+    std::set<std::string> selectorMigrationWarnings;
+    std::set<std::string> preinstallStack;
+    std::set<std::string> preinstallDone;
+    std::function<std::string(std::string_view)> cache_index_name;
+    std::function<std::optional<std::string>(const std::filesystem::path&,
+                                              const ResolvedKey&)> gitMemberDeclaring;
+    std::function<std::string(const ResolvedKey&)> qualifiedKey;
+    std::function<void(const WorkItem&, const ResolvedKey&)> stateAdoptedIdentity;
+    std::function<void(const std::string&, const std::string&, const ResolvedKey&,
+                        const ResolvedKey&, const std::string&)> reportAdoption;
+    std::function<mcpp::pm::IndexRoute(mcpp::config::GlobalConfig*)> index_route;
+    std::function<const mcpp::pm::IndexSpec*(const std::string&)> findIndexForNs;
+    std::function<std::expected<void, std::string>(mcpp::manifest::DependencySpec&,
+                                                    const std::string&)> resolveSemver;
+    std::function<std::optional<std::string>(const mcpp::pm::DependencyCoordinate&)>
+        readStrictLuaForCandidate;
+    std::function<bool(const mcpp::pm::DependencyCoordinate&, std::string_view, bool)>
+        xpkgLuaMatchesCandidate;
+    std::function<std::vector<mcpp::pm::DependencyCoordinate>(
+        const mcpp::manifest::DependencySpec&, const std::string&)> dependencyCoordinates;
+    std::function<std::expected<void, std::string>(mcpp::manifest::DependencySpec&,
+                                                    const std::string&)> selectDependencyCandidate;
+    std::function<std::expected<std::pair<std::filesystem::path, mcpp::manifest::Manifest>,
+                                 std::string>(const std::string&, const std::string&,
+                                              const std::string&, const std::string&)>
+        loadVersionDep;
+
     std::map<ResolvedKey, ResolvedRecord> resolved;
     std::map<std::size_t, std::vector<std::pair<std::string, std::string>>>
         toolEnvByConsumer;
@@ -10711,7 +10777,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
     // out at the end (PackageRoot stores a `Manifest` by value, so the
     // unique_ptr is not load-bearing for liveness — it's a leftover from
     // an earlier design and harmless).
-    auto cache_index_name = [](std::string_view ns) {
+    state.cache_index_name = [](std::string_view ns) {
         if (ns.empty()) return std::string(mcpp::pm::kDefaultNamespace);
         return std::string(ns);
     };
@@ -10719,25 +10785,6 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
 
     // Sentinel for "the consumer is the main package" (no dep_manifests entry).
     constexpr std::size_t kMainConsumer = static_cast<std::size_t>(-1);
-
-    struct WorkItem {
-        std::string                          name;                // dep map key as written
-        mcpp::manifest::DependencySpec       spec;                // copy (we may mutate version)
-        std::string                          requestedBy;         // who asked for it
-        std::string                          originalConstraint;  // spec.version BEFORE pinning (for SemVer merge)
-        std::size_t                          consumerDepIndex;    // dep_manifests slot of who pushed this child; kMainConsumer for main
-        std::filesystem::path                resolveRoot;         // base dir for relative path deps (empty = use project root)
-        bool                                 devOnly = false;     // seeded from [dev-dependencies]; inherited by children
-        // Seeded from `[build-dependencies]`, and inherited by children the
-        // same way `devOnly` is. It answers "does this serve the build or the
-        // target", which is a different question from "which build-time
-        // product do I want" — that one is answered per edge by `tools` and
-        // `host-module`, and the two are orthogonal. A package linked into the
-        // target that also provides a tool is written once, in
-        // `[dependencies]`, with a `tools` request on it.
-        bool                                 buildOnly = false;
-    };
-    std::deque<WorkItem> worklist;
 
     // #634, A2. A `path` or `git` dependency's identity is the one its manifest
     // declares (SPEC-001 §1.2), and the key a consumer wrote is one way of
@@ -10748,13 +10795,6 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
     // identity came from, and records whether that manifest named its
     // namespace: one that does not takes the key's, so two keys over it would
     // be two identities over one source.
-    struct DeclaringManifest {
-        std::string path;
-        bool        namespaceDeclared = false;
-    };
-    std::map<std::string, ResolvedKey> identityBySource;
-    std::map<ResolvedKey, DeclaringManifest> declaringManifest;
-    std::set<std::pair<std::string, std::string>> adoptionsReported;
     // A GIT DEPENDENCY NAMES A REPOSITORY, AND THE KEY NAMES WHICH PACKAGE OF
     // IT (#649 E7). The root manifest's package is one; each `[workspace]
     // members` entry of that manifest is another. Before this a git source
@@ -10763,14 +10803,9 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
     // of every git source resolved so far is kept with the reference it was
     // resolved from, so a later key over the same source, and a member's
     // `path` edge that stays inside the clone, find it.
-    struct GitClone {
-        std::filesystem::path root;
-        std::string url, refKind, ref;
-    };
-    std::map<std::string, GitClone> gitCloneBySource;
     // The member of the repository at `cloneRoot` whose manifest declares
     // `want`, when the root manifest's package is not `want` itself.
-    auto gitMemberDeclaring = [&](const std::filesystem::path& cloneRoot,
+    state.gitMemberDeclaring = [&](const std::filesystem::path& cloneRoot,
                                   const ResolvedKey& want)
         -> std::optional<std::string> {
         auto declares = [&](const mcpp::manifest::Manifest& mm) {
@@ -10797,13 +10832,13 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         }
         return std::nullopt;
     };
-    auto qualifiedKey = [](const ResolvedKey& k) {
+    state.qualifiedKey = [](const ResolvedKey& k) {
         return k.ns.empty() ? k.shortName : std::format("{}.{}", k.ns, k.shortName);
     };
     // A root edge that adopted an identity states it on the root's own
     // declaration too, which is what every later reader of the root manifest
     // (the build banner, the resolution record) sees.
-    auto stateAdoptedIdentity = [&](const WorkItem& item, const ResolvedKey& declared) {
+    state.stateAdoptedIdentity = [&](const WorkItem& item, const ResolvedKey& declared) {
         if (item.consumerDepIndex != kMainConsumer) return;
         if (auto it = state.m->dependencies.find(item.name); it != state.m->dependencies.end()) {
             it->second.namespace_ = declared.ns;
@@ -10811,18 +10846,18 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         }
     };
     // One warning per declaring edge: each names a line someone can correct.
-    auto reportAdoption = [&](const std::string& requestedBy, const std::string& written,
+    state.reportAdoption = [&](const std::string& requestedBy, const std::string& written,
                               const ResolvedKey& normalised, const ResolvedKey& declared,
                               const std::string& manifestPath) {
-        if (!adoptionsReported.emplace(requestedBy, written).second) return;
+        if (!state.adoptionsReported.emplace(requestedBy, written).second) return;
         mcpp::diag::warning("dependency/identity", std::format(
             "'{}' declares the dependency '{}', which names {}; the manifest "
             "'{}' declares {}, and that identity is used.",
-            requestedBy, written, qualifiedKey(normalised), manifestPath,
-            qualifiedKey(declared)),
+            requestedBy, written, state.qualifiedKey(normalised), manifestPath,
+            state.qualifiedKey(declared)),
             std::format("write '{}' in '{}' to state the identity the "
                         "manifest declares.",
-                        qualifiedKey(declared), requestedBy));
+                        state.qualifiedKey(declared), requestedBy));
     };
 
 
@@ -10832,19 +10867,19 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
     // packages are real (#305/#307). `cfg` is filled in per call: the route is
     // rebuilt on demand because `root` moves when a workspace member is
     // selected above.
-    auto index_route = [&](mcpp::config::GlobalConfig* cfg = nullptr) {
+    state.index_route = [&](mcpp::config::GlobalConfig* cfg = nullptr) {
         return mcpp::pm::IndexRoute{ &state.m->indices, *state.root, cfg };
     };
-    auto findIndexForNs = [&](const std::string& ns)
+    state.findIndexForNs = [&](const std::string& ns)
         -> const mcpp::pm::IndexSpec*
     {
-        return index_route().find_for_ns(ns);
+        return state.index_route(nullptr).find_for_ns(ns);
     };
 
     // SemVer constraint resolver, shared across the worklist so transitive
     // deps with caret/range constraints (`^1.0`) also get pinned to a
     // concrete version before fetch.
-    auto resolveSemver = [&](mcpp::manifest::DependencySpec& s,
+    state.resolveSemver = [&](mcpp::manifest::DependencySpec& s,
                               const std::string& depName)
         -> std::expected<void, std::string>
     {
@@ -10857,7 +10892,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         // `[indices]` entry — see #308.
         auto resolved = mcpp::pm::resolve_semver(
             s.namespace_, s.shortName.empty() ? depName : s.shortName,
-            s.version, index_route(*cfg), *state.targetPlatform);
+            s.version, state.index_route(*cfg), *state.targetPlatform);
         if (!resolved) return std::unexpected(resolved.error());
         mcpp::ui::info("Resolved",
             std::format("{} {} → v{}", depName, s.version, *resolved));
@@ -10895,16 +10930,16 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
     // peer-root candidate `(aimol, tensorvia-cpu)`, leaving the request pinned to
     // the wrong front candidate `(mcpplibs.aimol, …)`. See
     // .agents/docs/2026-06-26-identity-first-resolution-no-filename.md.
-    auto readStrictLuaForCandidate =
+    state.readStrictLuaForCandidate =
         [&](const mcpp::pm::DependencyCoordinate& coord)
             -> std::optional<std::string>
     {
         auto cfg = state.get_cfg(true);
         if (!cfg) return std::nullopt;
-        return index_route(*cfg).read(coord);
+        return state.index_route(*cfg).read(coord);
     };
 
-    auto xpkgLuaMatchesCandidate =
+    state.xpkgLuaMatchesCandidate =
         [&](const mcpp::pm::DependencyCoordinate& coord,
             std::string_view luaContent,
             bool allowLegacyBareDefault) {
@@ -10913,7 +10948,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             // descriptor served by a declared project index inherits that
             // index's namespace when package.namespace is omitted; preserve
             // the same owner context during this second, stricter check.
-            const auto route = index_route();
+            const auto route = state.index_route(nullptr);
             const auto* owner = route.find_for_ns(coord.namespace_);
             const std::string_view ownerNs = owner
                 ? std::string_view{owner->name} : std::string_view{};
@@ -10922,7 +10957,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                 allowLegacyBareDefault, ownerNs);
         };
 
-    auto dependencyCoordinates =
+    state.dependencyCoordinates =
         [](const mcpp::manifest::DependencySpec& spec,
            const std::string& depName) {
             if (!spec.candidates.empty()) return spec.candidates;
@@ -10936,13 +10971,12 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             return out;
         };
 
-    std::set<std::string> selectorMigrationWarnings;
 
-    auto selectDependencyCandidate =
+    state.selectDependencyCandidate =
         [&](mcpp::manifest::DependencySpec& spec,
             const std::string& depName) -> std::expected<void, std::string>
     {
-        auto candidates = dependencyCoordinates(spec, depName);
+        auto candidates = state.dependencyCoordinates(spec, depName);
         if (candidates.empty()) {
             return std::unexpected(
                 with_index_cause(std::format(
@@ -10966,7 +11000,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                         .namespace_ = locked->second,
                         .shortName = exact.shortName,
                     };
-                    if (selectorMigrationWarnings.insert(depName).second) {
+                    if (state.selectorMigrationWarnings.insert(depName).second) {
                         mcpp::ui::warning(std::format(
                             "dependency selector '{}' now means exact package "
                             "'{}', but mcpp.lock records '{}'; keeping the "
@@ -10985,11 +11019,11 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
 
             if (!lockExpressesIntent && spec.isVersion()) {
                 if (auto old = mcpp::pm::legacy_prefixed_coordinate(exact)) {
-                    auto oldLua = readStrictLuaForCandidate(*old);
-                    if (oldLua && xpkgLuaMatchesCandidate(
+                    auto oldLua = state.readStrictLuaForCandidate(*old);
+                    if (oldLua && state.xpkgLuaMatchesCandidate(
                             *old, *oldLua,
                             /*allowLegacyBareDefault=*/false)
-                        && selectorMigrationWarnings.insert(depName).second) {
+                        && state.selectorMigrationWarnings.insert(depName).second) {
                         mcpp::ui::warning(std::format(
                             "dependency selector '{}' now resolves exactly to "
                             "'{}'; an older mcpp would select the existing "
@@ -11009,14 +11043,14 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         bool matched  = false;
         if (spec.isVersion()) {
             for (auto& candidate : candidates) {
-                auto lua = readStrictLuaForCandidate(candidate);
+                auto lua = state.readStrictLuaForCandidate(candidate);
                 if (!lua) continue;
                 if (auto violation = mcpp::manifest::
                         xpkg_name_form_violation_from_lua(*lua)) {
                     return std::unexpected(std::format(
                         "dependency '{}': {}", depName, *violation));
                 }
-                if (!xpkgLuaMatchesCandidate(
+                if (!state.xpkgLuaMatchesCandidate(
                         candidate, *lua, /*allowLegacyBareDefault=*/false)) {
                     continue;
                 }
@@ -11075,11 +11109,11 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             if (!matched && spec.isVersion() && spec.namespaceOmitted) {
                 for (auto& legacy :
                          mcpp::pm::legacy_bare_candidates(candidates.front())) {
-                    auto lua = readStrictLuaForCandidate(legacy);
+                    auto lua = state.readStrictLuaForCandidate(legacy);
                     if (!lua) continue;
                     if (mcpp::manifest::xpkg_name_form_violation_from_lua(*lua))
                         continue;
-                    if (!xpkgLuaMatchesCandidate(
+                    if (!state.xpkgLuaMatchesCandidate(
                             legacy, *lua, /*allowLegacyBareDefault=*/false))
                         continue;
                     auto declaredNs =
@@ -11099,7 +11133,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                     // exactly one place: the user's manifest, until they edit it.
                     candidates.assign(1, selected);
 
-                    if (selectorMigrationWarnings.insert(depName).second) {
+                    if (state.selectorMigrationWarnings.insert(depName).second) {
                         mcpp::ui::warning(std::format(
                             "dependency '{}' resolved to '{}' through the "
                             "deprecated bare-name search; namespace omission "
@@ -11130,7 +11164,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             // under the strict rule below.
             bool anyLazyGitIndex = std::ranges::any_of(candidates,
                 [&](const mcpp::pm::DependencyCoordinate& c) {
-                    return index_route().lazy_git(c.namespace_);
+                    return state.index_route(nullptr).lazy_git(c.namespace_);
                 });
 
             // An exact coordinate that a readable index cannot serve fails at
@@ -11151,7 +11185,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                 std::string hint;
                 if (auto cfg = state.get_cfg(true)) {
                     auto suggestions = mcpp::pm::cross_namespace_suggestions(
-                        index_route(*cfg), candidates.front().shortName);
+                        state.index_route(*cfg), candidates.front().shortName);
                     if (!suggestions.empty()) {
                         hint += "\n  a package with this name exists under "
                                 "another namespace:";
@@ -11213,16 +11247,8 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
     // 0.0.10+: loadVersionDep accepts structured (ns, shortName) for
     // namespace-aware lookup. depName is the map key (qualified or bare),
     // kept for install() target formatting and error messages.
-    std::set<std::string> preinstallStack;
-    std::set<std::string> preinstallDone;
 
-    std::function<std::expected<LoadedDep, std::string>(
-        const std::string&,
-        const std::string&,
-        const std::string&,
-        const std::string&)> loadVersionDep;
-
-    loadVersionDep = [&](const std::string& depName,
+    state.loadVersionDep = [&](const std::string& depName,
                          const std::string& ns,
                          const std::string& shortName,
                          const std::string& version)
@@ -11233,7 +11259,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         mcpp::fetcher::Fetcher fetcher(**cfg);
 
         // ─── Routing: check if this dep's namespace maps to a custom index ──
-        auto* idxSpec = findIndexForNs(ns);
+        auto* idxSpec = state.findIndexForNs(ns);
 
         const bool useProjectEnv = idxSpec && !idxSpec->is_builtin();
 
@@ -11373,28 +11399,28 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                     warn_unknown_xpkg_keys(*depManifest, depName);
 
                     auto preinstallKey = std::format("{}:{}@{}", ns, shortName, version);
-                    if (preinstallStack.contains(preinstallKey)) {
+                    if (state.preinstallStack.contains(preinstallKey)) {
                         return std::unexpected(std::format(
                             "dependency '{}': cyclic mcpp.deps while preparing install hooks",
                             depName));
                     }
 
-                    if (!preinstallDone.contains(preinstallKey)) {
-                        preinstallStack.insert(preinstallKey);
+                    if (!state.preinstallDone.contains(preinstallKey)) {
+                        state.preinstallStack.insert(preinstallKey);
                         for (auto [childName, childSpec] : depManifest->dependencies) {
                             mcpp::pm::compat::normalize_nested_namespace(
                                 childSpec.namespace_,
                                 childSpec.shortName,
                                 childSpec.legacyDottedKey);
 
-                            if (auto r = selectDependencyCandidate(
+                            if (auto r = state.selectDependencyCandidate(
                                     childSpec, childName); !r) {
-                                preinstallStack.erase(preinstallKey);
+                                state.preinstallStack.erase(preinstallKey);
                                 return std::unexpected(r.error());
                             }
 
-                            if (auto r = resolveSemver(childSpec, childName); !r) {
-                                preinstallStack.erase(preinstallKey);
+                            if (auto r = state.resolveSemver(childSpec, childName); !r) {
+                                state.preinstallStack.erase(preinstallKey);
                                 return std::unexpected(r.error());
                             }
 
@@ -11404,17 +11430,17 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                                 childSpec.namespace_,
                                 childSpec.shortName.empty() ? childName : childSpec.shortName,
                             };
-                            if (auto child = loadVersionDep(
+                            if (auto child = state.loadVersionDep(
                                     childName,
                                     childKey.ns,
                                     childKey.shortName,
                                     childSpec.version); !child) {
-                                preinstallStack.erase(preinstallKey);
+                                state.preinstallStack.erase(preinstallKey);
                                 return std::unexpected(child.error());
                             }
                         }
-                        preinstallStack.erase(preinstallKey);
-                        preinstallDone.insert(preinstallKey);
+                        state.preinstallStack.erase(preinstallKey);
+                        state.preinstallDone.insert(preinstallKey);
                     }
                 }
             }
@@ -12826,14 +12852,14 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         auto req = s;
         injectForwards(*state.m, rootActive, n, req);
         injectCliForwards(n, req);
-        worklist.push_back({n, req, mainPkgLabel, req.version, kMainConsumer, {}});
+        state.worklist.push_back({n, req, mainPkgLabel, req.version, kMainConsumer, {}});
     }
     if (state.includeDevDeps) {
         for (auto& [n, s] : state.m->devDependencies) {
             auto req = s;
             injectForwards(*state.m, rootActive, n, req);
             injectCliForwards(n, req);
-            worklist.push_back({n, req, mainPkgLabel + " (dev-dep)",
+            state.worklist.push_back({n, req, mainPkgLabel + " (dev-dep)",
                                 req.version, kMainConsumer, {}, /*devOnly=*/true});
         }
     }
@@ -12847,7 +12873,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         auto req = s;
         injectForwards(*state.m, rootActive, n, req);
         injectCliForwards(n, req);
-        worklist.push_back({n, req, mainPkgLabel + " (build-dep)",
+        state.worklist.push_back({n, req, mainPkgLabel + " (build-dep)",
                             req.version, kMainConsumer, {}, /*devOnly=*/false,
                             /*buildOnly=*/true});
     }
@@ -12877,9 +12903,9 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         return originalConstraint.empty() ? std::string("*") : originalConstraint;
     };
 
-    while (!worklist.empty()) {
-        auto item = std::move(worklist.front());
-        worklist.pop_front();
+    while (!state.worklist.empty()) {
+        auto item = std::move(state.worklist.front());
+        state.worklist.pop_front();
 
         const auto& name = item.name;
         auto& spec = item.spec;
@@ -12893,7 +12919,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             }};
         }
 
-        if (auto r = selectDependencyCandidate(spec, name); !r) {
+        if (auto r = state.selectDependencyCandidate(spec, name); !r) {
             return std::unexpected(r.error());
         }
         if (item.consumerDepIndex == kMainConsumer) {
@@ -12911,14 +12937,14 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         // second, path-sourced declaration of it. Only the clone root itself
         // and its `[workspace] members` are mapped; any other directory keeps
         // being an ordinary path.
-        if (spec.isPath() && !gitCloneBySource.empty()) {
+        if (spec.isPath() && !state.gitCloneBySource.empty()) {
             std::filesystem::path p = spec.path;
             auto base = item.resolveRoot.empty() ? *state.root : item.resolveRoot;
             if (p.is_relative()) p = base / p;
             std::error_code ec;
             auto canon = std::filesystem::weakly_canonical(p, ec);
             if (ec) canon = p.lexically_normal();
-            for (auto const& [src, clone] : gitCloneBySource) {
+            for (auto const& [src, clone] : state.gitCloneBySource) {
                 auto rel = canon.lexically_relative(clone.root).generic_string();
                 if (rel.empty() || rel.starts_with("..")) continue;
                 bool mapped = rel == ".";
@@ -12940,7 +12966,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         }
 
         // Pin SemVer constraint before dedup/fetch.
-        if (auto r = resolveSemver(spec, name); !r) {
+        if (auto r = state.resolveSemver(spec, name); !r) {
             return std::unexpected(r.error());
         }
 
@@ -12969,14 +12995,14 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             // member, not a second key over the root's identity (#649 E7).
             bool namesMember = false;
             if (sourceKind == "git")
-                if (auto clone = gitCloneBySource.find(source);
-                    clone != gitCloneBySource.end())
-                    namesMember = gitMemberDeclaring(clone->second.root, key).has_value();
-            if (auto bySource = identityBySource.find(source);
-                !namesMember && bySource != identityBySource.end()
+                if (auto clone = state.gitCloneBySource.find(source);
+                    clone != state.gitCloneBySource.end())
+                    namesMember = state.gitMemberDeclaring(clone->second.root, key).has_value();
+            if (auto bySource = state.identityBySource.find(source);
+                !namesMember && bySource != state.identityBySource.end()
                 && !(bySource->second == key)) {
                 const auto& existing = state.resolved.at(bySource->second);
-                const auto& declaring = declaringManifest.at(bySource->second);
+                const auto& declaring = state.declaringManifest.at(bySource->second);
                 if (!declaring.namespaceDeclared) {
                     return std::unexpected(std::format(
                         "one source is reached as two packages: '{}' names it {} "
@@ -12985,14 +13011,14 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                         "its modules would be compiled twice.\n"
                         "       fix: declare `namespace` in '{}', or write the "
                         "same key in both places.",
-                        existing.requestedBy, qualifiedKey(bySource->second),
-                        item.requestedBy, qualifiedKey(key),
+                        existing.requestedBy, state.qualifiedKey(bySource->second),
+                        item.requestedBy, state.qualifiedKey(key),
                         declaring.path, declaring.path));
                 }
-                reportAdoption(item.requestedBy, name, key, bySource->second,
+                state.reportAdoption(item.requestedBy, name, key, bySource->second,
                                declaring.path);
                 key = bySource->second;
-                stateAdoptedIdentity(item, key);
+                state.stateAdoptedIdentity(item, key);
             }
         }
 
@@ -13115,7 +13141,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                     key.ns, key.shortName,
                     it->second.constraint,
                     item.originalConstraint,
-                    index_route(*cfg), *state.targetPlatform);
+                    state.index_route(*cfg), *state.targetPlatform);
                 if (!merged) {
                     // Level 1 fallback: multi-version mangling. Two
                     // versions can't be reconciled by SemVer, but they
@@ -13148,7 +13174,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                             merged.error()));
                     }
 
-                    auto loaded = loadVersionDep(name, key.ns, key.shortName, spec.version);
+                    auto loaded = state.loadVersionDep(name, key.ns, key.shortName, spec.version);
                     if (!loaded) return std::unexpected(loaded.error());
                     auto& [secondaryRoot, secondaryManifest] = *loaded;
 
@@ -13244,7 +13270,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                             ? std::string(mcpp::pm::kDefaultNamespace) : key.ns;
                     }
                     stagedManifest.package.sourceProvenance = std::format(
-                        "index+{}@{}", cache_index_name(key.ns), spec.version);
+                        "index+{}@{}", state.cache_index_name(key.ns), spec.version);
                     // Absolutize secondary's include_dirs against its original
                     // install root so the staged copy still finds headers.
                     for (auto& inc : stagedManifest.buildConfig.includeDirs) {
@@ -13257,7 +13283,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                     state.dep_manifests.push_back(
                         std::make_unique<mcpp::manifest::Manifest>(std::move(stagedManifest)));
                     state.dep_cache_identities.push_back({
-                        .indexName   = cache_index_name(key.ns),
+                        .indexName   = state.cache_index_name(key.ns),
                         .packageName = mangledPackage,
                         .version     = spec.version,
                         .sourceKind  = "version",
@@ -13323,7 +13349,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                     std::format("{}{}{} {} ⨯ {} → v{}",
                         key.ns, key.ns.empty() ? "" : ".", key.shortName,
                         it->second.version, spec.version, *merged));
-                auto reloaded = loadVersionDep(name, key.ns, key.shortName, *merged);
+                auto reloaded = state.loadVersionDep(name, key.ns, key.shortName, *merged);
                 if (!reloaded) return std::unexpected(reloaded.error());
                 auto& [newRoot, newManifest] = *reloaded;
 
@@ -13355,7 +13381,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                         ? std::string(mcpp::pm::kDefaultNamespace) : key.ns;
                 }
                 newManifest.package.sourceProvenance = std::format(
-                    "index+{}@{}", cache_index_name(key.ns), *merged);
+                    "index+{}@{}", state.cache_index_name(key.ns), *merged);
 
                 removeLinkFlags(it->second.linkFlagsAdded);
                 auto linkFlagsAdded = propagateLinkFlags(newRoot, newManifest);
@@ -13385,7 +13411,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                     key.shortName, *merged);
                 for (auto& [child_name, child_spec] :
                         state.dep_manifests[it->second.depIndex]->dependencies) {
-                    worklist.push_back({child_name, child_spec, newLabel,
+                    state.worklist.push_back({child_name, child_spec, newLabel,
                                         child_spec.version,
                                         it->second.depIndex, {}, item.devOnly});
                 }
@@ -13631,10 +13657,10 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             }
             sourceCommit = resolvedGitRev;
             dep_root = gitRoot;
-            gitCloneBySource.try_emplace(
+            state.gitCloneBySource.try_emplace(
                 sourceRefOf("git", spec, item.resolveRoot, item.originalConstraint),
                 GitClone{ gitRoot, spec.git, spec.gitRefKind, spec.gitRev });
-            if (auto member = gitMemberDeclaring(gitRoot, key)) {
+            if (auto member = state.gitMemberDeclaring(gitRoot, key)) {
                 gitMember = *member;
                 gitMemberCloneRoot = gitRoot;
                 dep_root = gitRoot / *member;
@@ -13720,7 +13746,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             // units here, as it does for a version dependency.
             if (state.abiThreadsRendered) state.add_once(dep_manifest->buildConfig.cflags, "-pthread");
         } else {
-            auto loaded = loadVersionDep(name, key.ns, key.shortName, spec.version);
+            auto loaded = state.loadVersionDep(name, key.ns, key.shortName, spec.version);
             if (!loaded) return std::unexpected(loaded.error());
             dep_root     = std::move(loaded->first);
             dep_manifest = std::move(loaded->second);
@@ -13762,8 +13788,8 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
             ResolvedKey declared{ dep_manifest->package.namespace_,
                                   declaredName.shortName };
             if (!(declared == key)) {
-                reportAdoption(item.requestedBy, name, key, declared, manifestPath);
-                stateAdoptedIdentity(item, declared);
+                state.reportAdoption(item.requestedBy, name, key, declared, manifestPath);
+                state.stateAdoptedIdentity(item, declared);
                 if (state.resolved.contains(declared)) {
                     // Another source already resolved the declared identity,
                     // and the rules for two declarations of one identity
@@ -13777,7 +13803,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                     item.spec.namespaceOmitted = false;
                     item.spec.legacyCandidateSearch = false;
                     item.spec.legacyDottedKey = false;
-                    worklist.push_front(std::move(item));
+                    state.worklist.push_front(std::move(item));
                     continue;
                 }
                 key = declared;
@@ -13795,7 +13821,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         }
         if (sourceKind == "version") {
             dep_manifest->package.sourceProvenance = std::format(
-                "index+{}@{}", cache_index_name(key.ns), spec.version);
+                "index+{}@{}", state.cache_index_name(key.ns), spec.version);
         } else if (sourceKind == "git") {
             dep_manifest->package.sourceProvenance = std::format(
                 "git+{}#{}={}", spec.git, spec.gitRefKind, spec.gitRev);
@@ -13831,7 +13857,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         state.dep_manifests.push_back(
             std::make_unique<mcpp::manifest::Manifest>(std::move(*dep_manifest)));
         state.dep_cache_identities.push_back({
-            .indexName   = cache_index_name(key.ns),
+            .indexName   = state.cache_index_name(key.ns),
             .packageName = name,
             .version     = sourceKind == "version"
                 ? spec.version
@@ -13851,11 +13877,11 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         // Record this dep as resolved so future encounters of the same
         // (ns, name) hit the fast path (skip / merge / conflict).
         if (sourceKind != "version") {
-            identityBySource.emplace(
+            state.identityBySource.emplace(
                 sourceRefOf(sourceKind, spec, item.resolveRoot, item.originalConstraint)
                     + (gitMember.empty() ? std::string{} : "#member=" + gitMember),
                 key);
-            declaringManifest[key] = DeclaringManifest{ manifestPath, namespaceDeclared };
+            state.declaringManifest[key] = DeclaringManifest{ manifestPath, namespaceDeclared };
         }
         state.resolved[key] = ResolvedRecord{
             .version           = sourceKind == "version" ? spec.version : "",
@@ -13896,7 +13922,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
         for (auto& [child_name, child_spec] : state.dep_manifests.back()->dependencies) {
             auto childReq = child_spec;
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
-            worklist.push_back({child_name, childReq, thisDepLabel,
+            state.worklist.push_back({child_name, childReq, thisDepLabel,
                                 childReq.version, selfIdx, dep_root,
                                 item.devOnly, item.buildOnly});
         }
@@ -13914,7 +13940,7 @@ static std::expected<void, std::string> phase4_dependency_graph(PrepareState& st
                  state.dep_manifests.back()->buildDependencies) {
             auto childReq = child_spec;
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
-            worklist.push_back({child_name, childReq,
+            state.worklist.push_back({child_name, childReq,
                                 thisDepLabel + " (build-dep)",
                                 childReq.version, selfIdx, dep_root,
                                 item.devOnly, /*buildOnly=*/true});
