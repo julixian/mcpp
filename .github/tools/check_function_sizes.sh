@@ -30,9 +30,16 @@
 # A compile database that names BMIs explicitly (-fmodule-file=...), which
 # only a build actually produces: `mcpp build --toolchain llvm@22.1.8` writes
 # compile_commands.json at the project root. This script does not build it:
-# the caller runs that build first (a developer, or ci-linux.yml's LLVM
-# toolchain job, which builds mcpp with llvm@20.1.7 before this step).
-# check_file_lengths.sh needs no such division because it reads the tree.
+# the caller runs that build first. check_file_lengths.sh needs no such
+# division because it reads the tree.
+#
+# NOT IN CI YET. The only CI job that builds mcpp with clang (ci-linux.yml,
+# "toolchain: musl + llvm", llvm@20.1.7) does not produce a complete build:
+# libc++ 20's `std` module does not make directory_iterator's comparison
+# visible, and that step reads the resolution line rather than the build's
+# exit status. Over the partial database clang-tidy crashes. The gate is wired
+# in once a CI job builds mcpp with clang (mcpp-community/mcpp#729); until
+# then it is run by hand after `mcpp build --toolchain llvm@22.1.8`.
 #
 # clang-tidy itself is not part of the plain xim:llvm payload mcpp resolves
 # for `--toolchain llvm@...` (measured: xim-x-llvm/22.1.8/bin has clang,
@@ -150,7 +157,10 @@ rc=$?
 # Only findings inside the decomposition's own directory gate the build: a
 # bundled third-party header (e.g. modules/libs/src/json/json.hpp) reached
 # through one of these files' imports is not this decomposition's to fix.
-relevant=$(grep "readability-function-size" "$OUT" | grep -F -e "/$DIR/" -e "/$(basename "$PRIMARY")" || true)
+# A finding is a diagnostic line, which ends with the bracketed check name; a
+# crash dump also names the check (in its program arguments) together with
+# every file path, and must not read as a finding.
+relevant=$(grep -E '\[readability-function-size\]$' "$OUT" | grep -F -e "/$DIR/" -e "/$(basename "$PRIMARY")" || true)
 
 if [ -n "$relevant" ]; then
     echo "$relevant" >&2

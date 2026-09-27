@@ -1402,9 +1402,16 @@ each with a phase-local context struct where several of its steps share locals.
 Readings on the final tree: the gate reports no function over 400 lines; the
 seven fixtures are byte-identical to the pre-split binary; AddressSanitizer
 reports nothing over the fixtures and a 20-script e2e subset; the unit suite
-passes. The gate runs in `ci-linux.yml`'s LLVM toolchain job after mcpp builds
-itself with llvm@20.1.7, with clang-tidy from `xim:llvm-tools` at the version
-that wrote the compile database, because it reads that clang's BMIs. The merge
+passes. The gate was wired into `ci-linux.yml`'s LLVM toolchain job, after the
+step that builds mcpp with llvm@20.1.7, and crashed there: that build has
+never completed (libc++ 20's `std` module hides `directory_iterator`'s
+comparison), and the step reads the resolution line rather than the build's
+exit status, so the job reports success on `main` too. The step came out again,
+the gate's finding filter was narrowed to diagnostic lines (the crash dump named
+the check and every file and had read as a finding), and #729 records the step
+and the wiring. The gate resolves clang-tidy from `xim:llvm-tools` at the
+version that wrote the compile database, because it reads that clang's BMIs,
+and is run by hand after `mcpp build --toolchain llvm@22.1.8`. The merge
 of the first pass took `plan.cpp` to 2,505 lines, over the file gate; the
 records half of P13 (`mcpp.lock`, `resolution.json`) moved to `records.cpp`,
 byte-identical on the same fixtures.

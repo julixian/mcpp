@@ -253,16 +253,6 @@ jobs:
           # Restore
           sed -i 's/^default = "llvm@20.1.7"/default = "gcc@16.1.0"/' mcpp.toml
 
-      # The function-size gate (mcpp#722) reads clang-tidy's own function
-      # boundaries over the compile database the LLVM build above wrote, so it
-      # runs here, where mcpp itself was just built with clang. clang-tidy is
-      # the sibling payload xim:llvm-tools at that clang's version, because it
-      # reads the BMIs that clang wrote.
-      - name: "Function-size gate (src/build/prepare, clang-tidy)"
-        run: |
-          XLINGS_HOME="$MCPP_HOME/registry" "$XLINGS_BIN" install xim:llvm-tools@20.1.7 -y
-          bash .github/tools/check_function_sizes.sh
-
   # Integration: the mcpp built from THIS PR's source builds & runs a real
   # external C++ project — xlings (openxlings/xlings ships its own mcpp.toml).
   # MCPP_VENDORED_XLINGS only supplies the xlings package backend that mcpp

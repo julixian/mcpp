@@ -371,7 +371,14 @@ static std::expected<void, std::string> step13_make_plan(PrepareState& state, Bu
     // SPEC-007 R4.3: a declared deploy outranks a search directory's file of
     // the same name, and a difference between the two is said here, where
     // the user sees it (the post-link placement edge says it only under -v).
+    // A declared source that an action writes is left to that edge: at
+    // planning it may still hold the previous build's bytes.
+    std::set<std::filesystem::path> actionOutputs;
+    for (auto const& a : ctx.plan.actions)
+        for (auto const& o : a.outputs)
+            actionOutputs.insert(std::filesystem::path(o).lexically_normal());
     for (auto const& s : ctx.plan.shadowedSearchDirDlls) {
+        if (actionOutputs.contains(s.declared.lexically_normal())) continue;
         std::error_code ec;
         if (std::filesystem::is_regular_file(s.declared, ec)
             && !mcpp::build::stage::same_content(s.declared, s.offered))
