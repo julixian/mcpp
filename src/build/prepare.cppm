@@ -1526,7 +1526,6 @@ std::string git_cache_head(const std::filesystem::path& gitRoot) {
 //   extraTargets:   additional Target entries (e.g. synthetic test targets)
 //                   appended to the manifest before the modgraph runs.
 //   overrides:      --target / --static.
-namespace {
 // A dependency that "cannot be found" while an index is unreadable is almost
 // never missing — it is unreachable, and the two need different actions from
 // the user (publish it vs upgrade mcpp). The floor error is printed when the
@@ -2334,7 +2333,6 @@ std::string with_index_cause(std::string msg) {
         msg += "\n" + hint;
     return msg;
 }
-} // namespace
 
 // The toolchain a host tool's package chose for itself, read the way its own
 // build reads it (#710): the package's manifest with the root-position keys of
