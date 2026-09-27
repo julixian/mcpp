@@ -77,23 +77,16 @@ import mcpp.bmi_cache;
 
 namespace mcpp::build {
 
-std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
-    BuildContext ctx;
-    ctx.strict      = state.overrides.strict;
-    ctx.manifest    = *state.m;
-    ctx.tc          = *state.tc;
-    ctx.fp          = state.fp;
-    ctx.runtimeSelection = state.runtimeSelection;
-    ctx.runtimeBinding = state.runtimeBindingSnapshot;
-    ctx.profile     = state.effectiveProfile;
-    ctx.activeFeatureRequest = state.overrides.features;
-    ctx.compilerChoice = { std::string(tc_origin_name(state.tcOrigin)),
-                           state.graphCompilerRequiredBy,
-                           state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
-                                                         : state.graphCompilerReplaced };
-    ctx.cacheMode   = state.cacheMode;
-    ctx.projectRoot= *state.root;
-    ctx.outputDir  = target_dir(*state.tc, state.fp, state.workRoot);
+
+// SUB-STEPS (mcpp#722 / T6). Each function below is one section of
+// phase13_finish, named for what its own banner already called it,
+// extracted verbatim: statements moved, not reordered or rewritten. Every
+// step takes the same (PrepareState&, BuildContext&) pair phase13_finish
+// held locally, called in the original order from the slimmed-down
+// phase13_finish at the bottom of this file. Internal linkage: these
+// names are this file's own, not part of mcpp.build.prepare's surface.
+
+static std::expected<void, std::string> step13_source_packages(PrepareState& state, BuildContext& ctx) {
     {
         std::error_code ec;
         const bool firstPlan = !std::filesystem::exists(ctx.outputDir / "build.ninja", ec);
@@ -168,6 +161,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         }
         ctx.depSourceRoots = std::move(roots);
     }
+    return {};
+}
+
+static std::expected<void, std::string> step13_runner_and_xlings(PrepareState& state, BuildContext& ctx) {
     // Where a runner may find the programs this project declared (#544). The
     // same resolution `fillXpkgDirs` hands to build programs, kept as
     // directories rather than env vars because the reader is mcpp's own
@@ -259,6 +256,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             }
         }
     }
+    return {};
+}
+
+static std::expected<void, std::string> step13_prebuilt_check(PrepareState& state, BuildContext& ctx) {
     // ─── Prebuilt dependencies: check before planning to link them ─────
     //
     // Here rather than at each place a dependency manifest is loaded, because
@@ -298,7 +299,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                 return std::unexpected(ok.error());
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_link_forms(PrepareState& state, BuildContext& ctx) {
     // ── #519: the form each dependency takes, APPLIED ──────────────────────
     //
     // The answers were computed before the root build program (see there).
@@ -353,7 +357,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                     t.kind = mcpp::manifest::Target::SharedLibrary;
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_make_plan(PrepareState& state, BuildContext& ctx) {
     auto planResult = mcpp::build::make_plan(*state.m, *state.tc, state.fp, state.scan.graph, state.report.topoOrder,
                                              state.packages, *state.root, ctx.outputDir,
                                              state.stdBmiPath, state.stdObjectPath, state.storeRoots);
@@ -406,7 +413,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         add_std_unit(state.tc->stdCompatSource, sm.compatCommands, sm.compatObjectPath,
                     sm.compatBmiPath, "std.compat", {"std"});
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_cxx_private_runtime(PrepareState& state, BuildContext& ctx) {
     // A DEPENDENCY'S C++ SHARED LIBRARY OVER A C++ RUNTIME THAT IS A PACKAGE
     // (#641, item 5).
     //
@@ -508,7 +518,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                 providerName, provider.package.version, constrained, staticRemedy));
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_cxx_process_runtime(PrepareState& state, BuildContext& ctx) {
     // ONE PROCESS, ONE C++ RUNTIME; ONE STATIC PACKAGE, ONE IMAGE (#646).
     //
     // Both are decided by `make_plan` and the contract table; this is where a
@@ -698,7 +711,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                             "= \"shared\" }}", first));
         }
     }
+    return {};
+}
 
+static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
     // The module graph outlives the plan for one consumer: `mcpp pack`, which
     // has to know which units are INTERFACE (published as source) and which
     // are implementation (published only as an object). The plan flattens that
@@ -788,7 +804,9 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     if (state.tc->compiler == mcpp::toolchain::CompilerId::GCC && !state.overrides.plan_only)
         ctx.plan.gccCleanSpecs = mcpp::toolchain::write_clean_link_specs(
             state.tc->binaryPath, ctx.outputDir);
+}
 
+static std::expected<void, std::string> step13_build_graph_actions(PrepareState& state, BuildContext& ctx) {
     // ── Declared build-graph nodes → the plan ───────────────────────────────
     //
     // Collected here rather than inside make_plan because the engine-variable
@@ -1145,7 +1163,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     }
     ctx.plan.stdCompatBmiPath = state.stdCompatBmiPath;
     ctx.plan.stdCompatObjectPath = state.stdCompatObjectPath;
+    return {};
+}
 
+static std::expected<void, std::string> step13_assembly_units(PrepareState& state, BuildContext& ctx) {
     // Clang: discover clang-scan-deps for P1689 dyndep scanning.
     if (mcpp::toolchain::is_clang(*state.tc)) {
         if (auto sd = mcpp::toolchain::clang::find_scan_deps(*state.tc)) {
@@ -1236,7 +1257,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             ctx.plan.nasmPath = *nasmBin;
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_windows_resources(PrepareState& state, BuildContext& ctx) {
     // ─── Windows resources: [resources] → a tracked link input (mcpp#365) ──
     //
     // Four rules, in this order:
@@ -1576,7 +1600,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         if (trip.is_pe())
             if (auto r = plan_resources(); !r) return std::unexpected(r.error());
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_dependency_cache(PrepareState& state, BuildContext& ctx) {
     // ─── Global dependency cache: per-package keys, hit → stage edges ──
     //
     // Every index package gets a key over the axes that actually reach its
@@ -1905,7 +1932,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         }
     }
     // ──────────────────────────────────────────────────────────────────
+    return {};
+}
 
+static std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildContext& ctx) {
     // Write/update mcpp.lock for any version-based deps that succeeded.
     // Path deps are intentionally NOT locked — their source is local filesystem.
     //
@@ -2052,7 +2082,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             ctx.resolvedVersions[lock_name_for(key)] = rec.version;
         }
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_runtime_provider_overrides(PrepareState& state, BuildContext& ctx) {
     // Apply [runtime.<capability>] provider = "<pkg>" overrides. Canonical
     // identity wins; the old short spelling is accepted only when it denotes
     // exactly one provider.  A same-short-name collision is never guessed.
@@ -2095,7 +2128,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             return pr.capability.starts_with(capKey) && pr.provider == selected;
         });
     }
+    return {};
+}
 
+static std::expected<void, std::string> step13_abi_enforcement(PrepareState& state, BuildContext& ctx) {
     // Capability-driven ABI enforcement, dimensional (see src/toolchain/abi.cppm
     // and .agents/docs/2026-06-27-abi-compat-model-single-pr-design.md). Each
     // dependency may constrain specific toolchain dimensions via `abi:`
@@ -2130,7 +2166,10 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
                 mm.need));
         }
     }
+    return {};
+}
 
+static void step13_resolution_json(PrepareState& state, BuildContext& ctx) {
     // Per-build resolution manifest: the durable, provider-neutral facts that
     // `mcpp why runtime` interprets without resolving again or probing the
     // current host.  The post-link validator replaces `validation.pending`
@@ -2358,7 +2397,9 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             }
         }
     }
+}
 
+static std::expected<void, std::string> step13_empty_link_check(PrepareState& state, BuildContext& ctx) {
     // ── A link unit with no inputs is not a build (mcpp#533) ────────────────
     //
     // Checked HERE, last, because objects arrive from three places and each
@@ -2405,6 +2446,44 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
             lu.targetName, kindName, lu.output.generic_string(),
             lu.targetName));
     }
+    return {};
+}
+
+std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
+    BuildContext ctx;
+    ctx.strict      = state.overrides.strict;
+    ctx.manifest    = *state.m;
+    ctx.tc          = *state.tc;
+    ctx.fp          = state.fp;
+    ctx.runtimeSelection = state.runtimeSelection;
+    ctx.runtimeBinding = state.runtimeBindingSnapshot;
+    ctx.profile     = state.effectiveProfile;
+    ctx.activeFeatureRequest = state.overrides.features;
+    ctx.compilerChoice = { std::string(tc_origin_name(state.tcOrigin)),
+                           state.graphCompilerRequiredBy,
+                           state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
+                                                         : state.graphCompilerReplaced };
+    ctx.cacheMode   = state.cacheMode;
+    ctx.projectRoot= *state.root;
+    ctx.outputDir  = target_dir(*state.tc, state.fp, state.workRoot);
+
+    if (auto r = step13_source_packages(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_runner_and_xlings(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_prebuilt_check(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_link_forms(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_make_plan(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_cxx_private_runtime(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_cxx_process_runtime(state, ctx); !r) return std::unexpected(r.error());
+    step13_graph_and_schedule(state, ctx);
+    if (auto r = step13_build_graph_actions(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_assembly_units(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_windows_resources(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_dependency_cache(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_lockfile(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_runtime_provider_overrides(state, ctx); !r) return std::unexpected(r.error());
+    if (auto r = step13_abi_enforcement(state, ctx); !r) return std::unexpected(r.error());
+    step13_resolution_json(state, ctx);
+    if (auto r = step13_empty_link_check(state, ctx); !r) return std::unexpected(r.error());
 
     ctx.planNotes = std::move(state.planNotes);
     return ctx;
