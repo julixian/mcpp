@@ -1563,26 +1563,6 @@ sysroot_override(const mcpp::manifest::Manifest& m,
     return (e && e->sysrootDeclared) ? &e->sysroot : nullptr;
 }
 
-// The toolchain a host tool's package chose for itself, read the way its own
-// build reads it (#710): the package's manifest with the root-position keys of
-// the workspace that lists it (`inherit_workspace_root_position`), then its
-// host row's `[target.<host>] toolchain`, then `[toolchain]`. nullopt when none
-// names one.
-std::optional<std::string>
-host_tool_declared_toolchain(const mcpp::manifest::Manifest& tool,
-                             const std::filesystem::path& toolRoot,
-                             std::string_view platform) {
-    auto effective = tool;
-    if (const auto wsRoot = mcpp::project::find_workspace_root(toolRoot); !wsRoot.empty())
-        if (auto ws = mcpp::manifest::load(wsRoot / "mcpp.toml");
-            ws && mcpp::project::is_workspace_member(*ws, wsRoot, toolRoot))
-            mcpp::project::inherit_workspace_root_position(effective, *ws, wsRoot);
-    if (auto* row = find_target_entry(effective, mcpp::toolchain::triple::host_triple());
-        row && !row->toolchain.empty())
-        return row->toolchain;
-    return effective.toolchain.for_platform(platform);
-}
-
 // THE MSVC TOOLSET A CLANG `*-windows-msvc` BUILD COMPILES AGAINST.
 //
 // On an MSVC-ABI row the compiler is the toolchain and the MSVC toolset -- its
@@ -2355,6 +2335,27 @@ std::string with_index_cause(std::string msg) {
     return msg;
 }
 } // namespace
+
+// The toolchain a host tool's package chose for itself, read the way its own
+// build reads it (#710): the package's manifest with the root-position keys of
+// the workspace that lists it (`inherit_workspace_root_position`), then its
+// host row's `[target.<host>] toolchain`, then `[toolchain]`. nullopt when none
+// names one. Exported for its unit test
+// (tests/unit/test_workspace_inheritance.cpp).
+export std::optional<std::string>
+host_tool_declared_toolchain(const mcpp::manifest::Manifest& tool,
+                             const std::filesystem::path& toolRoot,
+                             std::string_view platform) {
+    auto effective = tool;
+    if (const auto wsRoot = mcpp::project::find_workspace_root(toolRoot); !wsRoot.empty())
+        if (auto ws = mcpp::manifest::load(wsRoot / "mcpp.toml");
+            ws && mcpp::project::is_workspace_member(*ws, wsRoot, toolRoot))
+            mcpp::project::inherit_workspace_root_position(effective, *ws, wsRoot);
+    if (auto* row = find_target_entry(effective, mcpp::toolchain::triple::host_triple());
+        row && !row->toolchain.empty())
+        return row->toolchain;
+    return effective.toolchain.for_platform(platform);
+}
 
 export std::expected<BuildContext, std::string>
 
