@@ -52,8 +52,20 @@
 - `mcpp pack` 的 bundle-all 形态随 glibc 载荷复制 `lib/locale` 与 `lib/gconv`,启动脚本设置
   `LOCPATH` 与 `GCONV_PATH`(用户已设置时保留用户的值)。
 
+### 兼容性
+
+以下变化对已有工程可见:
+
+- 未解析的 `workspace = true` 此前静默成为空版本依赖,现在在加载时报错并点名条目(#714)。
+  修正方法是在工作空间根的 `[workspace.dependencies]` 中声明该包,或在条目上写明版本。
+- `[build] sources = []` 不再推断库目标。依赖这一推断的包在 `[targets]` 中声明库目标。
+- note 代码 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT` 由 `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED`
+  取代,不保留旧代码。
+
 ### 其他
 
+- 测试:e2e 804 覆盖不属于任何工作空间的路径宿主工具包的工具链选择(#710);e2e 802 固定 gcc
+  工具链,使其断言不依赖机器的默认工具链。
 - ELF 检查以一次读取载入文件。此前逐字节读入,`mcpp test` 的链接后检查在测试程序较多时耗时
   数十分钟。
 - 规范:SPEC-001 v1.5、SPEC-004 v1.8、SPEC-005 v1.4、SPEC-007 v0.3。

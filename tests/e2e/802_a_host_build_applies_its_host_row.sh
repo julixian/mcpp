@@ -33,6 +33,11 @@ version = "0.1.0"
 standard   = "c++23"
 import_std = false
 
+# The criteria read libstdc++'s NEEDED entry, so the compiler is gcc whatever
+# the machine's default toolchain is.
+[toolchain]
+default = "gcc@16.1.0"
+
 [targets.cxxrt]
 kind = "bin"
 main = "src/main.cpp"
