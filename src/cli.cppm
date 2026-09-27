@@ -1084,9 +1084,16 @@ int run(int argc, char** argv) {
                     std::filesystem::path{requireDir}, aec).string();
         }
         if (!cwd.empty()) {
+            // The directory the command inherits is a plain absolute path, not
+            // `extended_length`'s `\\?\` form: that form is a spelling for
+            // opening files. Windows accepts it as the current directory, but
+            // a child started there does not recognise it -- an MSYS shell ran
+            // in C:\Windows instead (e2e 799) -- and a working directory is
+            // limited to MAX_PATH in either spelling.
             std::error_code cec;
-            std::filesystem::current_path(
-                mcpp::platform::fs::extended_length(std::filesystem::path{cwd}), cec);
+            const auto dir = std::filesystem::absolute(std::filesystem::path{cwd}, cec)
+                                 .lexically_normal();
+            if (!cec) std::filesystem::current_path(dir, cec);
             if (cec) {
                 std::println(stderr, "error: cannot enter the action's directory '{}': {}",
                              cwd, cec.message());
