@@ -12,6 +12,7 @@ export module mcpp.project;
 
 import std;
 import mcpp.manifest;
+import mcpp.ui;
 
 namespace mcpp::project {
 
@@ -468,35 +469,166 @@ load_effective_manifest(const std::filesystem::path& dir) {
     return EffectiveManifest{ std::move(*m), std::move(*ws), wsRoot, true };
 }
 
+// One declared workspace member, with the identity its own manifest states.
+//
+// #725: `-p, --package <NAME>` promises a package (SPEC-001's `(namespace,
+// name)`), so resolving it needs each member's OWN declaration, not only the
+// directory `[workspace] members` names it with.
+export struct WorkspaceMember {
+    std::string            memberPath;  // as written in [workspace] members
+    std::filesystem::path  dir;         // rootDir / memberPath
+    std::string            namespace_;  // "" when undeclared, or unreadable
+    std::string            name;        // "" when the manifest could not be
+                                        // read -- such a member still matches
+                                        // by directory or path (step 3 below)
+};
+
+// A member's qualified name the way SPEC-001 spells one: `<namespace>.<name>`.
+// Meaningless (and not attempted by the resolver below) when the member
+// declares no namespace -- SPEC-001 §3.1: an unnamespaced package's bare name
+// already IS its full identity, so there is no separate dotted spelling to
+// match against.
+export std::string qualified_member_name(const WorkspaceMember& m) {
+    return m.namespace_.empty() ? m.name : m.namespace_ + "." + m.name;
+}
+
+// Every declared member, with its own package identity. Loaded the way a
+// member is always loaded (`insideWorkspace = true`, so an omitted
+// `package.version` is not refused here); a member whose manifest fails to
+// parse keeps an empty name rather than aborting the listing, because `-p`
+// still owes an answer about the members that DO parse.
+export std::vector<WorkspaceMember>
+workspace_members(const mcpp::manifest::Manifest& rootManifest,
+                  const std::filesystem::path& rootDir) {
+    std::vector<WorkspaceMember> out;
+    out.reserve(rootManifest.workspace.members.size());
+    for (auto& mp : rootManifest.workspace.members) {
+        WorkspaceMember wm;
+        wm.memberPath = mp;
+        wm.dir = rootDir / mp;
+        if (auto mm = mcpp::manifest::load(wm.dir / "mcpp.toml", {.insideWorkspace = true})) {
+            wm.namespace_ = mm->package.namespace_;
+            wm.name       = mm->package.name;
+        }
+        out.push_back(std::move(wm));
+    }
+    return out;
+}
+
 // Resolve which member directory a workspace command acts on, for the
-// single-member case. Shares the match rule (basename OR member path) with
-// prepare_build's member switch, so `build -p X` and `test -p X` agree.
+// single-member case. Shared by every `-p`/`--package` reader (build, test,
+// run, emit, and prepare_build's own root-level switch, #725), so
+// `build -p X` and `test -p X` always agree on what X means.
+//
+// A value is resolved in this order, because the option names a package
+// (SPEC-001) and a directory is a fallback spelling docs/07 §5.3 has always
+// documented:
+//   1. a member's qualified name, `<namespace>.<name>` (only attempted for a
+//      member that declares a namespace -- see `qualified_member_name`);
+//   2. otherwise, a member's bare package name -- refused, naming every
+//      match's qualified name, when two or more members share it;
+//   3. otherwise, a member's path as written in `[workspace] members`, or its
+//      directory's last segment. Two members sharing a directory basename
+//      keep today's first-match selection (a script written against it keeps
+//      working), with a warning naming the others and their paths.
+// A value that is one member's package name (step 2) and a different
+// member's directory (step 3) selects the step-2 member, with a warning
+// naming the other member and its path.
+//
 // Returns:
 //   - the member dir   when `package_filter` names a member,
 //   - empty path       when no switch applies (not a workspace, or a rooted
 //                      workspace with no filter → act on the root package),
-//   - error            when the filter names an unknown member, or a *virtual*
-//                      workspace is addressed with no filter (the caller must
-//                      pick a member with -p or fan out with --workspace).
+//   - error            when the filter names no member, names more than one,
+//                      or a *virtual* workspace is addressed with no filter
+//                      (the caller must pick a member with -p or fan out with
+//                      --workspace).
 export std::expected<std::filesystem::path, std::string>
 resolve_member_dir(const mcpp::manifest::Manifest& rootManifest,
                    const std::filesystem::path& rootDir,
                    std::string_view package_filter) {
     if (!rootManifest.workspace.present) return std::filesystem::path{};
-    if (!package_filter.empty()) {
-        for (auto& mp : rootManifest.workspace.members) {
-            auto basename = std::filesystem::path(mp).filename().string();
-            if (basename == package_filter || mp == package_filter)
-                return rootDir / mp;
+    if (package_filter.empty()) {
+        if (rootManifest.package.name.empty()) {
+            return std::unexpected(std::string(
+                "virtual workspace: specify -p <member> or --workspace"));
         }
+        return std::filesystem::path{};  // rooted workspace, no filter → root
+    }
+
+    auto members = workspace_members(rootManifest, rootDir);
+
+    // Step 1: the qualified name. Unique by construction (SPEC-001 §3.3 asks
+    // a single index to keep `(namespace, name)` unique; two workspace
+    // members sharing one is a manifest defect this resolver does not
+    // adjudicate), so the first hit is taken without a warning.
+    for (auto const& m : members)
+        if (!m.namespace_.empty() && qualified_member_name(m) == package_filter)
+            return m.dir;
+
+    // Step 2: the bare package name, ignoring namespace.
+    std::vector<std::size_t> byName;
+    for (std::size_t i = 0; i < members.size(); ++i)
+        if (!members[i].name.empty() && members[i].name == package_filter)
+            byName.push_back(i);
+    if (byName.size() > 1) {
+        std::string names;
+        for (auto i : byName)
+            names += (names.empty() ? "" : ", ") + qualified_member_name(members[i]);
         return std::unexpected(std::format(
-            "workspace member '{}' not found in [workspace].members", package_filter));
+            "-p '{}' is ambiguous: it is the package name of {} members ({}). "
+            "Write the qualified name (<namespace>.<name>) to select one.",
+            package_filter, byName.size(), names));
     }
-    if (rootManifest.package.name.empty()) {
-        return std::unexpected(std::string(
-            "virtual workspace: specify -p <member> or --workspace"));
+
+    // Step 3: the directory path or basename `[workspace] members` writes.
+    std::vector<std::size_t> byPath;
+    for (std::size_t i = 0; i < members.size(); ++i) {
+        auto basename = members[i].dir.filename().string();
+        if (basename == package_filter || members[i].memberPath == package_filter)
+            byPath.push_back(i);
     }
-    return std::filesystem::path{};  // rooted workspace, no filter → root package
+
+    if (byName.size() == 1) {
+        const auto& picked = members[byName.front()];
+        if (!byPath.empty() && byPath.front() != byName.front()) {
+            const auto& other = members[byPath.front()];
+            mcpp::ui::warning(std::format(
+                "-p '{}' is the package name of member '{}' ({}) and also the "
+                "directory of member '{}' ({}); the package is selected. Write "
+                "'{}' to select the other member.",
+                package_filter, picked.memberPath, qualified_member_name(picked),
+                other.memberPath, qualified_member_name(other), other.memberPath));
+        }
+        return picked.dir;
+    }
+
+    if (!byPath.empty()) {
+        if (byPath.size() > 1) {
+            std::string others;
+            for (std::size_t k = 1; k < byPath.size(); ++k)
+                others += std::format("{}'{}'", others.empty() ? "" : ", ",
+                                      members[byPath[k]].memberPath);
+            mcpp::ui::warning(std::format(
+                "-p '{}' matches more than one member's directory; '{}' is "
+                "selected (the first listed in [workspace] members). Also "
+                "matched: {}.",
+                package_filter, members[byPath.front()].memberPath, others));
+        }
+        return members[byPath.front()].dir;
+    }
+
+    std::string list;
+    for (auto const& m : members) {
+        auto label = m.name.empty() ? std::string("?")
+                   : (m.namespace_.empty() ? m.name
+                                            : std::format("{} ({})", m.name,
+                                                          qualified_member_name(m)));
+        list += std::format("\n  {} at '{}'", label, m.memberPath);
+    }
+    return std::unexpected(std::format(
+        "workspace member '{}' not found. [workspace] members:{}",
+        package_filter, list));
 }
 
 } // namespace mcpp::project

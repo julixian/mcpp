@@ -332,14 +332,22 @@ mcpp 从当前目录向上搜索；若发现某个 `mcpp.toml` 含 `[workspace]`
 
 ### 5.3 `-p, --package` 选项
 
-`-p` 可用于 `build`、`test`、`run` 等命令，指定目标成员。参数值可以是成员目录名
-的最后一段，也可以是完整相对路径：
+`-p` 可用于 `build`、`test`、`run` 等命令，指定目标成员。选项名说的是**包**，
+参数值按下述顺序解析：
+
+1. 成员的限定名 `<namespace>.<name>`（只有声明了 namespace 的成员才有这个拼法）；
+2. 否则，成员裸的 `package.name`——如果两个以上成员共享它，拒绝并点名每一个匹配；
+3. 否则，成员在 `[workspace] members` 里写的路径，或其目录名的最后一段（历史拼法，
+   作为回落保留）。
 
 ```bash
-mcpp build -p server        # matches apps/server
+mcpp build -p server        # matches apps/server（按目录或包名）
 mcpp test -p core           # matches libs/core
 mcpp run -p server -- --port 8080
 ```
+
+参数值若既是某个成员的包名，又是另一个成员的目录，选中包名所命名的那个成员，并给
+出警告点名另一个成员——选项名的是包，包名的精确匹配压过恰好同名的目录。
 
 `--workspace`（用于 `build` 与 `test`）是扇出形式：作用于**每个**成员。
 `mcpp test --workspace` 逐成员分别汇报，遇失败继续，只要有任一成员失败就非零

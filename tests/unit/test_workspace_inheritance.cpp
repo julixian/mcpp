@@ -256,3 +256,162 @@ TEST(HostToolToolchain, AMemberToolReadsItsWorkspaceToolchain) {
     std::error_code ec;
     fs::remove_all(root, ec);
 }
+
+// #725. `-p, --package <NAME>` resolves the package identity first, and the
+// directory spellings docs/07 §5.3 has always documented second
+// (mcpp::project::resolve_member_dir). One resolver serves every `-p`
+// reading command; the e2e halves (the workspace-context repair itself, and
+// `-p` on a real build) are tests/e2e/805_… and tests/e2e/806_….
+namespace resolve_member {
+
+namespace fs = std::filesystem;
+
+struct Fixture {
+    fs::path root;
+
+    explicit Fixture(std::string_view tag) {
+        root = fs::temp_directory_path()
+             / std::format("mcpp-725-{}-{:x}", tag, std::random_device{}());
+    }
+    ~Fixture() {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
+    Fixture(const Fixture&) = delete;
+
+    void write(const fs::path& rel, std::string_view text) {
+        auto p = root / rel;
+        fs::create_directories(p.parent_path());
+        std::ofstream(p) << text;
+    }
+    // `path` is written into `mcpp.toml` as the manifest's own [package]
+    // fields; `dir` is the directory it lives in, relative to `root`.
+    void member(std::string_view dir, std::string_view name,
+                std::string_view ns = "") {
+        std::string toml = "[package]\n";
+        if (!ns.empty()) toml += std::format("namespace = \"{}\"\n", ns);
+        toml += std::format("name = \"{}\"\n", name);
+        write(fs::path(dir) / "mcpp.toml", toml);
+    }
+    mcpp::manifest::Manifest root_manifest(std::string_view membersToml) {
+        write("mcpp.toml", std::format(
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n{}", membersToml));
+        auto m = mcpp::manifest::load(root / "mcpp.toml");
+        EXPECT_TRUE(m.has_value()) << (m ? "" : m.error().format());
+        return m ? std::move(*m) : mcpp::manifest::Manifest{};
+    }
+};
+
+// A member's own package name selects it, its full path does, and so does
+// its directory's last segment (docs/07 §5.3's historical spellings, kept as
+// a fallback).
+TEST(ResolveMember, PackageNamePathAndBasenameAllSelectTheOneMember) {
+    Fixture f("single");
+    f.member("modules/base", "ws-base");
+    auto ws = f.root_manifest("[workspace]\nmembers = [\"modules/base\"]\n");
+
+    for (std::string_view filter : {"ws-base", "base", "modules/base"}) {
+        SCOPED_TRACE(std::string(filter));
+        testing::internal::CaptureStderr();
+        auto m = mcpp::project::resolve_member_dir(ws, f.root, filter);
+        auto warned = testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(m.has_value()) << (m ? "" : m.error());
+        EXPECT_EQ(*m, f.root / "modules/base");
+        EXPECT_TRUE(warned.empty()) << warned;
+    }
+}
+
+// Two members declare the same package name under different namespaces:
+// the bare name is refused (naming both qualified names), and each
+// qualified name selects its own member without any ambiguity.
+TEST(ResolveMember, SameNameUnderTwoNamespacesRefusesTheBareNameOnly) {
+    Fixture f("dup-ns");
+    f.member("a", "ws-common", "ns1");
+    f.member("b", "ws-common", "ns2");
+    auto ws = f.root_manifest("[workspace]\nmembers = [\"a\", \"b\"]\n");
+
+    auto bare = mcpp::project::resolve_member_dir(ws, f.root, "ws-common");
+    ASSERT_FALSE(bare.has_value());
+    EXPECT_NE(bare.error().find("ns1.ws-common"), std::string::npos) << bare.error();
+    EXPECT_NE(bare.error().find("ns2.ws-common"), std::string::npos) << bare.error();
+
+    auto qa = mcpp::project::resolve_member_dir(ws, f.root, "ns1.ws-common");
+    ASSERT_TRUE(qa.has_value()) << qa.error();
+    EXPECT_EQ(*qa, f.root / "a");
+
+    auto qb = mcpp::project::resolve_member_dir(ws, f.root, "ns2.ws-common");
+    ASSERT_TRUE(qb.has_value()) << qb.error();
+    EXPECT_EQ(*qb, f.root / "b");
+}
+
+// A value that is one member's package name and a different member's
+// directory selects the package -- the option names a package -- and warns,
+// naming the other member and its path.
+TEST(ResolveMember, PackageNameOutranksAnotherMembersDirectoryAndWarns) {
+    Fixture f("name-vs-dir");
+    f.member("modules/base", "ws-base");
+    f.member("ws-base", "other");
+    auto ws = f.root_manifest(
+        "[workspace]\nmembers = [\"modules/base\", \"ws-base\"]\n");
+
+    testing::internal::CaptureStderr();
+    auto m = mcpp::project::resolve_member_dir(ws, f.root, "ws-base");
+    auto warned = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(m.has_value()) << (m ? "" : m.error());
+    EXPECT_EQ(*m, f.root / "modules/base");
+    EXPECT_NE(warned.find("modules/base"), std::string::npos) << warned;
+    EXPECT_NE(warned.find("ws-base"), std::string::npos) << warned;
+}
+
+// Two members share a directory basename (no package-name collision): the
+// first in `[workspace] members` is still selected (a script written against
+// it keeps working), and a warning now names the other and its path.
+TEST(ResolveMember, DuplicateBasenameKeepsFirstMatchAndWarns) {
+    Fixture f("dup-basename");
+    f.member("apps/core", "coreapp");
+    f.member("libs/core", "corelib");
+    auto ws = f.root_manifest("[workspace]\nmembers = [\"apps/core\", \"libs/core\"]\n");
+
+    testing::internal::CaptureStderr();
+    auto m = mcpp::project::resolve_member_dir(ws, f.root, "core");
+    auto warned = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(m.has_value()) << (m ? "" : m.error());
+    EXPECT_EQ(*m, f.root / "apps/core");
+    EXPECT_NE(warned.find("libs/core"), std::string::npos) << warned;
+}
+
+// A filter matching nothing lists every member with its package name and its
+// path.
+TEST(ResolveMember, NotFoundListsEveryMemberByNameAndPath) {
+    Fixture f("not-found");
+    f.member("a", "widget", "acme");
+    f.member("b", "gadget");
+    auto ws = f.root_manifest("[workspace]\nmembers = [\"a\", \"b\"]\n");
+
+    auto m = mcpp::project::resolve_member_dir(ws, f.root, "no-such-member");
+    ASSERT_FALSE(m.has_value());
+    EXPECT_NE(m.error().find("acme.widget"), std::string::npos) << m.error();
+    EXPECT_NE(m.error().find("'a'"), std::string::npos) << m.error();
+    EXPECT_NE(m.error().find("gadget"), std::string::npos) << m.error();
+    EXPECT_NE(m.error().find("'b'"), std::string::npos) << m.error();
+}
+
+// No filter on a rooted workspace acts on the root package; no filter on a
+// virtual one is refused. Unaffected by #725, kept here as the resolver's
+// baseline.
+TEST(ResolveMember, NoFilterActsOnRootedRootAndRefusesVirtual) {
+    Fixture f("no-filter");
+    f.member("a", "a");
+    auto rooted = f.root_manifest("[workspace]\nmembers = [\"a\"]\n");
+    auto onRoot = mcpp::project::resolve_member_dir(rooted, f.root, "");
+    ASSERT_TRUE(onRoot.has_value()) << onRoot.error();
+    EXPECT_TRUE(onRoot->empty());
+
+    auto virt = mcpp::manifest::parse_string("[workspace]\nmembers = [\"a\"]\n");
+    ASSERT_TRUE(virt.has_value()) << virt.error().format();
+    auto onVirtual = mcpp::project::resolve_member_dir(*virt, f.root, "");
+    ASSERT_FALSE(onVirtual.has_value());
+    EXPECT_NE(onVirtual.error().find("--workspace"), std::string::npos);
+}
+
+} // namespace resolve_member
