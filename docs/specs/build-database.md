@@ -10,7 +10,7 @@
 | 对应实现 | mcpp >= 2026.9.15.1;v1.3 修改的 R2.5、R3.7、R3.8、R4.1、R5.2 为 mcpp >= 2026.9.26.2;v1.4 修改的 R2.5 为 mcpp >= 2026.9.27.1 |
 | 相关设计文档 | `.agents/docs/2026-09-14-636-build-database-and-the-latest-xlings.md`<br>`.agents/docs/2026-09-26-compile-database-and-issue-699-design.md` |
 | 相关 issue | #636, #648, #655, #699, #702, #707 |
-| 依据的外部规范 | S1「C++ Build Database: IDE Profile」profile 0.2.0 与 S2 0.2.0 §3.4,取自 https://github.com/Sunrisepeak/lsp-mcpp-private 提交 `b82859d`(schema 自提交 `28ecd6e` 起未变);S2 0.3.0 §3.4 的部分回答(S2-3.4-12、S2-3.4-13,Sunrisepeak/mcpp-language-server#25);JSON Compilation Database |
+| 依据的外部规范 | S1「C++ Build Database: IDE Profile」profile 0.3.0(§7.2 的 `generated`,Sunrisepeak/mcpp-language-server#28;此前为 0.2.0)与 S2 0.2.0 §3.4,取自 https://github.com/Sunrisepeak/lsp-mcpp-private 提交 `b82859d`(schema 自提交 `28ecd6e` 起未变);S2 0.3.0 §3.4 的部分回答(S2-3.4-12、S2-3.4-13,Sunrisepeak/mcpp-language-server#25);JSON Compilation Database |
 
 ## 0. 适用范围
 
@@ -152,6 +152,20 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
   命令中找不到该源文件时,不列出该单元,并输出警告
   `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED`。**已实现**
 
+### 3.5 生成的文件
+
+- **R3.12** 一个集合的 `ide.generated`(S1 0.3.0 §7.2)列出该集合所属包的构建程序以
+  `role = "source"` 的 action 生成的每一个输出,以及该集合的单元以 `-I` 命名、位于规划
+  目录的 `target/.build-mcpp` 之下的每一个目录。每一项给出 `path`(本文档中的路径)、
+  `build-path`(同一组选择器下 `mcpp build` 写入的路径:把规划目录换成工程根,文件存在
+  与否都给出)与 `kind`。一个输出同时是该集合某个单元的 `source` 时 `kind` 为 `source`,
+  否则为 `header`;目录为 `directory`。文件一项另有 `generator`:action 的 `id`、`inputs`、
+  作为 `arguments` 的命令,以及 `work-directory`(action 声明的 `cwd`,未声明时为构建
+  目录)。没有这样的输出与目录的集合不带该字段。该字段不进入 `--spec compile-commands`
+  的文档,因为 JSON Compilation Database 的读者拒绝未知的键。命令不运行任何 action
+  (R2.5);由消费方决定是否在其用户同意时运行 `generator`。**已实现**
+  (mcpp >= 2026.9.28.1,mcpp#724)
+
 ## 4. `--spec compile-commands`
 
 - **R4.1** 文档为 `mcpp build --configure-only` 在同一组选择器下写入
@@ -162,7 +176,7 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 ## 5. 信封
 
 - **R5.1** `kind` 为 `mcpp.build-database`,`kindVersion` 为 1。`data` 含 `spec`
-  (`{"name": "s1", "version": "0.2.0"}` 或 `{"name": "compile-commands"}`)、
+  (`{"name": "s1", "version": "0.3.0"}` 或 `{"name": "compile-commands"}`)、
   `database`、`watch` 与 `inputs-fingerprint`。**已实现**
 - **R5.2** 命令独立规划每一个被选中的成员:一个成员规划失败只影响它自己,不影响
   其余成员的集合(#699 第 1 项)。规划失败的成员不贡献任何集合,只贡献一条 `error`
