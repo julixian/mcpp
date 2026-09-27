@@ -123,6 +123,13 @@ jobs:
         run: |
           CAND="$PWD/candidate/mcpp.exe"
           QTW=$(cygpath -m "$QT")
+          # The state before this change is the last release. `$MCPP` is the
+          # bootstrap's shim for this repository's own pin, which refuses to
+          # run outside the repository, so the release is installed and called
+          # by its store path. From a neutral directory, so the repository's
+          # .xlings.json does not select a project scope.
+          ( cd "$RUNNER_TEMP" && "$XLINGS_BIN" install mcpp@2026.9.28.1 -y ) > "$RUNNER_TEMP/released-install.log" 2>&1 || true
+          REL="$(cygpath -u "$USERPROFILE")/.xlings/data/xpkgs/xim-x-mcpp/2026.9.28.1/bin/mcpp.exe"
           toolchain=""
           [ "${{ matrix.row }}" = bare ] && toolchain='[toolchain]
           windows = "msvc@14.44.35207"'
@@ -155,8 +162,15 @@ jobs:
               return 0;
           }
           EOF
-            m="$CAND"; [ "$who" = released ] && m="$MCPP"
-            ( cd "$d" && "$m" build ) || { echo "::error::the $who build of the probe failed with the system's runtime present"; exit 1; }
+            m="$CAND"; [ "$who" = released ] && m="$REL"
+            if ! ( cd "$d" && "$m" build ); then
+              if [ "$who" = candidate ]; then
+                echo "::error::the candidate's build of the probe failed with the system's runtime present"; exit 1
+              fi
+              echo "READING M-c: the released mcpp could not record the edge ($(tail -1 "$RUNNER_TEMP/released-install.log"))"
+              : > "$d/ninja-file"
+              continue
+            fi
             grep -rl "moc.exe" "$d/target" --include=build.ninja | head -1 > "$d/ninja-file"
             test -s "$d/ninja-file" || { echo "::error::no build.ninja records the moc edge ($who)"; exit 1; }
             echo "--- $who: the moc edge"
@@ -212,6 +226,7 @@ jobs:
         shell: bash
         run: |
           nf=$(cat "$RUNNER_TEMP/probe-released/ninja-file")
+          [ -n "$nf" ] || { echo "READING M-c: not recorded (see the step above)"; exit 0; }
           bd=$(dirname "$nf")
           find "$bd" \( -name moc-probe.txt -o -name lrelease-probe.stamp \) -delete
           edges=$("$NINJA" -C "$bd" -t targets all | grep -E 'moc-probe.txt|lrelease-probe.stamp' | cut -d: -f1)

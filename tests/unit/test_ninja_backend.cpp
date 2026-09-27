@@ -1158,7 +1158,10 @@ TEST(NinjaBackend, PeProgramWithRuntimeSearchDirsGetsAPlacementEdge) {
     auto ninja = emit_ninja_string(program_plan("x86_64-w64-windows-gnu", true));
     // One rule, carrying the directories in search order, each one word.
     EXPECT_NE(ninja.find("rule place_dlls\n"), std::string::npos) << ninja;
-    EXPECT_NE(ninja.find("place-dlls --output $out --depfile $out.d $in "),
+    // The C++ runtime rule the resolver applied (mcpp.build.runtime_placement):
+    // a GNU PE program has no MSVC runtime set, so the edge is told so and
+    // places by search order.
+    EXPECT_NE(ninja.find("place-dlls --output $out --depfile $out.d --crt not-applicable $in "),
               std::string::npos) << ninja;
     EXPECT_NE(ninja.find("my bin"), std::string::npos) << ninja;
     EXPECT_NE(ninja.find("  deps = gcc\n"), std::string::npos) << ninja;
