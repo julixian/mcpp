@@ -423,7 +423,7 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 
 | 字段 | |
 |---|---|
-| `spec` | `{"name": "s1", "version": "0.2.0"}`；使用 `--spec compile-commands` 时为 `{"name": "compile-commands"}` |
+| `spec` | `{"name": "s1", "version": "0.3.0"}`（2026.9.28.1 之前为 0.2.0）；使用 `--spec compile-commands` 时为 `{"name": "compile-commands"}` |
 | `database` | 该规范对应的文档：一份 S1 构建数据库，或者 `mcpp build --configure-only` 写入 `compile_commands.json` 的那些条目 |
 | `watch` | 一旦发生变化就可能改变这份文档的输入：相对工作区根目录的路径与 glob，或绝对路径 |
 | `inputs-fingerprint` | `fnv1a:<16 位十六进制>`，对上述输入、mcpp 版本与选择器求出的摘要 |
@@ -431,6 +431,11 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 不带 `--format` 时，命令只输出这份文档；`-o <file>` 会把原本要输出的内容
 写入 `<file>`。文档的内容、不写入项目目录这条保证，以及 `watch` 的规则，见
 [SPEC-005](../specs/build-database.md)。
+
+自 2026.9.28.1 起，S1 的集合还在 `ide.generated` 中列出其包的构建程序生成的文件
+（S1 0.3.0 §7.2）。命令不运行任何 action，所以这样的文件在文档所指的目录中尚不存在。
+每一项给出同一组选择下 `mcpp build` 写入的路径（`build-path`）以及写出它的步骤，
+编辑器因此可以说明“这是生成的文件，构建一次即可”，而不是报告缺少头文件。
 
 `emit` 独立规划每一个被选中的成员（#699 第 1 项）：一个成员的规划失败不会
 连累它的兄弟成员。不在项目中，或者被选中的成员全部规划失败时，信封省略
