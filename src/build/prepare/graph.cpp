@@ -59,362 +59,32 @@ import mcpp.project;
 
 namespace mcpp::build {
 
-std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
+// STEP FUNCTIONS (mcpp#722 / T6). The preamble closures below that
+// captured only `state`, or nothing, are ordinary file-scope functions:
+// statements moved verbatim, only their header changed (a name and a
+// return type in place of `auto x = [&](...) {`, and an explicit
+// `PrepareState& state` parameter where the body used to capture it).
+// Internal linkage: these names belong to this file, not to
+// mcpp.build.prepare's surface.
 
-    // #634, X: every request that reached a package, as the requester wrote
-    // it, for the `graph` section of resolution.json. Kept apart from
-    // `dependencyEdges`, which merges two requests of one consumer for one
-    // dependency into one edge; the record has to keep both keys, because two
-    // keys over one identity (A2) and the table a declaration came from (A1)
-    // are what it exists to show.
-    // The link form each dependency takes and the facts it was decided from,
-    // by package index. COMPUTED ONCE, before the root build program runs, so
-    // that program can read the answer (#642 E2); APPLIED after the scan, where
-    // it always was. Every reader below reads this, never a second resolution.
-    // #355: consumer package index → (env var, absolute path) for each host
-    // tool that consumer requested. Filled by the provisioning pass below;
-    // read by BOTH build.mcpp call sites (the dependency loop and the root),
-    // which is why it lives out here rather than inside the resolution block.
-    // #355 step 5: consumer package index → (logical module name, interface
-    // path) for each dependency that offers HOST build rules. Same fan-out
-    // shape as toolEnvByConsumer, and read by the same two call sites.
-    // The same providers by INDEX, and the reason they are needed twice.
-    //
-    // A rule's code runs inside its CONSUMER's build program, so
-    // `mcpp::xpkg_dir("cuda-nvcc")` is asked there -- while the payload that
-    // answers it was declared by the RULE, under `[feature-xlings.<f>]`, which
-    // is where it belongs: which packages a device compiler needs is the
-    // rule's knowledge and no project should have to rediscover it.
-    //
-    // The graph pass already INSTALLS what a dependency declares. Only the
-    // answer was missing: `fillXpkgDirs` read one manifest, so the address was
-    // fetched, unpacked, and then unreachable from the only code that wanted
-    // it -- a failure that reads as "the toolkit is not installed" while it
-    // sits on disk.
-    //
-    // The set is the host-module providers rather than every dependency: the
-    // code that can call `xpkg_dir` in this build program is the consumer's
-    // own `build.mcpp` plus exactly the rule modules compiled into it.
-    // #359: who can see which build-time provision. Computed once by the
-    // provisioning pass below (a fixpoint over `dependencyEdges`, the same
-    // shape as computeUsageRequirements) and read by every consumer of the
-    // three env channels above. Declared here because `fillDepDirs` closes
-    // over it and is defined long before the pass runs; every call site is
-    // after it.
-    // The spellings a given consumer may address a provider by. The qualified
-    // name always works; the bare tail only when the namespace ladder binds it
-    // to exactly this package FOR THIS CONSUMER. Scoped per consumer rather
-    // than globally because two packages sharing a tail only collide inside an
-    // environment that contains both.
-    state.bareBindingsFor = [&](std::size_t consumer) {
-        std::vector<std::string> fqns;
-        if (consumer < state.provisionGraph.visible.size())
-            for (auto const& pr : state.provisionGraph.visible[consumer]) {
-                if (pr.provider >= state.packages.size()) continue;
-                auto const& n = state.packages[pr.provider].manifest.package.name;
-                if (std::find(fqns.begin(), fqns.end(), n) == fqns.end())
-                    fqns.push_back(n);
-            }
-        return prov::bind_bare_names(fqns);
-    };
-    // THE NAMES UNDER WHICH ONE PROVIDER IS PUBLISHED TO ONE CONSUMER, derived
-    // once for every channel (#647 E4.3). The manifest's `name`, the qualified
-    // `namespace.name` when the manifest writes the two apart, and the bare
-    // tail where the namespace ladder binds it to this provider for this
-    // consumer. `dep_dir`/`dep_linkage` and `dep_bin` used to derive this list
-    // separately; #642 added the qualified spelling to the first and the second
-    // kept publishing `MCPP_DEP_INSTALLER_BIN_*` alone for a package written
-    // `namespace = "spike"`, `name = "installer"`, so
-    // `dep_bin("spike.installer", ...)` read nothing.
-    state.publishedNamesFor =
-        [&](std::size_t provider,
-            const std::map<std::string, prov::BareBinding>& bind) {
-        std::vector<std::string> out;
-        auto const& manifest = state.packages[provider].manifest;
-        auto const& canon = manifest.package.name;
-        out.push_back(canon);
-        if (auto qualified = mcpp::build::qualified_package_name(manifest);
-            qualified != canon)
-            out.push_back(std::move(qualified));
-        if (auto tail = prov::tail_of(canon); tail != canon) {
-            auto it = bind.find(tail);
-            if (it != bind.end() && it->second.owner == canon)
-                out.push_back(std::move(tail));
-        }
-        return out;
-    };
-
-    // A package whose DECLARED targets are all programs (#649 E6). See the
-    // worklist, where such a package is not walked into a consumer's graph.
-    state.isProgramOnlyPackage = [](const mcpp::manifest::Manifest& pm) {
-        if (pm.targetsInferred || pm.targets.empty()) return false;
-        return std::ranges::none_of(pm.targets, [](const mcpp::manifest::Target& t) {
-            return t.kind == mcpp::manifest::Target::Library
-                || t.kind == mcpp::manifest::Target::SharedLibrary;
-        });
-    };
-    // A package some edge asked for programs to SHIP (mcpp#711). Its programs
-    // are linked in this plan, so it is scanned and configured here like any
-    // library dependency, even when every target it declares is a program.
-    state.isArtifactPackage = [&](std::size_t i) {
-        return std::ranges::any_of(state.dependencyEdges, [&](const DependencyEdge& e) {
-            return e.dependencyPackageIndex == i && !e.requestedArtifacts.empty();
-        });
-    };
-    // Compiled in this plan: not a package of programs, or one whose programs
-    // this plan ships.
-    state.compilesHere = [&](std::size_t i) {
-        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest) || state.isArtifactPackage(i);
-    };
-    auto parseVisibility = [](std::string_view visibility) {
+static mcpp::modgraph::DependencyVisibility parseVisibility(std::string_view visibility) {
         if (visibility == "private")
             return mcpp::modgraph::DependencyVisibility::Private;
         if (visibility == "interface")
             return mcpp::modgraph::DependencyVisibility::Interface;
         return mcpp::modgraph::DependencyVisibility::Public;
-    };
+}
 
-    auto packageIndexForConsumer = [&](std::size_t consumerDepIndex) {
+static std::size_t packageIndexForConsumer(std::size_t consumerDepIndex) {
         if (consumerDepIndex == kMainConsumer) return std::size_t{0};
         return consumerDepIndex + 1;
-    };
+}
 
-    state.appendUniquePath =
-        [](std::vector<std::filesystem::path>& dirs,
-           const std::filesystem::path& dir) -> bool
-    {
-        if (std::find(dirs.begin(), dirs.end(), dir) != dirs.end()) return false;
-        dirs.push_back(dir);
-        return true;
-    };
-
-    state.appendUniquePaths =
-        [&](std::vector<std::filesystem::path>& dirs,
-            const std::vector<std::filesystem::path>& additions) -> bool
-    {
-        bool changed = false;
-        for (auto const& dir : additions) {
-            changed = state.appendUniquePath(dirs, dir) || changed;
-        }
-        return changed;
-    };
-
-    // "Which compile-visible channels a build.mcpp directive lands in" is a
-    // property of the DIRECTIVE TABLE, not of this call site, so both the mark
-    // and the fold now live with the table in mcpp.build.directives. This pair
-    // used to be defined here and was already incomplete — the comment it
-    // replaced admitted that link/source residues stayed at the call sites,
-    // which is the #242 two-derivations shape.
-    //
-    // The fold is PRIVATE by design (Cargo discipline — a build-time program
-    // must not widen the package's public interface): privateBuild only, never
-    // publicUsage. The after-dirs ride the typed #249 channel, which owns the
-    // per-dialect degradations (cl.exe /I, NASM -I).
-    using DirectiveMark = mcpp::build::directives::Mark;
-    state.markDirectiveTail = [](const mcpp::manifest::Manifest& mm) {
-        return mcpp::build::directives::mark(mm);
-    };
-    state.foldDirectiveTailIntoPrivateBuild =
-        [](mcpp::modgraph::PackageRoot& pkg, const mcpp::manifest::Manifest& ran,
-           const DirectiveMark& t)
-    {
-        mcpp::build::directives::fold_private_tail(pkg.privateBuild, ran, t);
-    };
-
-    // mcpp#241: the (name → dir) pairs a package's build.mcpp receives as
-    // MCPP_DEP_<NAME>_DIR. ONE owner: the dependency loop and the root call
-    // site had drifted into two near-identical copies of this, and #355 was
-    // about to add a third. Each dependency is emitted under BOTH its
-    // canonical name and its namespace-stripped tail, so
-    // `mcpp::dep_dir("compat.zlib")` and `mcpp::dep_dir("zlib")` both resolve
-    // regardless of which spelling the author used in `deps`.
-    //
-    // #359: the set is now the consumer's VISIBLE provisions rather than its
-    // direct edges, so a re-exported dependency's directory reaches it too.
-    // That is what makes a rule package able to find data files belonging to a
-    // dependency the user never declared — protoc's well-known .proto files
-    // are exactly such a directory, and `grpcgen` reads them through dep_dir.
-    //
-    // The bare tail is emitted only when the namespace ladder binds it here.
-    // Emitting it unconditionally was safe while only the root's own
-    // declarations reached build.mcpp; with re-export, two packages that never
-    // heard of each other can share a tail and the later emplace_back would
-    // silently win.
-    // The xlings half of fillDepDirs. Same question ("where did my declared
-    // dependency's payload land"), different namespace and store layout, so it
-    // cannot ride the mcpp dependency channel — but it must be an INTERFACE on
-    // the build.mcpp side for the same reason that one is: a program that
-    // reconstructs the store path is coupled to internals mcpp is free to
-    // change. See mcpp::build::hostprogram::xpkg_dir.
-    // Which dependency supplied the runner, for the exactly-one-provider
-    // error below. A name rather than a bool: the message has to name both.
-    // ONE PROVIDER PER RUNNER NAME. `runner` has had this rule since #544;
-    // a NAMED runner inherits it per name, because a board may legitimately
-    // supply `flash` while a different package supplies `monitor`.
-
-    state.fillXpkgDirs = [&](mcpp::build::BuildProgramEnv& e,
-                            const mcpp::manifest::Manifest& owner,
-                            std::size_t consumer) {
-        // `[feature-xlings.<f>]` is provisioned when `<f>` is active, so it has
-        // to be answerable here too. Before this, a tool a feature declared was
-        // downloaded and installed and then `mcpp::xpkg_dir` returned "" for it
-        // — the build program was told to declare a package it had already
-        // declared, which is a diagnostic pointing at the wrong file.
-        //
-        // The set is taken from the SAME env the caller already computed, so
-        // "which features are on" is answered once. Installation stays the
-        // filter below: a declared address whose payload is absent answers "",
-        // which is what a `when = "dev"` entry looks like to a consumer.
-        std::vector<std::string> declared = owner.xlings.deps;
-        for (auto const& f : e.features)
-            if (auto it = owner.xlings.featureDeps.find(f);
-                it != owner.xlings.featureDeps.end())
-                for (auto const& address : it->second)
-                    if (std::ranges::find(declared, address) == declared.end())
-                        declared.push_back(address);
-        // …and what the rule packages compiled INTO this build program
-        // declared. Their own active features, not the consumer's: the
-        // consumer asked for `features = ["rules-cuda"]` on the edge, and that
-        // is what decides which of the rule's `[feature-xlings]` tables apply.
-        if (auto pit = state.hostModuleProvidersByConsumer.find(consumer);
-            pit != state.hostModuleProvidersByConsumer.end()) {
-            for (auto q : pit->second) {
-                if (q >= state.packages.size()) continue;
-                auto const& pm = state.packages[q].manifest;
-                auto want = [&](const std::string& address) {
-                    if (std::ranges::find(declared, address) == declared.end())
-                        declared.push_back(address);
-                };
-                for (auto const& address : pm.xlings.deps) want(address);
-                const auto& pf = q < state.activeFeaturesByPackage.size()
-                    ? state.activeFeaturesByPackage[q] : std::vector<std::string>{};
-                for (auto const& f : pf)
-                    if (auto it = pm.xlings.featureDeps.find(f);
-                        it != pm.xlings.featureDeps.end())
-                        for (auto const& address : it->second) want(address);
-            }
-        }
-        if (declared.empty()) return;
-        auto cfg = state.get_cfg(true);
-        if (!cfg) return;
-        auto xlEnv = mcpp::config::make_xlings_env(**cfg);
-        std::set<std::string> answered;
-        for (auto const& raw : declared) {
-            // THE VERSION THIS BUILD INSTALLED, NOT THE ONE THIS MANIFEST
-            // WROTE. Both statements are about one package, and only one
-            // version of it exists on disk; answering from the local spelling
-            // is how a rule package could declare `>=8.5.0`, have the project's
-            // exact pin installed instead, and then be told nothing is there.
-            // `xlingsWinner` is empty only before the split has run, and every
-            // caller of this lambda runs after it — the fallback keeps that a
-            // fact about ordering rather than a crash.
-            const auto key = mcpp::xlings::addrset::package_key(raw);
-            if (!answered.insert(key).second) continue;
-            auto wit = state.xlingsWinner.find(key);
-            const std::string spec = wit == state.xlingsWinner.end() ? raw : wit->second;
-            auto ref = mcpp::xlings::paths::parse_xpkg_ref(spec);
-            auto dir = mcpp::xlings::paths::xpkg_payload(xlEnv, ref);
-            if (!dir) continue;   // declared but not installed: "" is the answer
-            // Namespaced first — it is the exact spelling, and the bare form
-            // below must not shadow it (the receiver keeps the first value it
-            // is given for a name).
-            e.xpkgDirs.emplace_back(
-                mcpp::build::xpkg_env_var(ref.ns, ref.name), dir->string());
-            e.xpkgDirs.emplace_back(
-                mcpp::build::xpkg_env_var("", ref.name), dir->string());
-        }
-    };
-
-    // `linkForms` (#642 E2): when given, each dependency that has a resolved
-    // library form is also offered under exactly the names its directory is,
-    // so `dep_linkage(n)` answers for every `n` that `dep_dir(n)` answers for.
-    // Only the root's program passes it; see the root call site for why.
-    state.fillDepDirs = [&](mcpp::build::BuildProgramEnv& e, std::size_t consumer,
-                           const std::map<std::size_t, std::string>* linkForms = nullptr) {
-        if (consumer >= state.provisionGraph.visible.size()) return;
-        auto bind = state.bareBindingsFor(consumer);
-        for (auto const& [tail, b] : bind) {
-            if (auto note = prov::contest_note(tail, b); !note.empty())
-                mcpp::diag::warning("provisions/ambiguous", note);
-        }
-        for (auto const& pr : state.provisionGraph.visible[consumer]) {
-            if (pr.kind != prov::Kind::DepDir) continue;
-            if (pr.provider >= state.packages.size()) continue;
-            auto const& depPkg = state.packages[pr.provider];
-            auto const& canon  = depPkg.manifest.package.name;
-            const std::string* form = nullptr;
-            if (linkForms)
-                if (auto f = linkForms->find(pr.provider); f != linkForms->end())
-                    form = &f->second;
-            // Every spelling of `publishedNamesFor`: the manifest's name, the
-            // qualified name a manifest writing `namespace = "ns"` and
-            // `name = "fw"` is addressed by (#642: the framework's rule asks
-            // `dep_linkage("huxerui.huxerui")`), and the bound tail.
-            for (auto const& n : state.publishedNamesFor(pr.provider, bind)) {
-                e.depDirs.emplace_back(n, depPkg.root);
-                if (form) e.depLinkages.emplace_back(n, *form);
-            }
-        }
-    };
-
-    // A declared build-graph node's Source outputs must be visible to the
-    // scan, so they are materialized as placeholders and joined to the source
-    // set here — the same two lists `generated=` feeds, for the same reason
-    // (the scanner walks the legacy modules.sources mirror). ninja overwrites
-    // the placeholder before the compile edge runs, because that compile
-    // depends on the action's output.
-    state.adoptActionOutputs = [](mcpp::manifest::Manifest& mm,
-                                 const std::filesystem::path& pkgRoot,
-                                 std::size_t firstNewAction) {
-        if (firstNewAction >= mm.buildConfig.actions.size()) return;
-        std::vector<mcpp::manifest::BuildAction> fresh(
-            mm.buildConfig.actions.begin()
-                + static_cast<std::ptrdiff_t>(firstNewAction),
-            mm.buildConfig.actions.end());
-        // The package that DECLARED the outputs classifies them: a dependency
-        // generating a `.ixx` asks its own manifest, not the root project's.
-        // Built once per package, not once per output — and BEFORE
-        // `prepare_actions`, which needs the same table to decide which
-        // outputs get a placeholder (a header does not; see mcpp#534).
-        const auto pkgExtTable =
-            mcpp::extension_table_for(mm.buildConfig.moduleExtensions,
-                                      mm.buildConfig.deviceExtensions);
-        mcpp::build::directives::prepare_actions(fresh, pkgRoot, pkgExtTable);
-        std::copy(fresh.begin(), fresh.end(),
-                  mm.buildConfig.actions.begin()
-                      + static_cast<std::ptrdiff_t>(firstNewAction));
-        for (auto const& a : fresh) {
-            if (a.role != mcpp::manifest::BuildAction::Role::Source) continue;
-            for (auto const& o : a.outputs) {
-                if (o.find("${mcpp.") != std::string::npos) continue;
-                // Companion outputs (protoc's .pb.h next to its .pb.cc) are
-                // produced by the edge but are NOT translation units.
-                if (!mcpp::build::directives::is_compilable_output(o, pkgExtTable))
-                    continue;
-                mm.buildConfig.sources.push_back(o);
-                mm.modules.sources.push_back(o);
-            }
-        }
-    };
-
-
-    state.appendUniqueFlags =
-        [](std::vector<std::string>& flags,
-           const std::vector<std::string>& additions) -> bool
-    {
-        bool changed = false;
-        for (auto const& f : additions) {
-            if (std::find(flags.begin(), flags.end(), f) != flags.end()) continue;
-            flags.push_back(f);
-            changed = true;
-        }
-        return changed;
-    };
-
-    auto expandIncludeDirs =
-        [&](const std::filesystem::path& packageRoot,
-            const mcpp::manifest::Manifest& manifest)
-    {
+static std::vector<std::filesystem::path> expandIncludeDirs(
+        PrepareState& state,
+        const std::filesystem::path& packageRoot,
+        const mcpp::manifest::Manifest& manifest)
+{
         std::vector<std::filesystem::path> dirs;
         for (auto const& inc : manifest.buildConfig.includeDirs) {
             if (inc.is_absolute()) {
@@ -433,14 +103,15 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             }
         }
         return dirs;
-    };
+}
 
     // #249: same glob expansion for `include_dirs_after` (the -idirafter
     // channel — searched after the toolchain's system dirs).
-    auto expandIncludeDirsAfter =
-        [&](const std::filesystem::path& packageRoot,
-            const mcpp::manifest::Manifest& manifest)
-    {
+static std::vector<std::filesystem::path> expandIncludeDirsAfter(
+        PrepareState& state,
+        const std::filesystem::path& packageRoot,
+        const mcpp::manifest::Manifest& manifest)
+{
         std::vector<std::filesystem::path> dirs;
         for (auto const& inc : manifest.buildConfig.includeDirsAfter) {
             if (inc.is_absolute()) {
@@ -455,14 +126,15 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             }
         }
         return dirs;
-    };
+}
 
     // The same expansion for `private_include_dirs`, so a private entry may be
     // a glob and still name exactly the directories it expands to.
-    auto expandPrivateIncludeDirs =
-        [&](const std::filesystem::path& packageRoot,
-            const mcpp::manifest::Manifest& manifest)
-    {
+static std::vector<std::filesystem::path> expandPrivateIncludeDirs(
+        PrepareState& state,
+        const std::filesystem::path& packageRoot,
+        const mcpp::manifest::Manifest& manifest)
+{
         std::vector<std::filesystem::path> dirs;
         for (auto const& inc : manifest.buildConfig.privateIncludeDirs) {
             if (inc.is_absolute()) {
@@ -477,13 +149,13 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             }
         }
         return dirs;
-    };
+}
 
-    auto makePackageRoot =
-        [&](const std::filesystem::path& packageRoot,
-            const mcpp::manifest::Manifest& manifest)
-        -> std::expected<mcpp::modgraph::PackageRoot, std::string>
-    {
+static std::expected<mcpp::modgraph::PackageRoot, std::string> makePackageRoot(
+        PrepareState& state,
+        const std::filesystem::path& packageRoot,
+        const mcpp::manifest::Manifest& manifest)
+{
         // THE SNAPSHOT READS A NORMALISED MANIFEST; IT DOES NOT NORMALISE ONE.
         //
         // Every merge that feeds a package's build inputs (workspace
@@ -510,8 +182,8 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         pkg.manifest = manifest;
         pkg.usageResolved = true;
 
-        pkg.privateBuild.includeDirs = expandIncludeDirs(packageRoot, manifest);
-        pkg.privateBuild.includeDirsAfter = expandIncludeDirsAfter(packageRoot, manifest);
+        pkg.privateBuild.includeDirs = expandIncludeDirs(state, packageRoot, manifest);
+        pkg.privateBuild.includeDirsAfter = expandIncludeDirsAfter(state, packageRoot, manifest);
         pkg.privateBuild.cflags = manifest.buildConfig.cflags;
         pkg.privateBuild.cxxflags = manifest.buildConfig.cxxflags;
         // NOT `= privateBuild` ANY MORE — a package may now say which of
@@ -530,7 +202,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         // published because it is not literally equal to `musl/src/include`.
         {
             const auto privateExpanded =
-                expandPrivateIncludeDirs(packageRoot, manifest);
+                expandPrivateIncludeDirs(state, packageRoot, manifest);
             for (auto const& d : pkg.privateBuild.includeDirs)
                 if (std::ranges::find(privateExpanded, d) == privateExpanded.end())
                     pkg.publicUsage.includeDirs.push_back(d);
@@ -564,21 +236,16 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         pkg.publicUsage.includeDirsAfter = pkg.privateBuild.includeDirsAfter;
         pkg.linkUsage.ldflags = manifest.buildConfig.ldflags;
         return pkg;
-    };
+}
 
-    {
-        auto rootPackage = makePackageRoot(*state.root, *state.m);
-        if (!rootPackage) return std::unexpected(rootPackage.error());
-        state.packages[0] = std::move(*rootPackage);
-    }
-
-    auto recordDependencyEdge =
-        [&](std::size_t consumerDepIndex,
-            std::size_t dependencyPackageIndex,
-            const mcpp::manifest::DependencySpec& spec,
-            bool buildOnly,
-            const std::string& writtenKey)
-    {
+static void recordDependencyEdge(
+        PrepareState& state,
+        std::size_t consumerDepIndex,
+        std::size_t dependencyPackageIndex,
+        const mcpp::manifest::DependencySpec& spec,
+        bool buildOnly,
+        const std::string& writtenKey)
+{
         const auto consumerPackageIndex = packageIndexForConsumer(consumerDepIndex);
         if (consumerPackageIndex >= state.packages.size()
             || dependencyPackageIndex >= state.packages.size()) {
@@ -665,67 +332,10 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             .reexport = spec.reexport,
             .buildOnly = buildOnly,
         });
-    };
+}
 
-    state.computeUsageRequirements = [&] {
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (auto const& edge : state.dependencyEdges) {
-                if (edge.consumerPackageIndex >= state.packages.size()
-                    || edge.dependencyPackageIndex >= state.packages.size()) {
-                    continue;
-                }
-                auto& consumer = state.packages[edge.consumerPackageIndex];
-                auto const& dependency = state.packages[edge.dependencyPackageIndex];
-                // A package of programs publishes no usage requirements to its
-                // consumers (#649 E6): nothing of it is compiled or linked here.
-                if (edge.dependencyPackageIndex > 0
-                    && state.isProgramOnlyPackage(dependency.manifest)) continue;
-
-                if (edge.visibility == mcpp::modgraph::DependencyVisibility::Private
-                    || edge.visibility == mcpp::modgraph::DependencyVisibility::Public) {
-                    changed = state.appendUniquePaths(consumer.privateBuild.includeDirs,
-                                                dependency.publicUsage.includeDirs)
-                              || changed;
-                    // #249: after-dirs ride the same edges but keep their
-                    // after-ness — consumers receive them as -idirafter,
-                    // never upgraded to -I.
-                    changed = state.appendUniquePaths(consumer.privateBuild.includeDirsAfter,
-                                                dependency.publicUsage.includeDirsAfter)
-                              || changed;
-                    // Interface defines (a dependency's active-feature `defines`)
-                    // ride the same edges as include dirs: they must reach the
-                    // consumer's own TUs so header-only switches like
-                    // EIGEN_USE_BLAS take effect where the headers are used.
-                    changed = state.appendUniqueFlags(consumer.privateBuild.cflags,
-                                                dependency.publicUsage.cflags)
-                              || changed;
-                    changed = state.appendUniqueFlags(consumer.privateBuild.cxxflags,
-                                                dependency.publicUsage.cxxflags)
-                              || changed;
-                }
-                if (edge.visibility == mcpp::modgraph::DependencyVisibility::Public
-                    || edge.visibility == mcpp::modgraph::DependencyVisibility::Interface) {
-                    changed = state.appendUniquePaths(consumer.publicUsage.includeDirs,
-                                                dependency.publicUsage.includeDirs)
-                              || changed;
-                    changed = state.appendUniquePaths(consumer.publicUsage.includeDirsAfter,
-                                                dependency.publicUsage.includeDirsAfter)
-                              || changed;
-                    changed = state.appendUniqueFlags(consumer.publicUsage.cflags,
-                                                dependency.publicUsage.cflags)
-                              || changed;
-                    changed = state.appendUniqueFlags(consumer.publicUsage.cxxflags,
-                                                dependency.publicUsage.cxxflags)
-                              || changed;
-                }
-            }
-        }
-    };
-
-    auto normalizeDepLdflag = [](const std::filesystem::path& depRoot,
-                                 const std::string& flag) {
+static std::string normalizeDepLdflag(const std::filesystem::path& depRoot,
+                                      const std::string& flag) {
         auto absolute_path = [&](std::string_view raw) {
             std::filesystem::path p{std::string(raw)};
             // A loader token stays as written; see the predicate.
@@ -745,12 +355,13 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         }
 
         return flag;
-    };
+}
 
-    auto propagateLinkFlags = [&](const std::filesystem::path& depRoot,
-                                  const mcpp::manifest::Manifest& depManifest)
-        -> std::vector<std::string>
-    {
+static std::vector<std::string> propagateLinkFlags(
+        PrepareState& state,
+        const std::filesystem::path& depRoot,
+        const mcpp::manifest::Manifest& depManifest)
+{
         // Word by word (SPEC-004 §8, #703): a search path is made absolute
         // per word, and each word is written back as an element that reads as
         // exactly that word, so the consumer's renderer reads the dependency's
@@ -763,21 +374,20 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             added.push_back(std::move(normalized));
         }
         return added;
-    };
+}
 
-    auto removeLinkFlags = [&](const std::vector<std::string>& flags) {
+static void removeLinkFlags(PrepareState& state, const std::vector<std::string>& flags) {
         auto& ldflags = state.m->buildConfig.ldflags;
         for (auto const& flag : flags) {
             auto pos = std::find(ldflags.begin(), ldflags.end(), flag);
             if (pos != ldflags.end()) ldflags.erase(pos);
         }
-    };
+}
 
-    auto package_source_files = [](
+static std::expected<std::set<std::filesystem::path>, std::string> package_source_files(
         const std::filesystem::path& srcRoot,
         const mcpp::manifest::Manifest& depManifest)
-        -> std::expected<std::set<std::filesystem::path>, std::string>
-    {
+{
         // Resolve the source globs against the original root, falling
         // back to the convention default if the manifest didn't set any.
         std::vector<std::string> globs = depManifest.modules.sources;
@@ -808,7 +418,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 srcRoot.string(), globs.size()));
         }
         return sourceFiles;
-    };
+}
 
     // Stage a dep's source files into a fresh directory, rewriting their
     // module / import declarations against `rename`. Used by the multi-
@@ -839,12 +449,12 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
     // source and is not itself staged, verbatim: rewriting applies to module
     // declarations, and a header has none. Directories with no staged source
     // are not visited, so this stays proportional to what is being staged.
-    auto stage_with_rewrite = [&](const std::filesystem::path& srcRoot,
-                                  const std::filesystem::path& dstRoot,
-                                  const mcpp::manifest::Manifest& depManifest,
-                                  const std::map<std::string, std::string>& rename)
-        -> std::expected<void, std::string>
-    {
+static std::expected<void, std::string> stage_with_rewrite(
+        const std::filesystem::path& srcRoot,
+        const std::filesystem::path& dstRoot,
+        const mcpp::manifest::Manifest& depManifest,
+        const std::map<std::string, std::string>& rename)
+{
         std::error_code ec;
         std::filesystem::create_directories(dstRoot, ec);
         if (ec) return std::unexpected(std::format(
@@ -896,12 +506,12 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             ec.clear();
         }
         return {};
-    };
+}
 
-    auto declared_modules_for = [&](const std::filesystem::path& srcRoot,
-                                    const mcpp::manifest::Manifest& depManifest)
-        -> std::expected<std::vector<std::string>, std::string>
-    {
+static std::expected<std::vector<std::string>, std::string> declared_modules_for(
+        const std::filesystem::path& srcRoot,
+        const mcpp::manifest::Manifest& depManifest)
+{
         auto sources = package_source_files(srcRoot, depManifest);
         if (!sources) return std::unexpected(sources.error());
         std::vector<std::string> modules;
@@ -919,18 +529,48 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             "mangle: package '{}' declares no named C++ module to rewrite",
             depManifest.package.name));
         return modules;
-    };
+}
 
-    // Stage 2a — feature-activated optional dependencies. Defined as local
-    // lambdas (NOT file-scope functions): keeping their std::map instantiations
-    // inside this implementation unit avoids polluting the exported module BMI,
-    // which otherwise trips a GCC-16 modules bug ("failed to load pendings for
-    // __normal_iterator") when other modules import std.
-    auto activateFeatures = [](const mcpp::manifest::Manifest& pm,
-                               const std::vector<std::string>& requested,
-                               bool seedDefault = true) {
+    // Stage 2a — feature-activated optional dependencies. Static file-scope
+    // functions (mcpp#722 / T6 split), not local lambdas as originally
+    // written: the GCC 16 modules bug this comment used to warn about
+    // ("failed to load pendings for __normal_iterator") is triggered by an
+    // EXPORTED declaration's reachable set including a std::map
+    // instantiation; a `static` function has no external linkage and is
+    // never reachable from mcpp.build.prepare's exported interface, so it
+    // cannot pollute the BMI the bug reads from. Verified by a full build
+    // (mcpp itself, GCC 16.1): every consumer of this module still
+    // compiles clean.
+static std::vector<std::string> activateFeatures(
+        const mcpp::manifest::Manifest& pm,
+        const std::vector<std::string>& requested,
+        bool seedDefault = true) {
         return feature_closure(pm, requested, seedDefault); // single shared implementation
-    };
+}
+
+static std::string dependencySourceOf(const mcpp::manifest::DependencySpec& s) {
+        if (s.inheritWorkspace) return std::string("workspace = true");
+        if (s.isPath()) {
+            auto norm = std::filesystem::path(s.path).lexically_normal().generic_string();
+            while (norm.size() > 1 && norm.back() == '/') norm.pop_back();
+            return std::format("path = \"{}\"", norm);
+        }
+        if (s.isGit())
+            return std::format("git = \"{}\", {} = \"{}\"", s.git,
+                               s.gitRefKind.empty() ? "rev" : s.gitRefKind, s.gitRev);
+        return std::format("version = \"{}\"", s.version);
+}
+
+    // What the comparison is made on. The message shows the declaration as it
+    // was written; the judgement drops the whitespace inside a constraint, so
+    // the two declarations are compared on what they mean.
+static std::string dependencySourceKey(const mcpp::manifest::DependencySpec& s) {
+        auto spelled = dependencySourceOf(s);
+        if (!s.inheritWorkspace && !s.isPath() && !s.isGit())
+            std::erase_if(spelled, [](char c) { return c == ' ' || c == '\t'; });
+        return spelled;
+}
+
     // Merge a manifest's active feature-deps into its `dependencies` map so the
     // worklist below pulls them like any normal dep. A top-level dep of the same
     // key is never overwritten; deps declared only under a feature appear only
@@ -954,31 +594,10 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
     // `">= 1.2.0"` and `">=1.2.0"` are one constraint and the manifest that
     // spells them differently built on 2026.9.15.2. A gate added for #647 E4.2
     // must refuse a restatement that names another source, and nothing else.
-    auto dependencySourceOf = [](const mcpp::manifest::DependencySpec& s) {
-        if (s.inheritWorkspace) return std::string("workspace = true");
-        if (s.isPath()) {
-            auto norm = std::filesystem::path(s.path).lexically_normal().generic_string();
-            while (norm.size() > 1 && norm.back() == '/') norm.pop_back();
-            return std::format("path = \"{}\"", norm);
-        }
-        if (s.isGit())
-            return std::format("git = \"{}\", {} = \"{}\"", s.git,
-                               s.gitRefKind.empty() ? "rev" : s.gitRefKind, s.gitRev);
-        return std::format("version = \"{}\"", s.version);
-    };
-    // What the comparison is made on. The message shows the declaration as it
-    // was written; the judgement drops the whitespace inside a constraint, so
-    // the two declarations are compared on what they mean.
-    auto dependencySourceKey = [&](const mcpp::manifest::DependencySpec& s) {
-        auto spelled = dependencySourceOf(s);
-        if (!s.inheritWorkspace && !s.isPath() && !s.isGit())
-            std::erase_if(spelled, [](char c) { return c == ' ' || c == '\t'; });
-        return spelled;
-    };
-    auto mergeActiveFeatureDeps = [&](mcpp::manifest::Manifest& pm,
-                                      const std::vector<std::string>& requested,
-                                      bool seedDefault = true)
-        -> std::expected<void, std::string> {
+static std::expected<void, std::string> mergeActiveFeatureDeps(
+        mcpp::manifest::Manifest& pm,
+        const std::vector<std::string>& requested,
+        bool seedDefault = true) {
         if (pm.featureDeps.empty()) return {};
         for (auto& f : activateFeatures(pm, requested, seedDefault)) {
             auto it = pm.featureDeps.find(f);
@@ -1027,7 +646,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             }
         }
         return {};
-    };
+}
 
     // #243: dep/feat forwarding. When a resolved package's feature F is active,
     // it may forward features to its dependencies (Cargo `[features] F =
@@ -1037,10 +656,11 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
     // spec.features) and activation (recordDependencyEdge stores spec.features on
     // the P->D edge, which aggregatedRequest unions and apply() activates).
     // Transitive forwarding rides the BFS forward edge (root -> mid -> leaf).
-    auto injectForwards = [](const mcpp::manifest::Manifest& parent,
-                             const std::vector<std::string>& parentActive,
-                             const std::string& childKey,
-                             mcpp::manifest::DependencySpec& childSpec) {
+static void injectForwards(
+        const mcpp::manifest::Manifest& parent,
+        const std::vector<std::string>& parentActive,
+        const std::string& childKey,
+        mcpp::manifest::DependencySpec& childSpec) {
         if (parent.featureForwards.empty()) return;
         for (auto const& f : parentActive) {
             auto it = parent.featureForwards.find(f);
@@ -1052,23 +672,10 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                     childSpec.features.push_back(depFeat);
             }
         }
-    };
-    // #243: a forward whose active feature targets a dependency that is not
-    // declared is a manifest bug — name it instead of silently dropping. Only
-    // active features' forwards are checked (lazy, like the
-    // unknown-requested-feature gate at ~2875).
-    //
-    // THE VALIDATOR ASKS WHAT THE FORWARD LANGUAGE DEFINES: IS THE KEY DECLARED
-    // IN ANY DEPENDENCY TABLE OF THIS MANIFEST, ON ANY ROW, UNDER ANY FEATURE
-    // (#647 E4.1). It used to look in `dependencies` and `devDependencies`
-    // only, while `injectForwards` applies a forward to the build-dependency
-    // edge as well, so a forward along `[build-dependencies]` was applied and
-    // reported as undeclared in the same run, and `--strict` refused a build
-    // whose forward had worked. A key declared only for another row, or only
-    // under an inactive feature, is declared: on this row the forward reaches
-    // no edge and does nothing, which is what a portable manifest means by it.
-    auto declaresDependencyKey = [](const mcpp::manifest::Manifest& pm,
-                                    const std::string& key) {
+}
+
+static bool declaresDependencyKey(const mcpp::manifest::Manifest& pm,
+                                  const std::string& key) {
         auto inFeatureDeps = [&](const auto& byFeature) {
             for (auto const& [f, deps] : byFeature)
                 if (deps.contains(key)) return true;
@@ -1083,11 +690,27 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 || inFeatureDeps(cc.featureDeps))
                 return true;
         return false;
-    };
-    auto validateForwards = [&](const mcpp::manifest::Manifest& parent,
-                                const std::vector<std::string>& parentActive,
-                                std::string_view parentName)
-        -> std::expected<void, std::string> {
+}
+
+    // #243: a forward whose active feature targets a dependency that is not
+    // declared is a manifest bug — name it instead of silently dropping. Only
+    // active features' forwards are checked (lazy, like the
+    // unknown-requested-feature gate at ~2875).
+    //
+    // THE VALIDATOR ASKS WHAT THE FORWARD LANGUAGE DEFINES: IS THE KEY DECLARED
+    // IN ANY DEPENDENCY TABLE OF THIS MANIFEST, ON ANY ROW, UNDER ANY FEATURE
+    // (#647 E4.1). It used to look in `dependencies` and `devDependencies`
+    // only, while `injectForwards` applies a forward to the build-dependency
+    // edge as well, so a forward along `[build-dependencies]` was applied and
+    // reported as undeclared in the same run, and `--strict` refused a build
+    // whose forward had worked. A key declared only for another row, or only
+    // under an inactive feature, is declared: on this row the forward reaches
+    // no edge and does nothing, which is what a portable manifest means by it.
+static std::expected<void, std::string> validateForwards(
+        PrepareState& state,
+        const mcpp::manifest::Manifest& parent,
+        const std::vector<std::string>& parentActive,
+        std::string_view parentName) {
         for (auto const& f : parentActive) {
             auto it = parent.featureForwards.find(f);
             if (it == parent.featureForwards.end()) continue;
@@ -1103,93 +726,19 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             }
         }
         return {};
-    };
-
-    // Pull the root package's active feature-deps into its dependency set before
-    // seeding, so `mcpp build --features X` resolves X's optional deps.
-    state.rootReq = parse_feature_request(state.overrides.features);
-    if (auto fm = mergeActiveFeatureDeps(*state.m, state.rootReq); !fm)
-        return std::unexpected(fm.error());
-    // #243: the root's active features may forward features to its direct deps.
-    std::vector<std::string> rootActive = feature_closure(*state.m, state.rootReq, true);
-    if (auto fe = validateForwards(*state.m, rootActive, state.m->package.name); !fe)
-        return std::unexpected(fe.error());
-    state.activeFeaturesByPackage.assign(1, rootActive);
-
-    // `--features <dependency key>/<feature>` (#649 E8): a forward of the root,
-    // applied to the edges exactly as a `[features]` forward is and checked
-    // against the same tables. Named whether or not the root declares
-    // `[features]`: the token cannot be a macro of the root, so there is no
-    // "pure macro usage" to preserve for it.
-    std::vector<std::pair<std::string, std::string>> cliForwards;
-    for (auto const& tok : feature_forward_request_tokens(state.overrides.features)) {
-        auto fwd = mcpp::pm::split_feature_forward_token(tok);
-        std::string msg;
-        if (!fwd)
-            msg = std::format("--features requests '{}', which names neither a "
-                              "feature nor `<dependency>/<feature>`", tok);
-        else if (!declaresDependencyKey(*state.m, fwd->first))
-            msg = std::format("--features requests '{}', and no dependency table "
-                              "of '{}' declares '{}'", tok, state.m->package.name,
-                              fwd->first);
-        if (!msg.empty()) {
-            if (state.overrides.strict) return std::unexpected(msg);
-            mcpp::diag::warning("features/request", msg);
-            continue;
-        }
-        cliForwards.push_back(std::move(*fwd));
-    }
-    auto injectCliForwards = [&](const std::string& childKey,
-                                 mcpp::manifest::DependencySpec& childSpec) {
-        for (auto const& [depKey, depFeat] : cliForwards)
-            if (depKey == childKey
-                && std::ranges::find(childSpec.features, depFeat)
-                       == childSpec.features.end())
-                childSpec.features.push_back(depFeat);
-    };
-
-    // Seed the worklist from the main manifest. Dev-deps only when the
-    // caller wants them; they're never propagated transitively.
-    const std::string mainPkgLabel = state.m->package.name;
-    for (auto& [n, s] : state.m->dependencies) {
-        auto req = s;
-        injectForwards(*state.m, rootActive, n, req);
-        injectCliForwards(n, req);
-        state.worklist.push_back({n, req, mainPkgLabel, req.version, kMainConsumer, {}});
-    }
-    if (state.includeDevDeps) {
-        for (auto& [n, s] : state.m->devDependencies) {
-            auto req = s;
-            injectForwards(*state.m, rootActive, n, req);
-            injectCliForwards(n, req);
-            state.worklist.push_back({n, req, mainPkgLabel + " (dev-dep)",
-                                req.version, kMainConsumer, {}, /*devOnly=*/true});
-        }
-    }
-    // `[build-dependencies]`. Parsed since 0.0.x, merged across workspace
-    // members, conditionalised by target predicate — and until now read by
-    // nothing that made a decision, so writing it produced a manifest that
-    // loaded, no diagnostic, and no effect. Seeded here, and unlike dev-deps
-    // it IS walked transitively: a build dependency's own dependencies are
-    // what make it work, and they inherit its build-only nature.
-    for (auto& [n, s] : state.m->buildDependencies) {
-        auto req = s;
-        injectForwards(*state.m, rootActive, n, req);
-        injectCliForwards(n, req);
-        state.worklist.push_back({n, req, mainPkgLabel + " (build-dep)",
-                            req.version, kMainConsumer, {}, /*devOnly=*/false,
-                            /*buildOnly=*/true});
-    }
+}
 
     // `ResolvedRecord::sourceRef` for a given declaration — see the field's
     // comment. Computed from what was AUTHORED, not from a network round
     // trip: a `branch` reference is compared by name here, and the two
     // clones it may eventually resolve to are a question `resolveSemver`-style
     // ANSWERING code, not this IDENTITY code, would have to ask.
-    auto sourceRefOf = [&](const std::string& kind,
-                           const mcpp::manifest::DependencySpec& s,
-                           const std::filesystem::path& resolveRoot,
-                           const std::string& originalConstraint) -> std::string {
+static std::string sourceRefOf(
+        PrepareState& state,
+        const std::string& kind,
+        const mcpp::manifest::DependencySpec& s,
+        const std::filesystem::path& resolveRoot,
+        const std::string& originalConstraint) {
         if (kind == "git") {
             return std::format("{}#{}={}", s.git, s.gitRefKind, s.gitRev);
         }
@@ -1204,11 +753,32 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         // "version": the constraint as authored; empty means unconstrained,
         // matching `addrset::unify`'s treatment of a bare-name claim.
         return originalConstraint.empty() ? std::string("*") : originalConstraint;
-    };
+}
 
-    while (!state.worklist.empty()) {
-        auto item = std::move(state.worklist.front());
-        state.worklist.pop_front();
+// The worklist's per-item locals that cross a step boundary within one
+// iteration (mcpp#722 / T6) -- the PrepareState pattern one level deeper:
+// a phase-local struct passed by reference to the steps of ONE worklist
+// item, the way the phase itself is passed PrepareState. Each field is
+// a local the original single-function loop body declared once and read
+// again in a later part of the same iteration.
+struct WorklistItemCtx {
+    WorkItem item;
+    std::string sourceKind;
+    ResolvedKey key;
+    // The commit a `git` dependency resolved to, carried out of the clone
+    // branch below for the cache identity.
+    std::string sourceCommit;
+    // The repository member a `git` dependency selected; empty for the
+    // repository's root package (#649 E7).
+    std::string gitMember;
+    std::filesystem::path gitMemberCloneRoot;
+    std::filesystem::path dep_root;
+    std::optional<mcpp::manifest::Manifest> dep_manifest;
+};
+
+static std::expected<void, std::string>
+step4b_resolve_identity(PrepareState& state, WorklistItemCtx& ctx) {
+    auto& item = ctx.item;
 
         const auto& name = item.name;
         auto& spec = item.spec;
@@ -1273,26 +843,20 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             return std::unexpected(r.error());
         }
 
-        ResolvedKey key{
+        auto& key = ctx.key;
+        key = ResolvedKey{
             spec.namespace_,
             spec.shortName.empty() ? name : spec.shortName,
         };
-        const std::string sourceKind =
+        auto& sourceKind = ctx.sourceKind;
+        sourceKind =
             spec.isPath()    ? "path"
             : spec.isGit()    ? "git"
             : "version";
-        // The commit a `git` dependency resolved to, carried out of the clone
-        // branch below for the cache identity.
-        std::string sourceCommit;
-        // The repository member a `git` dependency selected; empty for the
-        // repository's root package (#649 E7).
-        std::string gitMember;
-        std::filesystem::path gitMemberCloneRoot;
-
         // A second key over a source that is already resolved takes the
         // identity resolved there; its manifest is not loaded again.
         if (sourceKind != "version") {
-            const auto source = sourceRefOf(sourceKind, spec, item.resolveRoot,
+            const auto source = sourceRefOf(state, sourceKind, spec, item.resolveRoot,
                                             item.originalConstraint);
             // A key naming another package of the same repository is that
             // member, not a second key over the root's identity (#649 E7).
@@ -1325,112 +889,18 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             }
         }
 
-        if (auto it = state.resolved.find(key); it != state.resolved.end()) {
-            // A package is dev-only until some non-dev consumer wants it. Order
-            // of arrival must not decide, so this is an AND over every request.
-            it->second.devOnly = it->second.devOnly && item.devOnly;
-            // Conflict detection: a KIND clash (`path`/`git`/`version` differ).
-            // Rows 4 and 5 of the decision table in the 2026-09-13-630 record
-            // §2.2. Two non-root requesters keep the outright refusal (row
-            // 5); when the root is a party, its declaration wins instead
-            // (row 4) — a whole-graph choice of WHICH checkout an identity
-            // resolves to is exactly the kind of decision
-            // `DependencySpec::linkage` already reserves to the root's own
-            // edges (dep_spec.cppm).
-            if (it->second.source != sourceKind) {
-                const bool existingIsRoot = it->second.fromRoot;
-                const bool incomingIsRoot = item.consumerDepIndex == kMainConsumer;
+    return {};
+}
 
-                if (!existingIsRoot && !incomingIsRoot) {
-                    return std::unexpected(std::format(
-                        "dependency '{}{}{}' is requested as both a {} dep "
-                        "(by '{}') and a {} dep (by '{}'). Pick one.\n"
-                        "       declare '{}{}{}' in the root to settle it.",
-                        key.ns, key.ns.empty() ? "" : ".", key.shortName,
-                        it->second.source, it->second.requestedBy,
-                        sourceKind, item.requestedBy,
-                        key.ns, key.ns.empty() ? "" : ".", key.shortName));
-                }
-                if (incomingIsRoot && !existingIsRoot) {
-                    // FIFO SEEDING MAKES THIS UNREACHABLE. Every root-declared
-                    // identity is pushed onto `worklist` before this loop
-                    // starts; a transitive dependency's request is pushed
-                    // onto the BACK of the same deque while the loop runs.
-                    // The root's own entry for any identity is therefore
-                    // always dequeued — and resolved — before any
-                    // dependency's request for that identity can arrive. If
-                    // this branch is ever reached, the invariant broke
-                    // upstream (the seed reordered, or a new seed source was
-                    // added after the loop starts): refusing and naming the
-                    // invariant is safer than silently letting whichever side
-                    // arrived first win, which is the accident #630 reports.
-                    return std::unexpected(std::format(
-                        "internal: dependency '{}{}{}': the root's "
-                        "declaration arrived after '{}' had already resolved "
-                        "it. This is unreachable under first-in-first-out "
-                        "worklist seeding; please report this as an mcpp "
-                        "engine defect.",
-                        key.ns, key.ns.empty() ? "" : ".", key.shortName,
-                        it->second.requestedBy));
-                }
+static std::expected<void, std::string>
+step4b_identity_version_merge(PrepareState& state, WorklistItemCtx& ctx,
+                               std::map<ResolvedKey, ResolvedRecord>::iterator it) {
+    auto& item = ctx.item;
+    auto& name = item.name;
+    auto& spec = item.spec;
+    auto& key = ctx.key;
+    auto& sourceKind = ctx.sourceKind;
 
-                // The root already holds this identity (existingIsRoot); the
-                // incoming, non-root declaration is overridden. When the
-                // OVERRIDDEN declaration is a version requirement, it is
-                // still a promise about the graph and is checked against
-                // what the root's checkout actually is — the same
-                // Holds/Violated test `addrset::unify` runs for a tool pin
-                // (address_set.cppm).
-                if (sourceKind == "version") {
-                    const std::string winnerVersion = it->second.source == "version"
-                        ? it->second.version
-                        : (it->second.depIndex < state.dep_manifests.size()
-                               ? state.dep_manifests[it->second.depIndex]->package.version
-                               : std::string{});
-                    auto req = mcpp::version_req::parse_req(item.originalConstraint);
-                    auto ver = mcpp::version_req::parse_version(winnerVersion);
-                    // An unparseable requirement or checkout version is
-                    // reported as an override below rather than refused: a
-                    // refusal manufactured from ignorance is worse than the
-                    // silent override it would be preventing (the same
-                    // reasoning `addrset::check` states for an unparseable
-                    // spelling).
-                    if (req && ver && !mcpp::version_req::matches(*req, *ver)) {
-                        return std::unexpected(std::format(
-                            "'{}{}{}' is pinned to {} (version {}) by '{}', "
-                            "and '{}' requires {}.\n"
-                            "       One checkout of a package is used, so the "
-                            "two cannot both hold.\n"
-                            "       fix: relax the requirement, or point the "
-                            "root's pin at a checkout satisfying it.",
-                            key.ns, key.ns.empty() ? "" : ".", key.shortName,
-                            it->second.sourceRef, winnerVersion,
-                            it->second.requestedBy,
-                            item.requestedBy, item.originalConstraint));
-                    }
-                }
-
-                mcpp::diag::warning("dependency/source-override", std::format(
-                    "'{}{}{}' is declared as a {} dep (by '{}', {}) and as a "
-                    "{} dep (by '{}', {}); the root's declaration wins.",
-                    key.ns, key.ns.empty() ? "" : ".", key.shortName,
-                    it->second.source, it->second.requestedBy, it->second.sourceRef,
-                    sourceKind, item.requestedBy,
-                    sourceKind == "version" ? item.originalConstraint
-                                            : sourceRefOf(sourceKind, spec,
-                                                          item.resolveRoot,
-                                                          item.originalConstraint)),
-                    std::format("declare '{}{}{}' in the root to choose the other.",
-                        key.ns, key.ns.empty() ? "" : ".", key.shortName));
-
-                if (it->second.depIndex + 1 < state.packages.size()) {
-                    recordDependencyEdge(item.consumerDepIndex,
-                                         it->second.depIndex + 1,
-                                         spec, item.buildOnly, name);
-                }
-                continue;
-            }
-            if (sourceKind == "version" && it->second.version != spec.version) {
                 // SemVer merge attempt: AND-combine the two original
                 // constraint strings and ask the index for a single version
                 // satisfying both. Same-major caret/tilde/exact pairs that
@@ -1592,12 +1062,12 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                         .sourceKind  = "version",
                     });
                     const auto depPackageIndex = state.packages.size();
-                    auto secPackage = makePackageRoot(secStage, *state.dep_manifests.back());
+                    auto secPackage = makePackageRoot(state, secStage, *state.dep_manifests.back());
                     if (!secPackage) return std::unexpected(secPackage.error());
                     state.packages.push_back(std::move(*secPackage));
-                    recordDependencyEdge(item.consumerDepIndex, depPackageIndex,
+                    recordDependencyEdge(state, item.consumerDepIndex, depPackageIndex,
                                          spec, item.buildOnly, name);
-                    auto linkFlagsAdded = propagateLinkFlags(secStage, *state.dep_manifests.back());
+                    auto linkFlagsAdded = propagateLinkFlags(state, secStage, *state.dep_manifests.back());
 
                     ResolvedKey mangledKey{key.ns, mangledPackage};
                     state.resolved[mangledKey] = ResolvedRecord{
@@ -1621,7 +1091,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                         std::format("{} v{} ↔ v{} → {} (cross-major fallback)",
                             moduleName, it->second.version, spec.version,
                             mangledModule));
-                    continue;
+                    return {};
                 }
 
                 // Combine the constraint strings so future merges AND with
@@ -1637,10 +1107,10 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 if (*merged == it->second.version) {
                     // The existing pin already satisfies the new constraint —
                     // no re-fetch needed; just record this consumer edge.
-                    recordDependencyEdge(item.consumerDepIndex,
+                    recordDependencyEdge(state, item.consumerDepIndex,
                                          it->second.depIndex + 1,
                                          spec, item.buildOnly, name);
-                    continue;
+                    return {};
                 }
 
                 // Merged version differs from the previously-pinned one.
@@ -1686,18 +1156,18 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 newManifest.package.sourceProvenance = std::format(
                     "index+{}@{}", state.cache_index_name(key.ns), *merged);
 
-                removeLinkFlags(it->second.linkFlagsAdded);
-                auto linkFlagsAdded = propagateLinkFlags(newRoot, newManifest);
+                removeLinkFlags(state, it->second.linkFlagsAdded);
+                auto linkFlagsAdded = propagateLinkFlags(state, newRoot, newManifest);
 
                 // Replace in dep_manifests + packages. depIndex is the slot
                 // in dep_manifests; packages = [main, dep_0, dep_1, …], so
                 // packages[depIndex+1] is the same dep.
                 *state.dep_manifests[it->second.depIndex] = std::move(newManifest);
                 auto mergedPackage =
-                    makePackageRoot(newRoot, *state.dep_manifests[it->second.depIndex]);
+                    makePackageRoot(state, newRoot, *state.dep_manifests[it->second.depIndex]);
                 if (!mergedPackage) return std::unexpected(mergedPackage.error());
                 state.packages[it->second.depIndex + 1] = std::move(*mergedPackage);
-                recordDependencyEdge(item.consumerDepIndex,
+                recordDependencyEdge(state, item.consumerDepIndex,
                                      it->second.depIndex + 1,
                                      spec, item.buildOnly, name);
 
@@ -1718,7 +1188,127 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                                         child_spec.version,
                                         it->second.depIndex, {}, item.devOnly});
                 }
-                continue;
+                return {};
+    return {};
+}
+
+static std::expected<void, std::string>
+step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
+                                std::map<ResolvedKey, ResolvedRecord>::iterator it) {
+    auto& item = ctx.item;
+    auto& name = item.name;
+    auto& spec = item.spec;
+    auto& key = ctx.key;
+    auto& sourceKind = ctx.sourceKind;
+
+            // A package is dev-only until some non-dev consumer wants it. Order
+            // of arrival must not decide, so this is an AND over every request.
+            it->second.devOnly = it->second.devOnly && item.devOnly;
+            // Conflict detection: a KIND clash (`path`/`git`/`version` differ).
+            // Rows 4 and 5 of the decision table in the 2026-09-13-630 record
+            // §2.2. Two non-root requesters keep the outright refusal (row
+            // 5); when the root is a party, its declaration wins instead
+            // (row 4) — a whole-graph choice of WHICH checkout an identity
+            // resolves to is exactly the kind of decision
+            // `DependencySpec::linkage` already reserves to the root's own
+            // edges (dep_spec.cppm).
+            if (it->second.source != sourceKind) {
+                const bool existingIsRoot = it->second.fromRoot;
+                const bool incomingIsRoot = item.consumerDepIndex == kMainConsumer;
+
+                if (!existingIsRoot && !incomingIsRoot) {
+                    return std::unexpected(std::format(
+                        "dependency '{}{}{}' is requested as both a {} dep "
+                        "(by '{}') and a {} dep (by '{}'). Pick one.\n"
+                        "       declare '{}{}{}' in the root to settle it.",
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                        it->second.source, it->second.requestedBy,
+                        sourceKind, item.requestedBy,
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName));
+                }
+                if (incomingIsRoot && !existingIsRoot) {
+                    // FIFO SEEDING MAKES THIS UNREACHABLE. Every root-declared
+                    // identity is pushed onto `worklist` before this loop
+                    // starts; a transitive dependency's request is pushed
+                    // onto the BACK of the same deque while the loop runs.
+                    // The root's own entry for any identity is therefore
+                    // always dequeued — and resolved — before any
+                    // dependency's request for that identity can arrive. If
+                    // this branch is ever reached, the invariant broke
+                    // upstream (the seed reordered, or a new seed source was
+                    // added after the loop starts): refusing and naming the
+                    // invariant is safer than silently letting whichever side
+                    // arrived first win, which is the accident #630 reports.
+                    return std::unexpected(std::format(
+                        "internal: dependency '{}{}{}': the root's "
+                        "declaration arrived after '{}' had already resolved "
+                        "it. This is unreachable under first-in-first-out "
+                        "worklist seeding; please report this as an mcpp "
+                        "engine defect.",
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                        it->second.requestedBy));
+                }
+
+                // The root already holds this identity (existingIsRoot); the
+                // incoming, non-root declaration is overridden. When the
+                // OVERRIDDEN declaration is a version requirement, it is
+                // still a promise about the graph and is checked against
+                // what the root's checkout actually is — the same
+                // Holds/Violated test `addrset::unify` runs for a tool pin
+                // (address_set.cppm).
+                if (sourceKind == "version") {
+                    const std::string winnerVersion = it->second.source == "version"
+                        ? it->second.version
+                        : (it->second.depIndex < state.dep_manifests.size()
+                               ? state.dep_manifests[it->second.depIndex]->package.version
+                               : std::string{});
+                    auto req = mcpp::version_req::parse_req(item.originalConstraint);
+                    auto ver = mcpp::version_req::parse_version(winnerVersion);
+                    // An unparseable requirement or checkout version is
+                    // reported as an override below rather than refused: a
+                    // refusal manufactured from ignorance is worse than the
+                    // silent override it would be preventing (the same
+                    // reasoning `addrset::check` states for an unparseable
+                    // spelling).
+                    if (req && ver && !mcpp::version_req::matches(*req, *ver)) {
+                        return std::unexpected(std::format(
+                            "'{}{}{}' is pinned to {} (version {}) by '{}', "
+                            "and '{}' requires {}.\n"
+                            "       One checkout of a package is used, so the "
+                            "two cannot both hold.\n"
+                            "       fix: relax the requirement, or point the "
+                            "root's pin at a checkout satisfying it.",
+                            key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                            it->second.sourceRef, winnerVersion,
+                            it->second.requestedBy,
+                            item.requestedBy, item.originalConstraint));
+                    }
+                }
+
+                mcpp::diag::warning("dependency/source-override", std::format(
+                    "'{}{}{}' is declared as a {} dep (by '{}', {}) and as a "
+                    "{} dep (by '{}', {}); the root's declaration wins.",
+                    key.ns, key.ns.empty() ? "" : ".", key.shortName,
+                    it->second.source, it->second.requestedBy, it->second.sourceRef,
+                    sourceKind, item.requestedBy,
+                    sourceKind == "version" ? item.originalConstraint
+                                            : sourceRefOf(state, sourceKind, spec,
+                                                          item.resolveRoot,
+                                                          item.originalConstraint)),
+                    std::format("declare '{}{}{}' in the root to choose the other.",
+                        key.ns, key.ns.empty() ? "" : ".", key.shortName));
+
+                if (it->second.depIndex + 1 < state.packages.size()) {
+                    recordDependencyEdge(state, item.consumerDepIndex,
+                                         it->second.depIndex + 1,
+                                         spec, item.buildOnly, name);
+                }
+                return {};
+            }
+            if (sourceKind == "version" && it->second.version != spec.version) {
+                if (auto r = step4b_identity_version_merge(state, ctx, it); !r)
+                    return std::unexpected(r.error());
+                return {};
             }
             // SAME kind, possibly DIFFERENT reference: two `git` declarations
             // of different rev/tag/branch, or two `path` declarations of
@@ -1731,7 +1321,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             // order").
             if (sourceKind != "version") {
                 const std::string incomingRef =
-                    sourceRefOf(sourceKind, spec, item.resolveRoot, item.originalConstraint);
+                    sourceRefOf(state, sourceKind, spec, item.resolveRoot, item.originalConstraint);
                 if (incomingRef != it->second.sourceRef) {
                     const bool existingIsRoot = it->second.fromRoot;
                     const bool incomingIsRoot = item.consumerDepIndex == kMainConsumer;
@@ -1776,14 +1366,25 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             // consumers can need the same dep's public surface even though
             // the dep itself is fetched/scanned once.
             if (it->second.depIndex + 1 < state.packages.size()) {
-                recordDependencyEdge(item.consumerDepIndex,
+                recordDependencyEdge(state, item.consumerDepIndex,
                                      it->second.depIndex + 1,
                                      spec, item.buildOnly, name);
             }
-            continue;
-        }
+            return {};
+    return {};
+}
 
-        std::filesystem::path dep_root;
+static std::expected<void, std::string>
+step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
+    auto& item = ctx.item;
+    auto& name = item.name;
+    auto& spec = item.spec;
+    auto& key = ctx.key;
+    auto& sourceCommit = ctx.sourceCommit;
+    auto& gitMember = ctx.gitMember;
+    auto& gitMemberCloneRoot = ctx.gitMemberCloneRoot;
+
+        auto& dep_root = ctx.dep_root;
 
         if (spec.isPath()) {
             // Path-based: resolve relative to the consumer's root dir.
@@ -1961,7 +1562,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             sourceCommit = resolvedGitRev;
             dep_root = gitRoot;
             state.gitCloneBySource.try_emplace(
-                sourceRefOf("git", spec, item.resolveRoot, item.originalConstraint),
+                sourceRefOf(state, "git", spec, item.resolveRoot, item.originalConstraint),
                 GitClone{ gitRoot, spec.git, spec.gitRefKind, spec.gitRev });
             if (auto member = state.gitMemberDeclaring(gitRoot, key)) {
                 gitMember = *member;
@@ -1977,7 +1578,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         //   - Version dep: delegate to loadVersionDep — the index entry's
         //     `mcpp` field decides where mcpp.toml lives (StringPath /
         //     TableBody / default lookup).
-        std::optional<mcpp::manifest::Manifest> dep_manifest;
+        auto& dep_manifest = ctx.dep_manifest;
         if (spec.isPath() || spec.isGit()) {
             if (!std::filesystem::exists(dep_root / "mcpp.toml")) {
                 return std::unexpected(std::format(
@@ -2054,24 +1655,36 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             dep_root     = std::move(loaded->first);
             dep_manifest = std::move(loaded->second);
         }
+    return {};
+}
+
+static std::expected<void, std::string>
+step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
+    auto& item = ctx.item;
+    auto& name = item.name;
+    auto& spec = item.spec;
+    auto& key = ctx.key;
+    auto& sourceKind = ctx.sourceKind;
+    auto& sourceCommit = ctx.sourceCommit;
+    auto& gitMember = ctx.gitMember;
 
         // Name match via compat::resolve_package_name — handles both
         // canonical (explicit namespace field) and legacy (dotted name)
         // forms transparently.
         {
             auto resolved = mcpp::pm::compat::resolve_package_name(
-                dep_manifest->package.name, dep_manifest->package.namespace_);
+                ctx.dep_manifest->package.name, ctx.dep_manifest->package.namespace_);
             const std::string& expectedShort =
                 spec.shortName.empty() ? name : spec.shortName;
             const bool nameOk =
                 resolved.shortName == expectedShort
-                || dep_manifest->package.name == expectedShort
-                || dep_manifest->package.name ==
+                || ctx.dep_manifest->package.name == expectedShort
+                || ctx.dep_manifest->package.name ==
                     mcpp::pm::compat::qualified_name(spec.namespace_, expectedShort);
             if (!nameOk) {
                 return std::unexpected(std::format(
                     "dependency '{}' resolved to package '{}' (mismatch with declared name '{}')",
-                    name, dep_manifest->package.name, expectedShort));
+                    name, ctx.dep_manifest->package.name, expectedShort));
             }
         }
 
@@ -2081,14 +1694,14 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         // resolved as `mcpplibs.fw` while every reader that builds a name from
         // the manifest saw `huxdemo.fw`, and a second edge written
         // `huxdemo.fw` put the same sources into the build twice.
-        const bool namespaceDeclared = !dep_manifest->package.namespace_.empty();
+        const bool namespaceDeclared = !ctx.dep_manifest->package.namespace_.empty();
         const std::string manifestPath = sourceKind == "version"
             ? std::string{}
-            : (dep_root / "mcpp.toml").lexically_normal().generic_string();
+            : (ctx.dep_root / "mcpp.toml").lexically_normal().generic_string();
         if (sourceKind != "version" && namespaceDeclared) {
             auto declaredName = mcpp::pm::compat::resolve_package_name(
-                dep_manifest->package.name, dep_manifest->package.namespace_);
-            ResolvedKey declared{ dep_manifest->package.namespace_,
+                ctx.dep_manifest->package.name, ctx.dep_manifest->package.namespace_);
+            ResolvedKey declared{ ctx.dep_manifest->package.namespace_,
                                   declaredName.shortName };
             if (!(declared == key)) {
                 state.reportAdoption(item.requestedBy, name, key, declared, manifestPath);
@@ -2107,7 +1720,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                     item.spec.legacyCandidateSearch = false;
                     item.spec.legacyDottedKey = false;
                     state.worklist.push_front(std::move(item));
-                    continue;
+                    return {};
                 }
                 key = declared;
             }
@@ -2118,26 +1731,26 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         // answered it; otherwise two indices containing the same short name
         // collapse in runtime provenance even though resolution distinguished
         // them correctly.
-        if (dep_manifest->package.namespace_.empty()) {
-            dep_manifest->package.namespace_ = key.ns.empty()
+        if (ctx.dep_manifest->package.namespace_.empty()) {
+            ctx.dep_manifest->package.namespace_ = key.ns.empty()
                 ? std::string(mcpp::pm::kDefaultNamespace) : key.ns;
         }
         if (sourceKind == "version") {
-            dep_manifest->package.sourceProvenance = std::format(
+            ctx.dep_manifest->package.sourceProvenance = std::format(
                 "index+{}@{}", state.cache_index_name(key.ns), spec.version);
         } else if (sourceKind == "git") {
-            dep_manifest->package.sourceProvenance = std::format(
+            ctx.dep_manifest->package.sourceProvenance = std::format(
                 "git+{}#{}={}", spec.git, spec.gitRefKind, spec.gitRev);
         } else {
-            dep_manifest->package.sourceProvenance =
-                "path+" + dep_root.lexically_normal().generic_string();
+            ctx.dep_manifest->package.sourceProvenance =
+                "path+" + ctx.dep_root.lexically_normal().generic_string();
         }
 
         // Stage 2a: merge this dependency's active feature-deps into its own
         // dependency set before its children are pushed, so a dep's feature can
         // transitively pull a provider. `spec.features` = features the consumer
         // requested for this dep.
-        if (auto fm = mergeActiveFeatureDeps(*dep_manifest, spec.features,
+        if (auto fm = mergeActiveFeatureDeps(*ctx.dep_manifest, spec.features,
                                              spec.defaultFeatures); !fm)
             return std::unexpected(fm.error());
 
@@ -2149,16 +1762,16 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         // application `z.o`), compiled its sources in the consumer's build, and
         // made a tool that depends on the package declaring it a cycle of the
         // consumer's graph although the two builds never meet.
-        const bool depProgramOnly = state.isProgramOnlyPackage(*dep_manifest)
+        const bool depProgramOnly = state.isProgramOnlyPackage(*ctx.dep_manifest)
                                  && spec.artifacts.empty();
         auto linkFlagsAdded = depProgramOnly
             ? std::vector<std::string>{}
-            : propagateLinkFlags(dep_root, *dep_manifest);
+            : propagateLinkFlags(state, ctx.dep_root, *ctx.dep_manifest);
 
         // Move the manifest into stable storage so we can later look it up
         // by depIndex (the SemVer merger needs to overwrite the slot).
         state.dep_manifests.push_back(
-            std::make_unique<mcpp::manifest::Manifest>(std::move(*dep_manifest)));
+            std::make_unique<mcpp::manifest::Manifest>(std::move(*ctx.dep_manifest)));
         state.dep_cache_identities.push_back({
             .indexName   = state.cache_index_name(key.ns),
             .packageName = name,
@@ -2167,21 +1780,21 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 : state.dep_manifests.back()->package.version,
             .sourceKind  = sourceKind,
             .sourceRef   = sourceKind == "git"  ? sourceCommit
-                         : sourceKind == "path" ? dep_root.string()
+                         : sourceKind == "path" ? ctx.dep_root.string()
                          : std::string{},
         });
         const auto depPackageIndex = state.packages.size();
-        auto depPackage = makePackageRoot(dep_root, *state.dep_manifests.back());
+        auto depPackage = makePackageRoot(state, ctx.dep_root, *state.dep_manifests.back());
         if (!depPackage) return std::unexpected(depPackage.error());
         state.packages.push_back(std::move(*depPackage));
-        recordDependencyEdge(item.consumerDepIndex, depPackageIndex, spec,
+        recordDependencyEdge(state, item.consumerDepIndex, depPackageIndex, spec,
                              item.buildOnly, name);
 
         // Record this dep as resolved so future encounters of the same
         // (ns, name) hit the fast path (skip / merge / conflict).
         if (sourceKind != "version") {
             state.identityBySource.emplace(
-                sourceRefOf(sourceKind, spec, item.resolveRoot, item.originalConstraint)
+                sourceRefOf(state, sourceKind, spec, item.resolveRoot, item.originalConstraint)
                     + (gitMember.empty() ? std::string{} : "#member=" + gitMember),
                 key);
             state.declaringManifest[key] = DeclaringManifest{ manifestPath, namespaceDeclared };
@@ -2191,7 +1804,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             .constraint        = sourceKind == "version" ? item.originalConstraint : "",
             .requestedBy       = item.requestedBy,
             .source            = sourceKind,
-            .sourceRef         = sourceRefOf(sourceKind, spec, item.resolveRoot,
+            .sourceRef         = sourceRefOf(state, sourceKind, spec, item.resolveRoot,
                                              item.originalConstraint),
             .fromRoot          = item.consumerDepIndex == kMainConsumer,
             .devOnly           = item.devOnly,
@@ -2203,7 +1816,7 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         // dev-dependencies are intentionally NOT walked — those are
         // private to the dep's test runs, not part of its public ABI.
         // A package of programs is not walked at all; see `depProgramOnly`.
-        if (depProgramOnly) continue;
+        if (depProgramOnly) return {};
         const std::string thisDepLabel = std::format(
             "{}{}{}@{}",
             key.ns,
@@ -2219,14 +1832,14 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
         // with resolution.
         auto depActive = feature_closure(*state.dep_manifests.back(), spec.features,
                                          spec.defaultFeatures);
-        if (auto fe = validateForwards(*state.dep_manifests.back(), depActive,
+        if (auto fe = validateForwards(state, *state.dep_manifests.back(), depActive,
                                        state.dep_manifests.back()->package.name); !fe)
             return std::unexpected(fe.error());
         for (auto& [child_name, child_spec] : state.dep_manifests.back()->dependencies) {
             auto childReq = child_spec;
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
             state.worklist.push_back({child_name, childReq, thisDepLabel,
-                                childReq.version, selfIdx, dep_root,
+                                childReq.version, selfIdx, ctx.dep_root,
                                 item.devOnly, item.buildOnly});
         }
         // A dependency's own `[build-dependencies]` — the only channel through
@@ -2245,11 +1858,13 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
             state.worklist.push_back({child_name, childReq,
                                 thisDepLabel + " (build-dep)",
-                                childReq.version, selfIdx, dep_root,
+                                childReq.version, selfIdx, ctx.dep_root,
                                 item.devOnly, /*buildOnly=*/true});
         }
-    }
+    return {};
+}
 
+static std::expected<void, std::string> step4b_cycle_check(PrepareState& state) {
     // ONE PLACE DETECTS A CYCLE OF PACKAGES, AND IT IS HERE, WHERE THE GRAPH
     // IS RESOLVED (#649 E6). The build-cache key walk was the only reader that
     // noticed, and it runs for the global cache only, so the same manifest was
@@ -2297,6 +1912,530 @@ std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
                 "own tool sub-build.", path));
         }
     }
+    return {};
+}
+
+static void step4b_define_lookup_closures(PrepareState& state) {
+    state.bareBindingsFor = [&](std::size_t consumer) {
+        std::vector<std::string> fqns;
+        if (consumer < state.provisionGraph.visible.size())
+            for (auto const& pr : state.provisionGraph.visible[consumer]) {
+                if (pr.provider >= state.packages.size()) continue;
+                auto const& n = state.packages[pr.provider].manifest.package.name;
+                if (std::find(fqns.begin(), fqns.end(), n) == fqns.end())
+                    fqns.push_back(n);
+            }
+        return prov::bind_bare_names(fqns);
+    };
+    // THE NAMES UNDER WHICH ONE PROVIDER IS PUBLISHED TO ONE CONSUMER, derived
+    // once for every channel (#647 E4.3). The manifest's `name`, the qualified
+    // `namespace.name` when the manifest writes the two apart, and the bare
+    // tail where the namespace ladder binds it to this provider for this
+    // consumer. `dep_dir`/`dep_linkage` and `dep_bin` used to derive this list
+    // separately; #642 added the qualified spelling to the first and the second
+    // kept publishing `MCPP_DEP_INSTALLER_BIN_*` alone for a package written
+    // `namespace = "spike"`, `name = "installer"`, so
+    // `dep_bin("spike.installer", ...)` read nothing.
+    state.publishedNamesFor =
+        [&](std::size_t provider,
+            const std::map<std::string, prov::BareBinding>& bind) {
+        std::vector<std::string> out;
+        auto const& manifest = state.packages[provider].manifest;
+        auto const& canon = manifest.package.name;
+        out.push_back(canon);
+        if (auto qualified = mcpp::build::qualified_package_name(manifest);
+            qualified != canon)
+            out.push_back(std::move(qualified));
+        if (auto tail = prov::tail_of(canon); tail != canon) {
+            auto it = bind.find(tail);
+            if (it != bind.end() && it->second.owner == canon)
+                out.push_back(std::move(tail));
+        }
+        return out;
+    };
+
+    // A package whose DECLARED targets are all programs (#649 E6). See the
+    // worklist, where such a package is not walked into a consumer's graph.
+    state.isProgramOnlyPackage = [](const mcpp::manifest::Manifest& pm) {
+        if (pm.targetsInferred || pm.targets.empty()) return false;
+        return std::ranges::none_of(pm.targets, [](const mcpp::manifest::Target& t) {
+            return t.kind == mcpp::manifest::Target::Library
+                || t.kind == mcpp::manifest::Target::SharedLibrary;
+        });
+    };
+    // A package some edge asked for programs to SHIP (mcpp#711). Its programs
+    // are linked in this plan, so it is scanned and configured here like any
+    // library dependency, even when every target it declares is a program.
+    state.isArtifactPackage = [&](std::size_t i) {
+        return std::ranges::any_of(state.dependencyEdges, [&](const DependencyEdge& e) {
+            return e.dependencyPackageIndex == i && !e.requestedArtifacts.empty();
+        });
+    };
+    // Compiled in this plan: not a package of programs, or one whose programs
+    // this plan ships.
+    state.compilesHere = [&](std::size_t i) {
+        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest) || state.isArtifactPackage(i);
+    };
+
+
+    state.appendUniquePath =
+        [](std::vector<std::filesystem::path>& dirs,
+           const std::filesystem::path& dir) -> bool
+    {
+        if (std::find(dirs.begin(), dirs.end(), dir) != dirs.end()) return false;
+        dirs.push_back(dir);
+        return true;
+    };
+
+    state.appendUniquePaths =
+        [&](std::vector<std::filesystem::path>& dirs,
+            const std::vector<std::filesystem::path>& additions) -> bool
+    {
+        bool changed = false;
+        for (auto const& dir : additions) {
+            changed = state.appendUniquePath(dirs, dir) || changed;
+        }
+        return changed;
+    };
+
+    // "Which compile-visible channels a build.mcpp directive lands in" is a
+    // property of the DIRECTIVE TABLE, not of this call site, so both the mark
+    // and the fold now live with the table in mcpp.build.directives. This pair
+    // used to be defined here and was already incomplete — the comment it
+    // replaced admitted that link/source residues stayed at the call sites,
+    // which is the #242 two-derivations shape.
+    //
+    // The fold is PRIVATE by design (Cargo discipline — a build-time program
+    // must not widen the package's public interface): privateBuild only, never
+    // publicUsage. The after-dirs ride the typed #249 channel, which owns the
+    // per-dialect degradations (cl.exe /I, NASM -I).
+    using DirectiveMark = mcpp::build::directives::Mark;
+    state.markDirectiveTail = [](const mcpp::manifest::Manifest& mm) {
+        return mcpp::build::directives::mark(mm);
+    };
+    state.foldDirectiveTailIntoPrivateBuild =
+        [](mcpp::modgraph::PackageRoot& pkg, const mcpp::manifest::Manifest& ran,
+           const DirectiveMark& t)
+    {
+        mcpp::build::directives::fold_private_tail(pkg.privateBuild, ran, t);
+    };
+
+    // mcpp#241: the (name → dir) pairs a package's build.mcpp receives as
+    // MCPP_DEP_<NAME>_DIR. ONE owner: the dependency loop and the root call
+    // site had drifted into two near-identical copies of this, and #355 was
+    // about to add a third. Each dependency is emitted under BOTH its
+    // canonical name and its namespace-stripped tail, so
+    // `mcpp::dep_dir("compat.zlib")` and `mcpp::dep_dir("zlib")` both resolve
+    // regardless of which spelling the author used in `deps`.
+    //
+    // #359: the set is now the consumer's VISIBLE provisions rather than its
+    // direct edges, so a re-exported dependency's directory reaches it too.
+    // That is what makes a rule package able to find data files belonging to a
+    // dependency the user never declared — protoc's well-known .proto files
+    // are exactly such a directory, and `grpcgen` reads them through dep_dir.
+    //
+    // The bare tail is emitted only when the namespace ladder binds it here.
+    // Emitting it unconditionally was safe while only the root's own
+    // declarations reached build.mcpp; with re-export, two packages that never
+    // heard of each other can share a tail and the later emplace_back would
+    // silently win.
+    // The xlings half of fillDepDirs. Same question ("where did my declared
+    // dependency's payload land"), different namespace and store layout, so it
+    // cannot ride the mcpp dependency channel — but it must be an INTERFACE on
+    // the build.mcpp side for the same reason that one is: a program that
+    // reconstructs the store path is coupled to internals mcpp is free to
+    // change. See mcpp::build::hostprogram::xpkg_dir.
+
+}
+
+static std::expected<void, std::string>
+step4b_define_provisioning_closures(PrepareState& state) {
+    // Which dependency supplied the runner, for the exactly-one-provider
+    // error below. A name rather than a bool: the message has to name both.
+    // ONE PROVIDER PER RUNNER NAME. `runner` has had this rule since #544;
+    // a NAMED runner inherits it per name, because a board may legitimately
+    // supply `flash` while a different package supplies `monitor`.
+
+    state.fillXpkgDirs = [&](mcpp::build::BuildProgramEnv& e,
+                            const mcpp::manifest::Manifest& owner,
+                            std::size_t consumer) {
+        // `[feature-xlings.<f>]` is provisioned when `<f>` is active, so it has
+        // to be answerable here too. Before this, a tool a feature declared was
+        // downloaded and installed and then `mcpp::xpkg_dir` returned "" for it
+        // — the build program was told to declare a package it had already
+        // declared, which is a diagnostic pointing at the wrong file.
+        //
+        // The set is taken from the SAME env the caller already computed, so
+        // "which features are on" is answered once. Installation stays the
+        // filter below: a declared address whose payload is absent answers "",
+        // which is what a `when = "dev"` entry looks like to a consumer.
+        std::vector<std::string> declared = owner.xlings.deps;
+        for (auto const& f : e.features)
+            if (auto it = owner.xlings.featureDeps.find(f);
+                it != owner.xlings.featureDeps.end())
+                for (auto const& address : it->second)
+                    if (std::ranges::find(declared, address) == declared.end())
+                        declared.push_back(address);
+        // …and what the rule packages compiled INTO this build program
+        // declared. Their own active features, not the consumer's: the
+        // consumer asked for `features = ["rules-cuda"]` on the edge, and that
+        // is what decides which of the rule's `[feature-xlings]` tables apply.
+        if (auto pit = state.hostModuleProvidersByConsumer.find(consumer);
+            pit != state.hostModuleProvidersByConsumer.end()) {
+            for (auto q : pit->second) {
+                if (q >= state.packages.size()) continue;
+                auto const& pm = state.packages[q].manifest;
+                auto want = [&](const std::string& address) {
+                    if (std::ranges::find(declared, address) == declared.end())
+                        declared.push_back(address);
+                };
+                for (auto const& address : pm.xlings.deps) want(address);
+                const auto& pf = q < state.activeFeaturesByPackage.size()
+                    ? state.activeFeaturesByPackage[q] : std::vector<std::string>{};
+                for (auto const& f : pf)
+                    if (auto it = pm.xlings.featureDeps.find(f);
+                        it != pm.xlings.featureDeps.end())
+                        for (auto const& address : it->second) want(address);
+            }
+        }
+        if (declared.empty()) return;
+        auto cfg = state.get_cfg(true);
+        if (!cfg) return;
+        auto xlEnv = mcpp::config::make_xlings_env(**cfg);
+        std::set<std::string> answered;
+        for (auto const& raw : declared) {
+            // THE VERSION THIS BUILD INSTALLED, NOT THE ONE THIS MANIFEST
+            // WROTE. Both statements are about one package, and only one
+            // version of it exists on disk; answering from the local spelling
+            // is how a rule package could declare `>=8.5.0`, have the project's
+            // exact pin installed instead, and then be told nothing is there.
+            // `xlingsWinner` is empty only before the split has run, and every
+            // caller of this lambda runs after it — the fallback keeps that a
+            // fact about ordering rather than a crash.
+            const auto key = mcpp::xlings::addrset::package_key(raw);
+            if (!answered.insert(key).second) continue;
+            auto wit = state.xlingsWinner.find(key);
+            const std::string spec = wit == state.xlingsWinner.end() ? raw : wit->second;
+            auto ref = mcpp::xlings::paths::parse_xpkg_ref(spec);
+            auto dir = mcpp::xlings::paths::xpkg_payload(xlEnv, ref);
+            if (!dir) continue;   // declared but not installed: "" is the answer
+            // Namespaced first — it is the exact spelling, and the bare form
+            // below must not shadow it (the receiver keeps the first value it
+            // is given for a name).
+            e.xpkgDirs.emplace_back(
+                mcpp::build::xpkg_env_var(ref.ns, ref.name), dir->string());
+            e.xpkgDirs.emplace_back(
+                mcpp::build::xpkg_env_var("", ref.name), dir->string());
+        }
+    };
+
+    // `linkForms` (#642 E2): when given, each dependency that has a resolved
+    // library form is also offered under exactly the names its directory is,
+    // so `dep_linkage(n)` answers for every `n` that `dep_dir(n)` answers for.
+    // Only the root's program passes it; see the root call site for why.
+    state.fillDepDirs = [&](mcpp::build::BuildProgramEnv& e, std::size_t consumer,
+                           const std::map<std::size_t, std::string>* linkForms = nullptr) {
+        if (consumer >= state.provisionGraph.visible.size()) return;
+        auto bind = state.bareBindingsFor(consumer);
+        for (auto const& [tail, b] : bind) {
+            if (auto note = prov::contest_note(tail, b); !note.empty())
+                mcpp::diag::warning("provisions/ambiguous", note);
+        }
+        for (auto const& pr : state.provisionGraph.visible[consumer]) {
+            if (pr.kind != prov::Kind::DepDir) continue;
+            if (pr.provider >= state.packages.size()) continue;
+            auto const& depPkg = state.packages[pr.provider];
+            auto const& canon  = depPkg.manifest.package.name;
+            const std::string* form = nullptr;
+            if (linkForms)
+                if (auto f = linkForms->find(pr.provider); f != linkForms->end())
+                    form = &f->second;
+            // Every spelling of `publishedNamesFor`: the manifest's name, the
+            // qualified name a manifest writing `namespace = "ns"` and
+            // `name = "fw"` is addressed by (#642: the framework's rule asks
+            // `dep_linkage("huxerui.huxerui")`), and the bound tail.
+            for (auto const& n : state.publishedNamesFor(pr.provider, bind)) {
+                e.depDirs.emplace_back(n, depPkg.root);
+                if (form) e.depLinkages.emplace_back(n, *form);
+            }
+        }
+    };
+
+    // A declared build-graph node's Source outputs must be visible to the
+    // scan, so they are materialized as placeholders and joined to the source
+    // set here — the same two lists `generated=` feeds, for the same reason
+    // (the scanner walks the legacy modules.sources mirror). ninja overwrites
+    // the placeholder before the compile edge runs, because that compile
+    // depends on the action's output.
+    state.adoptActionOutputs = [](mcpp::manifest::Manifest& mm,
+                                 const std::filesystem::path& pkgRoot,
+                                 std::size_t firstNewAction) {
+        if (firstNewAction >= mm.buildConfig.actions.size()) return;
+        std::vector<mcpp::manifest::BuildAction> fresh(
+            mm.buildConfig.actions.begin()
+                + static_cast<std::ptrdiff_t>(firstNewAction),
+            mm.buildConfig.actions.end());
+        // The package that DECLARED the outputs classifies them: a dependency
+        // generating a `.ixx` asks its own manifest, not the root project's.
+        // Built once per package, not once per output — and BEFORE
+        // `prepare_actions`, which needs the same table to decide which
+        // outputs get a placeholder (a header does not; see mcpp#534).
+        const auto pkgExtTable =
+            mcpp::extension_table_for(mm.buildConfig.moduleExtensions,
+                                      mm.buildConfig.deviceExtensions);
+        mcpp::build::directives::prepare_actions(fresh, pkgRoot, pkgExtTable);
+        std::copy(fresh.begin(), fresh.end(),
+                  mm.buildConfig.actions.begin()
+                      + static_cast<std::ptrdiff_t>(firstNewAction));
+        for (auto const& a : fresh) {
+            if (a.role != mcpp::manifest::BuildAction::Role::Source) continue;
+            for (auto const& o : a.outputs) {
+                if (o.find("${mcpp.") != std::string::npos) continue;
+                // Companion outputs (protoc's .pb.h next to its .pb.cc) are
+                // produced by the edge but are NOT translation units.
+                if (!mcpp::build::directives::is_compilable_output(o, pkgExtTable))
+                    continue;
+                mm.buildConfig.sources.push_back(o);
+                mm.modules.sources.push_back(o);
+            }
+        }
+    };
+
+
+    state.appendUniqueFlags =
+        [](std::vector<std::string>& flags,
+           const std::vector<std::string>& additions) -> bool
+    {
+        bool changed = false;
+        for (auto const& f : additions) {
+            if (std::find(flags.begin(), flags.end(), f) != flags.end()) continue;
+            flags.push_back(f);
+            changed = true;
+        }
+        return changed;
+    };
+
+
+
+
+
+    {
+        auto rootPackage = makePackageRoot(state, *state.root, *state.m);
+        if (!rootPackage) return std::unexpected(rootPackage.error());
+        state.packages[0] = std::move(*rootPackage);
+    }
+
+
+    state.computeUsageRequirements = [&] {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (auto const& edge : state.dependencyEdges) {
+                if (edge.consumerPackageIndex >= state.packages.size()
+                    || edge.dependencyPackageIndex >= state.packages.size()) {
+                    continue;
+                }
+                auto& consumer = state.packages[edge.consumerPackageIndex];
+                auto const& dependency = state.packages[edge.dependencyPackageIndex];
+                // A package of programs publishes no usage requirements to its
+                // consumers (#649 E6): nothing of it is compiled or linked here.
+                if (edge.dependencyPackageIndex > 0
+                    && state.isProgramOnlyPackage(dependency.manifest)) continue;
+
+                if (edge.visibility == mcpp::modgraph::DependencyVisibility::Private
+                    || edge.visibility == mcpp::modgraph::DependencyVisibility::Public) {
+                    changed = state.appendUniquePaths(consumer.privateBuild.includeDirs,
+                                                dependency.publicUsage.includeDirs)
+                              || changed;
+                    // #249: after-dirs ride the same edges but keep their
+                    // after-ness — consumers receive them as -idirafter,
+                    // never upgraded to -I.
+                    changed = state.appendUniquePaths(consumer.privateBuild.includeDirsAfter,
+                                                dependency.publicUsage.includeDirsAfter)
+                              || changed;
+                    // Interface defines (a dependency's active-feature `defines`)
+                    // ride the same edges as include dirs: they must reach the
+                    // consumer's own TUs so header-only switches like
+                    // EIGEN_USE_BLAS take effect where the headers are used.
+                    changed = state.appendUniqueFlags(consumer.privateBuild.cflags,
+                                                dependency.publicUsage.cflags)
+                              || changed;
+                    changed = state.appendUniqueFlags(consumer.privateBuild.cxxflags,
+                                                dependency.publicUsage.cxxflags)
+                              || changed;
+                }
+                if (edge.visibility == mcpp::modgraph::DependencyVisibility::Public
+                    || edge.visibility == mcpp::modgraph::DependencyVisibility::Interface) {
+                    changed = state.appendUniquePaths(consumer.publicUsage.includeDirs,
+                                                dependency.publicUsage.includeDirs)
+                              || changed;
+                    changed = state.appendUniquePaths(consumer.publicUsage.includeDirsAfter,
+                                                dependency.publicUsage.includeDirsAfter)
+                              || changed;
+                    changed = state.appendUniqueFlags(consumer.publicUsage.cflags,
+                                                dependency.publicUsage.cflags)
+                              || changed;
+                    changed = state.appendUniqueFlags(consumer.publicUsage.cxxflags,
+                                                dependency.publicUsage.cxxflags)
+                              || changed;
+                }
+            }
+        }
+    };
+
+    return {};
+}
+
+std::expected<void, std::string> phase4b_graph_worklist(PrepareState& state) {
+
+    // #634, X: every request that reached a package, as the requester wrote
+    // it, for the `graph` section of resolution.json. Kept apart from
+    // `dependencyEdges`, which merges two requests of one consumer for one
+    // dependency into one edge; the record has to keep both keys, because two
+    // keys over one identity (A2) and the table a declaration came from (A1)
+    // are what it exists to show.
+    // The link form each dependency takes and the facts it was decided from,
+    // by package index. COMPUTED ONCE, before the root build program runs, so
+    // that program can read the answer (#642 E2); APPLIED after the scan, where
+    // it always was. Every reader below reads this, never a second resolution.
+    // #355: consumer package index → (env var, absolute path) for each host
+    // tool that consumer requested. Filled by the provisioning pass below;
+    // read by BOTH build.mcpp call sites (the dependency loop and the root),
+    // which is why it lives out here rather than inside the resolution block.
+    // #355 step 5: consumer package index → (logical module name, interface
+    // path) for each dependency that offers HOST build rules. Same fan-out
+    // shape as toolEnvByConsumer, and read by the same two call sites.
+    // The same providers by INDEX, and the reason they are needed twice.
+    //
+    // A rule's code runs inside its CONSUMER's build program, so
+    // `mcpp::xpkg_dir("cuda-nvcc")` is asked there -- while the payload that
+    // answers it was declared by the RULE, under `[feature-xlings.<f>]`, which
+    // is where it belongs: which packages a device compiler needs is the
+    // rule's knowledge and no project should have to rediscover it.
+    //
+    // The graph pass already INSTALLS what a dependency declares. Only the
+    // answer was missing: `fillXpkgDirs` read one manifest, so the address was
+    // fetched, unpacked, and then unreachable from the only code that wanted
+    // it -- a failure that reads as "the toolkit is not installed" while it
+    // sits on disk.
+    //
+    // The set is the host-module providers rather than every dependency: the
+    // code that can call `xpkg_dir` in this build program is the consumer's
+    // own `build.mcpp` plus exactly the rule modules compiled into it.
+    // #359: who can see which build-time provision. Computed once by the
+    // provisioning pass below (a fixpoint over `dependencyEdges`, the same
+    // shape as computeUsageRequirements) and read by every consumer of the
+    // three env channels above. Declared here because `fillDepDirs` closes
+    // over it and is defined long before the pass runs; every call site is
+    // after it.
+    // The spellings a given consumer may address a provider by. The qualified
+    // name always works; the bare tail only when the namespace ladder binds it
+    // to exactly this package FOR THIS CONSUMER. Scoped per consumer rather
+    // than globally because two packages sharing a tail only collide inside an
+    // environment that contains both.
+    step4b_define_lookup_closures(state);
+
+    if (auto r = step4b_define_provisioning_closures(state); !r)
+        return std::unexpected(r.error());
+
+    // Pull the root package's active feature-deps into its dependency set before
+    // seeding, so `mcpp build --features X` resolves X's optional deps.
+    state.rootReq = parse_feature_request(state.overrides.features);
+    if (auto fm = mergeActiveFeatureDeps(*state.m, state.rootReq); !fm)
+        return std::unexpected(fm.error());
+    // #243: the root's active features may forward features to its direct deps.
+    std::vector<std::string> rootActive = feature_closure(*state.m, state.rootReq, true);
+    if (auto fe = validateForwards(state, *state.m, rootActive, state.m->package.name); !fe)
+        return std::unexpected(fe.error());
+    state.activeFeaturesByPackage.assign(1, rootActive);
+
+    // `--features <dependency key>/<feature>` (#649 E8): a forward of the root,
+    // applied to the edges exactly as a `[features]` forward is and checked
+    // against the same tables. Named whether or not the root declares
+    // `[features]`: the token cannot be a macro of the root, so there is no
+    // "pure macro usage" to preserve for it.
+    std::vector<std::pair<std::string, std::string>> cliForwards;
+    for (auto const& tok : feature_forward_request_tokens(state.overrides.features)) {
+        auto fwd = mcpp::pm::split_feature_forward_token(tok);
+        std::string msg;
+        if (!fwd)
+            msg = std::format("--features requests '{}', which names neither a "
+                              "feature nor `<dependency>/<feature>`", tok);
+        else if (!declaresDependencyKey(*state.m, fwd->first))
+            msg = std::format("--features requests '{}', and no dependency table "
+                              "of '{}' declares '{}'", tok, state.m->package.name,
+                              fwd->first);
+        if (!msg.empty()) {
+            if (state.overrides.strict) return std::unexpected(msg);
+            mcpp::diag::warning("features/request", msg);
+            continue;
+        }
+        cliForwards.push_back(std::move(*fwd));
+    }
+    auto injectCliForwards = [&](const std::string& childKey,
+                                 mcpp::manifest::DependencySpec& childSpec) {
+        for (auto const& [depKey, depFeat] : cliForwards)
+            if (depKey == childKey
+                && std::ranges::find(childSpec.features, depFeat)
+                       == childSpec.features.end())
+                childSpec.features.push_back(depFeat);
+    };
+
+    // Seed the worklist from the main manifest. Dev-deps only when the
+    // caller wants them; they're never propagated transitively.
+    const std::string mainPkgLabel = state.m->package.name;
+    for (auto& [n, s] : state.m->dependencies) {
+        auto req = s;
+        injectForwards(*state.m, rootActive, n, req);
+        injectCliForwards(n, req);
+        state.worklist.push_back({n, req, mainPkgLabel, req.version, kMainConsumer, {}});
+    }
+    if (state.includeDevDeps) {
+        for (auto& [n, s] : state.m->devDependencies) {
+            auto req = s;
+            injectForwards(*state.m, rootActive, n, req);
+            injectCliForwards(n, req);
+            state.worklist.push_back({n, req, mainPkgLabel + " (dev-dep)",
+                                req.version, kMainConsumer, {}, /*devOnly=*/true});
+        }
+    }
+    // `[build-dependencies]`. Parsed since 0.0.x, merged across workspace
+    // members, conditionalised by target predicate — and until now read by
+    // nothing that made a decision, so writing it produced a manifest that
+    // loaded, no diagnostic, and no effect. Seeded here, and unlike dev-deps
+    // it IS walked transitively: a build dependency's own dependencies are
+    // what make it work, and they inherit its build-only nature.
+    for (auto& [n, s] : state.m->buildDependencies) {
+        auto req = s;
+        injectForwards(*state.m, rootActive, n, req);
+        injectCliForwards(n, req);
+        state.worklist.push_back({n, req, mainPkgLabel + " (build-dep)",
+                            req.version, kMainConsumer, {}, /*devOnly=*/false,
+                            /*buildOnly=*/true});
+    }
+
+
+    while (!state.worklist.empty()) {
+        WorklistItemCtx ctx;
+        ctx.item = std::move(state.worklist.front());
+        state.worklist.pop_front();
+
+        if (auto r = step4b_resolve_identity(state, ctx); !r)
+            return std::unexpected(r.error());
+
+        if (auto it = state.resolved.find(ctx.key); it != state.resolved.end()) {
+            if (auto r = step4b_handle_already_resolved(state, ctx, it); !r)
+                return std::unexpected(r.error());
+            continue;
+        }
+
+        if (auto r = step4b_acquire_dependency_source(state, ctx); !r)
+            return std::unexpected(r.error());
+        if (auto r = step4b_finalize_dependency(state, ctx); !r)
+            return std::unexpected(r.error());
+    }
+
+    if (auto r = step4b_cycle_check(state); !r) return std::unexpected(r.error());
 
     state.computeUsageRequirements();
 
