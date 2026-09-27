@@ -137,9 +137,17 @@ echo "checking ${#FILES[@]} file(s) with $CLANG_TIDY (LineThreshold=$LINE_THRESH
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
+# No --warnings-as-errors: the only check enabled is readability-function-size
+# itself, and a finding in json.hpp (bundled third-party, reached through one
+# of these files' imports) would then make clang-tidy exit non-zero on every
+# run regardless of this decomposition's own state -- exactly the ambiguity
+# the "diagnostic tool problem" branch below exists to catch, and it cannot
+# tell the two apart from an exit code alone. The `relevant` filter is the
+# sole pass/fail signal; clang-tidy's own exit code is read only as a sign
+# that the tool itself failed to run (a bad compile command, a crash), which
+# a plain warning never produces.
 "$CLANG_TIDY" \
     --checks='-*,readability-function-size' \
-    --warnings-as-errors='*' \
     --config="{CheckOptions: {readability-function-size.LineThreshold: '$LINE_THRESHOLD'}}" \
     -p "$REPO_DIR" \
     "${FILES[@]}" > "$OUT" 2>&1

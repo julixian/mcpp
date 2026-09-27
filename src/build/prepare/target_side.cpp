@@ -793,8 +793,7 @@ step9_target_side_include_broadcast(PrepareState& state, TargetSideGather& gathe
 }
 
 static std::expected<void, std::string>
-step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGather& gather) {
-    namespace tsd = mcpp::targetside;
+step9_kernel_abi_interface_enumeration(PrepareState& state) {
         // INTERFACE ENUMERATION — THE RESOLUTION-TIME HALF OF THE CAPABILITY
         // MODEL (design 2026-09-20 §5.5; openkal SPEC 0.14 §3.3, §6.2).
         //
@@ -816,113 +815,116 @@ step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGath
         // writes `[kernel-abi]` reaches neither loop below, so this addition
         // changes no command line and no diagnostic for every project built
         // before it.
-        {
-            // THE LIST COMES FROM THE PACKAGE THAT RESOLVED AS THE LAYER, NOT
-            // FROM THE FIRST ONE IN THE GRAPH THAT STATED ONE. A graph may
-            // carry more than one candidate for a layer — a workspace member
-            // beside a dependency, a second implementation reached through a
-            // feature that did not activate — and only one of them is the
-            // provider this build resolved. Reading whichever came first in
-            // `packages` would compare a consumer's requirements against an
-            // implementation the build is not using, which is a wrong answer
-            // rather than a missing one.
-            std::vector<std::string> providedInterfaces;
-            std::string providerId;
-            for (auto& pkg : state.packages) {
-                if (pkg.manifest.kernelAbiProvidesInterfaces.empty()) continue;
-                // `impl` is `name@version`; the name is what precedes the
-                // separator. A substring test would match `openkal` against
-                // `openkal-linux@0.15.0` and read one implementation's list
-                // as another's.
-                if (!state.resolvedTargetSide.kernelAbi.impl.empty()) {
-                    auto const& impl = state.resolvedTargetSide.kernelAbi.impl;
-                    const auto at = impl.find('@');
-                    const auto implName = at == std::string::npos
-                        ? impl : impl.substr(0, at);
-                    if (implName != pkg.manifest.package.name) continue;
-                }
-                providedInterfaces = pkg.manifest.kernelAbiProvidesInterfaces;
-                providerId = pkg.manifest.package.name;
-                break;
+        // THE LIST COMES FROM THE PACKAGE THAT RESOLVED AS THE LAYER, NOT
+        // FROM THE FIRST ONE IN THE GRAPH THAT STATED ONE. A graph may
+        // carry more than one candidate for a layer — a workspace member
+        // beside a dependency, a second implementation reached through a
+        // feature that did not activate — and only one of them is the
+        // provider this build resolved. Reading whichever came first in
+        // `packages` would compare a consumer's requirements against an
+        // implementation the build is not using, which is a wrong answer
+        // rather than a missing one.
+        std::vector<std::string> providedInterfaces;
+        std::string providerId;
+        for (auto& pkg : state.packages) {
+            if (pkg.manifest.kernelAbiProvidesInterfaces.empty()) continue;
+            // `impl` is `name@version`; the name is what precedes the
+            // separator. A substring test would match `openkal` against
+            // `openkal-linux@0.15.0` and read one implementation's list
+            // as another's.
+            if (!state.resolvedTargetSide.kernelAbi.impl.empty()) {
+                auto const& impl = state.resolvedTargetSide.kernelAbi.impl;
+                const auto at = impl.find('@');
+                const auto implName = at == std::string::npos
+                    ? impl : impl.substr(0, at);
+                if (implName != pkg.manifest.package.name) continue;
             }
-            // A REQUIREMENT NOBODY ANSWERED IS SAID SO, because otherwise
-            // "yes" and "never asked" are the same reading.
-            //
-            // Three situations exist and two of them build: the provider
-            // states a list and it contains the requirement (build); it
-            // states a list and does not (refuse, below); it states nothing
-            // at all (build, and until this note, in silence). The third is
-            // deliberate --- `provides-interfaces` is younger than the
-            // implementations that exist, and a graph that has not adopted it
-            // must keep building --- but a consumer reading a green build
-            // cannot tell it from the first. One line closes that, and it
-            // costs nothing to a graph where the provider does declare.
-            std::size_t uncheckedRequirements = 0;
-            for (auto& pkg : state.packages) {
-                const auto& need = pkg.manifest.kernelAbiRequiresInterfaces;
-                if (need.empty()) continue;
-                if (providerId.empty()) {
-                    uncheckedRequirements += need.size();
-                    continue;
-                }
-                auto missing = mcpp::targetside::interfaces_not_provided(
-                    need, providedInterfaces);
-                if (missing.empty()) continue;
-                refusal::record(refusal::Code::InterfaceNotProvided);
-                std::string names;
-                for (auto const& mI : missing) {
-                    names += "\n         ";
-                    names += mI;
-                }
-                // THE CODE IS PRINTED, THE WAY E0006 IS, BECAUSE SOMETHING
-                // READS THIS. A refusal that only a person can recognise
-                // forces every machine consumer to match prose --- and prose
-                // that a package's own compile error could coincidentally
-                // contain. The mcpp-index compatibility measurement
-                // distinguishes "this graph does not supply what the member
-                // asked for" from "the member did not build" on exactly this
-                // token, and that distinction decides whether a member counts
-                // against a compatibility figure.
-                // THE LABEL SAYS WHICH IMPLEMENTATION WAS RESOLVED, NOT
-                // "provided by". The missing names are listed immediately
-                // above it, and `provided by fakekernel` under `openkal.space`
-                // reads as the statement that fakekernel provides it --- the
-                // exact opposite of what this refusal is about. Read once,
-                // rendered, which is the only way that kind of defect is
-                // visible: every assertion on this message matches an
-                // identifier inside it, and an identifier is in the right
-                // place under either wording.
-                return std::unexpected(std::format(
-                    "'{}' requires interfaces the resolved implementation does "
-                    "not provide. [interface-not-provided]{}\n"
-                    "       the resolved implementation is {} ({} interface{}), "
-                    "and none of those listed above is among them.\n"
-                    "       This is refused before anything is compiled "
-                    "because dependency resolution is the earliest time the "
-                    "question can be answered. Select an implementation that "
-                    "provides them, or remove them from [kernel-abi] "
-                    "requires-interfaces in '{}'.",
-                    pkg.manifest.package.name, names, providerId,
-                    providedInterfaces.size(),
-                    providedInterfaces.size() == 1 ? "" : "s",
-                    pkg.manifest.package.name));
+            providedInterfaces = pkg.manifest.kernelAbiProvidesInterfaces;
+            providerId = pkg.manifest.package.name;
+            break;
+        }
+        // A REQUIREMENT NOBODY ANSWERED IS SAID SO, because otherwise
+        // "yes" and "never asked" are the same reading.
+        //
+        // Three situations exist and two of them build: the provider
+        // states a list and it contains the requirement (build); it
+        // states a list and does not (refuse, below); it states nothing
+        // at all (build, and until this note, in silence). The third is
+        // deliberate --- `provides-interfaces` is younger than the
+        // implementations that exist, and a graph that has not adopted it
+        // must keep building --- but a consumer reading a green build
+        // cannot tell it from the first. One line closes that, and it
+        // costs nothing to a graph where the provider does declare.
+        std::size_t uncheckedRequirements = 0;
+        for (auto& pkg : state.packages) {
+            const auto& need = pkg.manifest.kernelAbiRequiresInterfaces;
+            if (need.empty()) continue;
+            if (providerId.empty()) {
+                uncheckedRequirements += need.size();
+                continue;
             }
-
-            if (uncheckedRequirements > 0) {
-                // THE IMPLEMENTATION IS NAMED FROM THE RESOLVED LAYER, not
-                // from whichever package happened to be first: the note has
-                // to say WHOSE silence this is, or a reader cannot act on it.
-                const auto& impl = state.resolvedTargetSide.kernelAbi.impl;
-                mcpp::ui::info("note", std::format(
-                    "kernel-abi interfaces: {} states none, {} requirement{} "
-                    "unchecked",
-                    impl.empty() ? std::string("the resolved implementation")
-                                 : impl,
-                    uncheckedRequirements,
-                    uncheckedRequirements == 1 ? "" : "s"));
+            auto missing = mcpp::targetside::interfaces_not_provided(
+                need, providedInterfaces);
+            if (missing.empty()) continue;
+            refusal::record(refusal::Code::InterfaceNotProvided);
+            std::string names;
+            for (auto const& mI : missing) {
+                names += "\n         ";
+                names += mI;
             }
+            // THE CODE IS PRINTED, THE WAY E0006 IS, BECAUSE SOMETHING
+            // READS THIS. A refusal that only a person can recognise
+            // forces every machine consumer to match prose --- and prose
+            // that a package's own compile error could coincidentally
+            // contain. The mcpp-index compatibility measurement
+            // distinguishes "this graph does not supply what the member
+            // asked for" from "the member did not build" on exactly this
+            // token, and that distinction decides whether a member counts
+            // against a compatibility figure.
+            // THE LABEL SAYS WHICH IMPLEMENTATION WAS RESOLVED, NOT
+            // "provided by". The missing names are listed immediately
+            // above it, and `provided by fakekernel` under `openkal.space`
+            // reads as the statement that fakekernel provides it --- the
+            // exact opposite of what this refusal is about. Read once,
+            // rendered, which is the only way that kind of defect is
+            // visible: every assertion on this message matches an
+            // identifier inside it, and an identifier is in the right
+            // place under either wording.
+            return std::unexpected(std::format(
+                "'{}' requires interfaces the resolved implementation does "
+                "not provide. [interface-not-provided]{}\n"
+                "       the resolved implementation is {} ({} interface{}), "
+                "and none of those listed above is among them.\n"
+                "       This is refused before anything is compiled "
+                "because dependency resolution is the earliest time the "
+                "question can be answered. Select an implementation that "
+                "provides them, or remove them from [kernel-abi] "
+                "requires-interfaces in '{}'.",
+                pkg.manifest.package.name, names, providerId,
+                providedInterfaces.size(),
+                providedInterfaces.size() == 1 ? "" : "s",
+                pkg.manifest.package.name));
         }
 
+        if (uncheckedRequirements > 0) {
+            // THE IMPLEMENTATION IS NAMED FROM THE RESOLVED LAYER, not
+            // from whichever package happened to be first: the note has
+            // to say WHOSE silence this is, or a reader cannot act on it.
+            const auto& impl = state.resolvedTargetSide.kernelAbi.impl;
+            mcpp::ui::info("note", std::format(
+                "kernel-abi interfaces: {} states none, {} requirement{} "
+                "unchecked",
+                impl.empty() ? std::string("the resolved implementation")
+                             : impl,
+                uncheckedRequirements,
+                uncheckedRequirements == 1 ? "" : "s"));
+        }
+    return {};
+}
+
+static std::expected<void, std::string>
+step9_layering_and_requirement_checks(PrepareState& state, TargetSideGather& gather) {
+    namespace tsd = mcpp::targetside;
         if (auto why = tsd::check_layering(state.resolvedTargetSide)) {
             refusal::record(refusal::Code::LayerOrdering);
             return std::unexpected(*why);
@@ -959,7 +961,11 @@ step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGath
             refusal::record(refusal::Code::HostCannotServe);
             return std::unexpected(state.unservedTargetDiagnosis);
         }
+    return {};
+}
 
+static void
+step9_pin_and_linkage_diagnostics(PrepareState& state) {
         // THE TARGET AND THE COMPILER ARE NOT BOUND TOGETHER, AND THE
         // TARGET ROW'S CONVENTION IS A FALLBACK RATHER THAN A RULE.
         //
@@ -1051,7 +1057,11 @@ step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGath
                 "target's system comes from the dependency graph: those "
                 "packages are compiled into this build as objects, and there "
                 "is no shared object to link against. The artifact is static.");
+}
 
+static std::expected<void, std::string>
+step9_same_os_check_and_report(PrepareState& state) {
+    namespace tsd = mcpp::targetside;
         // Reported, and reported HERE rather than recorded in a manifest field.
         //
         // A line a project writes states an intention, and it goes stale the
@@ -1138,7 +1148,11 @@ step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGath
         }
         mcpp::ui::info("Target", tsd::format_report(
             state.resolvedTargetSide, reportedTargetName, mcpp::log::is_verbose()));
+    return {};
+}
 
+static std::expected<void, std::string>
+step9_platform_sdk_closure_visibility(PrepareState& state) {
         // CLOSURE VISIBILITY — design §6. Distinct from the five-layer
         // report above: a platform dependency is not a LAYER (no engine
         // vocabulary names it, and `mcpp.targetside` — the pure, layer-only
@@ -1194,6 +1208,22 @@ step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGath
                 joined));
         }
     return {};
+}
+
+static std::expected<void, std::string>
+step9_kernel_abi_interfaces_and_requirements(PrepareState& state, TargetSideGather& gather) {
+    if (auto r = step9_kernel_abi_interface_enumeration(state); !r)
+        return std::unexpected(r.error());
+
+    if (auto r = step9_layering_and_requirement_checks(state, gather); !r)
+        return std::unexpected(r.error());
+
+    step9_pin_and_linkage_diagnostics(state);
+
+    if (auto r = step9_same_os_check_and_report(state); !r)
+        return std::unexpected(r.error());
+
+    return step9_platform_sdk_closure_visibility(state);
 }
 
 static std::expected<void, std::string> step9_layer_conditional_config(PrepareState& state) {
