@@ -504,6 +504,37 @@ package = {
     EXPECT_EQ(keys[2], "25.0.4.7.1");
 }
 
+// openxlings/xlings#620, mcpp#524 A: a version entry's `revision` is read the
+// way the reference implementation reads it -- a non-negative integer, and 0
+// for anything else or for its absence -- including the per-arch shape, whose
+// arch tables must not be mistaken for the revision.
+TEST(ListXpkgVersions, RevisionIsReadPerEntry) {
+    constexpr auto src = R"(
+package = {
+    name = "rev",
+    xpm = {
+        linux = {
+            ["latest"] = { ref = "1.2.0" },
+            ["1.0.0"]  = { url = "u", sha256 = "a" },
+            ["1.1.0"]  = { url = "u", sha256 = "b", revision = 2 },
+            ["1.2.0"]  = { x86_64 = { url = "u", sha256 = "c" }, revision = 1 },
+            ["1.3.0"]  = { url = "u", sha256 = "d", revision = "3" },
+            ["1.4.0"]  = { url = "u", sha256 = "e", revision = -1 },
+        },
+    },
+}
+)";
+    auto e = mcpp::manifest::list_xpkg_version_entries(
+        src, mcpp::platform::TargetPlatform::for_lint_of("linux"));
+    ASSERT_EQ(e.size(), 6u);
+    EXPECT_EQ(e[0].revision, 0);   // an alias carries none
+    EXPECT_EQ(e[1].revision, 0);
+    EXPECT_EQ(e[2].revision, 2);
+    EXPECT_EQ(e[3].revision, 1);
+    EXPECT_EQ(e[4].revision, 0);   // a string is not a revision
+    EXPECT_EQ(e[5].revision, 0);   // nor is a negative number
+}
+
 // The scanner used to walk the platform table character by character, so a
 // bracket key nested inside a version's own body (mirror tables write
 // `["GLOBAL"] = "https://..."`) counted as a published version.
@@ -3782,7 +3813,7 @@ name = "depspeckeys"
 version = "0.1.0"
 
 [dependencies.compat]
-everything = { version = "1.0.0", features = ["x"], default-features = false, visibility = "private", backend = "openblas", tools = ["t"], host-module = true, reexport = true, linkage = "shared" }
+everything = { version = "1.0.0", features = ["x"], default-features = false, visibility = "private", backend = "openblas", tools = ["t"], artifacts = ["a"], host-module = true, reexport = true, linkage = "shared" }
 bygit      = { git = "https://example.invalid/x.git", tag = "v1", visibility = "interface" }
 bypath     = { path = "../sibling" }
 )";
@@ -3801,6 +3832,8 @@ bypath     = { path = "../sibling" }
     EXPECT_TRUE(all->reexport);
     ASSERT_EQ(all->tools.size(), 1u);
     EXPECT_EQ(all->tools[0], "t");
+    ASSERT_EQ(all->artifacts.size(), 1u);
+    EXPECT_EQ(all->artifacts[0], "a");
     // `backend = "openblas"` is sugar for requesting the backend-<impl> feature.
     EXPECT_NE(std::find(all->features.begin(), all->features.end(), "backend-openblas"),
               all->features.end());
@@ -5776,6 +5809,70 @@ kind = "shared"
     ASSERT_EQ(m.targets.size(), 1u);
     EXPECT_EQ(m.targets[0].kind, mcpp::manifest::Target::Library);
     EXPECT_EQ(m.targets[0].linkageDefault, "shared");
+}
+
+// #709: `[features.<f>] tools` names the package's own bin targets, and is
+// checked once inference has produced the target list.
+TEST(Manifest, AFeatureToolMustNameABinTargetOfThePackage) {
+    auto dir = std::filesystem::temp_directory_path()
+        / std::format("mcpp_feature_tools_{}", std::random_device{}());
+    std::filesystem::create_directories(dir / "src");
+    std::ofstream(dir / "src" / "gen.cpp") << "int main() {}\n";
+    auto write = [&](std::string_view tool) {
+        std::ofstream(dir / "mcpp.toml")
+            << "[package]\nname = \"gen\"\nversion = \"0.1.0\"\n\n"
+            << "[features.codegen]\ntools = [\"" << tool << "\"]\n\n"
+            << "[targets.gen-tool]\nkind = \"bin\"\nmain = \"src/gen.cpp\"\n";
+    };
+    write("gen-tool");
+    auto ok = mcpp::manifest::load(dir / "mcpp.toml");
+    ASSERT_TRUE(ok) << (ok ? "" : ok.error().message);
+    ASSERT_EQ(ok->featureTools.at("codegen").size(), 1u);
+    EXPECT_EQ(ok->featureTools.at("codegen")[0], "gen-tool");
+
+    write("nosuch");
+    auto bad = mcpp::manifest::load(dir / "mcpp.toml");
+    ASSERT_FALSE(bad);
+    EXPECT_NE(bad.error().message.find("nosuch"), std::string::npos) << bad.error().message;
+    EXPECT_NE(bad.error().message.find("gen-tool"), std::string::npos) << bad.error().message;
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// #714: `sources = []` states that the default build compiles nothing, so a
+// module interface under `src/` is not a library of that build. A build-logic
+// package keeps its module behind a feature that host-module consumers
+// request; inferring a library for it made every build of the package link an
+// archive with no inputs. A glob that happens to match nothing is a different
+// statement and keeps the inferred library (and #533's empty-link refusal).
+TEST(Manifest, AnExplicitlyEmptySourceListInfersNoLibrary) {
+    auto dir = std::filesystem::temp_directory_path()
+        / std::format("mcpp_empty_sources_{}", std::random_device{}());
+    std::filesystem::create_directories(dir / "src");
+    std::ofstream(dir / "src" / "buildlib.cppm") << "export module buildlib;\n";
+    {
+        std::ofstream(dir / "mcpp.toml")
+            << "[package]\nname = \"buildlib\"\nversion = \"0.1.0\"\n\n"
+               "[build]\nsources = []\n\n"
+               "[features.host]\nsources = [\"src/buildlib.cppm\"]\n";
+    }
+    auto empty = mcpp::manifest::load(dir / "mcpp.toml");
+    ASSERT_TRUE(empty) << (empty ? "" : empty.error().message);
+    EXPECT_TRUE(empty->targets.empty());
+
+    {
+        std::ofstream(dir / "mcpp.toml")
+            << "[package]\nname = \"buildlib\"\nversion = \"0.1.0\"\n\n"
+               "[build]\nsources = [\"srcs/**/*.cppm\"]\n";
+    }
+    auto typo = mcpp::manifest::load(dir / "mcpp.toml");
+    ASSERT_TRUE(typo) << (typo ? "" : typo.error().message);
+    ASSERT_EQ(typo->targets.size(), 1u);
+    EXPECT_EQ(typo->targets[0].kind, mcpp::manifest::Target::Library);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 // #649 E6: a consumer reads "every declared target is a program" as "a tool

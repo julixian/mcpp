@@ -1135,6 +1135,14 @@ std::optional<mcpp::manifest::BuildAction> decode_action(std::string_view payloa
         // is identical either way, so a cache entry written before this field
         // existed replays as one that never set it.
         a.outputDir   = j.value("output_dir", std::string{});
+        // mcpp#708, protocol 13. Omitted by an action that sets neither, so a
+        // payload written before the fields existed decodes as one that never
+        // set them. An `env` entry is `NAME=value` with a non-empty name.
+        arr("env", a.env);
+        for (auto const& e : a.env)
+            if (auto eq = e.find('='); eq == std::string::npos || eq == 0)
+                return std::nullopt;
+        a.cwd         = j.value("cwd", std::string{});
         if (a.command.empty() || a.outputs.empty()) return std::nullopt;
         // Prepare only: `output_dir` is the whole point of the role (R3.2,
         // R3.3) -- a `prepare` action with none declared would have a stamp
@@ -1268,6 +1276,23 @@ std::string action_error(const Directives& d) {
                 "       payload: {}", *role, payload);
         }
         if (decode_action(payload)) continue;
+        // Named before the general message, like the role above: an `env`
+        // entry that is not `NAME=value` is the one thing wrong with an
+        // otherwise complete declaration.
+        try {
+            auto j = nlohmann::json::parse(payload);
+            if (auto it = j.find("env"); it != j.end() && it->is_array())
+                for (auto const& e : *it) {
+                    const auto v = e.is_string() ? e.get<std::string>() : std::string{};
+                    if (auto eq = v.find('='); eq == std::string::npos || eq == 0)
+                        return std::format(
+                            "build.mcpp declared an action whose environment entry "
+                            "\"{}\" is not NAME=value.\n"
+                            "       mcpp::action::env(name, value) sets one variable "
+                            "for the action's command; the name may not be empty.\n"
+                            "       payload: {}", v, payload);
+                }
+        } catch (...) {}
         // A malformed action is a hard error, never a skip: an action that
         // silently does not exist produces a build missing generated sources,
         // and the user is left staring at a "no such file" three edges away.
@@ -1326,6 +1351,11 @@ void prepare_actions(std::vector<mcpp::manifest::BuildAction>& actions,
         // package root it was written against.
         if (!a.outputDir.empty() && a.outputDir.find("${mcpp.") == std::string::npos)
             a.outputDir = abs_against(pkgRoot, a.outputDir);
+        // The command's directory (mcpp#708), anchored the same way: a
+        // relative spelling names a directory of the package that declared
+        // the action (SPEC-007 R2.2), never the build directory.
+        if (!a.cwd.empty() && a.cwd.find("${mcpp.") == std::string::npos)
+            a.cwd = abs_against(pkgRoot, a.cwd);
         if (a.role != mcpp::manifest::BuildAction::Role::Source) continue;
         for (auto const& o : a.outputs) {
             if (o.find("${mcpp.") != std::string::npos) continue;

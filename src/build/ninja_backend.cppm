@@ -3052,9 +3052,19 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         // action with none at parse time — and is kept because this loop reads
         // as if it could see one, and a wrapper with no stamp to write would
         // be a command that swallows its own exit code.
-        if ((a.role == mcpp::manifest::BuildAction::Role::Check
+        const bool stamped =
+            (a.role == mcpp::manifest::BuildAction::Role::Check
              || a.role == mcpp::manifest::BuildAction::Role::Prepare)
-            && !a.outputs.empty()) {
+            && !a.outputs.empty();
+        // `env` and `cwd` (mcpp#708) go through the same wrapper, in its named
+        // form, whatever the role: the command is an argv with no shell
+        // assumed (SPEC-007 R3.1), so neither `NAME=value cmd` nor `cd dir &&`
+        // is available, and the engine is the one program on every platform
+        // that can set both before running it. An action that declares
+        // neither keeps the positional `__action-stamp` form, byte for byte,
+        // so upgrading changes no existing edge's command and re-runs nothing.
+        const bool named = !a.env.empty() || !a.cwd.empty();
+        if (stamped || named) {
             // `mcpp_exe_path()`, not `self_exe_path()` directly: this file
             // already has one spelling of "where am I" and a second would be
             // the same decision derived twice.
@@ -3064,19 +3074,22 @@ std::string emit_ninja_string(const BuildPlan& plan) {
             // is in the fingerprint); moving the binary without changing its
             // version would leave a stale path here, exactly as it would for
             // the compiler.
-            std::string wrapped =
-                shell_quote_arg(escape_ninja_chars(mcpp_exe_path().string()))
-                + " __action-stamp";
+            const auto q = [](const std::string& v) {
+                return shell_quote_arg(escape_ninja_chars(v));
+            };
+            std::string wrapped = q(mcpp_exe_path().string())
+                + (named ? " __action" : " __action-stamp");
+            for (auto const& e : a.env) wrapped += " --env " + q(e);
+            if (!a.cwd.empty()) wrapped += " --cwd " + q(a.cwd);
             // Before the stamp list, so the wrapper can tell the flag from a
             // stamp path without an allowlist of extensions. `directives.cppm`
             // refuses a `prepare` action with no `output_dir`, so this is
             // reached with a non-empty directory whenever the role is Prepare.
-            if (a.role == mcpp::manifest::BuildAction::Role::Prepare) {
-                wrapped += " --require-dir "
-                         + shell_quote_arg(escape_ninja_chars(a.outputDir));
-            }
-            for (auto const& o : a.outputs)
-                wrapped += " " + shell_quote_arg(escape_ninja_chars(o));
+            if (a.role == mcpp::manifest::BuildAction::Role::Prepare)
+                wrapped += " --require-dir " + q(a.outputDir);
+            if (stamped)
+                for (auto const& o : a.outputs)
+                    wrapped += (named ? " --stamp " : " ") + q(o);
             wrapped += " -- " + cmd;
             cmd = std::move(wrapped);
         }

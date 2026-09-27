@@ -1013,39 +1013,97 @@ int run(int argc, char** argv) {
     // command writes nothing -- clang-tidy, an installer run through
     // `mcpp-deps` -- re-ran on every build after its first input change,
     // because its output stayed older than that input forever.
-    if (std::string_view(argv[1]) == "__action-stamp") {
+    // `mcpp __action [--env NAME=VALUE]... [--cwd <dir>] [--require-dir <dir>]
+    // [--stamp <stamp>]... -- <argv>...` is the same wrapper with every part
+    // named (mcpp#708): an action that declares `env` or `cwd` is run through
+    // it whatever its role. An action that declares neither keeps the
+    // positional `__action-stamp` spelling above, so its command line -- and
+    // ninja's command hash for its edge -- is the one an earlier engine wrote,
+    // and upgrading re-runs no check and no `prepare`.
+    if (std::string_view(argv[1]) == "__action-stamp"
+        || std::string_view(argv[1]) == "__action") {
+        const bool named = std::string_view(argv[1]) == "__action";
         int i = 2;
         // `prepare` only: the directory its command populates
-        // (`mcpp::action::output_dir`). Parsed before the stamp list, which
-        // is otherwise everything up to `--`, so this flag cannot be mistaken
-        // for a stamp path.
+        // (`mcpp::action::output_dir`). A flag in both spellings, so it cannot
+        // be mistaken for a positional stamp path.
         std::string requireDir;
-        if (i < argc && std::string_view(argv[i]) == "--require-dir") {
+        std::string cwd;
+        std::vector<std::pair<std::string, std::string>> env;
+        std::vector<std::string> stamps;
+        for (; i < argc && std::string_view(argv[i]) != "--"; ++i) {
+            const std::string_view a = argv[i];
+            const bool takesValue = a == "--require-dir"
+                || (named && (a == "--env" || a == "--cwd" || a == "--stamp"));
+            if (!takesValue) {
+                if (named) {
+                    std::println(stderr, "error: __action: unknown option '{}'", a);
+                    return 2;
+                }
+                stamps.emplace_back(a);
+                continue;
+            }
             if (i + 1 >= argc) {
-                std::println(stderr, "error: --require-dir requires a directory");
+                std::println(stderr, "error: {} requires a value", a);
                 return 2;
             }
-            requireDir = argv[i + 1];
-            i += 2;
+            const std::string v = argv[++i];
+            if (a == "--require-dir") requireDir = v;
+            else if (a == "--cwd")    cwd = v;
+            else if (a == "--stamp")  stamps.push_back(v);
+            else {
+                const auto eq = v.find('=');
+                if (eq == std::string::npos || eq == 0) {
+                    std::println(stderr, "error: --env requires NAME=VALUE, got '{}'", v);
+                    return 2;
+                }
+                env.emplace_back(v.substr(0, eq), v.substr(eq + 1));
+            }
         }
-        std::vector<std::string> stamps;
-        for (; i < argc && std::string_view(argv[i]) != "--"; ++i)
-            stamps.emplace_back(argv[i]);
-        if (i >= argc || stamps.empty()) {
+        if (i >= argc || (!named && stamps.empty())) {
             std::println(stderr,
-                "error: __action-stamp requires <stamp>... -- <command>...");
+                "error: {} requires <stamp>... -- <command>...", argv[1]);
             return 2;
         }
         std::vector<std::string> cmd;
         for (++i; i < argc; ++i) cmd.emplace_back(argv[i]);
         if (cmd.empty()) {
-            std::println(stderr, "error: __action-stamp has no command to run");
+            std::println(stderr, "error: {} has no command to run", argv[1]);
             return 2;
         }
-        // `run_exec`: no shell, stdio inherited. The analyser's own output has
+        // Stamps and the required directory are named relative to the build
+        // directory, where ninja started this process. Anchored before the
+        // command's own directory is entered, so `cwd` moves the command and
+        // nothing else.
+        {
+            std::error_code aec;
+            for (auto& st : stamps)
+                st = std::filesystem::absolute(std::filesystem::path{st}, aec).string();
+            if (!requireDir.empty())
+                requireDir = std::filesystem::absolute(
+                    std::filesystem::path{requireDir}, aec).string();
+        }
+        if (!cwd.empty()) {
+            // The directory the command inherits is a plain absolute path, not
+            // `extended_length`'s `\\?\` form: that form is a spelling for
+            // opening files. Windows accepts it as the current directory, but
+            // a child started there does not recognise it -- an MSYS shell ran
+            // in C:\Windows instead (e2e 799) -- and a working directory is
+            // limited to MAX_PATH in either spelling.
+            std::error_code cec;
+            const auto dir = std::filesystem::absolute(std::filesystem::path{cwd}, cec)
+                                 .lexically_normal();
+            if (!cec) std::filesystem::current_path(dir, cec);
+            if (cec) {
+                std::println(stderr, "error: cannot enter the action's directory '{}': {}",
+                             cwd, cec.message());
+                return 1;
+            }
+        }
+    // `run_exec`: no shell, stdio inherited. The analyser's own output has
         // to reach the terminal unchanged — a check that fails is read by a
         // human, and capturing would either swallow it or reprint it wrapped.
-        const int r = mcpp::platform::process::run_exec(cmd);
+        const int r = mcpp::platform::process::run_exec(cmd, env);
         // The stamps are written ONLY on success. Writing them anyway would
         // make ninja consider the edge satisfied, so the next build would skip
         // a check (or a `prepare`) that had never passed.

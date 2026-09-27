@@ -452,18 +452,19 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 构建程序失败的包（#699 第 2 项）会被描述为不含该程序产生的指令：清单自身
 的那部分配置、工具链、模块图与标准库单元仍照常描述，另附一条 `error` 诊断
 `MCPP_BUILD_DATABASE_PROGRAM_FAILED` 点名它，`path` 为它的 `build.mcpp`。若
-后续失败是由缺失的指令引起的，则按上面的规则使整个成员失败。包请求的宿主
-工具构建失败则降级为警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`，点名工具、
-所属包与失败信息的第一行；规划继续进行，只点名该工具而不运行它的构建程序
-会像该工具构建成功时一样完成配置。这两者都不影响 `mcpp build`：构建程序或
-宿主工具在其中失败仍然会使构建失败。
+后续失败是由缺失的指令引起的，则按上面的规则使整个成员失败。这条命令
+不构建宿主工具（mcpp 2026.9.27.1+）：全局工具库中已有的被请求工具照常使用，
+库中没有的被推迟，以说明 `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` 报告，点名
+工具与所属包。请求它的构建程序收到该工具将被发布到的路径，并像工具已构建时
+一样完成配置。`mcpp build` 不受影响：它构建该工具，构建程序或宿主工具在其中
+失败仍然会使构建失败。
 
 | 诊断码 | 严重级别 | |
 |---|---|---|
 | `MCPP_LOCK_WOULD_CHANGE` | 警告 | 解析结果与项目的 `mcpp.lock` 不一致，命令不写这个文件 |
 | `MCPP_GENERATED_FILE_NOT_MATERIALIZED` | 警告 | 根包 `[build] generated_files` 中的某个文件缺失或内容已过期，命令不写这个文件 |
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | 警告 | 没有任何标准库构建命令点名它的模块源文件，该单元因此不被列出 |
-| `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT` | 警告 | 被请求的宿主工具构建失败；该工具仍会被构建，它的 `check` 动作仍会运行 |
+| `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | 说明 | 被请求的宿主工具不在工具库中，命令不构建它；计划给出它将被发布到的路径（2026.9.27.1+；取代 2026.9.26.2 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`） |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | 错误 | 构建程序失败；它所属的包被描述为不含它产生的指令 |
 
 `--protocol-version` 为这条命令声明 `init-mcpp-home`、`read-project`、

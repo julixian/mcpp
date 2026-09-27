@@ -102,6 +102,11 @@ struct LinkUnit {
     // `sycl::` instantiations, and the process then had two copies of the
     // island. Latent until a SYCL project first had a shared dependency.
     bool                            dependencyOwned = false;
+    // mcpp#711: the dependency whose program this is, when a consumer's edge
+    // asked for it with `artifacts = [...]` (qualified package name). Empty for
+    // every other unit. A dependency-owned `Binary` is always one of these; the
+    // name is what `${mcpp.artifact:<package>/<target>}` is resolved against.
+    std::string                     artifactOf;
     // Normally relative to plan.outputDir. A `role = "object"` action's outputs
     // land here ABSOLUTE, on purpose: ninja identifies a file by the string an
     // edge declares, and the action edge declares whatever prepare_actions
@@ -2231,6 +2236,96 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         plan.linkUnits.push_back(std::move(lu));
     }
 
+    // THE PROGRAMS A CONSUMER SHIPS FROM ITS DEPENDENCIES (mcpp#711).
+    //
+    // An edge `x = { ..., artifacts = ["updater"] }` asks for the dependency's
+    // `bin` target built for THIS plan's target and profile, as a link unit of
+    // this plan -- not a host tool, which is built for the build machine by a
+    // nested sub-build. Collected here, before the root's link units, because
+    // the same edges also decide what the root must NOT link: an artifact edge
+    // takes the dependency's program and none of its code, so a package the
+    // root reaches only through artifact edges stays out of the root's images.
+    struct ArtifactRequest {
+        std::size_t            packageIndex = 0;
+        mcpp::manifest::Target target;
+    };
+    std::vector<ArtifactRequest> artifactRequests;
+    std::set<std::pair<std::size_t, std::size_t>> artifactEdges;   // (consumer, dependency)
+    for (std::size_t i = 0; i < packages.size(); ++i) {
+        auto const& deps = i == 0 ? manifest.dependencies : packages[i].manifest.dependencies;
+        for (auto const& [depName, spec] : deps) {
+            if (spec.artifacts.empty()) continue;
+            std::optional<std::size_t> j;
+            for (auto const& candidate : dependency_name_candidates(depName, spec))
+                if (auto it = packageIndexByName.find(candidate);
+                    it != packageIndexByName.end() && it->second != i) { j = it->second; break; }
+            if (!j) continue;
+            artifactEdges.insert({i, *j});
+            auto const& dm = packages[*j].manifest;
+            for (auto const& name : spec.artifacts) {
+                auto t = std::ranges::find_if(dm.targets, [&](const mcpp::manifest::Target& x) {
+                    return x.name == name;
+                });
+                if (t == dm.targets.end() || t->kind != mcpp::manifest::Target::Binary) {
+                    std::string bins;
+                    for (auto const& x : dm.targets)
+                        if (x.kind == mcpp::manifest::Target::Binary)
+                            bins += (bins.empty() ? "" : ", ") + x.name;
+                    return std::unexpected(std::format(
+                        "dependency '{}' names the artifact '{}', which is not a "
+                        "`kind = \"bin\"` target of '{}' (its bin targets: {})",
+                        depName, name, qualified_package_name(dm),
+                        bins.empty() ? std::string("none") : bins));
+                }
+                const bool seen = std::ranges::any_of(artifactRequests,
+                    [&](const ArtifactRequest& r) {
+                        return r.packageIndex == *j && r.target.name == name;
+                    });
+                if (!seen) artifactRequests.push_back({*j, *t});
+            }
+        }
+    }
+    // Reached through a non-artifact edge from the root (its dependencies,
+    // dev- and build-dependencies included), versus reached only through an
+    // artifact edge. Only the second set is withheld from the root's images,
+    // so every package this plan linked before keeps being linked.
+    std::set<std::string> artifactOnlyPackages;
+    if (!artifactRequests.empty()) {
+        std::set<std::size_t> viaCode{0}, viaArtifact;
+        std::vector<std::size_t> work{0};
+        auto seed = [&](const auto& m) {
+            for (auto const& [depName, spec] : m)
+                for (auto const& candidate : dependency_name_candidates(depName, spec))
+                    if (auto it = packageIndexByName.find(candidate);
+                        it != packageIndexByName.end() && it->second != 0) {
+                        if (!spec.artifacts.empty()) break;
+                        if (viaCode.insert(it->second).second) work.push_back(it->second);
+                        break;
+                    }
+        };
+        seed(manifest.devDependencies);
+        seed(manifest.buildDependencies);
+        while (!work.empty()) {
+            const auto i = work.back(); work.pop_back();
+            if (auto it = directPackageDeps.find(i); it != directPackageDeps.end())
+                for (auto j : it->second) {
+                    if (artifactEdges.contains({i, j})) continue;
+                    if (viaCode.insert(j).second) work.push_back(j);
+                }
+        }
+        for (auto const& r : artifactRequests)
+            if (viaArtifact.insert(r.packageIndex).second) work.push_back(r.packageIndex);
+        while (!work.empty()) {
+            const auto i = work.back(); work.pop_back();
+            if (auto it = directPackageDeps.find(i); it != directPackageDeps.end())
+                for (auto j : it->second)
+                    if (viaArtifact.insert(j).second) work.push_back(j);
+        }
+        for (auto i : viaArtifact)
+            if (i != 0 && !viaCode.contains(i))
+                artifactOnlyPackages.insert(qualified_package_name(packages[i].manifest));
+    }
+
     // 4. Link units (one per [targets.X])
     // When any TestBinary target exists, skip Binary/Library/SharedLibrary
     // targets — `mcpp test` only cares about the test binaries, and pulling
@@ -2295,6 +2390,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         for (auto& cu : plan.compileUnits) {
             if (sharedDepPackages.contains(cu.packageName)) continue;
             if (placedInImage.contains(cu.packageName)) continue;
+            if (artifactOnlyPackages.contains(cu.packageName)) continue;
             if (mcpp::links_unconditionally(cu.kind)) {
                 lu.objects.push_back(cu.object);
             }
@@ -2412,6 +2508,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         for (auto& cu : plan.compileUnits) {
             if (sharedDepPackages.contains(cu.packageName)) continue;
             if (placedInImage.contains(cu.packageName)) continue;
+            if (artifactOnlyPackages.contains(cu.packageName)) continue;
             if (!is_implementation_source(cu.kind)) continue;
             if (lu.entryMain && cu.source == *lu.entryMain) continue;     // own entry: already added above
             if (entryFilesAcrossTargets.contains(cu.source)) continue;     // foreign entry: skip
@@ -2429,6 +2526,108 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             append_shared_deps_for_linked_objects(lu);
         }
 
+        plan.linkUnits.push_back(std::move(lu));
+    }
+
+    // 5. The dependency programs requested with `artifacts` (mcpp#711).
+    //
+    // Each is the dependency's own `bin` target, linked the way the package's
+    // own build links it: its objects and those of every package it reaches,
+    // and its entry. Built in THIS plan, so it follows the consumer's target,
+    // profile and toolchain -- a cross build ships a program for the machine
+    // the consumer runs on, and nothing is built twice. Its output is
+    // `bin/<target>`, beside the consumer's programs, which is where a program
+    // that launches it looks for it and what `mcpp pack` stages with it.
+    for (auto const& r : artifactRequests) {
+        auto const& pkg = packages[r.packageIndex];
+        const auto owner = qualified_package_name(pkg.manifest);
+        LinkUnit lu;
+        lu.targetName      = r.target.name;
+        lu.kind            = LinkUnit::Binary;
+        lu.dependencyOwned = true;
+        lu.artifactOf      = owner;
+        lu.output          = target_output(r.target, naming);
+        lu.windowsSubsystem = r.target.windowsSubsystem;
+        lu.windowsEntry     = r.target.windowsEntry;
+        lu.loaderTagFlag    = loader_tag_flag(lu.kind);
+        for (auto const& other : plan.linkUnits)
+            if (other.output == lu.output)
+                return std::unexpected(std::format(
+                    "the artifact '{}' of '{}' would be written to '{}', which "
+                    "target '{}' of this build also produces",
+                    r.target.name, owner, lu.output.generic_string(), other.targetName));
+
+        std::set<std::string> closure{owner};
+        {
+            std::vector<std::size_t> work{r.packageIndex};
+            std::set<std::size_t> seen{r.packageIndex};
+            while (!work.empty()) {
+                const auto i = work.back(); work.pop_back();
+                if (auto it = directPackageDeps.find(i); it != directPackageDeps.end())
+                    for (auto j : it->second)
+                        if (seen.insert(j).second) {
+                            work.push_back(j);
+                            closure.insert(qualified_package_name(packages[j].manifest));
+                        }
+            }
+        }
+        for (auto const& cu : plan.compileUnits) {
+            if (!closure.contains(cu.packageName)) continue;
+            if (sharedDepPackages.contains(cu.packageName)) continue;
+            if (mcpp::links_unconditionally(cu.kind)) lu.objects.push_back(cu.object);
+        }
+        if (!r.target.main.empty()) {
+            const auto entry = pkg.root / r.target.main;
+            lu.entryMain = entry;
+            // The package's `sources` glob normally scanned its entry already
+            // (every other image leaves it out as a foreign entry); when it did
+            // not, the entry is compiled here with the package's own flags.
+            std::optional<std::filesystem::path> entryObject;
+            for (auto const& cu : plan.compileUnits)
+                if (cu.source == entry) { entryObject = cu.object; break; }
+            if (!entryObject) {
+                const auto depExtTable = mcpp::extension_table_for(
+                    pkg.manifest.buildConfig.moduleExtensions,
+                    pkg.manifest.buildConfig.deviceExtensions);
+                CompileUnit main_cu;
+                main_cu.source      = entry;
+                main_cu.packageName = owner;
+                main_cu.kind        = mcpp::classify(entry, depExtTable);
+                if (pkg.usageResolved) {
+                    main_cu.localIncludeDirs      = pkg.privateBuild.includeDirs;
+                    main_cu.localIncludeDirsAfter = pkg.privateBuild.includeDirsAfter;
+                    main_cu.packageCflags         = pkg.privateBuild.cflags;
+                    main_cu.packageCxxflags       = pkg.privateBuild.cxxflags;
+                } else {
+                    main_cu.localIncludeDirs = local_include_dirs_for_manifest(pkg.root, pkg.manifest);
+                    main_cu.localIncludeDirsAfter =
+                        local_include_dirs_after_for_manifest(pkg.root, pkg.manifest);
+                    main_cu.packageCflags   = pkg.manifest.buildConfig.cflags;
+                    main_cu.packageCxxflags = pkg.manifest.buildConfig.cxxflags;
+                }
+                mcpp::modgraph::normalize_include_flags(pkg.root, main_cu.packageCflags);
+                mcpp::modgraph::normalize_include_flags(pkg.root, main_cu.packageCxxflags);
+                apply_c_standard(main_cu);
+                const auto scanned = mcpp::modgraph::scan_entry_file(entry, owner, depExtTable);
+                for (auto const& req : scanned.requires_) main_cu.imports.push_back(req.logicalName);
+                main_cu.declaration = scanned.provides
+                    ? mcpp::modgraph::ModuleDeclaration::Unknown : scanned.declaration;
+                main_cu.object = object_for(entry, owner,
+                    std::filesystem::relative(entry, pkg.root), r.packageIndex).object;
+                plan.compileUnits.push_back(main_cu);
+                entryObject = main_cu.object;
+            }
+            lu.objects.push_back(*entryObject);
+        }
+        for (auto const& cu : plan.compileUnits) {
+            if (!closure.contains(cu.packageName)) continue;
+            if (sharedDepPackages.contains(cu.packageName)) continue;
+            if (!is_implementation_source(cu.kind)) continue;
+            if (lu.entryMain && cu.source == *lu.entryMain) continue;
+            if (entryFilesAcrossTargets.contains(cu.source)) continue;
+            lu.objects.push_back(cu.object);
+        }
+        append_shared_deps_for_linked_objects(lu);
         plan.linkUnits.push_back(std::move(lu));
     }
 

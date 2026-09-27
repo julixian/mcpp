@@ -237,6 +237,14 @@ struct BuildCacheEntry {
     // not match a request whose inputs it never saw.
     std::string toolchainRequest;
     bool        toolchainRecorded = false;
+    // The payload directory of every `[xlings]` address the build resolved
+    // (#716). The fast path skips the pass that notices a removed payload --
+    // `xlings remove`, a pruned cache -- so it checks the directories still
+    // exist and declines otherwise; the full path then re-provisions or, with
+    // auto-install off, refuses naming what is missing. Recorded apart from
+    // the list for the reason `depSourceRootsRecorded` is.
+    std::vector<std::string> xlingsPayloads;
+    bool                     xlingsPayloadsRecorded = false;
 };
 
 std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& projectRoot) {
@@ -364,6 +372,16 @@ std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& proje
             e.toolchainRecorded = true;
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
+        // Count-prefixed, as `depSourceRoots=` is: absent means the entry
+        // predates the field and the fast paths decline it once.
+        if (haveNextLine && line.starts_with("xlingsPayloads=")) {
+            std::size_t n = 0;
+            try { n = std::stoul(line.substr(15)); } catch (...) { n = 0; }
+            for (std::size_t i = 0; i < n && std::getline(f, line); ++i)
+                e.xlingsPayloads.push_back(line);
+            e.xlingsPayloadsRecorded = true;
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
         entries.push_back(std::move(e));
         if (!haveNextLine || line.empty()) break;
     }
@@ -411,7 +429,8 @@ void write_build_cache(const std::filesystem::path& projectRoot,
                        bool runnerDeclared = false,
                        bool runTierPending = false,
                        const std::string& features = {},
-                       const std::string& toolchainRequest = {}) {
+                       const std::string& toolchainRequest = {},
+                       std::vector<std::string> xlingsPayloads = {}) {
     auto path = projectRoot / kBuildCacheFile;
     auto entries = read_build_cache(projectRoot);
 
@@ -437,6 +456,8 @@ void write_build_cache(const std::filesystem::path& projectRoot,
     newEntry.features = features;
     newEntry.toolchainRequest  = toolchainRequest;
     newEntry.toolchainRecorded = true;
+    newEntry.xlingsPayloads = std::move(xlingsPayloads);
+    newEntry.xlingsPayloadsRecorded = true;
     entries.insert(entries.begin(), std::move(newEntry));
 
     // Trim to LRU capacity.
@@ -481,6 +502,8 @@ void write_build_cache_entries(const std::filesystem::path& path,
         f << "runtier=" << (e.runTierPending ? 1 : 0) << '\n';
         f << "features=" << e.features << '\n';
         f << "toolchain=" << e.toolchainRequest << '\n';
+        f << "xlingsPayloads=" << e.xlingsPayloads.size() << '\n';
+        for (auto& p : e.xlingsPayloads) f << p << '\n';
     }
 }
 
@@ -539,6 +562,9 @@ compute_run_targets(const mcpp::build::BuildPlan& plan) {
     std::vector<std::pair<std::string, std::string>> out;
     for (auto& lu : plan.linkUnits) {
         if (lu.kind != mcpp::build::LinkUnit::Binary) continue;
+        // A dependency's program shipped with this one (mcpp#711) is not a
+        // program of this package, and `mcpp run` does not choose it.
+        if (!lu.artifactOf.empty()) continue;
         out.emplace_back(lu.targetName, lu.output.generic_string());
     }
     return out;
@@ -1022,7 +1048,15 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
                           normalize_features(ctx.activeFeatureRequest),
                           // The toolchain request, so a later `--toolchain` or
                           // a changed machine default declines the fast path.
-                          toolchain_request_identity());
+                          toolchain_request_identity(),
+                          // The xlings payloads it read, so a removed one
+                          // declines the fast path (#716).
+                          [&] {
+                              std::vector<std::string> v;
+                              for (auto const& p : ctx.xlingsPayloads)
+                                  v.push_back(p.generic_string());
+                              return v;
+                          }());
     }
 
     // The one place the --strict policy is settled. Degradations reported by
@@ -1434,6 +1468,16 @@ void restore_root_compile_commands(const std::filesystem::path& projectRoot,
     }
 }
 
+// Every xlings payload the entry's build read is still installed (#716). A
+// cache written before the field was recorded declines once.
+bool xlings_payloads_present(const BuildCacheEntry& e) {
+    if (!e.xlingsPayloadsRecorded) return false;
+    std::error_code ec;
+    return std::ranges::all_of(e.xlingsPayloads, [&](const std::string& p) {
+        return std::filesystem::is_directory(std::filesystem::path(p), ec);
+    });
+}
+
 export std::optional<int> try_fast_build(const std::filesystem::path& projectRoot,
                                   bool verbose, bool no_cache,
                                   std::string_view currentTarget = "") {
@@ -1541,6 +1585,7 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     if (!match->depSourceRootsRecorded) return std::nullopt;
     if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
         return std::nullopt;
+    if (!xlings_payloads_present(*match)) return std::nullopt;
 
     auto validatedBefore =
         mcpp::build::runtime_validation::validated_artifact_snapshot(
@@ -1694,6 +1739,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     if (!match->depSourceRootsRecorded) return std::nullopt;
     if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
         return std::nullopt;
+    if (!xlings_payloads_present(*match)) return std::nullopt;
 
     auto validatedBefore =
         mcpp::build::runtime_validation::validated_artifact_snapshot(
@@ -2176,6 +2222,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
     const mcpp::build::LinkUnit* chosen = nullptr;
     for (auto& lu : ctx->plan.linkUnits) {
         if (lu.kind != mcpp::build::LinkUnit::Binary) continue;
+        if (!lu.artifactOf.empty()) continue;   // mcpp#711; see compute_run_targets
         if (targetName && lu.targetName != *targetName) continue;
         chosen = &lu;
         if (targetName) break;

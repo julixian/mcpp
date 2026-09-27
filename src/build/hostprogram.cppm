@@ -263,6 +263,19 @@ struct action {
     // `prepare` action with no `output_dir` is refused (`action_error`) as a
     // `check` that forgot to declare what it built.
     action& output_dir(const char* p) { outputDir_ = p; return *this; }
+    // An environment variable for the COMMAND (protocol 13, mcpp#708), added
+    // to the environment the build already passes on. The command is an argv
+    // with no shell, so `NAME=value cmd` is not available to write; this is.
+    // Changing a value changes the edge's command, so the action re-runs.
+    action& env(const char* name, const char* value) {
+        add(env_, name, value);
+        return *this;
+    }
+    // The directory the COMMAND runs in (protocol 13, mcpp#708). Relative to
+    // this package's root; the default is the build directory. Declared
+    // inputs and outputs are unaffected: they keep naming files the way they
+    // always have.
+    action& cwd(const char* dir) { cwd_ = dir; return *this; }
     void submit() const {
         std::printf("mcpp:action={\"id\":");        esc(id);
         std::printf(",\"role\":");                  esc(role);
@@ -280,6 +293,10 @@ struct action {
         // that never calls `output_dir()` serialises to the same bytes it did
         // before the method existed.
         if (outputDir_[0]) { std::printf(",\"output_dir\":"); esc(outputDir_); }
+        // Same omission rule again: an action that sets neither serialises to
+        // the bytes it did before protocol 13.
+        if (env_.len) std::printf(",\"env\":[%s]", env_.c_str());
+        if (cwd_[0]) { std::printf(",\"cwd\":"); esc(cwd_); }
         // Set only when the process could not allocate memory for a list.
         // A declaration cut short would otherwise be INVALID rather than
         // obviously wrong -- the engine turns this marker into a diagnostic
@@ -342,10 +359,11 @@ private:
             len = o.len;
         }
     };
-    list inputs_, outputs_, command_, provides_, imports_, targets_;
+    list inputs_, outputs_, command_, provides_, imports_, targets_, env_;
     // `prepare` only: see `output_dir()` above. A plain `const char*`, not a
     // `list`: it is one directory, never a JSON array.
     const char* outputDir_ = "";
+    const char* cwd_ = "";
     mutable bool overflow_ = false;
     static void esc(const char* s) {
         std::putchar('"');
@@ -366,21 +384,27 @@ private:
     // here: that revision escaped `"` and `\\` and passed control characters
     // through, and a control character passed through was not JSON, so no
     // payload the engine accepted contained one.
-    bool add(list& l, const char* s) {
+    // `value`, when given, is appended to `s` after an `=`, inside the same
+    // string literal: one `env` entry is one `NAME=value` string.
+    bool add(list& l, const char* s, const char* value = nullptr) {
         bool ok = true;
         if (l.len) ok = ok && l.put(',');
         ok = ok && l.put('"');
-        for (const char* p = s; ok && *p; ++p) {
-            unsigned char c = (unsigned char)*p;
-            if (c == '"' || c == '\\') { ok = l.put('\\') && l.put((char)c); continue; }
-            if (c < 0x20) {
-                static const char hex[] = "0123456789abcdef";
-                ok = l.put('\\') && l.put('u') && l.put('0') && l.put('0')
-                  && l.put(hex[c >> 4]) && l.put(hex[c & 0xf]);
-                continue;
+        auto body = [&](const char* text) {
+            for (const char* p = text; ok && *p; ++p) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\') { ok = l.put('\\') && l.put((char)c); continue; }
+                if (c < 0x20) {
+                    static const char hex[] = "0123456789abcdef";
+                    ok = l.put('\\') && l.put('u') && l.put('0') && l.put('0')
+                      && l.put(hex[c >> 4]) && l.put(hex[c & 0xf]);
+                    continue;
+                }
+                ok = l.put((char)c);
             }
-            ok = l.put((char)c);
-        }
+        };
+        body(s);
+        if (value) { ok = ok && l.put('='); body(value); }
         ok = ok && l.put('"');
         if (!ok) overflow_ = true;
         return ok;

@@ -589,6 +589,17 @@ struct BuildAction {
     // to still exist after a successful build and has itself just removed.
     std::string                        depfile;
     std::string                        description;
+    // Environment variables set for the COMMAND, each `NAME=value`, in the
+    // order declared (mcpp#708). Added to the environment the build already
+    // passes on, never replacing it: `PATH`, `MCPP_OFFLINE` and the rest reach
+    // the command as they reach every other edge (SPEC-007 R3.7). No name has
+    // a meaning of its own here, `PATH` included.
+    std::vector<std::string>           env;
+    // The directory the command runs in (mcpp#708). Empty means the build
+    // directory, which is where every action ran before this field. Absolute
+    // once `prepare_actions` has run; a relative spelling names a directory
+    // of the declaring package (SPEC-007 R2.2).
+    std::string                        cwd;
 };
 
 // `[resources]` — metadata and assets compiled INTO the produced artifact
@@ -2059,6 +2070,14 @@ struct Manifest {
     // feature is a build rule, here is what it compiles and here is how to
     // reach it". A feature with one and not the other is refused at parse time.
     std::map<std::string, std::string> featureRuleModule;
+    // `[features].<f>.tools` -- this package's own `kind = "bin"` targets that
+    // the feature makes available as host tools (mcpp#709). A consumer on whose
+    // behalf the feature is active receives each one as if its dependency edge
+    // had written `tools = [...]`: built once for the build machine, reachable
+    // from its build program through `mcpp::dep_bin`. The key moves a request a
+    // package already knows it needs into the package, so a consumer that
+    // enables a rule does not also have to name the rule's tools.
+    std::map<std::string, std::vector<std::string>> featureTools;
     // Feature System v2 Stage 2a — dependencies activated by a feature. A dep
     // declared ONLY here is optional: pulled into the resolution worklist only
     // when its feature is active (root --features or a dep spec's features=[...]).

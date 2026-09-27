@@ -16,6 +16,7 @@ import mcpp.libs.json;
 import mcpp.platform;
 import mcpp.xlings.runtime_selection;
 import mcpp.xlings.subos_info;
+import mcpp.xlings;
 
 export namespace mcpp::platform::runtime {
 
@@ -178,6 +179,15 @@ std::string canonical_contract(const RuntimeBinding& binding) {
     append_field(out, binding.hostLibc);
     for (auto const& p : binding.libraryDirs)
         append_field(out, p.generic_string());
+    // A payload reinstalled under the same version with changed content is a
+    // different runtime (openxlings/xlings#620), so its packaging revision is
+    // part of the contract. Revision 0 contributes nothing: a payload installed
+    // before revisions existed keeps the contract, and the output directory,
+    // it had.
+    for (auto const& p : binding.libraryDirs)
+        if (const int r = mcpp::xlings::paths::installed_revision(p.parent_path())
+                              .value_or(0); r > 0)
+            append_field(out, std::format("revision={}", r));
     // The farm participates in the hash because it participates in the
     // artifact: it lands in DT_RPATH, so a build made against one farm is not
     // interchangeable with a build made against another. `declared` is in for
