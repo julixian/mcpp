@@ -31,6 +31,9 @@ SPEC-007 §9 与新的 SPEC-008。配套的 mcpp-plugins 0.17.0 以本版本为�
 - **快路径看见 path 依赖的整棵源码树。** 此前只扫描依赖的 `src/`;依赖在别处的 host module
   (例如 mcpp-plugins 的 `deps/vcpkg.cppm`)编入消费方的构建程序,不在任何 ninja 边上,被编辑后
   构建报告"无事可做"。现在扫描依赖的整棵树,跳过隐藏目录、`target` 与嵌套的包(e2e 831)。
+- **每个下载只占一行。** 非终端输出此前在开始时写一行 `Downloading <item> (<size>)`,完成时再写一行
+  `... done, <size> in <time>`;现在只写完成的一行,失败时写 `did not complete` 的一行。终端上进度条
+  原地刷新,结束时换成同样带大小与耗时的完成行。
 - **MSVC ABI 上的 clang 找不到工具集时说明原因。** 默认的 `msvc@system` 在没有带 C++ 工具的
   Visual Studio 实例时,此前静默继续,随后在预编译 `mcpp` 模块时以 `'cstdio' file not found` 失败;
   现在解析时给出警告,写出安装与指定托管工具集的命令(在屏蔽 Visual Studio 的 runner 上测得)。

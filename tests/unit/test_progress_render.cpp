@@ -6,7 +6,7 @@ import mcpp.fetcher.progress;
 import mcpp.platform.process;
 
 // W11: one renderer for every acquisition, with a terminal mode (redrawn in
-// place) and a plain mode (one start line and one finish line per item).
+// place) and a plain mode; either prints one line per item (#734).
 
 TEST(GitProgress, ParsesThePhaseAndThePercentage) {
     auto r = mcpp::fetcher::parse_git_progress(
@@ -25,7 +25,7 @@ TEST(GitProgress, ParsesThePhaseAndThePercentage) {
     EXPECT_FALSE(mcpp::fetcher::parse_git_progress("").has_value());
 }
 
-TEST(ProgressBarPlain, OneStartLineAndOneFinishLineWithoutRepaints) {
+TEST(ProgressBarPlain, OneCompletionLineWithoutRepaints) {
     mcpp::ui::disable_color();
     mcpp::ui::set_live_progress(false);
     testing::internal::CaptureStdout();
@@ -39,9 +39,9 @@ TEST(ProgressBarPlain, OneStartLineAndOneFinishLineWithoutRepaints) {
     auto out = testing::internal::GetCapturedStdout();
     EXPECT_EQ(out.find('\r'), std::string::npos) << out;
     EXPECT_EQ(out.find('\x1b'), std::string::npos) << out;
-    EXPECT_EQ(std::ranges::count(out, '\n'), 2) << out;
-    EXPECT_NE(out.find("Fetching example ("), std::string::npos) << out;
-    EXPECT_NE(out.find("done"), std::string::npos) << out;
+    // #734: one line per item, stating the size and the time.
+    EXPECT_EQ(std::ranges::count(out, '\n'), 1) << out;
+    EXPECT_NE(out.find("Fetching example done, 100 B in"), std::string::npos) << out;
 }
 
 TEST(ProgressBarPlain, AFailedItemIsNotReportedDone) {
