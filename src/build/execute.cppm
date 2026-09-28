@@ -941,7 +941,22 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
         mcpp::ui::status("Compiling",
             std::format("{} v{} (.)",
                         ctx.manifest.package.name, ctx.manifest.package.version));
-    for (auto& [name, spec] : ctx.manifest.dependencies) {
+    // The packages announced: the root's dependencies, and in a workspace
+    // plan each member followed by the member's own dependencies (§15), as
+    // the member's own build announced them.
+    std::vector<std::pair<std::string, mcpp::manifest::DependencySpec>> announcedDeps;
+    for (auto const& [name, spec] : ctx.manifest.dependencies) {
+        announcedDeps.emplace_back(name, spec);
+        if (!spec.workspaceMember) continue;
+        for (auto const& m : ctx.workspaceMembers) {
+            std::error_code e1, e2;
+            if (std::filesystem::weakly_canonical(spec.path, e1)
+                != std::filesystem::weakly_canonical(m.root, e2))
+                continue;
+            for (auto const& [dn, ds] : m.manifest.dependencies) announcedDeps.emplace_back(dn, ds);
+        }
+    }
+    for (auto& [name, spec] : announcedDeps) {
         if (announced.contains(name)) continue;
         announced.insert(name);
         // Two keys that resolved to one identity (#634, A2) are one package

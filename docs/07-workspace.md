@@ -438,6 +438,9 @@ member that several members use is compiled once.
   member order.
 - **No-op builds.** A command repeated with nothing changed is answered by one
   check per configuration, without planning.
+- **Module names.** Members built in one graph share one module namespace:
+  two members that each provide a module of the same name cannot be built in
+  one `--workspace` command; build each with `-p`.
 
 ## 6. Directory Layout
 

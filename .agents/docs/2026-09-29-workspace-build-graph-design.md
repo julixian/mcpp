@@ -517,6 +517,7 @@ left open, the answer is recorded here.
 | The lock | `<workspace>/mcpp.lock`. A plan of all members writes the whole record; a plan of some keeps the other entries, and `--locked` then reports no entry of another member as drift. A selected member's git dependencies are locked as a root's. | prepare/records.cpp |
 | Tests | `mcpp test` keeps one plan per member (`-p X` each), in the shared directory; the members' dev-dependencies are their own. | cmd_build.cppm |
 | Concurrency | Groups are planned in turn and built on threads with a static share of the jobs; the `.build_cache` write is one locked step. | cmd_build.cppm |
+| Module names across members | A graph has one module namespace (BMIs are found by name), so two members that each provide a module of one name are refused in one `--workspace` plan, as two `artifacts` programs are (#732, which tracks per-provider BMI names). Measured over the package index's 172 members: no module name is provided twice. | scanner |
 
 Readings with the implementation (Linux, llvm 22.1.8):
 
