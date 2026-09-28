@@ -173,7 +173,9 @@ bool links_on_placement(const std::filesystem::path& p) {
 // it and the link can be made, and a copy otherwise (another volume, FAT or
 // exFAT, a permission), so the fallback is today's behaviour.
 // Returns an empty error_code on success; otherwise the most informative error
-// (the in-place one — that's where 1224 / 32 shows up).
+// (the in-place one — that's where 1224 / 32 shows up), or the rename's when
+// the destination shares its bytes with another name and is not written in
+// place.
 std::error_code write_once(const std::filesystem::path& src,
                            const std::filesystem::path& dst) {
     auto tmp = temp_sibling(dst);

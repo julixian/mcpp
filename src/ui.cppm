@@ -315,7 +315,16 @@ void set_line_buffered() {
 #endif
 }
 
+// The configuration groups of one workspace command build on threads
+// (workspace design 2026-09-29 §6), and each narrates its build: one line is
+// written as a whole.
+std::mutex& line_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 void status(std::string_view verb, std::string_view message) {
+    std::lock_guard line(line_mutex());
     if (g_quiet) return;
     init();
     auto v = verb_padded(verb);
@@ -329,6 +338,7 @@ void status(std::string_view verb, std::string_view message) {
 }
 
 void info(std::string_view verb, std::string_view message) {
+    std::lock_guard line(line_mutex());
     if (g_quiet) return;
     init();
     auto v = verb_padded(verb);
@@ -343,6 +353,7 @@ void info(std::string_view verb, std::string_view message) {
 
 void finished(std::string_view profile, std::chrono::milliseconds elapsed,
               std::string_view descriptor) {
+    std::lock_guard line(line_mutex());
     if (g_quiet) return;
     init();
     auto v = verb_padded("Finished");
@@ -365,6 +376,7 @@ void finished(std::string_view profile, std::chrono::milliseconds elapsed,
 }
 
 void warning(std::string_view message) {
+    std::lock_guard line(line_mutex());
     init();
     if (g_color) {
         std::println(stderr, "{}{}warning:{} {}", kBold, kYellow, kReset, message);
@@ -374,6 +386,7 @@ void warning(std::string_view message) {
 }
 
 void error(std::string_view message) {
+    std::lock_guard line(line_mutex());
     init();
     if (g_color) {
         std::println(stderr, "{}{}error:{} {}", kBold, kBrightRed, kReset, message);
@@ -383,6 +396,7 @@ void error(std::string_view message) {
 }
 
 void note(std::string_view message) {
+    std::lock_guard line(line_mutex());
     init();
     if (g_color) {
         std::println(stderr, "{}{}note:{} {}", kBold, kCyan, kReset, message);

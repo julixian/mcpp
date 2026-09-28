@@ -135,12 +135,11 @@ namespace mcpp::modgraph {
 
 std::expected<std::vector<std::size_t>, CycleError> topo_sort(const Graph& g) {
     // g.edges: (consumer, producer) pairs, "consumer depends on producer".
-    // mcpp.graph's adjacency direction is the same: deps[u] lists what u
-    // depends on, so an edge translates straight across with no inversion.
-    mcpp::graph::AdjacencyList deps(g.units.size());
-    for (auto [c, p] : g.edges) deps[c].push_back(p);
-
-    auto order = mcpp::graph::topological_order(deps);
+    // The unit order is the order of the objects on a link line, which
+    // Mach-O uses as the initializer order, so this is the order the module
+    // graph has always had: Kahn's algorithm with the ready units on a stack,
+    // over the edges in the order the graph records them (see mcpp.graph).
+    auto order = mcpp::graph::stack_topological_order(g.units.size(), g.edges);
     if (!order) return std::unexpected(CycleError{std::move(order.error().cycle)});
     return std::move(*order);
 }

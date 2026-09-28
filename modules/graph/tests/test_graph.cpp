@@ -243,3 +243,90 @@ TEST(Closure, RootWithNoEdgesHasAnEmptyClosure) {
     auto c = g::closure(deps, std::array{std::size_t{0}});
     EXPECT_TRUE(c.empty());
 }
+
+// ── stack_topological_order: the module graph's unit order ──────────────────
+//
+// The order the module graph has always had, which is the order of the
+// objects on a link line. The reference below is the hand-written loop it
+// replaced, run on the same edges.
+namespace {
+std::vector<std::size_t> reference_stack_order(
+        std::size_t n, const std::vector<std::pair<std::size_t, std::size_t>>& edges) {
+    std::vector<std::size_t> indeg(n, 0);
+    std::vector<std::vector<std::size_t>> adj(n);
+    for (auto [c, p] : edges) { indeg[c]++; adj[p].push_back(c); }
+    std::vector<std::size_t> order, queue;
+    for (std::size_t i = 0; i < n; ++i) if (indeg[i] == 0) queue.push_back(i);
+    while (!queue.empty()) {
+        auto u = queue.back(); queue.pop_back();
+        order.push_back(u);
+        for (auto v : adj[u]) if (--indeg[v] == 0) queue.push_back(v);
+    }
+    return order;
+}
+}  // namespace
+
+TEST(StackTopologicalOrder, IsTheModuleGraphsHistoricalOrder) {
+    const std::vector<std::pair<std::size_t, std::size_t>> edges = {
+        {3, 0}, {4, 0}, {4, 1}, {5, 3}, {5, 4}, {6, 2}, {7, 6}, {7, 5}, {1, 2},
+    };
+    auto order = g::stack_topological_order(8, edges);
+    ASSERT_TRUE(order.has_value());
+    EXPECT_EQ(*order, reference_stack_order(8, edges));
+    // It is not the stable order: ties go to the most recently readied node.
+    g::AdjacencyList deps(8);
+    for (auto [c, p] : edges) deps[c].push_back(p);
+    EXPECT_NE(*order, *g::topological_order(deps));
+}
+
+TEST(StackTopologicalOrder, ACycleIsReportedAsItsPath) {
+    const std::vector<std::pair<std::size_t, std::size_t>> edges = {{0, 1}, {1, 2}, {2, 0}};
+    auto order = g::stack_topological_order(3, edges);
+    ASSERT_FALSE(order.has_value());
+    auto const& ring = order.error().cycle;
+    ASSERT_GE(ring.size(), 2u);
+    EXPECT_EQ(ring.front(), ring.back());
+}
+
+// ── depth_first_order: the host-module orders ───────────────────────────────
+
+TEST(DepthFirstOrder, DependenciesFirstFromEachRootInOrder) {
+    // 0 -> {2, 1}, 1 -> {3}, 2 -> {3}: from root 0, dependency 2 is visited
+    // before 1 because that is the order `deps[0]` lists them in.
+    g::AdjacencyList deps(4);
+    deps[0] = {2, 1};
+    deps[1] = {3};
+    deps[2] = {3};
+    auto order = g::depth_first_order(deps, std::array{std::size_t{0}});
+    ASSERT_TRUE(order.has_value());
+    EXPECT_EQ(*order, (std::vector<std::size_t>{3, 2, 1, 0}));
+}
+
+TEST(DepthFirstOrder, OnlyWhatTheRootsReachIsEmitted) {
+    g::AdjacencyList deps(4);
+    deps[1] = {0};
+    deps[3] = {2};
+    auto order = g::depth_first_order(deps, std::array{std::size_t{1}});
+    ASSERT_TRUE(order.has_value());
+    EXPECT_EQ(*order, (std::vector<std::size_t>{0, 1}));
+}
+
+TEST(DepthFirstOrder, ACycleIsAnErrorNamingTheRing) {
+    g::AdjacencyList deps(3);
+    deps[0] = {1};
+    deps[1] = {2};
+    deps[2] = {1};
+    auto order = g::depth_first_order(deps, std::array{std::size_t{0}});
+    ASSERT_FALSE(order.has_value());
+    EXPECT_EQ(order.error().cycle, (std::vector<std::size_t>{1, 2, 1}));
+}
+
+TEST(DepthFirstOrder, ACycleCanBeSkipped) {
+    g::AdjacencyList deps(2);
+    deps[0] = {1};
+    deps[1] = {0};
+    auto order = g::depth_first_order(deps, std::array{std::size_t{0}, std::size_t{1}},
+                                      g::Cycles::Skip);
+    ASSERT_TRUE(order.has_value());
+    EXPECT_EQ(*order, (std::vector<std::size_t>{1, 0}));
+}

@@ -328,19 +328,28 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
             return r != 0 ? r : rc;
         }
         const std::size_t hw = std::max(1u, std::thread::hardware_concurrency());
+        std::set<std::filesystem::path> directories;
+        for (auto const& c : contexts) directories.insert(c.outputDir.lexically_normal());
         for (auto& c : contexts) {
             const std::size_t want = c.plan.scheduleNinjaJobs > 0
                 ? static_cast<std::size_t>(c.plan.scheduleNinjaJobs) : hw + 2;
             c.plan.scheduleNinjaJobs = static_cast<int>(
-                std::max<std::size_t>(1, want / contexts.size()));
+                std::max<std::size_t>(1, want / directories.size()));
         }
+        // Concurrency is across build directories. Two groups whose values
+        // resolve to one directory (one toolchain spelled two ways) are built
+        // one after the other in it, since one ninja owns a directory.
+        std::map<std::filesystem::path, std::vector<std::size_t>> byDirectory;
+        for (std::size_t i = 0; i < contexts.size(); ++i)
+            byDirectory[contexts[i].outputDir.lexically_normal()].push_back(i);
         std::vector<int> results(contexts.size(), 0);
         {
             std::vector<std::jthread> builds;
-            for (std::size_t i = 0; i < contexts.size(); ++i)
-                builds.emplace_back([&, i] {
-                    results[i] = run_build_with_hooks(contexts[i], verbose, no_cache,
-                                                      ov.target_triple);
+            for (auto const& [dir, indices] : byDirectory)
+                builds.emplace_back([&, indices] {
+                    for (auto i : indices)
+                        results[i] = run_build_with_hooks(contexts[i], verbose, no_cache,
+                                                          ov.target_triple);
                 });
         }
         for (int r : results)

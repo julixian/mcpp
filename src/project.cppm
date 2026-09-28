@@ -834,8 +834,14 @@ export std::string product_directory_name(const std::vector<WorkspaceMember>& al
         for (auto& c : s) if (c == '/' || c == '\\') c = '.';
         return s;
     }
+    // Compared without case: a Windows or macOS file system gives two names
+    // that differ only in case one directory.
+    auto folded = [](std::string v) {
+        for (auto& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return v;
+    };
     const auto shared = std::ranges::count_if(all, [&](const WorkspaceMember& m) {
-        return m.name == it->name;
+        return folded(m.name) == folded(it->name);
     });
     return shared > 1 ? qualified_member_name(*it) : it->name;
 }

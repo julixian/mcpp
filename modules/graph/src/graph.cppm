@@ -22,6 +22,23 @@
 // a package's `[dependencies]`), so no call site has to invert its data to
 // call in.
 //
+// THREE ORDERS, AND WHY A CALLER KEEPS THE ONE IT HAD
+//
+// An order among nodes that do not constrain each other is still observable
+// when the order becomes a link order: Mach-O runs initializers in link order,
+// and the module graph's unit order is the order of the objects on the link
+// line. Changing it changed a program's initialization (measured 2026-09-29:
+// openkal's `same-source` example, linked for aarch64-macos, crashed at start
+// when its units moved to the stable order below). A caller whose order
+// reaches an artifact therefore keeps its order, and this module offers each
+// order the engine uses:
+//
+//   topological_order        Kahn, lowest ready index first (stable)
+//   stack_topological_order  Kahn, most recently readied first, over edges in
+//                            the order given (the module graph's unit order)
+//   depth_first_order        dependencies first, depth first, from roots in
+//                            the order given (the host-module orders)
+//
 // STABILITY
 //
 // `topological_order` and `levels` are Kahn's algorithm with the ready set
@@ -88,6 +105,27 @@ levels(const AdjacencyList& deps);
 std::vector<std::size_t>
 closure(const AdjacencyList& deps, std::span<const std::size_t> roots,
         bool include_roots = false);
+
+// Kahn's algorithm with the ready nodes on a stack: the node readied most
+// recently is emitted next. `edges` holds (dependent, dependency) pairs over
+// nodes 0..n-1, in the order that decides the ties. This is the order of the
+// module graph's units, and so of the objects on a link line (see the header).
+std::expected<std::vector<std::size_t>, CycleError>
+stack_topological_order(std::size_t n,
+                        std::span<const std::pair<std::size_t, std::size_t>> edges);
+
+// What a dependency on a node still on the depth-first path means.
+enum class Cycles {
+    Error,   // a cycle: the order is refused with the ring
+    Skip,    // the edge is ignored; the node is emitted where it stands
+};
+
+// Dependencies first, depth first: from each root in the order given, a node
+// is emitted after every node it depends on, its dependencies visited in the
+// order of `deps[u]`. Only nodes reachable from `roots` are emitted.
+std::expected<std::vector<std::size_t>, CycleError>
+depth_first_order(const AdjacencyList& deps, std::span<const std::size_t> roots,
+                  Cycles cycles = Cycles::Error);
 
 } // namespace mcpp::graph
 
@@ -183,6 +221,74 @@ kahn_order(const AdjacencyList& deps) {
 std::expected<std::vector<std::size_t>, CycleError>
 topological_order(const AdjacencyList& deps) {
     return kahn_order(deps);
+}
+
+std::expected<std::vector<std::size_t>, CycleError>
+stack_topological_order(std::size_t n,
+                        std::span<const std::pair<std::size_t, std::size_t>> edges) {
+    std::vector<std::size_t> remaining(n, 0);
+    std::vector<std::vector<std::size_t>> dependents(n);
+    for (auto [dependent, dependency] : edges) {
+        remaining[dependent]++;
+        dependents[dependency].push_back(dependent);
+    }
+    std::vector<std::size_t> order;
+    order.reserve(n);
+    std::vector<std::size_t> ready;
+    for (std::size_t u = 0; u < n; ++u)
+        if (remaining[u] == 0) ready.push_back(u);
+    while (!ready.empty()) {
+        const std::size_t u = ready.back();
+        ready.pop_back();
+        order.push_back(u);
+        for (auto w : dependents[u])
+            if (--remaining[w] == 0) ready.push_back(w);
+    }
+    if (order.size() == n) return order;
+    // The ring, found the way `topological_order` finds one.
+    AdjacencyList deps(n);
+    for (auto [dependent, dependency] : edges) deps[dependent].push_back(dependency);
+    auto ring = kahn_order(deps);
+    if (!ring) return std::unexpected(ring.error());
+    return std::unexpected(CycleError{});
+}
+
+std::expected<std::vector<std::size_t>, CycleError>
+depth_first_order(const AdjacencyList& deps, std::span<const std::size_t> roots,
+                  Cycles cycles) {
+    const std::size_t n = deps.size();
+    std::vector<char> state(n, 0);   // 0 unseen, 1 on the current path, 2 done
+    std::vector<std::size_t> order;
+    std::vector<std::size_t> path;
+    for (auto root : roots) {
+        if (root >= n || state[root] != 0) continue;
+        std::vector<std::pair<std::size_t, std::size_t>> frame{{root, 0}};
+        state[root] = 1;
+        path.push_back(root);
+        while (!frame.empty()) {
+            auto& [u, k] = frame.back();
+            if (k < deps[u].size()) {
+                const auto v = deps[u][k++];
+                if (v >= n || state[v] == 2) continue;
+                if (state[v] == 1) {
+                    if (cycles == Cycles::Skip) continue;
+                    CycleError err;
+                    err.cycle.assign(std::ranges::find(path, v), path.end());
+                    err.cycle.push_back(v);
+                    return std::unexpected(std::move(err));
+                }
+                state[v] = 1;
+                path.push_back(v);
+                frame.push_back({v, 0});
+                continue;
+            }
+            state[u] = 2;
+            order.push_back(u);
+            path.pop_back();
+            frame.pop_back();
+        }
+    }
+    return order;
 }
 
 std::expected<std::vector<std::size_t>, CycleError>
