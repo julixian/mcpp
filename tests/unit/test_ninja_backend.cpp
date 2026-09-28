@@ -1574,11 +1574,19 @@ TEST(NinjaBackendPeRuntime, ToolchainCoupledStagesTheToolsetCrtBesideTheExe) {
         EXPECT_EQ(d.sources.front().extension(), ".dll") << d.sources.front().string();
     }
 
-    auto ninja = emit_ninja_string(plan);
+    std::string placements;
+    auto ninja = emit_ninja_string(plan, &placements);
+    // #734 E4: two or more placements are one `stage_list` edge whose outputs
+    // are every destination, and the list the edge reads names each pair.
+    const auto listAt = ninja.find(": stage_list ");
+    ASSERT_NE(listAt, std::string::npos) << ninja;
+    const auto listLine = ninja.substr(ninja.rfind("\nbuild ", listAt) + 1,
+                                       ninja.find('\n', listAt) - ninja.rfind("\nbuild ", listAt) - 1);
     for (auto name : {"vcruntime140.dll", "msvcp140.dll", "vcruntime140_1.dll"}) {
-        EXPECT_NE(ninja.find(std::format("build bin/{} : stage_file", name)),
-                  std::string::npos)
-            << name << " has no copy edge\n" << ninja;
+        EXPECT_NE(listLine.find(std::format("bin/{}", name)), std::string::npos)
+            << name << " is not an output of the placement edge\n" << ninja;
+        EXPECT_NE(placements.find(std::format("\tbin/{}", name)), std::string::npos)
+            << name << " is not in the placement list\n" << placements;
     }
     EXPECT_EQ(ninja.find("Microsoft.VC143.CRT.manifest"), std::string::npos)
         << "copied something that is not a runtime DLL\n" << ninja;

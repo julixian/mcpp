@@ -127,7 +127,7 @@ cd app
 out="$("$MCPP" run 2>&1 | grep '^A=' | tail -1)"
 [[ "$out" == 'A=1 B=0 V=0.1.0' ]] || { echo "FAIL: expected A=1 B=0 V=0.1.0, got: $out"; exit 1; }
 echo "PASS: a feature the consumer activates makes its unit importable under its declared name"
-if grep -q 'prefix is reserved for rules maintained by the mcpp project' b1.log; then
+if grep -q 'belongs to the modules maintained by the mcpp project' b1.log; then
     echo "FAIL: the mcpp namespace drew a reserved-prefix warning"; cat b1.log; exit 1; fi
 echo "PASS: a collection in the mcpp namespace draws no reserved-prefix warning"
 cd ..
@@ -155,7 +155,7 @@ write_collection acme
 write_app acme '"rules-a", "rules-b"' 'mcpp.rules.a mcpp.rules.b'
 cd app
 "$MCPP" build > b4.log 2>&1 || { cat b4.log; echo "FAIL: the acme collection did not build"; exit 1; }
-n=$(grep -c 'prefix is reserved for rules maintained by the mcpp project' b4.log || true)
+n=$(grep -c 'belongs to the modules maintained by the mcpp project' b4.log || true)
 # three units -- the lib root `mcpp.plugins` and the two rules -- each claims the prefix
 [[ "$n" -eq 3 ]] || { echo "FAIL: expected 3 reserved-prefix warnings (one per unit), got $n"; cat b4.log; exit 1; }
 echo "PASS: the same collection under another namespace draws one warning per unit"

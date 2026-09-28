@@ -883,6 +883,11 @@ step11_prebuild_std_module(PrepareState& state, bool needsStdModule) {
 // dependency without a root, which states no interface.
 static void step11_public_module_check(PrepareState& state) {
     if (state.packages.empty()) return;
+    // The re-exports are read by the text scanner only; a P1689 scan reports
+    // imports without saying which are `export import`, and every re-exported
+    // module would then read as private. No reading, no warning.
+    if (const char* sel = std::getenv("MCPP_SCANNER"); sel && std::string_view(sel) == "p1689")
+        return;
     const auto& g = state.scan.graph;
     auto qualified = [](const mcpp::manifest::Manifest& m) {
         return m.package.namespace_.empty() ? m.package.name
