@@ -102,6 +102,29 @@ inline void run_exclusive()                    { std::printf("mcpp:run-exclusive
 // program, and an advisory that appeared once and then vanished would read as
 // "resolved". mcpp replays it on every hit.
 inline void warning(const char* message)          { std::printf("mcpp:warning=%s\n", message); }
+// A structured diagnostic (#734 E11, protocol 14), rendered by the engine in
+// its own form: the message, then `impact:` and `hint:` lines, in the JSON
+// stream with the same fields, and replayed on a cached run as `warning` is.
+// `severity` is "note", "warning" or "degraded" (a degradation fails the
+// build under `--strict`). `warning(message)` stays, and equals a diagnostic
+// with a message only.
+struct diagnostic {
+    const char* severity = "warning";
+    const char* message  = "";
+    const char* impact   = "";
+    const char* hint     = "";
+};
+inline void diagnostic_field_(const char* s) {
+    for (const char* p = s ? s : ""; *p; ++p)
+        std::fputc((*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p, stdout);
+}
+inline void report(const diagnostic& d) {
+    std::fputs("mcpp:diagnostic=", stdout);
+    diagnostic_field_(d.severity); std::fputc('\t', stdout);
+    diagnostic_field_(d.message);  std::fputc('\t', stdout);
+    diagnostic_field_(d.impact);   std::fputc('\t', stdout);
+    diagnostic_field_(d.hint);     std::fputc('\n', stdout);
+}
 
 // ── The probe channel (mcpp 2026.9.5.2+) ────────────────────────────────────
 //

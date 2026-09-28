@@ -1582,6 +1582,9 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
         bpEnv.hostModules = state.hostModulesByConsumer.count(0u)
             ? state.hostModulesByConsumer.at(0u)
             : decltype(bpEnv.hostModules){};
+        bpEnv.dormantFeatures = state.dormantFeaturesByConsumer.count(0u)
+            ? state.dormantFeaturesByConsumer.at(0u)
+            : decltype(bpEnv.dormantFeatures){};
         // #649 E5: the packaging pass's strip decision, beside its format.
         bpEnv.packStrip           = state.overrides.pack_strip;
         bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;

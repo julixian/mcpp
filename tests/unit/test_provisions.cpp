@@ -318,6 +318,34 @@ TEST(ReservedPrefix, AnOrdinaryNameIsSilent) {
                                                "acme.mcppish").has_value());
 }
 
+// #734 E10: a plugin may say it is an mcpp plugin under its own namespace;
+// the official second segments stay the mcpp project's.
+TEST(ReservedPrefix, AnOwnNamespaceUnderMcppIsSilent) {
+    EXPECT_FALSE(prov::reserved_prefix_warning("mcpp.acme.protobuf", "acme",
+                                               "acme.protobufgen").has_value());
+    EXPECT_FALSE(prov::reserved_prefix_warning("mcpp.acme", "acme",
+                                               "acme.gen").has_value());
+    EXPECT_FALSE(prov::reserved_prefix_warning("mcpp.mcpplibs.capi.lua", "mcpplibs.capi",
+                                               "mcpplibs.capi.lua").has_value());
+}
+
+TEST(ReservedPrefix, EveryReservedSecondSegmentIsWarnedAbout) {
+    for (auto seg : prov::kReservedSecondSegments) {
+        auto name = std::string("mcpp.") + std::string(seg) + ".x";
+        auto w = prov::reserved_prefix_warning(name, "acme", "acme.x");
+        ASSERT_TRUE(w.has_value()) << name;
+        EXPECT_NE(w->find("mcpp.acme.*"), std::string::npos) << *w;
+    }
+}
+
+TEST(ReservedPrefix, AnotherNamespaceUnderMcppIsWarnedAbout) {
+    auto w = prov::reserved_prefix_warning("mcpp.other.x", "acme", "acme.x");
+    ASSERT_TRUE(w.has_value());
+    EXPECT_NE(w->find("mcpp.acme.*"), std::string::npos) << *w;
+    // `mcpp.acmeish` is not under `mcpp.acme.`: the segment boundary decides.
+    EXPECT_TRUE(prov::reserved_prefix_warning("mcpp.acmeish.x", "acme", "acme.x").has_value());
+}
+
 // A package that offers several rules through features (mcpp 2026.9.5.3+)
 // contributes every module INTERFACE unit among its resolved sources. The
 // detector decides what counts as one, and the cases below are the ones a

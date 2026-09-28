@@ -1132,6 +1132,27 @@ step6_host_module_registration(PrepareState& state) {
                 if (direct.empty()) continue;
                 std::set<std::size_t> isDirect(direct.begin(), direct.end());
 
+                // #734 E7: what each direct provider could offer with a feature
+                // it does not have enabled here. Globs are expanded, nothing is
+                // read: the module names are looked up only if build.mcpp
+                // imports something no provider offers.
+                for (auto p : direct) {
+                    auto const& dm = state.packages[p].manifest;
+                    const auto& active = p < state.activeFeaturesByPackage.size()
+                        ? state.activeFeaturesByPackage[p] : std::vector<std::string>{};
+                    for (auto const& [fname, globs] : dm.buildConfig.featureSources) {
+                        if (std::ranges::find(active, fname) != active.end()) continue;
+                        mcpp::build::BuildProgramEnv::DormantFeature df;
+                        df.package = identity(p);
+                        df.feature = fname;
+                        for (auto const& g : globs)
+                            for (auto& f : mcpp::modgraph::expand_glob(state.packages[p].root, g))
+                                df.files.push_back(f);
+                        if (!df.files.empty())
+                            state.dormantFeaturesByConsumer[c].push_back(std::move(df));
+                    }
+                }
+
                 // Post-order DFS, so a rule's own host modules are compiled
                 // BEFORE it. That ordering is the entire mechanism: the
                 // compile loop in build_program.cppm accumulates the module
@@ -1890,6 +1911,9 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             bpEnv.hostModules = state.hostModulesByConsumer.count(i)
                 ? state.hostModulesByConsumer.at(i)
                 : decltype(bpEnv.hostModules){};
+            bpEnv.dormantFeatures = state.dormantFeaturesByConsumer.count(i)
+                ? state.dormantFeaturesByConsumer.at(i)
+                : decltype(bpEnv.dormantFeatures){};
             auto& bcDep = pkg.manifest.buildConfig;
             const auto mark = state.markDirectiveTail(pkg.manifest);
             const auto ldN = bcDep.ldflags.size();

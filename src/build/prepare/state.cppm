@@ -367,6 +367,9 @@ struct PrepareState {
     // detect (nothing outside the escaping closure's own body names them).
     std::vector<mcpp::modgraph::PackageRoot> packages;
     std::vector<std::vector<std::string>> activeFeaturesByPackage;
+    // #734 E7: per consumer, the dormant features of its host-module providers.
+    std::map<std::size_t, std::vector<mcpp::build::BuildProgramEnv::DormantFeature>>
+        dormantFeaturesByConsumer;
     std::map<std::string, std::string> xlingsWinner;
     std::vector<std::unique_ptr<mcpp::manifest::Manifest>> dep_manifests;
     std::vector<DepCacheIdentity> dep_cache_identities;

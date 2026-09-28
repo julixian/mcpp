@@ -65,6 +65,13 @@ void warning(std::string_view domain, std::string_view what,
 // `--strict`.
 void note(std::string_view domain, std::string_view what);
 
+// A diagnostic whose severity arrives as data: a build program's structured
+// diagnostic (#734 E11), stated in the engine's own form. Rendered and recorded
+// exactly as the three calls above would, so `--strict` and the JSON stream
+// treat a plugin's diagnostic as they treat the engine's.
+void report(Severity severity, std::string_view domain, std::string_view what,
+            std::string_view impact, std::string_view hint);
+
 // The records of this run, cleared: what a command that writes an envelope
 // reports for one member before planning the next. What was printed stays
 // printed -- the once-per-process rule is about the terminal.
@@ -140,6 +147,12 @@ void warning(std::string_view domain, std::string_view what,
              std::string_view hint) {
     push(Record{Severity::Warning, std::string(domain), std::string(what),
                 std::string{}, std::string(hint)});
+}
+
+void report(Severity severity, std::string_view domain, std::string_view what,
+            std::string_view impact, std::string_view hint) {
+    push(Record{severity, std::string(domain), std::string(what),
+                std::string(impact), std::string(hint)});
 }
 
 void note(std::string_view domain, std::string_view what) {

@@ -13,6 +13,7 @@ module;
 export module mcpp.build.build_program;
 
 import std;
+import mcpp.diag;   // structured diagnostics of build programs (#734 E11)
 import mcpp.manifest;
 import mcpp.platform;
 import mcpp.pm.mangle;        // imported_module_names -- what build.mcpp asks for
@@ -32,6 +33,26 @@ import mcpp.toolchain.stdmod;        // ensure_built — the SAME std BMI the ma
 import mcpp.toolchain.triple;        // host_triple (MCPP_HOST contract value)
 import mcpp.ui;
 import mcpp.version;         // MCPP_VERSION — the hint names the engine the reader is on
+
+namespace {
+// #734 E11: a build program's structured diagnostics, in the engine's own form.
+// Called at both sites that report advisories -- the run path and the cache
+// hit -- for the reason stated there: a replayed record must say what the run
+// said.
+void report_stated_diagnostics(std::string_view packageName,
+                               const mcpp::build::directives::Directives& d) {
+    namespace dirs = mcpp::build::directives;
+    for (auto const& sd : dirs::stated_diagnostics(d)) {
+        const auto sev = sd.severity == "note"     ? mcpp::diag::Severity::Note
+                       : sd.severity == "degraded" ? mcpp::diag::Severity::Degraded
+                                                   : mcpp::diag::Severity::Warning;
+        mcpp::diag::report(sev, std::format("build.mcpp/{}", packageName),
+                           packageName.empty() ? sd.message
+                                               : std::format("{}: {}", packageName, sd.message),
+                           sd.impact, sd.hint);
+    }
+}
+} // namespace
 
 export namespace mcpp::build {
 
@@ -87,6 +108,16 @@ struct BuildProgramEnv {
     // same producers the engine's own command lines read; a key absent here is
     // emitted empty.
     std::map<std::string, std::string> buildInfo;
+    // #734 E7: the features of this program's host-module providers that are
+    // NOT enabled, with the files each would add. Read only when build.mcpp
+    // imports a module nothing provides, to name the feature that would; the
+    // files are not opened on a successful plan.
+    struct DormantFeature {
+        std::string                        package;
+        std::string                        feature;
+        std::vector<std::filesystem::path> files;
+    };
+    std::vector<DormantFeature> dormantFeatures;
     // WHICH COMPILER RESOLVED — "gcc" | "clang" | "msvc" | "".
     //
     // A package should never have to guess this, and until this field existed
@@ -1155,6 +1186,35 @@ std::expected<void, std::string> run_build_program(
                     if (!importable.empty()) importable += ", ";
                     importable += hm.logical;
                 }
+            // #734 E7: the module may be one a provider offers behind a
+            // feature this build has not enabled. The files were listed while
+            // planning; they are read only now, on the way to an error.
+            for (auto const& df : env.dormantFeatures) {
+                for (auto const& f : df.files) {
+                    std::ifstream in(f, std::ios::binary);
+                    std::string text{std::istreambuf_iterator<char>(in), {}};
+                    std::size_t at = 0;
+                    bool declares = false;
+                    while ((at = text.find("export module", at)) != std::string::npos) {
+                        std::size_t i = at + std::string_view("export module").size();
+                        while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+                        std::size_t j = i;
+                        while (j < text.size() && text[j] != ';' && text[j] != ' '
+                               && text[j] != '\t' && text[j] != '\n' && text[j] != '\r') ++j;
+                        if (text.compare(i, j - i, want) == 0) { declares = true; break; }
+                        at = j;
+                    }
+                    if (!declares) continue;
+                    mcpp::build::refusal::record(
+                        mcpp::build::refusal::Code::HostModuleMissing);
+                    return std::unexpected(std::format(
+                        "build.mcpp imports '{}'\n"
+                        "  provided by: {}, feature \"{}\" (not enabled)\n"
+                        "  hint: enable it on the dependency edge: {} = {{ ..., "
+                        "features = [\"{}\"] }}",
+                        want, df.package, df.feature, df.package, df.feature));
+                }
+            }
             mcpp::build::refusal::record(
                 mcpp::build::refusal::Code::HostModuleMissing);
             return std::unexpected(std::format(
@@ -1200,6 +1260,7 @@ std::expected<void, std::string> run_build_program(
         // asserts the second build, not the first.
         for (auto const& a : dirs::advisories(m.package.name, cache.directives))
             mcpp::ui::warning(a);
+        report_stated_diagnostics(m.package.name, cache.directives);
         mcpp::ui::info("build.mcpp", "up to date (cached)");
         return {};
     }
@@ -1702,6 +1763,7 @@ std::expected<void, std::string> run_build_program(
     // The second of the two sites. See the note on the cache-hit path above.
     for (auto const& a : dirs::advisories(m.package.name, d))
         mcpp::ui::warning(a);
+    report_stated_diagnostics(m.package.name, d);
     write_cache(bdir, root, programHash, compilerHash, ctxHash, d);
     return {};
 }
