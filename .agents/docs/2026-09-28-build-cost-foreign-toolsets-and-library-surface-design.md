@@ -1130,7 +1130,7 @@ Each repository receives one pull request that carries all of its tasks. The
 order follows the dependencies: the engine first, because the plugins' floor
 names its release; the plugins next; the index and the validation project last.
 
-### 13.1 mcpp (one pull request, release V = 2026.9.29.1)
+### 13.1 mcpp (one pull request, release V = 2026.9.28.3)
 
 | Task | Items | Criterion (test) |
 |---|---|---|
@@ -1217,5 +1217,50 @@ Each item has an e2e:
 8. **W3 is skipped under `MCPP_SCANNER=p1689`.** That scanner does not report
    which imports are `export import`, so every re-exported module would read as
    private.
+9. **`mcpp::report` writes through `printf` only.** Its first form named
+   `stdout` and `fputc`, which carried `FILE` into the module interface; GCC
+   then rejected a build program that includes `<cstdio>` after `import mcpp;`
+   (e2e 651 on the GCC row).
+10. **Two fast-path defects outside E5's reading, found by the plugin test kit's
+    revert probe.** Both are present in 2026.9.28.2 on Linux.
+    - The dependency sweep read only a path dependency's `src/`. An edit to a
+      host module elsewhere (mcpp-plugins' `deps/vcpkg.cppm`) was replayed as
+      "no work", because such a unit is compiled into the consumer's build
+      program and no edge of build.ninja names it. The sweep now walks the
+      dependency's tree, skipping hidden directories, `target` and nested
+      packages (e2e 831).
+    - A full build that confirms the graph did not rewrite an unchanged
+      build.ninja, and the fast path compares every source with its time. After
+      any edit, every later build was therefore planned in full until the
+      graph's text changed. The backend now moves the file's time when it
+      confirms the graph (e2e 832).
+    Under `-v` each refusal is a sentence rather than the code of its condition.
 
-**mcpp-plugins, mcpp-index, validation.** Recorded below as they land.
+**mcpp-plugins 0.17.0.** U1 to U4 on one branch (`feat/734-plugins-0.17.0`).
+
+| Item | Where | Criterion |
+|---|---|---|
+| U1 | `plugins-core` (with `surface` as an alias), `plugins-testing`, `src/fs.cppm`, `[package] mcpp = ">=2026.9.28.3"`, `src/compat/`, `deps/compat/`, `.github/scripts/check-compat-retirement.sh` | the package and `all-rules-compile` build on the LLVM and GCC rows; the retirement check fails with `COMPAT_TODAY=2027-03-29` |
+| U2 | `src/toolset.cppm` | `tests/plugin-logic`, the mechanism cases |
+| U3 | `deps/vcpkg.cppm`, `deps/cmake.cppm`, docs/deps.md | the Linux rows locally (LLVM and GCC: derived triplets, ports against the program's C++ library, two prefixes coexisting); the Windows rows in CI |
+| U4 | `src/testing.cppm` | `tests/plugin-logic`: 14 cases; removing the host-triplet argument fails exactly the managed-row case |
+
+Departures from §6:
+
+1. **`resolve_named`.** `generator = ninja` under an instance needs the tools
+   named; `mcpp.plugins.toolset` gained `resolve_named`, which answers `chain`
+   where an instance exists.
+2. **The MSBuild refusal lives in the derived triplet.** The installation's
+   command is vcpkg itself, so the plugin cannot read vcpkg's output. The
+   derived triplet watches `VCPKG_PLATFORM_TOOLSET`, which vcpkg's MSBuild
+   helpers read to form `/p:PlatformToolset`, and stops the port there with the
+   plugin's message.
+3. **`detected` on the Linux libc++ row names mcpp's clang,** as 0.16.0 did; the
+   derived triplet's name replaces `<arch>-linux-libcxx`.
+4. **The `surface` alias prints no note.** A feature name is resolved before any
+   build program runs; its header records the retirement date, and the CI
+   check reads it.
+5. **Each deps-cmake toolset statement has its own build directory,** because
+   CMake refuses a cache made with another generator or instance.
+
+**mcpp-index, validation.** Recorded below as they land.
