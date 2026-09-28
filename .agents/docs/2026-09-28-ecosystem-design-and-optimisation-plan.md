@@ -743,3 +743,43 @@ on the branch found F4, F6, the fast path that e2e 821 assumed on every host
 (it serves only ELF products, #400), and the measurement's three harness
 defects; each was fixed on the branch.
 
+### 8.4 Self-review
+
+**Architecture.** Each fact that §1 set out to give one authority now has one:
+the files beside a PE program (`mcpp.build.runtime_placement`, read by the
+plan, `place-dlls` and `mcpp pack`), the order of conditional tables
+(`mcpp.manifest.cfg_selector`, read by both manifest readers), the host's
+default toolchain (`pins::host_default_toolchain`, read by the first run,
+`self env` and the docs check), and a home (`home_identity::is_home`, read by
+every xlings reader). Two statements remain second copies by construction:
+`verify-published.sh` embeds the PE synthesiser of `tests/e2e/_synth_pe.py`,
+because a sandbox sees no checkout, and the index keeps its own list of red
+members, because the owner of a failure is a fact of the index.
+
+**Crossings.** The pull-request template's table was filled before CI and
+still missed one crossing (F6: the action `PATH` against the stability of an
+action's command line). The table asks which invariants a change crosses; a
+change to a generated command line crosses every test and comment that reads
+that command, and those are found by searching for the old spelling, not by
+thinking of invariants.
+
+**Stability.** The release gate works and costs time: the GalTranslPP canary
+builds its vcpkg dependencies without a cache on `main`, about fifty minutes,
+before any archive is built. Its cache is saved per run, so later releases
+from `main` restore it. The measurement workflow renames system files on a
+disposable runner and restores them from bash in an `always()` step.
+
+**User experience.** A project that wrote the #718 workaround
+(`dialect_cxxflags = ["-fms-runtime-lib=dll"]`) is told once that the word is
+redundant; GalTranslPP carries it. Off a terminal, xlings still passes the
+sub-index build scripts' frames through (openxlings/xlings#629).
+
+**Compatibility.** On Windows the first build after the upgrade re-runs each
+action once and, for GNU-dialect compiles, rebuilds once; a program whose
+search directories carry an older runtime copy receives the toolset's. No
+index descriptor changes meaning under D7 (§8.3).
+
+**Open after this round.** openxlings/xlings#629 (the frames), mcpp #669 (the
+xcode-27 image's SDK), and the reach of a packaging revision, which is the
+reach of the consumer's index (F9) and is not a defect.
+
