@@ -147,6 +147,7 @@ mcpp pack --profile dev                # build with a different profile (default
 mcpp pack --dev                        # the same, as `build` and `run` spell it; --profile wins over it
 mcpp pack --message-format json        # one mcpp.pack envelope on stdout (mcpp 2026.9.16.1+)
 mcpp pack --no-strip                   # ship the artifacts as built
+mcpp pack -p app --format release      # a workspace member, as if run in its directory
 mcpp pack --debug-symbols dbg/         # write the separated *.debug files under dbg/
 mcpp pack --format msi --features installer   # activate root-package features for the pack
 ```
@@ -157,6 +158,11 @@ format. It is the value `mcpp build --features` takes, so a host tool needed onl
 one distribution is declared under `[feature-deps.<f>]` with `tools = [...]` and built
 only by the pack that names `<f>`. `mcpp run --format <name> --features <LIST>` hands
 the same features to the pack it performs.
+
+`-p <member>` (mcpp 2026.9.28.3+) packs a workspace member from the workspace
+root: the member is resolved as every other `-p` resolves it, and the pack runs in
+its directory, so the result is the one `mcpp pack` in that directory produces. A
+relative `-o` keeps meaning the directory the command was typed in.
 
 `--release` and `--dev` (mcpp 2026.9.16.1+) are the shorthands `build` and `run`
 take, with the same precedence: `--profile` wins over either, on all three

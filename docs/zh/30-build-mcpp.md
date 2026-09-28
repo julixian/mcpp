@@ -893,6 +893,82 @@ mcpp 会写出 `<暂存树>.stage-manifest` —— 一个兄弟文件，永不�
 - 这些条目就是 `resolution.json` 的 `graph` 一节再加四项（`manifest_dir`、`features`、
   `targets`、`metadata`），出自同一次推导。
 
+### 接口的名字：`mcpp.core`（协议 14）
+
+引擎提供给构建程序的接口名为 `mcpp.core`，与规范（SPEC-007）对这一层的称呼一致。`mcpp`
+是它永久等价的写法：引擎内嵌这两个单元，后者只含 `export import mcpp;`。构建程序可以使用
+任一写法，也可以同时使用。
+
+```cpp
+import mcpp.core;   // 与 `import mcpp;` 导出相同的符号
+```
+
+### 构建信息：解析出的工具链（协议 14）
+
+构建程序以事实的形式读取解析出的工具链。mcpp 不把这些事实翻译成任何外部构建系统的写法；
+驱动 CMake、vcpkg、Meson 或 make 的插件负责翻译。不适用时值为空；角色取 `cc`、`cxx`、`ld`、
+`ar`、`rc`、`as`、`mt` 之一。
+
+| 访问函数 | 取值 |
+|---|---|
+| `mcpp::tool(role)` | 这一行在该角色上的工具：GNU 风格的行上是驱动程序，cl.exe 行上是工具集自己的工具 |
+| `mcpp::abi_tool(role)` | 目标 ABI 的原生工具：MSVC ABI 上是 `cl`、`link`、`lib`、`ml64` 以及 SDK 的 `rc`、`mt`，与这一行用哪个驱动无关；其他 ABI 上与 `tool(role)` 相同 |
+| `mcpp::tool_env()` | 引擎运行这些工具时使用的环境变量，每行一个 `KEY=value`（MSVC ABI 上为 `INCLUDE`、`LIB`、`PATH`） |
+| `mcpp::toolset_identity()` | 不含路径的工具链标识，例如 `msvc 14.44.35207; sdk 10.0.26100.0` 或 `clang 22.1.8` |
+| `mcpp::msvc_instance_dir()` | MSVC 工具集所属的 Visual Studio 实例；受管工具集为空 |
+| `mcpp::ninja_program()` | mcpp 自己运行的 ninja |
+| `mcpp::cxx_runtime()` | 程序的 C++ 运行时契约：`self-contained`、`toolchain-coupled` 或 `host-coupled` |
+| `mcpp::msvc_crt_linkage()` | MSVC ABI 上为 `static`（`/MT`）或 `dynamic`（`/MD`），即 `place-dlls` 读取的值 |
+
+这些值进入构建程序的上下文，因此升级到引入它们的版本之后，每个构建程序会多运行一次。
+
+### 结构化诊断：`mcpp::report`（协议 14）
+
+用 `mcpp::report` 发出的诊断按引擎自己的形式呈现：先是消息，然后是 `impact:` 行与 `hint:`
+行。它以相同的字段进入 `--message-format json`；`degraded` 级别在 `--strict` 下使构建失败；
+缓存命中的运行会再次报告它。`mcpp::warning(text)` 保留，等价于只有消息的诊断。
+
+```cpp
+mcpp::report({.severity = "warning",
+              .message  = "the generator found no schema",
+              .impact   = "no bindings are generated",
+              .hint     = "add schema/*.proto"});
+```
+
+### 一次放置多个文件：`mcpp stage --list`
+
+`mcpp stage --list <file>` 在一个进程内放置文件中的每一对 `<源>\t<目的>`。每个目的地保持
+单文件时的语义：内容相同的目的地不重写，写入在临时位置完成后再改名，同一目的地的多个来源必须
+一致。程序的 deploy 条目在两条及以上时，引擎用一条这样的边完成放置；action 也可以调用
+`${mcpp.self} stage --list`。
+
+```text
+data/a.txt	bin/data/a.txt
+data/b.txt	bin/data/b.txt
+```
+
+### 插件模块的名字
+
+构建程序导入的模块可以用 `mcpp.` 前缀表明自己是 mcpp 插件，前提是位于所属包自己的命名空间
+之下。命名空间不是 `mcpp` 的包若使用保留的第二段或其他命名空间，引擎发出警告；mcpp-index 在
+收录包时施行同一条规则。
+
+| 模块名 | 提供者 |
+|---|---|
+| `mcpp`、`mcpp.core` | 引擎 |
+| `mcpp.plugins.*`、`mcpp.deps.*`、`mcpp.rules.*`、`mcpp.dist.*`、`mcpp.tools.*` | 命名空间为 `mcpp` 的包 |
+| `mcpp.<namespace>.*` | 该命名空间的包 |
+
+### 未启用的 feature 之后的模块
+
+构建程序导入的模块若只在某个依赖的某个 feature 之后提供，报错写出包名与 feature 名：
+
+```text
+error: build.mcpp imports 'mcpp.rules.qt'
+  provided by: mcpp.plugins, feature "rules-qt" (not enabled)
+  hint: enable it on the dependency edge: mcpp.plugins = { ..., features = ["rules-qt"] }
+```
+
 ### `import mcpp;` 才是会演进的那一面（mcpp 2026.8.5.1+）
 
 和 mcpp 对话有两条路，它们的**兼容性承诺不同**：
@@ -935,8 +1011,9 @@ if constexpr (requires { mcpp::runner("qemu"); })   // hard error when absent
 ```
 
 `requires` 表达式作用在一个**不存在的限定名**上时是 ill-formed，而**不是求值为
-`false`**。所以语言内没有特性探测这条路：采用了新指令的包只能在自己的 README 里
-用文字写明版本下限，并依赖上面那条诊断。**这类包应当写清楚它需要哪个版本的 mcpp。**
+`false`**。所以语言内没有特性探测这条路。采用了新指令的包在清单中写明版本下限
+`[package] mcpp = ">=<release>"`（mcpp 2026.9.28.3+，docs/04）：低于下限的引擎在编译任何
+内容之前停止，并写出应安装的版本。更旧的引擎以警告忽略这个键，报告的仍是上面那条诊断。
 
 ### `import std;`（mcpp 2026.8.2.1+）
 

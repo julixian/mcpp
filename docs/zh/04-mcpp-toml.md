@@ -115,6 +115,18 @@ manifest 目录解析。`[package]` 中 mcpp 不读取的任何其它键都会�
 resources = "res"
 ```
 
+`mcpp = ">=<release>"`（mcpp 2026.9.28.3+）写明包支持的最旧 mcpp 版本。它是下限而不是固定：
+项目安装哪个版本仍由 `.xlings.json` 决定。只接受 `>=` 写法，因为裸版本号在 mcpp 其他地方都
+表示"恰好这一版"；裸版本号和不是版本号的值都会被拒绝，并给出应写的形式。低于下限的引擎在
+做任何其他工作之前停止，写出包名、下限、自身版本以及安装新版本的命令。`[workspace.package]
+mcpp` 为所有成员统一声明一次。早于 2026.9.28.3 的引擎以警告忽略这个键。
+
+```toml
+[package]
+name = "myplugin"
+mcpp = ">=2026.9.28.3"
+```
+
 #### 方言标志与 `import std` BMI
 
 有些标志会改变标准库头文件的声明内容，所以预编译的 `import std` BMI 也
@@ -973,6 +985,9 @@ path = "src/capi/lua.cppm"    # Override the default lib-root location
 
 默认约定：`src/<包名的最后一段>.cppm`（例如包名 `mcpplibs.cmdline` →
 `src/cmdline.cppm`）。
+`path` 是这张表唯一的键；其他键像 `[build]` 中一样被报告（mcpp 2026.9.28.3+）。lib root 即
+SPEC-008 的接口根：打包后的库发布的模块（连同它转出的模块），以及构建程序从 host-module
+依赖中导入的模块。
 
 ### 2.5 `[dependencies]`、`[dev-dependencies]`、`[build-dependencies]`
 

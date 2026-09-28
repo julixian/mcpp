@@ -135,6 +135,7 @@ mcpp pack --profile dev                # build with a different profile (default
 mcpp pack --dev                        # the same, as `build` and `run` spell it; --profile wins over it
 mcpp pack --message-format json        # one mcpp.pack envelope on stdout (mcpp 2026.9.16.1+)
 mcpp pack --no-strip                   # ship the artifacts as built
+mcpp pack -p app --format release      # a workspace member, as if run in its directory
 mcpp pack --debug-symbols dbg/         # write the separated *.debug files under dbg/
 mcpp pack --format msi --features installer   # activate root-package features for the pack
 ```
@@ -145,6 +146,10 @@ feature：每一条 `--target` 腿，以及被分派格式的两遍构建。它�
 带 `tools = [...]` 的 `[feature-deps.<f>]` 下，只由点名 `<f>` 的那次打包构建
 出来。`mcpp run --format <name> --features <LIST>` 把同样的 feature 交给它
 执行的那次打包。
+
+`-p <member>`（mcpp 2026.9.28.3+）在工作区根目录打包某个成员：成员的解析方式与其他 `-p`
+相同，打包在该成员目录中进行，因此结果与在该目录执行 `mcpp pack` 相同。相对路径的 `-o` 仍以
+执行命令时所在的目录为基准。
 
 `--release` 与 `--dev`（mcpp 2026.9.16.1+）是 `build`、`run` 已接受的简写，
 优先级相同：三条命令上都是 `--profile` 优先于它们。
