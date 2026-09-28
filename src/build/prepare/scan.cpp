@@ -291,7 +291,9 @@ step11_msvc_crt_word_check(PrepareState& state) {
             state.m->buildConfig.linkage, state.m->buildConfig.cxxRuntime);
         for (std::size_t i = 0; i < state.packages.size(); ++i) {
             auto const& pkg = state.packages[i];
-            const bool isRoot = i == 0;
+            // A selected workspace member is the project being developed and
+            // is spoken to as a root (§15).
+            const bool isRoot = i == 0 || pkg.selectedMember;
             // A word `[workspace.build]` contributed is named at the table
             // that states it (WS3): the member's `[build]` does not contain
             // it, and a reader sent there finds nothing to remove.
