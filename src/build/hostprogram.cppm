@@ -829,7 +829,18 @@ bool imports_module(std::string_view src, std::string_view name) {
 struct McppModule {
     std::vector<std::string> useFlags;   // how the consumer names the BMI
     fs::path                 object;     // linked alongside build.mcpp
+    // `mcpp.core` (#734, E8): the same interface under the layer's name, a unit
+    // whose whole body re-exports `mcpp`. Empty for a host module.
+    fs::path                 aliasObject;
 };
+
+// The unit that makes `import mcpp.core;` and `import mcpp;` name one
+// interface. Written beside `mcpp.cppm` and compiled after it, so either
+// spelling -- or both in one program -- reaches the same symbols. Placeholders
+// for the keywords, for the reason `kMcppModuleSource` gives: mcpp's own
+// line-based scanner must not read this literal as a second module of this file.
+inline constexpr std::string_view kMcppCoreAliasSource =
+    "@MODULE@ mcpp.core;\n@EXPORT@ import mcpp;\n";
 
 // Compile ONE dependency-provided module interface for the host, into `bdir`,
 // with the SAME flags build.mcpp itself gets. Returns how to name its BMI plus
@@ -870,6 +881,16 @@ build_mcpp_module(const fs::path& bdir, const fs::path& compiler,
     { std::ofstream os(cppm, std::ios::trunc);
       os << moduleSrc;
       if (!os) return std::unexpected(std::string("could not write mcpp module source")); }
+    {
+        std::string aliasSrc(kMcppCoreAliasSource);
+        if (auto p = aliasSrc.find("@MODULE@"); p != std::string::npos)
+            aliasSrc.replace(p, std::string_view("@MODULE@").size(), "export module");
+        if (auto p = aliasSrc.find("@EXPORT@"); p != std::string::npos)
+            aliasSrc.replace(p, std::string_view("@EXPORT@").size(), "export");
+        std::ofstream os(bdir / "mcpp_core.cppm", std::ios::trunc);
+        os << aliasSrc;
+        if (!os) return std::unexpected(std::string("could not write the mcpp.core unit"));
+    }
 
     auto run = [&](std::vector<std::string> argv, const char* what)
         -> std::expected<void, std::string> {
@@ -920,6 +941,22 @@ build_mcpp_module(const fs::path& bdir, const fs::path& compiler,
         if (auto r = run(with_base(std::move(argv)), "compile"); !r)
             return std::unexpected(r.error());
         out.useFlags = mcpp::toolchain::bmi_reference_tokens(" /reference mcpp=", ifc);
+        fs::path coreIfc = bdir / ("mcpp.core" + std::string(traits.bmiExt));
+        out.aliasObject = bdir / ("mcpp_core" + std::string(dial.objExt));
+        std::vector<std::string> av{compiler.string()};
+        for (auto f : dial.alwaysFlagsArgv) av.emplace_back(f);
+        av.push_back(stdFlag);
+        av.push_back("/interface");
+        for (auto f : dial.forceCxxLangArgv) av.emplace_back(f);
+        av.push_back(dial.compileOnly == std::string_view("/c") ? "/c" : "-c");
+        av.push_back("mcpp_core.cppm");
+        av.push_back("/ifcOutput"); av.push_back(coreIfc.string());
+        av.push_back(std::string(dial.outputObjPrefix) + out.aliasObject.string());
+        for (auto& f : out.useFlags) av.push_back(f);
+        if (auto r = run(with_base(std::move(av)), "mcpp.core compile"); !r)
+            return std::unexpected(r.error());
+        for (auto& f : mcpp::toolchain::bmi_reference_tokens(" /reference mcpp.core=", coreIfc))
+            out.useFlags.push_back(f);
         return out;
     }
 
@@ -933,6 +970,20 @@ build_mcpp_module(const fs::path& bdir, const fs::path& compiler,
                                     pcm.string(), "-o", out.object.string()}), "object"); !r)
             return std::unexpected(r.error());
         out.useFlags = mcpp::toolchain::bmi_reference_tokens("-fmodule-file=mcpp=", pcm);
+        fs::path corePcm = bdir / ("mcpp.core" + std::string(traits.bmiExt));
+        out.aliasObject = bdir / ("mcpp_core" + std::string(dial.objExt));
+        std::vector<std::string> pre{compiler.string(), stdFlag, "--precompile",
+                                     "mcpp_core.cppm", "-o", corePcm.string()};
+        for (auto& f : out.useFlags) pre.push_back(f);
+        if (auto r = run(with_base(std::move(pre)), "mcpp.core precompile"); !r)
+            return std::unexpected(r.error());
+        std::vector<std::string> obj{compiler.string(), stdFlag, "-c",
+                                     corePcm.string(), "-o", out.aliasObject.string()};
+        for (auto& f : out.useFlags) obj.push_back(f);
+        if (auto r = run(with_base(std::move(obj)), "mcpp.core object"); !r)
+            return std::unexpected(r.error());
+        for (auto& f : mcpp::toolchain::bmi_reference_tokens("-fmodule-file=mcpp.core=", corePcm))
+            out.useFlags.push_back(f);
         return out;
     }
 
@@ -943,6 +994,12 @@ build_mcpp_module(const fs::path& bdir, const fs::path& compiler,
                                 "-c", "mcpp.cppm", "-o", out.object.string()}), "compile"); !r)
         return std::unexpected(r.error());
     out.useFlags = {"-fmodules"};
+    // GCC finds both BMIs under <cwd>/gcm.cache; the alias only has to exist.
+    out.aliasObject = bdir / ("mcpp_core" + std::string(dial.objExt));
+    if (auto r = run(with_base({compiler.string(), stdFlag, "-fmodules",
+                                "-c", "mcpp_core.cppm", "-o", out.aliasObject.string()}),
+                     "mcpp.core compile"); !r)
+        return std::unexpected(r.error());
     return out;
 }
 

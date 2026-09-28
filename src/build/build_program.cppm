@@ -1092,7 +1092,7 @@ std::expected<void, std::string> run_build_program(
     // import a module that is present as a prerequisite and not importable
     // here, which is the case the check above states.
     {
-        std::set<std::string> available{"std", "std.compat", "mcpp"};
+        std::set<std::string> available{"std", "std.compat", "mcpp", "mcpp.core"};
         for (auto const& hm : env.hostModules)
             if (hm.importable) available.insert(hm.logical);
         for (auto const& want : mcpp::pm::imported_module_names(srcText)) {
@@ -1271,12 +1271,14 @@ std::expected<void, std::string> run_build_program(
     // because build.mcpp grew a second implementation of it.
     std::vector<std::string> moduleFlags;
     fs::path mcppModuleObject;
+    fs::path mcppCoreObject;     // `mcpp.core`, the same interface (#734, E8)
     if (usesModule) {
         auto mf = build_mcpp_module(bdir, hostCompiler, base, std_flag, tc,
                                     compileEnv);
         if (!mf) return std::unexpected(mf.error());
         moduleFlags = std::move(mf->useFlags);
         mcppModuleObject = std::move(mf->object);
+        mcppCoreObject   = std::move(mf->aliasObject);
     }
 
     // ── `import std;` in build.mcpp ─────────────────────────────────────────
@@ -1461,6 +1463,7 @@ std::expected<void, std::string> run_build_program(
         // answered with `D9002: ignoring unknown option '-x'`.
         if (!msvcHost) { compileArgv.push_back("-x"); compileArgv.push_back("none"); }
         if (usesModule) compileArgv.push_back(mcppModuleObject.string());
+        if (usesModule && !mcppCoreObject.empty()) compileArgv.push_back(mcppCoreObject.string());
         for (auto& hmo : hostModuleObjects) compileArgv.push_back(hmo.string());
         for (auto& so : stdObjects) compileArgv.push_back(so);
     }
