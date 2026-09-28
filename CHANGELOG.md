@@ -1,79 +1,125 @@
 # Changelog
 
-> 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
-> 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+> The release history of `mcpp-community/mcpp`, in the form of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+> Each `## [<version>]` section is that release's notes. Entries are written in English
+> from 2026.9.28.3 on; earlier entries remain as written.
 
 ## [2026.9.28.3] - 2026-09-28
 
-本版本实施 #734 设计中 mcpp 的部分:构建插件体系的三层(`mcpp.core`、官方通用库、插件)、
-构建信息、工作区成员只构建一次、批量放置、`pack -p`、库接口规范的第一阶段与包的版本下限。
-设计、测量、任务划分与实施记录见
-`.agents/docs/2026-09-28-build-cost-foreign-toolsets-and-library-surface-design.md`,规范见
-SPEC-007 §9 与新的 SPEC-008。配套的 mcpp-plugins 0.17.0 以本版本为下限。
+This release implements mcpp's part of the #734 design: the three layers of the
+build-plugin architecture (`mcpp.core`, the official general library, plugins),
+build information for build programs, workspace members built once, batched
+placement, `pack -p`, phase 1 of the library-interface specification, and a
+package's engine floor. The design, the measurements, the tasks and the
+implementation record are in
+`.agents/docs/2026-09-28-build-cost-foreign-toolsets-and-library-surface-design.md`;
+the specifications are SPEC-007 §9 and the new SPEC-008. mcpp-plugins 0.17.0
+states this release as its floor.
 
-### 行为变化
+### Behaviour changes
 
-- **被其他成员以 path 依赖使用的工作区成员只构建一次(E1)。** 消费方构建之前,成员在自己的目录中
-  作为自身构建的根构建一次,由它的 ninja 判断过期(包括成员根目录之外的头文件);消费方经 stage
-  边取得其对象与 BMI,按内容比较。条件是成员在消费方图中的构建键输入与它作为根时相等
-  (`package.index` 除外,它只记来源);不相等时照旧在消费方图中编译,`-v` 写出不同的输入。同时
-  构建的两个消费方以文件锁轮流使用成员目录。一个五成员 Windows 工作区的核心库此前被编译三次。
-- **程序旁的文件由一个进程放置(E4)。** 程序的 deploy 条目在两条及以上时成为一条 `stage_list`
-  边,读取规划写出的 `placements.list`;`mcpp stage --list` 对每个目的地保持单文件语义。在
-  Windows 首次构建上,1270 条单文件放置耗时 4.5 s,一个进程复制同样的文件耗时 0.5 s。
-- **库接口的第一阶段(E6,SPEC-008)。** `mcpp pack` 写出未进入发布闭包的导出模块(W2),"Withheld"
-  一行列出每个未发布的单元(此前没有接口根时显示 "(nothing)",而两个导出模块既未发布也未列出);
-  `mcpp build` 在包导入依赖(本工作区成员除外)的非公开模块时警告(W3);缺少接口根的警告写明对 `mcpp pack` 的后果
-  (W1)。全部为警告。
-- **快路径在一次确认之后恢复。** 编辑源码后的那次构建经完整路径确认了图,却不重写内容未变的
-  build.ninja,而快路径以 build.ninja 的时间比较每个源码;此前编辑之后的每次构建都被拒绝,直到图的
-  文本改变。现在确认时移动 build.ninja 的时间(e2e 832,2026.9.28.2 在 Linux 上同样复现)。
-- **快路径看见 path 依赖的整棵源码树。** 此前只扫描依赖的 `src/`;依赖在别处的 host module
-  (例如 mcpp-plugins 的 `deps/vcpkg.cppm`)编入消费方的构建程序,不在任何 ninja 边上,被编辑后
-  构建报告"无事可做"。现在扫描依赖的整棵树,跳过隐藏目录、`target` 与嵌套的包(e2e 831)。
-- **每个下载只占一行。** 非终端输出此前在开始时写一行 `Downloading <item> (<size>)`,完成时再写一行
-  `... done, <size> in <time>`;现在只写完成的一行,失败时写 `did not complete` 的一行。终端上进度条
-  原地刷新,结束时换成同样带大小与耗时的完成行。
-- **MSVC ABI 上的 clang 找不到工具集时说明原因。** 默认的 `msvc@system` 在没有带 C++ 工具的
-  Visual Studio 实例时,此前静默继续,随后在预编译 `mcpp` 模块时以 `'cstdio' file not found` 失败;
-  现在解析时给出警告,写出安装与指定托管工具集的命令(在屏蔽 Visual Studio 的 runner 上测得)。
-- **`mcpp.core` 的输出不再把 `FILE` 带入模块接口。** `mcpp::report` 只经 `printf` 输出;此前 GCC
-  拒绝在 `import mcpp;` 之后 `#include <cstdio>` 的构建程序(e2e 651)。
+- **A workspace member used as a path dependency is built once (E1).** Before a
+  consumer builds, the member is built once in its own directory, as the root of
+  its own build, and its ninja decides what is stale (headers outside the
+  member's root included); consumers take its objects and BMIs through stage
+  edges that compare content. The condition is that the member's build-key
+  inputs in the consumer's graph equal its inputs as a root (`package.index`
+  excepted, which records only where it came from); otherwise it is compiled in
+  the consumer's graph as before, and `-v` names the differing inputs. Two
+  consumers built at once take the member's directory in turn under a file
+  lock. The core library of a five-member Windows workspace was compiled three
+  times before.
+- **One process places the files beside a program (E4).** Two or more deploy
+  entries of a program become one `stage_list` edge reading the
+  `placements.list` the plan writes; `mcpp stage --list` keeps the single-file
+  semantics per destination. On a first Windows build 1270 single-file
+  placements took 4.5 s; one process copying the same files takes 0.5 s.
+- **Phase 1 of the library interface (E6, SPEC-008).** `mcpp pack` names the
+  exported modules outside the shipped closure (W2), and its "Withheld" row lists
+  every unit not shipped (it read "(nothing)" for a package without an interface
+  root while two exported modules were neither shipped nor listed); `mcpp build`
+  warns when a package imports a non-public module of a dependency that is not a
+  member of its own workspace (W3); the warning for a missing interface root
+  states its consequence for `mcpp pack` (W1). All three are warnings.
+- **The fast path resumes after a confirmed edit.** The build after an edit
+  confirmed the graph through the full path but did not rewrite an unchanged
+  build.ninja, whose time the fast path compares every source with; every
+  later build was declined until the graph's text changed. Confirming the graph
+  now moves build.ninja's time (e2e 832; 2026.9.28.2 shows the same on Linux).
+- **The fast path sees a path dependency's whole tree.** Only the dependency's
+  `src/` was swept, so an edit to a host module elsewhere (mcpp-plugins'
+  `deps/vcpkg.cppm`), which is compiled into the consumer's build program and
+  named by no ninja edge, was reported as "no work". The whole tree is swept
+  now, skipping hidden directories, `target` and nested packages (e2e 831).
+- **One line per download.** Output that is not a terminal printed
+  `Downloading <item> (<size>)` at the start and `... done, <size> in <time>` at
+  the end; it now prints the completion line only, or the line saying the item
+  did not complete. On a terminal the bar is redrawn in place and ends with the
+  same completion line, which now states the size and the time.
+- **clang on the MSVC ABI says when no toolset is found.** With no Visual
+  Studio instance carrying the C++ tools, the default `msvc@system` continued
+  silently and the build failed at `'cstdio' file not found` while precompiling
+  the `mcpp` module; the resolution now warns and names the commands that
+  install and select a managed toolset (measured on a runner whose Visual
+  Studio was masked).
+- **`mcpp.core` carries no `FILE` into its interface.** `mcpp::report` writes
+  through `printf` only; GCC rejected a build program that includes `<cstdio>`
+  after `import mcpp;` (e2e 651).
 
-### 特性
+### Features
 
-- **`mcpp.core`(E8,协议 14)。** 引擎接口以 `mcpp.core` 为名,`mcpp` 是永久等价的写法。
-- **构建信息(E2,协议 14)。** `mcpp::tool(role)`、`abi_tool(role)`、`tool_env()`、
-  `toolset_identity()`、`msvc_instance_dir()`、`ninja_program()`、`cxx_runtime()`、
-  `msvc_crt_linkage()` 以事实陈述解析出的工具链与程序的 C++ 运行时契约,取自引擎自身命令行所读的
-  同一来源。
-- **结构化诊断(E11,协议 14)。** `mcpp::report({severity, message, impact, hint})` 以引擎的形式
-  呈现,进入 JSON 输出,缓存命中时重放。
-- **缺失的构建程序模块指出 feature(E7)。** 模块只在依赖未启用的 feature 之后提供时,错误写出包名、
-  feature 名与应加的一行。
-- **插件模块的名字(E10)。** `mcpp.<自己的命名空间>.*` 不再被警告;保留的第二段(`core`、
-  `plugins`、`deps`、`rules`、`dist`、`tools`)只属于命名空间 `mcpp` 的包。
-- **`mcpp pack -p <member>`(E3)。** 在工作区根目录打包某个成员,结果与在成员目录中打包相同。
-- **包的版本下限(E9)。** `[package] mcpp = ">=<release>"` 与 `[workspace.package] mcpp`;
-  低于下限的引擎在其他工作之前停止,写出升级命令;只接受 `>=`。
-- **`[lib]` 报告未知键(E12)。** 此前拼错的 `path` 被静默接受。
-- **快路径在 macOS、Windows 与自带 sysroot 的目标上生效(E5)。** 运行期校验只含 ELF/glibc 规则,在这些目标上
-  提前返回而不写校验记录,快路径因此找不到已校验的产物快照,每次构建都走完整路径(macOS 上 e2e 645、831、
-  832 读出 `no validated artifact snapshot is recorded`)。现在这些目标记录产物的戳记,判定为通过(没有适用的
-  规则);产物被重新链接时快路径仍交回完整路径。`-v` 下每个拒绝点以一句话写出其条件。
+- **`mcpp.core` (E8, protocol 14).** The engine's interface is named
+  `mcpp.core`; `mcpp` is its permanent equivalent.
+- **Build information (E2, protocol 14).** `mcpp::tool(role)`, `abi_tool(role)`,
+  `tool_env()`, `toolset_identity()`, `msvc_instance_dir()`, `ninja_program()`,
+  `cxx_runtime()` and `msvc_crt_linkage()` state the resolved toolchain and the
+  program's C++ runtime contract as facts, read from the producers the engine's
+  own command lines read.
+- **Structured diagnostics (E11, protocol 14).**
+  `mcpp::report({severity, message, impact, hint})` is rendered in the engine's
+  form, enters the JSON output, and is replayed on a cache hit.
+- **A missing build-program module names its feature (E7).** When a module is
+  provided only behind a feature the dependency edge does not enable, the error
+  names the package, the feature and the line to add.
+- **Plugin module names (E10).** `mcpp.<own namespace>.*` draws no warning; the
+  reserved second segments (`core`, `plugins`, `deps`, `rules`, `dist`,
+  `tools`) belong to packages in namespace `mcpp`.
+- **`mcpp pack -p <member>` (E3).** A member is packed from the workspace root,
+  with the result a pack in the member's directory gives.
+- **A package's engine floor (E9).** `[package] mcpp = ">=<release>"` and
+  `[workspace.package] mcpp`; an engine below the floor stops before any other
+  work and names the upgrade command; only `>=` is accepted.
+- **`[lib]` reports unknown keys (E12).** A misspelt `path` was accepted
+  silently.
+- **The fast path on macOS, Windows and SDK-sysroot targets (E5).** The runtime
+  validation holds ELF/glibc rules only and returned without writing its record
+  on these targets, so the fast path found no validated snapshot and every build
+  took the full path (read on macOS in e2e 645, 831 and 832: "no validated
+  artifact snapshot is recorded"). These targets now record the artifacts'
+  stamps with a Pass verdict (no rule applies); a relinked artifact still sends
+  the fast path to the full build. Under `-v` each refusal is stated as a
+  sentence.
 
-### 发布流程
+### Release process
 
-- **发布门只含本生态的工程。** GalTranslPP 从 `.github/release-canaries.toml` 移除:下游工程(用户的应用或其
-  fork)在发布之后于自己的 PR 中固定新版本加以验证,不作为 mcpp 发布的门。门中保留 xlings 与 mcppls。
+- **The release gate holds the ecosystem's own projects only.** A downstream
+  project's canary is removed from `.github/release-canaries.toml`; a downstream
+  project (a user's application, or a fork of one) validates a release in its
+  own pull request after the release. xlings and mcppls remain.
+- **Commit messages, pull requests, CHANGELOG entries and release notes are
+  written in English** from this release on; release notes are the CHANGELOG
+  section of the release. Earlier entries remain as written.
 
-### 兼容性
+### Compatibility
 
-- 协议升至 14:使用 §9 新接口的构建程序在旧引擎上编译失败并指出缺少的名字;以
-  `[package] mcpp` 声明下限的包在旧引擎上得到一条"不支持的键"警告。
-- 升级后的第一次构建各付一次代价:每个构建程序因上下文新增变量而重新运行一次;被共享的工作区
-  成员在消费方中改为暂存,其对象在成员目录中编译一次;程序旁的放置边形状改变而运行一次(内容相同
-  的文件不重写)。
+- Protocol 14: a build program that uses the new interfaces of §9 fails to
+  compile on an older engine, naming the missing name; a package that states a
+  floor with `[package] mcpp` receives an "unsupported key" warning from an
+  older engine.
+- The first build after the upgrade pays once: every build program runs again,
+  because its context gains variables; a shared workspace member is staged into
+  its consumers and compiled once in its own directory; the placement edge
+  changes shape and runs once (a file with equal content is not rewritten).
 
 ## [2026.9.28.2] - 2026-09-28
 
@@ -134,7 +180,7 @@ SPEC-007 §9 与新的 SPEC-008。配套的 mcpp-plugins 0.17.0 以本版本为�
   中验证已发布的 mcpp 与 xlings,每个发布项一节,并保留此前各版本的小节;PR 模板要求列出每条新规则
   所跨越的既有不变量与位于交点的测试。
   canary 以路径调用运行该步骤的 bash(`CANARY_BASH`):Windows 上按名字启动的 `bash` 是 System32 中的
-  WSL 启动器,本版本第一次发布运行因此在 GalTranslPP canary 处停止,未创建 tag(#731)。
+  WSL 启动器,本版本第一次发布运行因此在一个 Windows canary 处停止,未创建 tag(#731)。
 - **测量任务。** `measure-windows-tool-crt.yml` 在带 Visual Studio 与屏蔽 Visual Studio 的两个
   Windows 行上隐藏系统的 C++ 运行时,测量 Qt 的宿主工具能否只经 action 的 `PATH` 启动(设计 §2.9),
   它是从 `xim:qt-base` 中移除运行时副本的前提。

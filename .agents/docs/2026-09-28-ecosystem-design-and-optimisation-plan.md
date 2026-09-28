@@ -389,7 +389,7 @@ the Windows CI default row runs it.
 
 **Canary projects.**
 - `.github/release-canaries.toml` lists real projects with their build commands:
-  GalTranslPP, mcppls, the xlings self-build.
+  the validation project, mcppls, the xlings self-build.
 - A release-candidate workflow builds each with the candidate mcpp, rewriting the
   project's pin in its own checkout, never by a commit to the project
   (self-review §6.9). No new override mechanism is added to xlings for this.
@@ -427,7 +427,7 @@ release                WS10 verification script and canaries, from this release 
   cut (`YYYY.M.D.N`).
 - **xlings first.** Protocol 1.3 is additive, and mcpp's pin moves after it.
 - **WS1 before WS9.** WS1 lands in mcpp before the qt-base recipe changes, so the
-  mcpp fix is observed on the unchanged payload first: GalTranslPP on Windows
+  mcpp fix is observed on the unchanged payload first: the validation project on Windows
   must place the toolset's CRT with no warning.
 - **The measurement gates the qt-base payload.** The payload changes only after
   `moc.exe` is shown to start from a CRT-less payload through the action `PATH`,
@@ -605,7 +605,7 @@ it. A task that depends on another names it in the last column.
 - **The docs' `llvm@20.1.7` is what the first-run default picks.** The tables of
   docs/01 and docs/20 agree with `native_first_run_spec` on macOS and on Windows
   with MSVC. The `llvm@22.1.8` readings of the review came from project pins
-  (mcpp's own `[toolchain] macos`, GalTranslPP's manifest). M6 makes the function
+  (mcpp's own `[toolchain] macos`, the validation project's manifest). M6 makes the function
   the one authority and the tables its checked copies.
 - **mcpp reads no `prevLines`.** Its renderer already owns its frames, so X3 can
   drop the field from the producers without a change in mcpp.
@@ -619,7 +619,7 @@ M9     pins X's release -> CI on three hosts, with M2's measurement -> merge -> 
 I1-I3  after M2's measurement is green -> merge -> index artifact
 N1-N3  after the mcpp release is indexed
 verify verify-published.sh against the new and the previous pair in fresh SubOS
-       sandboxes with the CN mirror; GalTranslPP on Windows with the new mcpp and
+       sandboxes with the CN mirror; the validation project on Windows with the new mcpp and
        qt-base revision 1; then the issues are closed with their readings
 ```
 
@@ -699,7 +699,7 @@ implementing it, and the readings.
   steps. A list written from reading the files is the claim; the lint's output
   is the reading.
 - **F8. The release gate's first reading was of its own harness.** The first
-  release run of 2026.9.28.2 (36363585412) failed the GalTranslPP canary before
+  release run of 2026.9.28.2 (36363585412) failed the validation project canary before
   it built anything: `release_canaries.py` started `bash` by name, and a Windows
   program that does so gets `System32\bash.exe`, the WSL launcher, because the
   loader searches the system directory before `PATH`. The gate held and no tag
@@ -707,14 +707,14 @@ implementing it, and the readings.
   runner has tests, and the canaries were dispatched on the fix's branch before
   the release was dispatched again (#731).
 - **F9. A packaging revision reaches a consumer when its index does.** The
-  GalTranslPP canary, dispatched on #731's branch after `qt-base` revision 1
+  the validation project canary, dispatched on #731's branch after `qt-base` revision 1
   was published, built, ran and packed the project with the candidate, and
   stated once that `xim-x-qt-base\6.11.1\bin` ships the MSVC C++ runtime:
   the resolver placed the toolset's set instead, as WS1 specifies. The payload
   was revision 0 because the job restores the whole mcpp home from CI's cache,
   its index copy included, and that copy predates the revision; by that index
   the installed payload is current. A consumer receives revision 1 on the
-  first use after its index refreshes (GalTranslPP's own CI caches the
+  first use after its index refreshes (the validation project's own CI caches the
   payloads and not the index; its reading follows the release).
 
 ### 8.3 Readings
@@ -762,15 +762,15 @@ The two sections not run are Windows behaviour, read on the Windows CI rows
 (#717, #720, #723, #724, #725, the progress of an index refresh) passes in
 all three runs.
 
-**GalTranslPP on Windows.** The real project the review started from, read
+**The validation project on Windows.** The real project the review started from, read
 three ways with mcpp 2026.9.28.2, each with the LLVM row (llvm@22.1.8) over the
 Visual Studio 2026 toolset (MSVC 14.51.36231) on `windows-2025`:
 
 | Reading | Build, run, pack | The runtime beside the program |
 |---|---|---|
-| the release's canary (the candidate, CI's cached mcpp home) | 4 of 4 commands held; `GalTransl++ CLI v3.1.1` | `qt-base` revision 0 from the cached home: its copy is stated once as a packaging fault, and the toolset's set is placed (F9) |
-| the project's CI, pin 2026.9.28.2 (Sunrisepeak/GalTranslPP#3, `0681f59`) | success in 41 minutes | no runtime copy in `qt-base`'s `bin`: nothing is stated; the package carries the set the build placed |
-| the same, without the #718 workaround (`229f0d1`, run 36378870254) | success in 35 minutes; no statement that a CRT word is redundant | the model alone chooses the dynamic CRT: the packages carry `MSVCP140*` and `VCRUNTIME140*` beside GPPCLI and GPPGUI |
+| the release's canary (the candidate, CI's cached mcpp home) | 4 of 4 commands held; the CLI's banner line | `qt-base` revision 0 from the cached home: its copy is stated once as a packaging fault, and the toolset's set is placed (F9) |
+| the project's CI, pin 2026.9.28.2 (the validation project's pull request, `0681f59`) | success in 41 minutes | no runtime copy in `qt-base`'s `bin`: nothing is stated; the package carries the set the build placed |
+| the same, without the #718 workaround (`229f0d1`, run 36378870254) | success in 35 minutes; no statement that a CRT word is redundant | the model alone chooses the dynamic CRT: the packages carry `MSVCP140*` and `VCRUNTIME140*` beside cli and gui |
 
 ### 8.4 Self-review
 
@@ -792,7 +792,7 @@ change to a generated command line crosses every test and comment that reads
 that command, and those are found by searching for the old spelling, not by
 thinking of invariants.
 
-**Stability.** The release gate works and costs time: the GalTranslPP canary
+**Stability.** The release gate works and costs time: the validation project canary
 builds its vcpkg dependencies without a cache on `main`, about fifty minutes,
 before any archive is built. Its cache is saved per run, so later releases
 from `main` restore it. The measurement workflow renames system files on a
@@ -800,7 +800,7 @@ disposable runner and restores them from bash in an `always()` step.
 
 **User experience.** A project that wrote the #718 workaround
 (`dialect_cxxflags = ["-fms-runtime-lib=dll"]`) is told once that the word is
-redundant; GalTranslPP carries it. Off a terminal, xlings still passes the
+redundant; the validation project carries it. Off a terminal, xlings still passes the
 sub-index build scripts' frames through (openxlings/xlings#629).
 
 **Compatibility.** On Windows the first build after the upgrade re-runs each

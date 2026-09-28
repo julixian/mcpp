@@ -40,7 +40,7 @@ records their implementation.
     so revision 2's compatibility argument is corrected. `[lib]` accepts an
     unknown key without any warning, which is a defect (E12).
 
-**Input.** The Windows CI of Sunrisepeak/GalTranslPP#3 (runs 36324593343,
+**Input.** The Windows CI of the validation project's pull request (runs 36324593343,
 36378870254 and 36396398845; windows-2025, 4 vCPU, mcpp 2026.9.28.2, mcpp:plugins
 0.16.0), the sources of mcpp at `dbf71941`, of mcpp-plugins at `8e0362d`, of
 vcpkg-tool and of mcpp-index at `e9b80c5`, vcpkg's documentation of triplets and
@@ -49,7 +49,7 @@ of §2.2.
 
 ## 0. Scope and the rule that selects the items
 
-GalTranslPP is a validation project: a five-member workspace on Windows with a core
+The validation project is a five-member workspace on Windows with a core
 library of 76 translation units, a Qt GUI, 22 vcpkg ports and one CMake project.
 It is evidence, not a requirement.
 
@@ -92,14 +92,14 @@ Project-specific items are listed in §9 with the reason they stay with the proj
 | Reading | Value | Source |
 |---|---|---|
 | `mcpp build --workspace`, vcpkg binaries cached | 1726 s | run 36378870254 |
-| of which: member `GalTranslPP` (core) | 285 s | same |
-| of which: `GPPCLI`, including a second compilation of core | 315 s | same |
-| of which: `GPPGUI`, including a third compilation of core | 1039 s | same |
+| of which: the core member | 285 s | same |
+| of which: `cli`, including a second compilation of core | 315 s | same |
+| of which: `gui`, including a third compilation of core | 1039 s | same |
 | core's 76 compile commands in the three positions | identical except the output directory (76/76) | `mcpp emit build-database`, same run |
 | `mcpp build --workspace`, no vcpkg cache | 69.7 min, of which about 43 min are the 22 ports | run 36324593343 |
 | `mcpp pack --format release`, two members | 168 s, of which about 70 s are 2675 single-file copy actions | run 36378870254 |
 | files deployed beside each program by `mcpp build` | about 1270 per program, each one `stage_file` edge | `release-files.txt`, run 36396398845; `ninja_backend.cppm` |
-| a no-op `mcpp run -p GPPCLI` on Windows | about 3 s; the project fast path is not taken | run 36378870254 |
+| a no-op `mcpp run -p cli` on Windows | about 3 s; the project fast path is not taken | run 36378870254 |
 | build systems of the 22 ports at baseline `ee6a47d` | 18 CMake, 3 header-only, 1 make under msys (icu); none MSBuild | the ports' `portfile.cmake` |
 | `mcpp pack` of a library exporting `Alpha` and `Beta`, no lib root | exit 0, "Interface (headers only)", "Withheld (nothing)", `sources = []` | local, mcpp 2026.9.28.2 |
 | mcpp-plugins with `deps-*` among its default features | its own build fails: `deps/deps.cppm: module 'mcpp' not found` (and the same for `src/declare.cppm`) | local copy of mcpp-plugins `8e0362d`, mcpp 2026.9.28.2 |
@@ -351,7 +351,7 @@ workspace in which several members share a library.
   across projects.
 - **The tool store** keys a path package by `tree_stamp`, which covers the files
   under the package root. A library's inputs are not confined to its root:
-  GalTranslPP's core compiles `../3rdParty/3rdModule/*.ixx` and includes headers
+  the validation project's core compiles `../3rdParty/3rdModule/*.ixx` and includes headers
   from `../3rdParty/...`. A key that sees only the root would serve stale objects.
 
 **Design.**
@@ -740,7 +740,7 @@ package whose author can act on it.
 | Report | `mcpp pack` | always | "Interface" lists the shipped closure, and "Withheld" lists every other unit. This replaces the "(nothing)" that the local reading of §2 shows |
 
 W3 fires only for dependencies that declare a root, so libraries without a root,
-such as GalTranslPP's core, cause none.
+such as the validation project's core, cause none.
 
 ### 5.5 Phase 2 (conditions, no design)
 
@@ -982,7 +982,7 @@ The existing Linux libc++ row covers `resolve({resolved, row})`.
 | E1 | mcpp | none; can ship alone | V or a following release |
 | P0 to P4, P6 | mcpp-plugins | V released; `[package] mcpp = ">=V"` | plugins 0.17.0 |
 | I1 | mcpp-index | E10 released (the engine and the index state one rule) | none |
-| Validation | Sunrisepeak/GalTranslPP | plugins 0.17.0 | `resolved` on the masked row; `pack -p` |
+| Validation | The validation project | plugins 0.17.0 | `resolved` on the masked row; `pack -p` |
 | I2 | mcpp-index | E6 phase 1 released | input to E6 phase 2 |
 
 ## 9. Outside this design, and why
@@ -993,7 +993,7 @@ The existing Linux libc++ row covers `resolve({resolved, row})`.
 | Two `-p` invocations instead of `--workspace`; Updater as an `artifacts` dependency; hoisting repeated `[target.windows.build]` values to the root | the project's manifests; each is available today |
 | A CI job for the `release` profile | the project's CI |
 | Re-running build programs under `mcpp pack` | by design: the pack context (`pack_format`) is an input of the build program; the recompilation it prints costs about 1 s |
-| Flat module names (`Tool`, `Dictionary`) in GalTranslPP's core | the project's naming; I3 and the facade form of I2 are the remedy when the library is published |
+| Flat module names (`Tool`, `Dictionary`) in the validation project's core | the project's naming; I3 and the facade form of I2 are the remedy when the library is published |
 | Deriving `host-module` from a build program's imports (a consumer writes no `host-module = true` when `build.mcpp` imports the module) | a usability improvement, independent of every item here; it has its own evaluation, with its own criterion, so that it is not lost by being folded into another item |
 | Payloads provisioned when a build program uses them | unnecessary once families are enabled by feature (§3.4) |
 | An index resolver that skips versions above the engine's floor | a follow-up of E9 in mcpp-index and xlings |
@@ -1041,7 +1041,7 @@ states them together, so that one slow build is not read as a regression.
 
 | Case | 0.16.0 (`detected`) | 0.17.0 default (`resolved`) | Evidence |
 |---|---|---|---|
-| Windows with Visual Studio; mcpp resolves `msvc@system` (the usual machine, and GalTranslPP's CI) | vcpkg picks an instance itself | the same instance, named; **no rebuild**; MSBuild ports build | M1, M2a |
+| Windows with Visual Studio; mcpp resolves `msvc@system` (the usual machine, and the validation project's CI) | vcpkg picks an instance itself | the same instance, named; **no rebuild**; MSBuild ports build | M1, M2a |
 | the same, but the machine has several instances or toolsets and mcpp resolves another one than vcpkg would | ports built by a toolset other than the program's | ports built by the program's toolset; **one rebuild** | M1 (mechanism), vcpkg `get_toolset` |
 | Windows without Visual Studio; managed toolset | deps-vcpkg fails: no instance | CMake and make ports build; MSBuild ports fail with the named error | M3a, M3c, M2c |
 | Windows with Visual Studio, and the project pins a managed toolset | ports built by Visual Studio's toolset, the program by the managed one (inconsistent) | CMake and make ports rebuilt once by the managed toolset; **an MSBuild port now stops with the named error** | M2c |
@@ -1120,7 +1120,7 @@ Items checked and found in order:
 - no item makes the engine learn a foreign tool;
 - every warning has a reader;
 - every criterion names its denominator or its reading;
-- no item is justified by GalTranslPP alone;
+- no item is justified by the validation project alone;
 - every changed generated command line has a stated one-time cost;
 - every decision in §11 has a state.
 
@@ -1166,7 +1166,7 @@ green with V.
 - **Sandbox.** A fresh xlings sandbox with the CN mirror configured for mcpp and
   xlings. It checks that the released V and plugins 0.17.0 install, build and run
   the index members and the examples of this design.
-- **GalTranslPP.** PR #3 is rebased onto the latest upstream and adopts the
+- **The validation project.** PR #3 is rebased onto the latest upstream and adopts the
   results: `plugins-core` through the family features, `mcpp pack -p` from the
   root, and `resolved` in its CI. Its Windows CI measures the build again against
   the readings of §2.

@@ -273,7 +273,7 @@ would again let the index guard and the installed version drift apart.
 
 ```
 [ ] version bumped in mcpp.toml + fingerprint.cppm (one commit)
-[ ] CHANGELOG entry
+[ ] CHANGELOG entry, in English (it is the release notes; commits and pull requests are English too)
 [ ] `bash .github/tools/check_version_pins.sh` passes (verifies `mcpp.toml` = `MCPP_VERSION`, and `.xlings.json` is not newer)
 [ ] merge to main, CI green
 [ ] gh workflow run release.yml --ref main

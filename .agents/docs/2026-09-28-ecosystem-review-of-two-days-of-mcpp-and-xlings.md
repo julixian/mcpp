@@ -28,7 +28,7 @@ are upstream and are cited only where they shape a signal.
 
 **Evidence.** Each finding below cites code at `origin/main` (mcpp `acb9f52b`,
 xlings `d53162a`) or a measured output: CI runs on `main`, two xlings sandboxes
-against the published releases, the GalTranslPP Windows build on
+against the published releases, the validation project Windows build on
 mcpp 2026.9.28.1, and the output the maintainer reported from a real
 terminal. A finding without such evidence is marked as a hypothesis.
 
@@ -47,11 +47,11 @@ effect is visible and recoverable. P2 is noise, wording or cost.
 - **Sandbox verification.** In an xlings SubOS sandbox with the CN mirror for both
   tools, the published pair reads `13 ok, 0 failed`. The same script against
   mcpp and xlings 2026.9.27.1 reads `5 ok, 8 failed`.
-- **Real-world build.** GalTranslPP (Sunrisepeak/GalTranslPP#3) is a 22-port
+- **Real-world build.** the validation project (the validation project's pull request) is a 22-port
   vcpkg and Qt workspace with a project `.xlings.json`.
   - On mcpp 2026.9.27.1, its Windows build failed with vcpkg's compiler detection (#726).
   - With the pin moved to 2026.9.28.1, every step passes: `build --workspace`,
-    `run -p GPPCLI`, `pack --format release`, the CLI starting from the release
+    `run -p cli`, `pack --format release`, the CLI starting from the release
     layout, and `emit build-database`. That is run 36346122142.
   - Its output is the source of §2.1 and §2.3.
 - **mcpp-index.** A full sweep with the 2026.9.28.1 pin runs on the upstream branch
@@ -62,7 +62,7 @@ effect is visible and recoverable. P2 is noise, wording or cost.
 
 ### 2.1 P0 · mcpp · The toolset's CRT yields to a CRT copy found in a dependency's directory
 
-**Observed (GalTranslPP, Windows, llvm@22.1.8, MSVC 14.51).** For every program
+**Observed (the validation project, Windows, llvm@22.1.8, MSVC 14.51).** For every program
 that links Qt, ten warnings of the form:
 
 ```
@@ -135,7 +135,7 @@ chunk.
 ### 2.3 P2 · mcpp · One fact, many warnings
 
 - **The redundant CRT word, once per member.**
-  - GalTranslPP writes `dialect_cxxflags = ["-fms-runtime-lib=dll"]` at workspace
+  - The validation project writes `dialect_cxxflags = ["-fms-runtime-lib=dll"]` at workspace
     level, and every member inherits it.
   - A `--workspace` build plans each member as a root, so the redundancy warning
     appears once per member: five times.
@@ -177,7 +177,7 @@ chunk.
   is true only for GCC, and the comment above measures Clang's plain rule.
 - **The consequence.** Every clang++ build on Windows gets no `-MMD`, and a header
   edit does not rebuild the objects and BMIs that include it. Since #718 the LLVM
-  row is the default Windows row, so this is the default experience. GalTranslPP
+  row is the default Windows row, so this is the default experience. The validation project
   prints the degradation once per member.
 - **Direction.**
   - The depfile is emitted for Clang on every host; only GCC's filtered form is
@@ -198,7 +198,7 @@ chunk.
 - **Consequences.** No CI job builds mcpp with clang on Linux. The #722
   function-size gate, which needs a clang compile database, runs by hand.
 - **The docs disagree with what resolves.** `docs/01` and `docs/20` name llvm@20.1.7
-  as the macOS and Windows default, while Windows CI and GalTranslPP resolve
+  as the macOS and Windows default, while Windows CI and the validation project resolve
   llvm@22.1.8. The documentation should state what the resolver picks. The
   selection code was not traced in this review.
 
@@ -279,7 +279,7 @@ chunk.
    - A lint over the workflows would find the pattern: `| tee` followed by a `grep`
      that is not about success.
 4. **A pinned canary needs a person to move its pin.**
-   - GalTranslPP pins mcpp in `.xlings.json`. It measured #726 only after its pin
+   - The validation project pins mcpp in `.xlings.json`. It measured #726 only after its pin
      was moved by hand.
    - A small set of real projects, rebuilt against each release candidate with
      the pin overridden, would turn this into a release gate.
@@ -297,8 +297,8 @@ chunk.
 
 | Issue | Home | Priority | Next step |
 |---|---|---|---|
-| mcpp #718 | engine | done; reading passes | close with the GalTranslPP reading and e2e 814, and file §2.1 as its own issue |
-| mcpp #726 | engine | closed | closed during this review, with the GalTranslPP reading |
+| mcpp #718 | engine | done; reading passes | close with the validation project reading and e2e 814, and file §2.1 as its own issue |
+| mcpp #726 | engine | closed | closed during this review, with the validation project reading |
 | mcpp #729 | CI | P1 | fail the step on the build's status; build with llvm@22.1.8; wire the size gate after it |
 | mcpp #728 | specification | P2 | decide the order rule; then implement or restate |
 | mcpp #677, #397 | trackers | P2 | re-verify their open items against `acb9f52b` in the next sweep |
@@ -331,5 +331,5 @@ chunk.
 
 **Order and verification.** xlings first, then the mcpp pin, then the index. The
 same sandbox script, extended by one assertion per item, is run against the new
-and the previous versions. GalTranslPP is built on Windows as the real-world
+and the previous versions. The validation project is built on Windows as the real-world
 reading for §2.1, §2.3 and §3.1.
