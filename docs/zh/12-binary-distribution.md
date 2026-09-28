@@ -136,7 +136,7 @@ error: the published interface imports mathkit:secret , which no unit in this
 |---|---|---|
 | `lib` 目标导出了模块但没有 lib root | `mcpp build`，只对当前构建的包 | `mcpp pack` 发布的库不带模块接口 |
 | 打包形态不包含的导出模块 | `mcpp pack`，逐个写出模块名 | 使用打包形态的消费方无法 import 它们 |
-| 当前构建的包 import 了某个有 lib root 的依赖的非公开模块 | `mcpp build`，写出该模块与公开模块 | 从源码构建成功，但对打包形态会失败 |
+| 当前构建的包 import 了某个有 lib root 的依赖的非公开模块;该依赖不是本包所在工作区的成员(工作区成员总与本包一起从源码构建) | `mcpp build`，写出该模块与公开模块 | 从源码构建成功，但对打包形态会失败 |
 
 ## 兼容性 tag
 

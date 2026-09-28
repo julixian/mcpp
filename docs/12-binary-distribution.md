@@ -152,7 +152,7 @@ state which it means.
 |---|---|---|
 | a `lib` target exports modules and has no lib root | `mcpp build`, for the package being built | `mcpp pack` publishes the library without a module interface |
 | exported modules that the packed form does not ship | `mcpp pack`, naming each module | a consumer of the packed form cannot import them |
-| the package being built imports a module of a dependency that has a lib root, outside its public modules | `mcpp build`, naming the module and the public ones | the build succeeds from source and fails against the packed form |
+| the package being built imports a module of a dependency that has a lib root, outside its public modules; the dependency is not a member of the package's own workspace, whose members are built from source with it | `mcpp build`, naming the module and the public ones | the build succeeds from source and fails against the packed form |
 
 ## The compatibility tag
 

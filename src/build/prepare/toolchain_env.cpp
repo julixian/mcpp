@@ -7,6 +7,7 @@ module mcpp.build.prepare;
 import :state;
 
 import mcpp.build.prepare_inputs;
+import mcpp.diag;
 
 import std;
 import mcpp.build.version_floor;
@@ -136,7 +137,23 @@ bind_msvc_sysroot(mcpp::toolchain::Toolchain& tc,
             instances, msvc::msvc_env_snapshot(),
             systemSel ? std::string_view("system") : std::string_view(spec->version),
             needs);
-        if (!choice && systemSel) return {};
+        if (!choice && systemSel) {
+            // Not a refusal: clang's own detection may still find a toolset
+            // (a developer prompt's INCLUDE and LIB). Without one the first
+            // standard header fails -- `'cstdio' file not found` while the
+            // `mcpp` module precompiles -- which names neither the cause nor
+            // the remedy, so the resolution states both here (#734, measured
+            // on a runner whose Visual Studio was masked).
+            mcpp::diag::warning("toolchain/msvc",
+                std::format("clang on the MSVC ABI compiles against an MSVC toolset, and "
+                            "`msvc@system` found none on this machine (no Visual Studio "
+                            "instance with the C++ tools)"),
+                std::format("install one and name it: `mcpp toolchain install msvc "
+                            "14.44.35207`, then `[target.{}] sysroot = \"xim:msvc@14.44.35207\"` "
+                            "or `--toolchain xim:msvc@14.44.35207`",
+                            tt->str()));
+            return {};
+        }
     }
 
     std::string origin = "system";

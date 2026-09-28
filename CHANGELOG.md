@@ -23,7 +23,7 @@ SPEC-007 §9 与新的 SPEC-008。配套的 mcpp-plugins 0.17.0 以本版本为�
   Windows 首次构建上,1270 条单文件放置耗时 4.5 s,一个进程复制同样的文件耗时 0.5 s。
 - **库接口的第一阶段(E6,SPEC-008)。** `mcpp pack` 写出未进入发布闭包的导出模块(W2),"Withheld"
   一行列出每个未发布的单元(此前没有接口根时显示 "(nothing)",而两个导出模块既未发布也未列出);
-  `mcpp build` 在包导入依赖的非公开模块时警告(W3);缺少接口根的警告写明对 `mcpp pack` 的后果
+  `mcpp build` 在包导入依赖(本工作区成员除外)的非公开模块时警告(W3);缺少接口根的警告写明对 `mcpp pack` 的后果
   (W1)。全部为警告。
 - **快路径在一次确认之后恢复。** 编辑源码后的那次构建经完整路径确认了图,却不重写内容未变的
   build.ninja,而快路径以 build.ninja 的时间比较每个源码;此前编辑之后的每次构建都被拒绝,直到图的
@@ -31,6 +31,9 @@ SPEC-007 §9 与新的 SPEC-008。配套的 mcpp-plugins 0.17.0 以本版本为�
 - **快路径看见 path 依赖的整棵源码树。** 此前只扫描依赖的 `src/`;依赖在别处的 host module
   (例如 mcpp-plugins 的 `deps/vcpkg.cppm`)编入消费方的构建程序,不在任何 ninja 边上,被编辑后
   构建报告"无事可做"。现在扫描依赖的整棵树,跳过隐藏目录、`target` 与嵌套的包(e2e 831)。
+- **MSVC ABI 上的 clang 找不到工具集时说明原因。** 默认的 `msvc@system` 在没有带 C++ 工具的
+  Visual Studio 实例时,此前静默继续,随后在预编译 `mcpp` 模块时以 `'cstdio' file not found` 失败;
+  现在解析时给出警告,写出安装与指定托管工具集的命令(在屏蔽 Visual Studio 的 runner 上测得)。
 - **`mcpp.core` 的输出不再把 `FILE` 带入模块接口。** `mcpp::report` 只经 `printf` 输出;此前 GCC
   拒绝在 `import mcpp;` 之后 `#include <cstdio>` 的构建程序(e2e 651)。
 
