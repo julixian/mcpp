@@ -30,7 +30,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### design
 
-- [An ecosystem design for mcpp and xlings: one authority per fact, and the work that follows from it](2026-09-28-ecosystem-design-and-optimisation-plan.md) — active
+- [An ecosystem design for mcpp and xlings: one authority per fact, and the work that follows from it](2026-09-28-ecosystem-design-and-optimisation-plan.md) — landed
 - [The compile database, `emit build-database`, and #701/#702: triage against the specifications, and one design](2026-09-26-compile-database-and-issue-699-design.md) — landed
 - [Issues #693 to #696: triage against mcpp's contracts, and one repair plan](2026-09-25-issues-693-696-triage-and-repair-plan.md) — landed
 - [Workspace inheritance, flag scoping and the published form: a unified repair plan (#690)](2026-09-25-issue-690-workspace-build-inheritance-consistency.md) — landed
@@ -107,7 +107,7 @@ Records that declare one. Everything else is listed by date below.
 ### 2026-09
 
 - [Two days of mcpp and xlings: a review of what merged, what is known, and what is open](2026-09-28-ecosystem-review-of-two-days-of-mcpp-and-xlings.md) — active
-- [An ecosystem design for mcpp and xlings: one authority per fact, and the work that follows from it](2026-09-28-ecosystem-design-and-optimisation-plan.md) — active
+- [An ecosystem design for mcpp and xlings: one authority per fact, and the work that follows from it](2026-09-28-ecosystem-design-and-optimisation-plan.md) — landed
 - [Eight reports after 2026.9.27.1: implementation plan](2026-09-27-eight-reports-implementation-plan.md) — active
 - [Eight reports after 2026.9.27.1: what each one is, where it belongs, and one optimisation plan](2026-09-27-eight-reports-by-home-and-one-optimisation-plan.md) — active
 - [The compile database, `emit build-database`, and #701/#702: triage against the specifications, and one design](2026-09-26-compile-database-and-issue-699-design.md) — landed

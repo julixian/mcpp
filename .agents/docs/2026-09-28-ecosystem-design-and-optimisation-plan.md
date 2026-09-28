@@ -1,12 +1,13 @@
 ---
 subject: design
-status: active
+status: landed
 ---
 
 # An ecosystem design for mcpp and xlings: one authority per fact, and the work that follows from it
 
-**Status:** active, revision 3 (2026-09-28). The design is settled; §7 divides it
-into tasks and is the implementation record.
+**Status:** landed, revision 4 (2026-09-28). The design is settled; §7 divides it
+into tasks, and §8 records their implementation: mcpp 2026.9.28.2 and xlings
+2026.9.28.2 are released and indexed.
 
 - **Revision 1** proposed the design and seven decisions.
 - **Revision 2** records the reviewer's answers: D1 to D7 are settled as
@@ -16,6 +17,8 @@ into tasks and is the implementation record.
 - **Revision 3** divides the workstreams into tasks per repository, with the
   dependencies between them and the criterion of each (§7). Facts found while
   dividing them, which change no decision, are recorded in §7.4.
+- **Revision 4** records the implementation (§8): where it departed from §7,
+  nine findings, the before and after reading of each task, and a self-review.
 
 **Input.** The review `2026-09-28-ecosystem-review-of-two-days-of-mcpp-and-xlings.md`
 (cited below as "the review §n"), the #717-#726 round's records, and the
@@ -742,6 +745,21 @@ the two jobs of the xcode-27 image fail as known red (#669). The two earlier run
 on the branch found F4, F6, the fast path that e2e 821 assumed on every host
 (it serves only ELF products, #400), and the measurement's three harness
 defects; each was fixed on the branch.
+
+**Sandbox readings.** `tests/release/verify-published.sh` in fresh SubOS
+sandboxes (`xlings subos use <n> --sandbox`), with the CN mirror set for xlings
+and for mcpp, against what the index publishes:
+
+| mcpp | xlings | ok | failed | not run | The failures |
+|---|---|---|---|---|---|
+| 2026.9.28.1 | 2026.9.28.1 | 15 | 12 | 2 | every section this round adds, each with the reading of §8.3's second column |
+| 2026.9.28.1 | 2026.9.28.2 | 20 | 7 | 2 | the seven mcpp sections: mcpp's registry runs its pinned xlings 2026.9.28.1 and carries no marker (two); no `defaultToolchain`; the lexical order; the three `place-dlls` legs (`--crt` unknown) |
+| 2026.9.28.2 | 2026.9.28.2 | 27 | 0 | 2 | none |
+
+The two sections not run are Windows behaviour, read on the Windows CI rows
+(e2e 820, e2e 118, the measurement). Every section kept from 2026.9.28.1
+(#717, #720, #723, #724, #725, the progress of an index refresh) passes in
+all three runs.
 
 ### 8.4 Self-review
 
