@@ -761,6 +761,16 @@ The two sections not run are Windows behaviour, read on the Windows CI rows
 (#717, #720, #723, #724, #725, the progress of an index refresh) passes in
 all three runs.
 
+**GalTranslPP on Windows.** The real project the review started from, read
+three ways with mcpp 2026.9.28.2, each with the LLVM row (llvm@22.1.8) over the
+Visual Studio 2026 toolset (MSVC 14.51.36231) on `windows-2025`:
+
+| Reading | Build, run, pack | The runtime beside the program |
+|---|---|---|
+| the release's canary (the candidate, CI's cached mcpp home) | 4 of 4 commands held; `GalTransl++ CLI v3.1.1` | `qt-base` revision 0 from the cached home: its copy is stated once as a packaging fault, and the toolset's set is placed (F9) |
+| the project's CI, pin 2026.9.28.2 (Sunrisepeak/GalTranslPP#3, `0681f59`) | success in 41 minutes | no runtime copy in `qt-base`'s `bin`: nothing is stated; the package carries the set the build placed |
+| the same, without the #718 workaround (`229f0d1`, run 36378870254) | success in 35 minutes; no statement that a CRT word is redundant | the model alone chooses the dynamic CRT: the packages carry `MSVCP140*` and `VCRUNTIME140*` beside GPPCLI and GPPGUI |
+
 ### 8.4 Self-review
 
 **Architecture.** Each fact that §1 set out to give one authority now has one:
