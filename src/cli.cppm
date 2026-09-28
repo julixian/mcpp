@@ -930,6 +930,8 @@ int run(int argc, char** argv) {
                 .help("Destination path; its parent directory is created"))
             .option(cl::Option("verify").takes_value().value_name("MODE")
                 .help("How an existing destination is judged up to date: content (default) | size"))
+            .option(cl::Option("list").takes_value().value_name("FILE")
+                .help("Place every `<source>\\t<destination>` pair of FILE in one process (#734 E4); several lines naming one destination are its sources"))
             .action(wrap_rc(cmd_stage)))
         .subcommand(cl::App("place-dlls")
             .description("(internal: invoked by ninja) Place beside a Windows program the DLLs it imports from its runtime search directories")

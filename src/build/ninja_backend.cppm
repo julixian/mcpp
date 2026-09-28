@@ -69,6 +69,10 @@ std::string ninja_program_for(const mcpp::toolchain::Toolchain& tc);
 
 // Helper exposed for testing / debugging
 std::string emit_ninja_string(const BuildPlan& plan);
+// The same, and when the plan places two or more files beside its programs,
+// the placement list the one `stage_list` edge reads (#734 E4), for the caller
+// to write as `<outputDir>/placements.list`. Empty when there is no such edge.
+std::string emit_ninja_string(const BuildPlan& plan, std::string* placements);
 std::string filter_ninja_output(std::string_view output,
                                 std::span<const std::string> commandPrefixes);
 
@@ -1138,6 +1142,10 @@ std::string filter_ninja_output(std::string_view output,
 }
 
 std::string emit_ninja_string(const BuildPlan& plan) {
+    return emit_ninja_string(plan, nullptr);
+}
+
+std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // dyndep requires P1689 scanning capability:
     //   GCC: built-in -fdeps-format=p1689r5
     //   Clang: external clang-scan-deps tool (same P1689 output format)
@@ -1327,6 +1335,16 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     append("rule stage_file\n");
     append("  command = $mcpp stage $verify --output $out $in\n");
     append("  description = STAGE $out\n");
+    append("  restat = 1\n\n");
+    // #734 E4: every file a program's runtime needs beside it, placed by ONE
+    // process. A process per file cost 4.5 s for 1270 files on a first
+    // Windows build, against 0.5 s for one copying process. The list is a
+    // file of the build directory, rewritten only when it changes, and an
+    // input of the edge, so adding or removing an entry re-runs it; `restat`
+    // keeps an unchanged destination's time stamp.
+    append("rule stage_list\n");
+    append("  command = $mcpp stage --list placements.list\n");
+    append("  description = STAGE $count files\n");
     append("  restat = 1\n\n");
 
     // P1: per-file dyndep rule. Converts one .ddi → .dd independently.
@@ -3017,11 +3035,27 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     // exactly one source (every project before this feature, and most
     // packages after it) emits the exact same line as always: the loop below
     // reduces to the one-word case with no change in spelling.
-    for (auto const& d : deployFiles) {
-        std::string ins;
-        for (auto const& s : d.sources) ins += " " + escape_ninja_path(s);
-        append(std::format("build {} : stage_file{}\n",
-            escape_ninja_path(d.dest), ins));
+    if (deployFiles.size() >= 2) {
+        // #734 E4: one edge for the whole list. One entry keeps the per-file
+        // edge below, byte for byte.
+        std::string outs, ins, list;
+        for (auto const& d : deployFiles) {
+            outs += " " + escape_ninja_path(d.dest);
+            for (auto const& s : d.sources) {
+                ins += " " + escape_ninja_path(s);
+                list += std::format("{}\t{}\n", s.string(), d.dest.string());
+            }
+        }
+        append(std::format("build{} : stage_list{} | placements.list\n  count = {}\n",
+                           outs, ins, deployFiles.size()));
+        if (placements) *placements = std::move(list);
+    } else {
+        for (auto const& d : deployFiles) {
+            std::string ins;
+            for (auto const& s : d.sources) ins += " " + escape_ninja_path(s);
+            append(std::format("build {} : stage_file{}\n",
+                escape_ninja_path(d.dest), ins));
+        }
     }
     if (!deployFiles.empty())
         append("\n");
@@ -3677,8 +3711,23 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         plan.targetSide.cAbiDecl ? plan.targetSide.cAbiDecl->absent
                                  : std::vector<mcpp::targetside::CAbiAbsentEntry>{});
     write_consumer_include_sidecar(plan.outputDir, root_include_dirs_of(plan));
-    auto manifest = emit_ninja_string(plan);
+    std::string placements;
+    auto manifest = emit_ninja_string(plan, &placements);
     stage("emit-ninja");
+    if (!placements.empty()) {
+        // Written only when it changes: it is an input of the placement edge.
+        const auto listPath = plan.outputDir / "placements.list";
+        std::error_code lec;
+        std::string old;
+        if (std::filesystem::exists(listPath, lec)) {
+            std::ifstream in(listPath, std::ios::binary);
+            old.assign(std::istreambuf_iterator<char>(in), {});
+        }
+        if (old != placements) {
+            std::filesystem::create_directories(plan.outputDir, lec);
+            std::ofstream(listPath, std::ios::binary | std::ios::trunc) << placements;
+        }
+    }
 
     // Command-length backstop (see
     // .agents/docs/2026-08-06-command-length-architecture.md). The structural
