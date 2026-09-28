@@ -889,6 +889,167 @@ static std::expected<void, std::string> step6_xlings_workspace_from_graph(Prepar
     return {};
 }
 
+// Every host module one package contributes, the lib root first.
+//
+// The lib root is what a rule package has always been: one unit,
+// compiled alone, registered under the name it declares. A package
+// that offers several rules through features (mcpp 2026.9.5.3+)
+// lists their sources under `[features.<f>] sources`, and those
+// globs have been folded into `buildConfig.sources` by now for
+// exactly the features the consumer activated. Every module
+// INTERFACE unit among them is therefore a host module of its own,
+// under its own declared name, and nothing else in the host-module
+// path assumes one unit per package: `build_host_module` is per
+// unit and the compile loop accumulates BMIs in list order, so a
+// feature unit may import the lib root, which precedes it.
+//
+// Only sources the manifest LISTS take part. The inferred `src/**`
+// of a package with no `sources` is not consulted, so a rule
+// package published before this round exposes exactly what it
+// exposed then; widening that implicitly would compile units that
+// were written to be part of an ordinary library, alone.
+//
+// Split out of step6_host_module_registration (#734).
+static std::vector<prov::HostModule> host_module_units(const PrepareState& st, std::size_t p) {
+    auto identity = [&](std::size_t q) {
+        auto const& pkg = st.packages[q].manifest.package;
+        return pkg.namespace_.empty() ? pkg.name : pkg.namespace_ + "." + pkg.name;
+    };
+    auto const& depPkg = st.packages[p];
+    auto const& pkg    = depPkg.manifest.package;
+    std::vector<prov::HostModule> out;
+    auto push = [&](std::filesystem::path iface, std::string name) {
+        prov::HostModule hm;
+        hm.module    = std::move(name);
+        hm.package   = identity(p);
+        hm.nameSpace = pkg.namespace_;
+        hm.interface = std::move(iface);
+        out.push_back(std::move(hm));
+    };
+    // PROBING form: a host-module dependency whose interface is
+    // `.ixx` resolves to a `src/<tail>.cppm` that does not exist,
+    // and the consumer's build.mcpp is then handed a path to
+    // nothing.
+    auto rel   = mcpp::manifest::resolve_lib_root_path(
+        depPkg.manifest, depPkg.root);
+    auto iface = depPkg.root / rel;
+    auto rootName = prov::host_module_name(iface, pkg.name);
+    // A missing lib root is reported as such by build_host_module,
+    // and that has to stay the diagnostic. Enumerating the listed
+    // units first would let one of them collide with the missing
+    // root's fallback name and report a collision between a file
+    // and a file that does not exist.
+    std::error_code ec;
+    if (!std::filesystem::exists(iface, ec)) {
+        push(iface, std::move(rootName));
+        return out;
+    }
+
+    std::set<std::filesystem::path> matched, dropped;
+    for (auto const& g : depPkg.manifest.buildConfig.sources) {
+        if (g.empty()) continue;
+        if (g[0] == '!') {
+            for (auto& f : mcpp::modgraph::expand_glob(depPkg.root, g.substr(1)))
+                dropped.insert(f.lexically_normal());
+        } else {
+            for (auto& f : mcpp::modgraph::expand_glob(depPkg.root, g))
+                matched.insert(f.lexically_normal());
+        }
+    }
+    const auto root = iface.lexically_normal();
+    // ORDERED BY WHAT THEY IMPORT, NOT BY WHERE THEY SIT.
+    //
+    // The compile loop accumulates BMIs in list order, so each
+    // entry sees only what precedes it. Path order was the previous
+    // rule and it is not a valid one: `rules/spirv.cppm` sorts
+    // before `src/surface.cppm`, so a member importing a unit its
+    // package shares was compiled first and failed with "failed to
+    // read compiled module ... imports must be built before being
+    // imported". Reproduced, and reproduced in both directions --
+    // renaming the shared unit so its path sorted first made the
+    // same package build, which is what says the cause is the sort
+    // and nothing else.
+    //
+    // A package that works today is ordered IDENTICALLY: the sort
+    // below keeps path order wherever no import constrains it, so
+    // it differs only where the old order was already broken.
+    struct Unit {
+        std::filesystem::path        path;
+        std::string                  name;
+        std::vector<std::string>     imports;
+    };
+    // The lib root is the first node of the same sort (mcpp#720).
+    // Placing it ahead of the sort assumed that it imports no
+    // other unit of its package; a root that does was compiled
+    // before the unit it imports and failed with "module not
+    // found". As the first node it is still emitted first whenever
+    // it imports nothing of its own package, so the order of every
+    // package that built before is unchanged.
+    std::vector<Unit> pending;
+    {
+        std::ifstream is(root);
+        std::stringstream buf;
+        if (is) buf << is.rdbuf();
+        pending.push_back({root, std::move(rootName),
+                           prov::declared_imports(buf.str())});
+    }
+    for (auto const& f : matched) {          // std::set: sorted
+        if (dropped.contains(f)) continue;
+        if (std::filesystem::equivalent(f, root, ec)) continue;
+        std::ifstream is(f);
+        if (!is) continue;
+        std::stringstream buf;
+        buf << is.rdbuf();
+        auto text = buf.str();
+        auto name = prov::declared_interface_name(text);
+        if (name.empty()) continue;
+        pending.push_back({f, std::move(name), prov::declared_imports(text)});
+    }
+
+    // Only names this package itself declares constrain anything.
+    // `import std;` is ahead of every entry here, and a name from
+    // another package is ordered by the cross-package DFS below
+    // rather than by this sort.
+    std::map<std::string, std::size_t> byName;
+    for (std::size_t i = 0; i < pending.size(); ++i)
+        byName.emplace(pending[i].name, i);
+
+    std::vector<char> state(pending.size(), 0);   // 0 new, 1 open, 2 done
+    std::vector<std::size_t> order;
+    order.reserve(pending.size());
+    // Iterative post-order DFS over the path-sorted list: the first
+    // unit that can be emitted is emitted, which is what preserves
+    // path order in the unconstrained case.
+    const auto visit = [&](std::size_t start) {
+        std::vector<std::pair<std::size_t, std::size_t>> stack{{start, 0}};
+        while (!stack.empty()) {
+            auto& [u, k] = stack.back();
+            if (state[u] == 2) { stack.pop_back(); continue; }
+            state[u] = 1;
+            if (k < pending[u].imports.size()) {
+                auto const& want = pending[u].imports[k++];
+                auto it = byName.find(want);
+                // A CYCLE IS LEFT TO THE COMPILER, ON PURPOSE. It
+                // is ill-formed C++ and the compiler says so with
+                // the two units named; refusing here would report
+                // the same fact in a worse place, and getting the
+                // ordering wrong is no longer possible either way.
+                if (it != byName.end() && state[it->second] == 0)
+                    stack.push_back({it->second, 0});
+                continue;
+            }
+            state[u] = 2;
+            order.push_back(u);
+            stack.pop_back();
+        }
+    };
+    for (std::size_t i = 0; i < pending.size(); ++i)
+        if (state[i] == 0) visit(i);
+
+    for (auto i : order) push(pending[i].path, std::move(pending[i].name));
+    return out;
+}
+
 static std::expected<std::map<std::size_t, std::set<std::string>>, std::string>
 step6_host_module_registration(PrepareState& state) {
         // ── #355: HOST tool provisioning ────────────────────────────────────
@@ -973,160 +1134,7 @@ step6_host_module_registration(PrepareState& state) {
                 return pkg.namespace_.empty()
                      ? pkg.name : pkg.namespace_ + "." + pkg.name;
             };
-            // Every host module one package contributes, the lib root first.
-            //
-            // The lib root is what a rule package has always been: one unit,
-            // compiled alone, registered under the name it declares. A package
-            // that offers several rules through features (mcpp 2026.9.5.3+)
-            // lists their sources under `[features.<f>] sources`, and those
-            // globs have been folded into `buildConfig.sources` by now for
-            // exactly the features the consumer activated. Every module
-            // INTERFACE unit among them is therefore a host module of its own,
-            // under its own declared name, and nothing else in the host-module
-            // path assumes one unit per package: `build_host_module` is per
-            // unit and the compile loop accumulates BMIs in list order, so a
-            // feature unit may import the lib root, which precedes it.
-            //
-            // Only sources the manifest LISTS take part. The inferred `src/**`
-            // of a package with no `sources` is not consulted, so a rule
-            // package published before this round exposes exactly what it
-            // exposed then; widening that implicitly would compile units that
-            // were written to be part of an ordinary library, alone.
-            auto units = [&](std::size_t p) {
-                auto const& depPkg = state.packages[p];
-                auto const& pkg    = depPkg.manifest.package;
-                std::vector<prov::HostModule> out;
-                auto push = [&](std::filesystem::path iface, std::string name) {
-                    prov::HostModule hm;
-                    hm.module    = std::move(name);
-                    hm.package   = identity(p);
-                    hm.nameSpace = pkg.namespace_;
-                    hm.interface = std::move(iface);
-                    out.push_back(std::move(hm));
-                };
-                // PROBING form: a host-module dependency whose interface is
-                // `.ixx` resolves to a `src/<tail>.cppm` that does not exist,
-                // and the consumer's build.mcpp is then handed a path to
-                // nothing.
-                auto rel   = mcpp::manifest::resolve_lib_root_path(
-                    depPkg.manifest, depPkg.root);
-                auto iface = depPkg.root / rel;
-                auto rootName = prov::host_module_name(iface, pkg.name);
-                // A missing lib root is reported as such by build_host_module,
-                // and that has to stay the diagnostic. Enumerating the listed
-                // units first would let one of them collide with the missing
-                // root's fallback name and report a collision between a file
-                // and a file that does not exist.
-                std::error_code ec;
-                if (!std::filesystem::exists(iface, ec)) {
-                    push(iface, std::move(rootName));
-                    return out;
-                }
-
-                std::set<std::filesystem::path> matched, dropped;
-                for (auto const& g : depPkg.manifest.buildConfig.sources) {
-                    if (g.empty()) continue;
-                    if (g[0] == '!') {
-                        for (auto& f : mcpp::modgraph::expand_glob(depPkg.root, g.substr(1)))
-                            dropped.insert(f.lexically_normal());
-                    } else {
-                        for (auto& f : mcpp::modgraph::expand_glob(depPkg.root, g))
-                            matched.insert(f.lexically_normal());
-                    }
-                }
-                const auto root = iface.lexically_normal();
-                // ORDERED BY WHAT THEY IMPORT, NOT BY WHERE THEY SIT.
-                //
-                // The compile loop accumulates BMIs in list order, so each
-                // entry sees only what precedes it. Path order was the previous
-                // rule and it is not a valid one: `rules/spirv.cppm` sorts
-                // before `src/surface.cppm`, so a member importing a unit its
-                // package shares was compiled first and failed with "failed to
-                // read compiled module ... imports must be built before being
-                // imported". Reproduced, and reproduced in both directions --
-                // renaming the shared unit so its path sorted first made the
-                // same package build, which is what says the cause is the sort
-                // and nothing else.
-                //
-                // A package that works today is ordered IDENTICALLY: the sort
-                // below keeps path order wherever no import constrains it, so
-                // it differs only where the old order was already broken.
-                struct Unit {
-                    std::filesystem::path        path;
-                    std::string                  name;
-                    std::vector<std::string>     imports;
-                };
-                // The lib root is the first node of the same sort (mcpp#720).
-                // Placing it ahead of the sort assumed that it imports no
-                // other unit of its package; a root that does was compiled
-                // before the unit it imports and failed with "module not
-                // found". As the first node it is still emitted first whenever
-                // it imports nothing of its own package, so the order of every
-                // package that built before is unchanged.
-                std::vector<Unit> pending;
-                {
-                    std::ifstream is(root);
-                    std::stringstream buf;
-                    if (is) buf << is.rdbuf();
-                    pending.push_back({root, std::move(rootName),
-                                       prov::declared_imports(buf.str())});
-                }
-                for (auto const& f : matched) {          // std::set: sorted
-                    if (dropped.contains(f)) continue;
-                    if (std::filesystem::equivalent(f, root, ec)) continue;
-                    std::ifstream is(f);
-                    if (!is) continue;
-                    std::stringstream buf;
-                    buf << is.rdbuf();
-                    auto text = buf.str();
-                    auto name = prov::declared_interface_name(text);
-                    if (name.empty()) continue;
-                    pending.push_back({f, std::move(name), prov::declared_imports(text)});
-                }
-
-                // Only names this package itself declares constrain anything.
-                // `import std;` is ahead of every entry here, and a name from
-                // another package is ordered by the cross-package DFS below
-                // rather than by this sort.
-                std::map<std::string, std::size_t> byName;
-                for (std::size_t i = 0; i < pending.size(); ++i)
-                    byName.emplace(pending[i].name, i);
-
-                std::vector<char> state(pending.size(), 0);   // 0 new, 1 open, 2 done
-                std::vector<std::size_t> order;
-                order.reserve(pending.size());
-                // Iterative post-order DFS over the path-sorted list: the first
-                // unit that can be emitted is emitted, which is what preserves
-                // path order in the unconstrained case.
-                const auto visit = [&](std::size_t start) {
-                    std::vector<std::pair<std::size_t, std::size_t>> stack{{start, 0}};
-                    while (!stack.empty()) {
-                        auto& [u, k] = stack.back();
-                        if (state[u] == 2) { stack.pop_back(); continue; }
-                        state[u] = 1;
-                        if (k < pending[u].imports.size()) {
-                            auto const& want = pending[u].imports[k++];
-                            auto it = byName.find(want);
-                            // A CYCLE IS LEFT TO THE COMPILER, ON PURPOSE. It
-                            // is ill-formed C++ and the compiler says so with
-                            // the two units named; refusing here would report
-                            // the same fact in a worse place, and getting the
-                            // ordering wrong is no longer possible either way.
-                            if (it != byName.end() && state[it->second] == 0)
-                                stack.push_back({it->second, 0});
-                            continue;
-                        }
-                        state[u] = 2;
-                        order.push_back(u);
-                        stack.pop_back();
-                    }
-                };
-                for (std::size_t i = 0; i < pending.size(); ++i)
-                    if (state[i] == 0) visit(i);
-
-                for (auto i : order) push(pending[i].path, std::move(pending[i].name));
-                return out;
-            };
+            auto units = [&](std::size_t p) { return host_module_units(state, p); };
             for (std::size_t c = 0; c < state.provisionGraph.visible.size(); ++c) {
                 const auto direct = directHostProviders(c);
                 if (direct.empty()) continue;

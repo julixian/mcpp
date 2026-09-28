@@ -911,25 +911,10 @@ static void step11_public_module_check(PrepareState& state) {
     // A member of the root's own workspace is built from source together with
     // the root, whichever form it is published in, so the packed-form
     // consequence W3 states does not arise for it (SPEC-008 §4).
-    auto sameWorkspace = [&](const std::filesystem::path& root) {
-        if (!state.wsManifest || state.runtimeWorkspaceRoot.empty()) return false;
-        const auto rel = root.lexically_normal()
-                             .lexically_relative(state.runtimeWorkspaceRoot.lexically_normal())
-                             .generic_string();
-        if (rel.empty() || rel == "." || rel.starts_with("..")) return false;
-        for (auto const& m : state.wsManifest->workspace.members) {
-            if (m == rel) return true;
-            if (m.ends_with("/*") && rel.starts_with(m.substr(0, m.size() - 1))
-                && rel.find('/', m.size() - 1) == std::string::npos)
-                return true;
-        }
-        return false;
-    };
-
     std::map<std::string, std::set<std::string>> publicOf;
     for (std::size_t i = 1; i < state.packages.size(); ++i) {
         auto const& pr = state.packages[i];
-        if (sameWorkspace(pr.root)) continue;
+        if (!workspace_member_of(state, pr.root).empty()) continue;
         const auto rootFile = (pr.root / mcpp::manifest::resolve_lib_root_path(pr.manifest, pr.root))
                                   .lexically_normal();
         std::error_code ec;

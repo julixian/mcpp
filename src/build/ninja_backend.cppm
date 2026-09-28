@@ -3045,7 +3045,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
             outs += " " + escape_ninja_path(d.dest);
             for (auto const& s : d.sources) {
                 ins += " " + escape_ninja_path(s);
-                list += std::format("{}\t{}\n", s.string(), d.dest.string());
+                list += std::format("{}\t{}\n", s.generic_string(), d.dest.generic_string());
             }
         }
         append(std::format("build{} : stage_list{} | placements.list\n  count = {}\n",

@@ -1262,5 +1262,23 @@ Departures from §6:
    check reads it.
 5. **Each deps-cmake toolset statement has its own build directory,** because
    CMake refuses a cache made with another generator or instance.
+6. **The Linux GCC row keeps the foreign system's detection under `resolved`.**
+   §6.2 named every non-MSVC toolset through `chain`. The plugins' CI measured
+   that the GCC payload's driver is not a complete handover: mcpp runs it with a
+   sysroot, a binutils directory and a link model that only its own command
+   lines carry, and vcpkg's compiler detection failed with the driver alone.
+   The clang payloads are complete through their `.cfg` files. On the GCC row
+   the host compiler's libstdc++ is the program's C++ library, so
+   `mcpp.plugins.toolset` answers `detected` there and states why.
+7. **The MSBuild refusal matches the call stack.** A read inside a function
+   reports the caller's list file to a `variable_watch` callback, so a match on
+   the current file never fired (measured on the masked row: MSBuild failed
+   with "no such file or directory" and no reason). The stack names the
+   helper's defining file.
+8. **E2 has no "tool flags" accessor.** Deviation 6 is where one would be
+   read. The engine states `toolchain_sysroot()` and
+   `toolchain_binutils_dir()` already, but not the link model; handing a
+   foreign system the GCC payload completely is left to a later design with its
+   own criterion (a port that builds and runs a host tool).
 
 **mcpp-index, validation.** Recorded below as they land.

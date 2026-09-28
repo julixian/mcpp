@@ -502,6 +502,10 @@ struct PrepareState {
 // static would give each definition internal linkage, invisible outside
 // its own file.
 std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& state);
+
+// plan.cpp: the member path of a package root within the workspace this build
+// runs in, or empty (#734 E1, W3).
+std::string workspace_member_of(const PrepareState& state, const std::filesystem::path& root);
 std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state);
 std::expected<void, std::string> phase2_define_toolchain_resolver(PrepareState& state);
 std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state);

@@ -978,6 +978,7 @@ export int cmd_stage(const mcpplibs::cmdline::ParsedArgs& parsed) {
             return 1;
         }
         std::vector<std::pair<std::string, std::vector<std::filesystem::path>>> groups;
+        std::vector<std::vector<std::string>> spelled;   // each group's sources as the list writes them
         std::map<std::string, std::size_t> index;
         std::string line;
         while (std::getline(in, line)) {
@@ -990,15 +991,22 @@ export int cmd_stage(const mcpplibs::cmdline::ParsedArgs& parsed) {
             }
             std::string src = line.substr(0, tab), dst = line.substr(tab + 1);
             auto [it, fresh] = index.emplace(dst, groups.size());
-            if (fresh) groups.push_back({dst, {}});
+            if (fresh) { groups.push_back({dst, {}}); spelled.emplace_back(); }
             groups[it->second].second.push_back(
                 mcpp::platform::fs::extended_length(std::filesystem::path{src}));
+            spelled[it->second].push_back(src);
         }
-        for (auto const& [dst, srcs] : groups) {
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            auto const& [dst, srcs] = groups[g];
             auto r = mcpp::build::stage::stage_files(
                 srcs, mcpp::platform::fs::extended_length(std::filesystem::path{dst}), opts);
             if (!r) {
+                // One edge places the whole list, so ninja's echo of the
+                // command no longer shows which files were involved; the
+                // entries are named here as the list writes them.
                 std::println(stderr, "error: {}", r.error().message);
+                std::println(stderr, "  placement list entries ({}):", listFile);
+                for (auto const& src : spelled[g]) std::println(stderr, "    {} -> {}", src, dst);
                 return 1;
             }
         }
