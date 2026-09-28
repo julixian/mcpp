@@ -1796,6 +1796,190 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
         for (std::size_t i = 0; i < state.packages.size(); ++i)
             (void)compute_key(compute_key, i);
         if (!keyCycleError.empty()) return std::unexpected(keyCycleError);
+        ctx.plan.packageKeys = pkgKeys;
+        ctx.plan.packageKeyInputs.clear();
+        for (auto const& j : pkgInputs) ctx.plan.packageKeyInputs.push_back(j.dump());
+
+        // ── #734 E1: a workspace member used as a path dependency ─────────
+        //
+        // Built once, in its own directory, as the root of its own build, and
+        // taken from there by every member that consumes it. The member's own
+        // ninja decides what is stale, so an input outside the member's root
+        // (a header under `../3rdParty`) counts as it does for the member's
+        // own build; nothing here stamps files. The member's objects and
+        // module interfaces reach this graph through the stage edges the
+        // global cache uses. Equal build keys are the admission rule: the key
+        // holds everything that decides a unit's compile command, so a member
+        // whose key differs here (other features, another profile) is compiled
+        // in this graph as before. A host-tool sub-build and a planning-only
+        // command (`mcpp emit build-database`) never build a member.
+        if (state.overrides.tool_depth == 0 && !state.overrides.plan_only
+            && state.wsManifest && !state.runtimeWorkspaceRoot.empty()) {
+            const auto wsRoot = state.runtimeWorkspaceRoot.lexically_normal();
+            auto memberPath = [&](const std::filesystem::path& root) -> std::string {
+                const auto rel = root.lexically_normal().lexically_relative(wsRoot).generic_string();
+                if (rel.empty() || rel == "." || rel.starts_with("..")) return {};
+                for (auto const& m : state.wsManifest->workspace.members) {
+                    if (m == rel) return rel;
+                    if (m.ends_with("/*") && rel.starts_with(m.substr(0, m.size() - 1))
+                        && rel.find('/', m.size() - 1) == std::string::npos)
+                        return rel;
+                }
+                return {};
+            };
+            auto qualified = [](const mcpp::manifest::Manifest& mm) {
+                return mm.package.namespace_.empty() ? mm.package.name
+                                                     : mm.package.namespace_ + "." + mm.package.name;
+            };
+            auto bmiT = mcpp::toolchain::bmi_traits(*state.tc);
+            for (std::size_t i = 1; i < state.packages.size(); ++i) {
+                const auto* depIdent = i - 1 < state.dep_cache_identities.size()
+                    ? &state.dep_cache_identities[i - 1] : nullptr;
+                if (!depIdent || depIdent->sourceKind != "path") continue;
+                const auto& pkgRoot = state.packages[i];
+                const auto member = memberPath(pkgRoot.root);
+                if (member.empty()) continue;
+
+                BuildOverrides sub;
+                sub.project_root     = state.runtimeWorkspaceRoot;
+                sub.package_filter   = member;
+                sub.target_triple    = state.overrides.target_triple;
+                sub.accel            = state.overrides.accel;
+                sub.force_static     = state.overrides.force_static;
+                sub.profile          = state.overrides.profile;
+                sub.profile_fallback = state.overrides.profile_fallback;
+                sub.capabilities     = state.overrides.capabilities;
+                sub.toolchain        = state.overrides.toolchain;
+                sub.cache_mode       = state.overrides.cache_mode;
+                if (i < state.activeFeaturesByPackage.size())
+                    for (auto const& f : state.activeFeaturesByPackage[i]) {
+                        if (!sub.features.empty()) sub.features += ",";
+                        sub.features += f;
+                    }
+                auto subCtx = prepare_build(/*print_fingerprint=*/false,
+                                            /*includeDevDeps=*/false, /*extraTargets=*/{}, sub);
+                const auto who = qualified(pkgRoot.manifest);
+                if (!subCtx) {
+                    mcpp::log::verbose("workspace-member", std::format(
+                        "{} is compiled in this graph: its own build could not be "
+                        "planned: {}", who, subCtx.error()));
+                    continue;
+                }
+                // The admission compares the key's INPUTS, less `package.index`:
+                // that field names where a package came from (the namespace a
+                // dependency is reached under; empty for a root), not how it
+                // compiles. Every other input must be equal.
+                auto compile_inputs = [](nlohmann::json j) {
+                    if (j.is_object() && j.contains("package") && j["package"].is_object())
+                        j["package"].erase("index");
+                    return j;
+                };
+                const bool sameCompile = !subCtx->plan.packageKeyInputs.empty()
+                    && compile_inputs(nlohmann::json::parse(subCtx->plan.packageKeyInputs[0], nullptr, false))
+                       == compile_inputs(pkgInputs[i]);
+                if (!sameCompile) {
+                    // Name the inputs that differ: a mismatch is either a
+                    // real difference (another feature set) or a key input
+                    // that depends on the position, and only the field names
+                    // tell which.
+                    std::string fields;
+                    if (!subCtx->plan.packageKeyInputs.empty()) {
+                        auto own  = nlohmann::json::parse(subCtx->plan.packageKeyInputs[0], nullptr, false);
+                        auto here = pkgInputs[i];
+                        if (own.is_object() && here.is_object())
+                            for (auto it = here.begin(); it != here.end(); ++it) {
+                                if (own.contains(it.key()) && own[it.key()] == it.value()) continue;
+                                if (it.value().is_object() && own.contains(it.key())
+                                    && own[it.key()].is_object()) {
+                                    auto const& o = own[it.key()];
+                                    for (auto jt = it.value().begin(); jt != it.value().end(); ++jt)
+                                        if (!o.contains(jt.key()) || o[jt.key()] != jt.value()) {
+                                            if (!fields.empty()) fields += ", ";
+                                            fields += std::format("{}.{} (here {}, own {})", it.key(),
+                                                jt.key(), jt.value().dump(),
+                                                o.contains(jt.key()) ? o[jt.key()].dump() : "absent");
+                                        }
+                                    continue;
+                                }
+                                if (!fields.empty()) fields += ", ";
+                                fields += it.key();
+                            }
+                    }
+                    mcpp::log::verbose("workspace-member", std::format(
+                        "{} is compiled in this graph: its build key here ({}) differs "
+                        "from its own ({}); differing inputs: {}", who, pkgKeys[i],
+                        subCtx->plan.packageKeys.empty() ? std::string("none")
+                                                         : subCtx->plan.packageKeys[0],
+                        fields.empty() ? std::string("(unknown)") : fields));
+                    continue;
+                }
+                // Every unit of the member in this graph must have its
+                // counterpart in the member's own build, or none is taken:
+                // a half-served package is the mixed state the global cache
+                // refuses for the same reason.
+                std::map<std::filesystem::path, const CompileUnit*> own;
+                for (auto const& scu : subCtx->plan.compileUnits)
+                    own.emplace(scu.source.lexically_normal(), &scu);
+                std::vector<std::pair<std::size_t, const CompileUnit*>> pairs;
+                bool complete = true;
+                for (std::size_t u = 0; u < ctx.plan.compileUnits.size(); ++u) {
+                    auto const& cu = ctx.plan.compileUnits[u];
+                    if (cu.packageName != who) continue;
+                    auto it = own.find(cu.source.lexically_normal());
+                    if (it == own.end()) { complete = false; break; }
+                    pairs.push_back({u, it->second});
+                }
+                if (!complete || pairs.empty()) {
+                    mcpp::log::verbose("workspace-member", std::format(
+                        "{} is compiled in this graph: its units here and in its own "
+                        "build are not the same set", who));
+                    continue;
+                }
+
+                mcpp::ui::status("Building", std::format(
+                    "workspace member {} in its own directory, once for every "
+                    "member that uses it", who));
+                // Two consumers built at once (two `-p` commands) share this
+                // directory; one ninja runs in it at a time.
+                std::error_code lockEc;
+                std::filesystem::create_directories(subCtx->plan.outputDir, lockEc);
+                std::optional<mcpp::platform::fs::FileLock> memberLock;
+                for (int waited = 0;
+                     !(memberLock = mcpp::platform::fs::FileLock::try_acquire(subCtx->plan.outputDir));
+                     ++waited) {
+                    if (waited == 0)
+                        mcpp::ui::status("Waiting", std::format(
+                            "for another build of workspace member {}", who));
+                    if (waited >= 3000) return std::unexpected(std::format(
+                        "workspace member {}: another build has held {} for ten minutes",
+                        who, subCtx->plan.outputDir.string()));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+                auto be = mcpp::build::make_ninja_backend();
+                mcpp::build::BuildOptions bopt;
+                auto br = be->build(subCtx->plan, bopt);
+                memberLock.reset();
+                if (!br) return std::unexpected(std::format(
+                    "building workspace member {} failed: {}\n{}", who,
+                    br.error().message, br.error().diagnosticOutput));
+                if (br->exitCode != 0) return std::unexpected(std::format(
+                    "building workspace member {} failed (exit {})", who, br->exitCode));
+
+                const auto subOut = subCtx->plan.outputDir;
+                for (auto const& [u, scu] : pairs) {
+                    auto& cu = ctx.plan.compileUnits[u];
+                    cu.servedFromCache  = true;
+                    cu.servedFromMember = true;
+                    cu.cachedObject = subOut / scu->object;
+                    if (!cu.providesModule.empty()) {
+                        std::string bmi;
+                        for (char c : cu.providesModule) bmi.push_back(c == ':' ? '-' : c);
+                        bmi += std::string(bmiT.bmiExt);
+                        cu.cachedBmi = subOut / std::string(bmiT.bmiDir) / bmi;
+                    }
+                }
+            }
+        }
 
         for (std::size_t i = 1; i < state.packages.size(); ++i) {  // skip [0] = main
             const auto& pkgRoot   = state.packages[i];
