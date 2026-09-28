@@ -81,6 +81,12 @@ jobs:
         run: |
           export MCPP="$CANDIDATE"
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
+          # The bash running this step, by path (release_canaries.py says why).
+          if [ "$RUNNER_OS" = Windows ]; then
+            export CANARY_BASH="$(cygpath -w "$BASH")"
+          else
+            export CANARY_BASH="$BASH"
+          fi
           "$MCPP" self config --mirror GLOBAL
           tool="$GITHUB_WORKSPACE/.github/tools/release_canaries.py"
           py=python3; command -v python3 >/dev/null 2>&1 || py=python

@@ -10,6 +10,12 @@ ecosystem design), read by .github/workflows/release-canaries.yml.
 `set -eo pipefail`, so a failure is the command's own; a command listed under
 `expect` must also print the given text. The whole list runs, and the exit
 status says whether every command held.
+
+The bash is `$CANARY_BASH` when the workflow names one. On Windows it must: a
+Windows program that starts `bash` by name gets `System32\bash.exe`, the WSL
+launcher, because the loader searches the system directory before PATH (the
+first release run of these canaries printed "Windows Subsystem for Linux has
+no installed distributions" for every command).
 """
 from __future__ import annotations
 
@@ -67,6 +73,12 @@ def cmd_unpin(checkout: str) -> int:
     return 0
 
 
+def shell_argv(command: str) -> list[str]:
+    """The argv that runs one canary command: the named bash, else `bash`."""
+    shell = os.environ.get("CANARY_BASH") or "bash"
+    return [shell, "-c", f"set -eo pipefail\n{command}"]
+
+
 def cmd_run(name: str) -> int:
     mcpp = os.environ.get("MCPP", "")
     if not mcpp:
@@ -79,7 +91,7 @@ def cmd_run(name: str) -> int:
     failed = []
     for command in c["commands"]:
         print(f"::group::{command}", flush=True)
-        proc = subprocess.run(["bash", "-c", f"set -eo pipefail\n{command}"],
+        proc = subprocess.run(shell_argv(command),
                               capture_output=True, text=True, check=False,
                               env={**os.environ, "MCPP": mcpp})
         sys.stdout.write(proc.stdout)

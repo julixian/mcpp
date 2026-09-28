@@ -107,6 +107,9 @@ jobs:
           python3 tests/scripts/test_check_workflow_assertions.py
           python3 .github/tools/check_workflow_assertions.py --check-open
 
+      - name: The release canary runner runs each command under the named bash
+        run: python3 tests/scripts/test_release_canaries.py
+
       # Text-only, like the two steps around it, and it belongs here rather
       # than in the target-matrix workflow: that workflow runs the matrix, and
       # this asserts a property of the TABLE, which is readable without a
