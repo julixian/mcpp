@@ -217,14 +217,19 @@ ValidateReport validate(const Graph&                    g,
     // 3. Topology
     auto topo = topo_sort(g);
     if (!topo) {
-        std::string names;
+        // The cycle is now the actual ring `topo_sort` walked (mcpp.graph),
+        // not merely the units it could not order, so the message can name
+        // the path rather than an unordered set of suspects.
+        std::string ring;
+        bool first = true;
         for (auto i : topo.error().cycle) {
-            if (i < g.units.size()) {
-                names += g.units[i].path.string() + " ";
-            }
+            if (i >= g.units.size()) continue;
+            if (!first) ring += " -> ";
+            first = false;
+            ring += g.units[i].path.string();
         }
         r.errors.push_back({{},
-            std::format("circular module dependency among: {}", names)});
+            std::format("circular module dependency: {}", ring)});
     } else {
         r.topoOrder = std::move(*topo);
     }

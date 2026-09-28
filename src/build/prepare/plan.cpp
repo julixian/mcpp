@@ -44,6 +44,7 @@ import mcpp.platform.capacity;   // the host fallback handed to schedule::decide
 import mcpp.build.graph_shape;  // #407: the graph says which mode wrote it
 import mcpp.build.runtime_validation;  // declared artifact -> identity verdict
 import mcpp.build.cache_key;
+import mcpp.graph;
 import mcpp.pack.abi_tag;      // the tag a prebuilt dependency is checked against
 import mcpp.pack.prebuilt;     // …and the check itself
 import mcpp.pack.stage_tree;   // where `${mcpp.stage_dir}` points, and its manifest
@@ -1736,7 +1737,6 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
         std::vector<std::string>    pkgKeys(state.packages.size());
         std::vector<nlohmann::json> pkgInputs(state.packages.size(),
                                               nlohmann::json::object());
-        std::vector<int>            keyState(state.packages.size(), 0); // 0 new/1 busy/2 done
         std::string                 keyCycleError;
         // Does this package's own transitive upstream contain anything that is
         // not an immutable index payload? If so it cannot be cached either, even
@@ -1751,19 +1751,28 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
         // enforced structurally anyway, because "unreachable today" is how the
         // transitive path-dep leak got in.
         std::vector<char>           localTaint(state.packages.size(), 0);
-        auto compute_key = [&](auto&& self, std::size_t idx) -> const std::string& {
-            static const std::string kEmpty;
-            if (keyState[idx] == 2) return pkgKeys[idx];
-            if (keyState[idx] == 1) {
-                if (keyCycleError.empty()) {
-                    keyCycleError = std::format(
-                        "dependency cycle through package '{}' while computing "
-                        "its build-cache key", state.packages[idx].manifest.package.name);
-                }
-                return kEmpty;
-            }
-            keyState[idx] = 1;
 
+        // Axis F is each direct dependency's OWN key, which forces a
+        // bottom-up order: `dependencyEdges` is a DAG (the modgraph
+        // validator rejects cycles among module imports, but this is the
+        // package graph, which has no such upstream guard), so the fold
+        // below walks `mcpp::graph::topological_order` — dependencies before
+        // dependents — instead of recursing, with an explicit cycle check up
+        // front standing in for the old in-progress guard.
+        mcpp::graph::AdjacencyList pkgDeps(state.packages.size());
+        for (auto& e : state.dependencyEdges)
+            if (e.consumerPackageIndex < pkgDeps.size())
+                pkgDeps[e.consumerPackageIndex].push_back(e.dependencyPackageIndex);
+        auto keyOrder = mcpp::graph::topological_order(pkgDeps);
+        if (!keyOrder) {
+            keyCycleError = std::format(
+                "dependency cycle through package '{}' while computing "
+                "its build-cache key",
+                state.packages[keyOrder.error().cycle.front()].manifest.package.name);
+            return std::unexpected(keyCycleError);
+        }
+
+        for (auto idx : *keyOrder) {
             ck::PackageAxes pa;
             if (idx > 0 && idx - 1 < state.dep_cache_identities.size()) {
                 pa.indexName   = state.dep_cache_identities[idx - 1].indexName;
@@ -1794,7 +1803,9 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
             if (!selfIsIndex) localTaint[idx] = 1;
             for (auto& e : state.dependencyEdges) {
                 if (e.consumerPackageIndex != idx) continue;
-                auto& up = self(self, e.dependencyPackageIndex);
+                // `idx`'s dependencies precede it in `keyOrder`, so their
+                // keys and taint are already folded in below.
+                auto const& up = pkgKeys[e.dependencyPackageIndex];
                 if (!up.empty()) pa.upstreamKeys.push_back(up);
                 if (localTaint[e.dependencyPackageIndex]) localTaint[idx] = 1;
                 for (auto& f : e.requestedFeatures) pa.features.push_back(f);
@@ -1807,14 +1818,9 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
             pa.features.erase(std::unique(pa.features.begin(), pa.features.end()),
                               pa.features.end());
 
-            pkgKeys[idx]     = ck::key_hex(axes, pa);
-            pkgInputs[idx]   = ck::to_json(axes, pa);
-            keyState[idx]    = 2;
-            return pkgKeys[idx];
-        };
-        for (std::size_t i = 0; i < state.packages.size(); ++i)
-            (void)compute_key(compute_key, i);
-        if (!keyCycleError.empty()) return std::unexpected(keyCycleError);
+            pkgKeys[idx]   = ck::key_hex(axes, pa);
+            pkgInputs[idx] = ck::to_json(axes, pa);
+        }
 
         for (std::size_t i = 1; i < state.packages.size(); ++i) {  // skip [0] = main
             const auto& pkgRoot   = state.packages[i];

@@ -19,6 +19,7 @@ import mcpp.modgraph.glob;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
+import mcpp.graph;
 import mcpp.toolchain.hostflags;   // the compile-token producer the package std module reuses
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
@@ -1917,33 +1918,15 @@ static std::expected<void, std::string> step4b_cycle_check(PrepareState& state) 
     // refused by default and built under `--cache=local`. Every edge counts,
     // build-only ones included, as the key walk counts them.
     {
-        // Named visitState, not state: `state` is this function's PrepareState
-        // parameter, which the loop below also reads.
-        std::vector<int> visitState(state.packages.size(), 0);   // 0 new / 1 on stack / 2 done
-        std::vector<std::size_t> stack, cycle;
-        auto visit = [&](auto&& self, std::size_t u) -> bool {
-            visitState[u] = 1;
-            stack.push_back(u);
-            for (auto const& e : state.dependencyEdges) {
-                if (e.consumerPackageIndex != u) continue;
-                const auto v = e.dependencyPackageIndex;
-                if (v >= state.packages.size()) continue;
-                if (visitState[v] == 1) {
-                    cycle.assign(std::ranges::find(stack, v), stack.end());
-                    cycle.push_back(v);
-                    return true;
-                }
-                if (visitState[v] == 0 && self(self, v)) return true;
-            }
-            stack.pop_back();
-            visitState[u] = 2;
-            return false;
-        };
-        for (std::size_t i = 0; i < state.packages.size() && cycle.empty(); ++i)
-            if (visitState[i] == 0) (void)visit(visit, i);
-        if (!cycle.empty()) {
+        mcpp::graph::AdjacencyList deps(state.packages.size());
+        for (auto const& e : state.dependencyEdges) {
+            if (e.consumerPackageIndex >= deps.size()) continue;
+            if (e.dependencyPackageIndex >= state.packages.size()) continue;
+            deps[e.consumerPackageIndex].push_back(e.dependencyPackageIndex);
+        }
+        if (auto order = mcpp::graph::topological_order(deps); !order) {
             std::string path;
-            for (auto p : cycle) {
+            for (auto p : order.error().cycle) {
                 if (!path.empty()) path += " -> ";
                 path += std::format("'{}'",
                     mcpp::build::qualified_package_name(state.packages[p].manifest));

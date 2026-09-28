@@ -4,6 +4,7 @@ export module mcpp.modgraph.graph;
 
 import std;
 import mcpp.source_kind;
+import mcpp.graph;
 
 export namespace mcpp::modgraph {
 
@@ -121,7 +122,8 @@ struct Graph {
 };
 
 // Topological order: returns indices of units in producer-before-consumer order.
-// Returns std::unexpected with the cycle if any.
+// Returns std::unexpected with the cycle if any, as the ordered path that
+// walks it (see mcpp.graph) rather than merely the units left over.
 struct CycleError {
     std::vector<std::size_t> cycle;
 };
@@ -132,38 +134,15 @@ std::expected<std::vector<std::size_t>, CycleError> topo_sort(const Graph& g);
 namespace mcpp::modgraph {
 
 std::expected<std::vector<std::size_t>, CycleError> topo_sort(const Graph& g) {
-    std::vector<std::size_t> indeg(g.units.size(), 0);
-    std::vector<std::vector<std::size_t>> adj(g.units.size());
-    for (auto [c, p] : g.edges) {
-        // edge means: consumer depends on producer. So producer must come first.
-        // indegree of consumer counts unmet producer dependencies.
-        indeg[c]++;
-        adj[p].push_back(c);
-    }
+    // g.edges: (consumer, producer) pairs, "consumer depends on producer".
+    // mcpp.graph's adjacency direction is the same: deps[u] lists what u
+    // depends on, so an edge translates straight across with no inversion.
+    mcpp::graph::AdjacencyList deps(g.units.size());
+    for (auto [c, p] : g.edges) deps[c].push_back(p);
 
-    std::vector<std::size_t> order;
-    order.reserve(g.units.size());
-    std::vector<std::size_t> queue;
-    for (std::size_t i = 0; i < indeg.size(); ++i) {
-        if (indeg[i] == 0) queue.push_back(i);
-    }
-    while (!queue.empty()) {
-        std::size_t u = queue.back();
-        queue.pop_back();
-        order.push_back(u);
-        for (auto v : adj[u]) {
-            if (--indeg[v] == 0) queue.push_back(v);
-        }
-    }
-    if (order.size() != g.units.size()) {
-        // Cycle remains. Report units still with positive indegree.
-        CycleError err;
-        for (std::size_t i = 0; i < indeg.size(); ++i) {
-            if (indeg[i] > 0) err.cycle.push_back(i);
-        }
-        return std::unexpected(err);
-    }
-    return order;
+    auto order = mcpp::graph::topological_order(deps);
+    if (!order) return std::unexpected(CycleError{std::move(order.error().cycle)});
+    return std::move(*order);
 }
 
 } // namespace mcpp::modgraph

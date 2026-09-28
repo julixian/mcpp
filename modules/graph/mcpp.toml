@@ -1,0 +1,20 @@
+# mcpp.graph — algorithms over index-addressed directed graphs.
+#
+# A leaf by construction: ordering a set of nodes by their dependency edges
+# needs no knowledge of packages, modules or manifests, and every caller
+# already reduces its own graph (module imports, package dependencies, build
+# rules) to node indices 0..n-1 before it asks the question. This package is
+# that reduction's common answer, factored out after the same three
+# algorithms — Kahn's algorithm with a cycle path, dependency levels, and a
+# closure walk — had been hand-written at four call sites with four different
+# tie-break and cycle-reporting behaviours.
+
+[package]
+name        = "graph"
+namespace   = "mcpp"
+version     = "0.1.0"
+description = "Algorithms over index-addressed directed graphs: topological order, levels, closure"
+license     = "Apache-2.0"
+
+[dev-dependencies.compat]
+gtest = "1.15.2"

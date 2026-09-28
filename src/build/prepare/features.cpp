@@ -18,6 +18,7 @@ import mcpp.modgraph.glob;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
+import mcpp.graph;
 import mcpp.toolchain.hostflags;   // the compile-token producer the package std module reuses
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
@@ -1014,37 +1015,29 @@ static std::vector<prov::HostModule> host_module_units(const PrepareState& st, s
     for (std::size_t i = 0; i < pending.size(); ++i)
         byName.emplace(pending[i].name, i);
 
-    std::vector<char> state(pending.size(), 0);   // 0 new, 1 open, 2 done
+    // deps[u] = the pending-list indices `u` imports BY NAME within this
+    // same package. mcpp.graph's stable tie-break (lowest index first among
+    // unconstrained nodes) is what preserves path order in the
+    // unconstrained case; the old hand-written DFS achieved the same thing
+    // by always trying the path-sorted list from the front.
+    mcpp::graph::AdjacencyList deps(pending.size());
+    for (std::size_t u = 0; u < pending.size(); ++u)
+        for (auto const& want : pending[u].imports)
+            if (auto it = byName.find(want); it != byName.end())
+                deps[u].push_back(it->second);
+
+    // A CYCLE IS LEFT TO THE COMPILER, ON PURPOSE. It is ill-formed C++ and
+    // the compiler says so with the two units named; refusing here would
+    // report the same fact in a worse place, and getting the ordering wrong
+    // is no longer possible either way -- so on a cycle this falls back to
+    // declaration order instead of surfacing mcpp.graph's CycleError.
     std::vector<std::size_t> order;
-    order.reserve(pending.size());
-    // Iterative post-order DFS over the path-sorted list: the first
-    // unit that can be emitted is emitted, which is what preserves
-    // path order in the unconstrained case.
-    const auto visit = [&](std::size_t start) {
-        std::vector<std::pair<std::size_t, std::size_t>> stack{{start, 0}};
-        while (!stack.empty()) {
-            auto& [u, k] = stack.back();
-            if (state[u] == 2) { stack.pop_back(); continue; }
-            state[u] = 1;
-            if (k < pending[u].imports.size()) {
-                auto const& want = pending[u].imports[k++];
-                auto it = byName.find(want);
-                // A CYCLE IS LEFT TO THE COMPILER, ON PURPOSE. It
-                // is ill-formed C++ and the compiler says so with
-                // the two units named; refusing here would report
-                // the same fact in a worse place, and getting the
-                // ordering wrong is no longer possible either way.
-                if (it != byName.end() && state[it->second] == 0)
-                    stack.push_back({it->second, 0});
-                continue;
-            }
-            state[u] = 2;
-            order.push_back(u);
-            stack.pop_back();
-        }
-    };
-    for (std::size_t i = 0; i < pending.size(); ++i)
-        if (state[i] == 0) visit(i);
+    if (auto ordered = mcpp::graph::topological_order(deps)) {
+        order = std::move(*ordered);
+    } else {
+        order.resize(pending.size());
+        std::iota(order.begin(), order.end(), std::size_t{0});
+    }
 
     for (auto i : order) push(pending[i].path, std::move(pending[i].name));
     return out;
@@ -1135,6 +1128,12 @@ step6_host_module_registration(PrepareState& state) {
                      ? pkg.name : pkg.namespace_ + "." + pkg.name;
             };
             auto units = [&](std::size_t p) { return host_module_units(state, p); };
+            // Host-module provider edges over EVERY package, built once:
+            // pkgHostDeps[p] is what directHostProviders(p) computes, reused
+            // below instead of re-querying provisionGraph per consumer.
+            mcpp::graph::AdjacencyList pkgHostDeps(state.packages.size());
+            for (std::size_t p = 0; p < state.packages.size(); ++p)
+                pkgHostDeps[p] = directHostProviders(p);
             for (std::size_t c = 0; c < state.provisionGraph.visible.size(); ++c) {
                 const auto direct = directHostProviders(c);
                 if (direct.empty()) continue;
@@ -1161,55 +1160,60 @@ step6_host_module_registration(PrepareState& state) {
                     }
                 }
 
-                // Post-order DFS, so a rule's own host modules are compiled
-                // BEFORE it. That ordering is the entire mechanism: the
-                // compile loop in build_program.cppm accumulates the module
-                // flags as it goes, so each entry sees the BMIs of everything
-                // ahead of it, and "a rule may import another rule" needs no
-                // second machinery — only this sort.
-                std::vector<prov::HostModule> ordered;
-                std::set<std::size_t> done;
-                std::vector<std::size_t> path;   // for the cycle diagnostic
-                auto visit = [&](auto&& self, std::size_t p) -> std::expected<void, std::string> {
-                    if (done.contains(p)) return {};
-                    if (std::ranges::find(path, p) != path.end()) {
-                        // A cycle, reported AS a cycle and naming the packages
-                        // on it. A depth limit would answer a different
-                        // question and would answer it later.
-                        std::string ring;
-                        bool started = false;
-                        for (auto q : path) {
-                            if (q == p) started = true;
-                            if (!started) continue;
-                            ring += identity(q);
-                            ring += " -> ";
-                        }
-                        ring += identity(p);
-                        return std::unexpected(std::format(
-                            "build rules form an import cycle: {}\n"
-                            "       A rule's host modules are compiled before "
-                            "it, so a cycle has no order that could satisfy "
-                            "all of them.", ring));
+                // Dependency-first order, so a rule's own host modules are
+                // compiled BEFORE it. That ordering is the entire mechanism:
+                // the compile loop in build_program.cppm accumulates the
+                // module flags as it goes, so each entry sees the BMIs of
+                // everything ahead of it, and "a rule may import another
+                // rule" needs no second machinery — only this sort.
+                //
+                // Restricted to `c`'s own reachable closure (not the whole
+                // project) and reindexed to a dense local graph before
+                // calling mcpp.graph: a cycle elsewhere among packages `c`
+                // never reaches must not fail `c`'s build.
+                auto reach = mcpp::graph::closure(pkgHostDeps, direct,
+                                                   /*include_roots=*/true);
+                std::map<std::size_t, std::size_t> local;
+                for (std::size_t i = 0; i < reach.size(); ++i)
+                    local.emplace(reach[i], i);
+                mcpp::graph::AdjacencyList sub(reach.size());
+                for (std::size_t i = 0; i < reach.size(); ++i)
+                    for (auto q : pkgHostDeps[reach[i]])
+                        if (auto it = local.find(q); it != local.end())
+                            sub[i].push_back(it->second);
+
+                auto topo = mcpp::graph::topological_order(sub);
+                if (!topo) {
+                    // A cycle, reported AS a cycle and naming the packages
+                    // on it. A depth limit would answer a different
+                    // question and would answer it later.
+                    std::string ring;
+                    bool first = true;
+                    for (auto li : topo.error().cycle) {
+                        if (!first) ring += " -> ";
+                        first = false;
+                        ring += identity(reach[li]);
                     }
-                    path.push_back(p);
-                    for (auto q : directHostProviders(p))
-                        if (auto r = self(self, q); !r) return r;
-                    path.pop_back();
-                    done.insert(p);
+                    return std::unexpected(std::format(
+                        "build rules form an import cycle: {}\n"
+                        "       A rule's host modules are compiled before "
+                        "it, so a cycle has no order that could satisfy "
+                        "all of them.", ring));
+                }
+
+                std::vector<prov::HostModule> ordered;
+                for (auto li : *topo) {
+                    auto p = reach[li];
                     for (auto& hm : units(p)) {
                         hm.importable = isDirect.contains(p);
                         ordered.push_back(std::move(hm));
                     }
-                    return {};
-                };
-                for (auto p : direct)
-                    if (auto r = visit(visit, p); !r)
-                        return std::unexpected(r.error());
+                }
 
                 // Every provider on this consumer's rule closure, transitive
-                // ones included -- `done` is exactly that set, and a rule
+                // ones included -- `reach` is exactly that set, and a rule
                 // imported by another rule declares payloads just as directly.
-                state.hostModuleProvidersByConsumer[c].assign(done.begin(), done.end());
+                state.hostModuleProvidersByConsumer[c].assign(reach.begin(), reach.end());
 
                 if (auto clash = prov::host_module_collision(ordered))
                     return std::unexpected(*clash);

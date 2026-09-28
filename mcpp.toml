@@ -92,6 +92,7 @@ libs            = { path = "modules/libs" }
 log             = { path = "modules/log" }
 versioning      = { path = "modules/versioning" }
 source-kind     = { path = "modules/source-kind" }
+graph           = { path = "modules/graph" }
 dyndep          = { path = "modules/dyndep" }
 platform        = { path = "modules/platform" }
 manifest        = { path = "modules/manifest" }
@@ -104,6 +105,7 @@ members = [
     "modules/log",
     "modules/versioning",
     "modules/source-kind",
+    "modules/graph",
     "modules/dyndep",
     "modules/platform",
     "modules/manifest",
