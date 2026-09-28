@@ -93,9 +93,16 @@ class Unpin(unittest.TestCase):
 
 class Matrix(unittest.TestCase):
     def test_the_repository_list_is_well_formed(self) -> None:
-        names = [c["name"] for c in rc.canaries()]
+        canaries = rc.canaries()
+        names = [c["name"] for c in canaries]
+        self.assertTrue(names)
         self.assertEqual(len(names), len(set(names)))
-        self.assertIn("GalTranslPP", names)
+        for c in canaries:
+            for key in ("repo", "ref", "os", "commands"):
+                self.assertTrue(c.get(key), f"canary {c['name']} has no {key}")
+        # The gate holds the ecosystem's own projects (mcpp#736); a downstream
+        # project validates a release in its own pull request after it.
+        self.assertNotIn("GalTranslPP", names)
 
 
 if __name__ == "__main__":
