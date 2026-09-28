@@ -14,8 +14,9 @@
 # runs only for PE programs; the rule is the edge's, not the tool's.
 #
 #   A1  the full path reports the advice once, without -v;
-#   A2  after the action's input changes, the build takes the fast path, the
-#       edge runs again, and the advice is reported once, with the new text;
+#   A2  after the action's input changes, the build takes the fast path (on
+#       Linux; it serves only ELF products, #400), the edge runs again, and
+#       the advice is reported once, with the new text;
 #   A3  a build in which the edge does not run reports nothing.
 set -e
 
@@ -62,15 +63,21 @@ echo "ok: A1 the full path reports the advice once"
 sleep 1   # a coarse file system clock must see the input as newer
 printf 'second\n' > data/probe.in
 "$MCPP" build > b2.log 2>&1 || fail "the second build failed" b2.log
+# The fast path serves only ELF products (#400): on Linux the second build
+# must take it, or A2 tests nothing new; elsewhere it declines, and A2 reads
+# the full path again.
 if grep -q "Compiling" b2.log; then
-    fail "A2: the second build planned again, so the fast path was not exercised" b2.log
+    case "$(uname -s)" in
+        Linux) fail "A2: the second build planned again, so the fast path was not exercised" b2.log ;;
+        *)     echo "READING 821: the fast path declines on $(uname -s) (#400); A2 reads the full path" ;;
+    esac
 fi
 [[ "$(grep -c "probe input reads second" b2.log)" -eq 1 ]] \
-    || fail "A2: the fast path did not report the edge's advice exactly once" b2.log
+    || fail "A2: the second build did not report the edge's advice exactly once" b2.log
 if grep -q "probe input reads first" b2.log; then
-    fail "A2: the fast path reported the previous run's advice" b2.log
+    fail "A2: the second build reported the previous run's advice" b2.log
 fi
-echo "ok: A2 the fast path reports the advice of the edge that ran"
+echo "ok: A2 the second build reports the advice of the edge that ran"
 
 "$MCPP" build > b3.log 2>&1 || fail "the third build failed" b3.log
 if grep -q "probe input reads" b3.log; then
