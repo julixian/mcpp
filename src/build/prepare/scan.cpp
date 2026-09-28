@@ -874,9 +874,85 @@ step11_prebuild_std_module(PrepareState& state, bool needsStdModule) {
     return {};
 }
 
+// SPEC-008 W3 (#734 E6): the package being built imports a module of a
+// dependency that states an interface root, and that module is not one of the
+// dependency's public modules (the root and what it re-exports with
+// `export import`, transitively). The build succeeds from source; against the
+// dependency's packed form it would not, because a packed library ships its
+// public modules' closure only. Warned once per module, and never for a
+// dependency without a root, which states no interface.
+static void step11_public_module_check(PrepareState& state) {
+    if (state.packages.empty()) return;
+    const auto& g = state.scan.graph;
+    auto qualified = [](const mcpp::manifest::Manifest& m) {
+        return m.package.namespace_.empty() ? m.package.name
+                                            : m.package.namespace_ + "." + m.package.name;
+    };
+    auto primary = [](std::string_view name) {
+        return std::string(name.substr(0, name.find(':')));
+    };
+    const std::string rootName = qualified(state.packages[0].manifest);
+
+    std::map<std::string, std::string> providerOf;   // primary module -> package
+    std::map<std::string, std::vector<const mcpp::modgraph::SourceUnit*>> unitsOf;
+    for (auto const& u : g.units) {
+        if (!u.provides) continue;
+        const auto prim = primary(u.provides->logicalName);
+        unitsOf[prim].push_back(&u);
+        if (u.provides->logicalName.find(':') == std::string::npos)
+            providerOf.emplace(prim, u.packageName);
+    }
+
+    std::map<std::string, std::set<std::string>> publicOf;
+    for (std::size_t i = 1; i < state.packages.size(); ++i) {
+        auto const& pr = state.packages[i];
+        const auto rootFile = (pr.root / mcpp::manifest::resolve_lib_root_path(pr.manifest, pr.root))
+                                  .lexically_normal();
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(rootFile, ec)) continue;
+        const mcpp::modgraph::SourceUnit* rootUnit = nullptr;
+        for (auto const& u : g.units)
+            if (u.path.lexically_normal() == rootFile && u.provides) { rootUnit = &u; break; }
+        if (!rootUnit) continue;
+        std::set<std::string> pub{primary(rootUnit->provides->logicalName)};
+        std::vector<std::string> work(pub.begin(), pub.end());
+        while (!work.empty()) {
+            auto mod = work.back(); work.pop_back();
+            for (auto const* u : unitsOf[mod])
+                for (auto const& re : u->reexports)
+                    if (auto p = primary(re.logicalName); pub.insert(p).second) work.push_back(p);
+        }
+        publicOf[qualified(pr.manifest)] = std::move(pub);
+    }
+
+    std::set<std::string> warned;
+    for (auto const& u : g.units) {
+        if (u.packageName != rootName) continue;
+        for (auto const& req : u.requires_) {
+            const auto prim = primary(req.logicalName);
+            auto prov = providerOf.find(prim);
+            if (prov == providerOf.end() || prov->second == rootName) continue;
+            auto pub = publicOf.find(prov->second);
+            if (pub == publicOf.end() || pub->second.contains(prim)) continue;
+            if (!warned.insert(prim).second) continue;
+            std::string names;
+            for (auto const& n : pub->second) { if (!names.empty()) names += ", "; names += n; }
+            mcpp::diag::report(
+                mcpp::diag::Severity::Warning, "build/interface",
+                std::format("'{}' imports '{}' of '{}', which is not one of that "
+                            "package's public modules", u.relPath.generic_string(),
+                            prim, prov->second),
+                std::format("the build succeeds from source, and fails against the "
+                            "packed form of '{}'", prov->second),
+                std::format("import a public module of '{}': {}", prov->second, names));
+        }
+    }
+}
+
 std::expected<void, std::string> phase11_scan(PrepareState& state) {
     auto needsStdModule = step11_scan_sources(state);
     if (!needsStdModule) return std::unexpected(needsStdModule.error());
+    step11_public_module_check(state);
 
     if (auto r = step11_dependency_standard_scope_check(state); !r)
         return std::unexpected(r.error());

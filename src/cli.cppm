@@ -640,6 +640,8 @@ int run(int argc, char** argv) {
                 .help("Output format: human (default) | json (one mcpp.pack envelope on stdout; narration on stderr)"))
             .option(cl::Option("no-strip")
                 .help("Ship the artifacts as built (default: strip debug info)"))
+            .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
+                .help("Pack the named workspace member (namespace.name or package name, then directory), as if run in its directory"))
             .option(cl::Option("debug-symbols").takes_value().value_name("DIR")
                 .help("Write the separated *.debug files here (default: discard)"))
             .action(wrap_rc(cmd_pack)))

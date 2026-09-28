@@ -87,6 +87,9 @@ struct SourceUnit {
     // to prevent. Unknown now warns, naming the file and the reason.
     std::optional<bool>             providesInterface;
     std::vector<ModuleId>           requires_;
+    // The subset of `requires_` imported with `export import` (the text
+    // scanner; a P1689 scan does not report it and leaves this empty).
+    std::vector<ModuleId>           reexports;
     // The declaration form (see ModuleDeclaration). Read by the build database
     // renderer (mcpp.build.build_database), which states it as the unit's role.
     ModuleDeclaration               declaration = ModuleDeclaration::None;

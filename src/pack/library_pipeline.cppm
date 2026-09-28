@@ -24,6 +24,7 @@ module;
 export module mcpp.pack.library_pipeline;
 
 import std;
+import mcpp.diag;   // SPEC-008 W2 (#734 E6)
 import mcpp.build.backend;
 import mcpp.build.ninja;
 import mcpp.build.plan;
@@ -132,6 +133,7 @@ export int build_and_pack_library(const std::string& targetName,
 
     InterfaceClosure closure;
     bool             haveClosure = false;
+    bool             warnedUnshipped = false;   // #734 E6 W2, once per pack
     std::string      firstTriple;
     // `[package] platforms` — the support CLAIM, read once. Checked against the
     // legs after the loop; see there for why only two of the four comparisons
@@ -238,6 +240,52 @@ export int build_and_pack_library(const std::string& targetName,
         }
         // else: a header-only package. `sources = []` in the emitted manifest
         // says so explicitly, which is a thing a manifest can say now.
+
+        // #734 E6 (SPEC-008): every unit of this package that is not shipped is
+        // withheld, and the report says so -- including when there is no
+        // interface root, where the closure is empty and the report used to
+        // read "(nothing)" over a package that exported modules. An exported
+        // primary module that is not shipped is named (W2): a consumer of the
+        // packed form cannot import it. A warning, not an error: a library may
+        // implement itself in modules and publish only headers on purpose, and
+        // only the author can say which it is.
+        {
+            std::set<std::filesystem::path> shipped(here.published.begin(), here.published.end());
+            std::set<std::filesystem::path> held(here.withheld.begin(), here.withheld.end());
+            std::vector<std::string> unshipped;
+            const auto proj = ctx->projectRoot.lexically_normal();
+            for (auto const& u : ctx->graph.units) {
+                const auto rel = u.path.lexically_normal().lexically_relative(proj);
+                if (rel.empty()) continue;
+                const auto head = rel.begin()->string();
+                if (head == ".." || head == "target") continue;   // another package, or generated
+                if (shipped.contains(u.path)) continue;
+                if (held.insert(u.path).second) here.withheld.push_back(u.path);
+                if (u.provides && u.providesInterface.value_or(false)
+                    && u.provides->logicalName.find(':') == std::string::npos)
+                    unshipped.push_back(u.provides->logicalName);
+            }
+            if (!unshipped.empty() && !warnedUnshipped) {
+                warnedUnshipped = true;
+                std::string names;
+                for (auto const& n : unshipped) {
+                    if (!names.empty()) names += ", ";
+                    names += n;
+                }
+                mcpp::diag::report(
+                    mcpp::diag::Severity::Warning, "pack/interface",
+                    std::format("the package exports module{} {} that the packed form "
+                                "does not ship", unshipped.size() == 1 ? "" : "s", names),
+                    "a consumer of the packed form cannot import "
+                        + std::string(unshipped.size() == 1 ? "it" : "them"),
+                    here.published.empty()
+                        ? "add an interface root that re-exports the public modules "
+                          "(`export import`), or set [lib].path; a library that "
+                          "publishes headers only can ignore this"
+                        : "re-export it from the interface root with `export import`, "
+                          "or keep it internal on purpose");
+            }
+        }
 
         if (!here.unresolvedImports.empty()) {
             std::string list;
