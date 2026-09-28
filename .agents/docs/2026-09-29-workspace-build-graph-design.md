@@ -1,3 +1,8 @@
+---
+subject: design
+status: active
+---
+
 # The workspace as the unit of build: one graph per configuration, one scheduler, product directories, and a reusable graph module
 
 - Status: design, agreed; implementation in progress (revision 4)

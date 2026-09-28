@@ -327,7 +327,7 @@ static std::expected<void, std::string> step6_activate_features(PrepareState& st
             // of its targets is gated, as a root's are (§15).
             std::erase_if(pkg.manifest.targets,
                           [&](const mcpp::manifest::Target& t) {
-                if (!pkg.memberProducts
+                if (!pkg.selectedMember
                     && t.kind != mcpp::manifest::Target::Library
                     && t.kind != mcpp::manifest::Target::SharedLibrary)
                     return false;

@@ -127,7 +127,7 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
         for (auto const& [name, spec] : state.m->dependencies) gitDeps.emplace_back(name, spec);
         if (state.workspacePlan())
             for (std::size_t i = 1; i < state.packages.size(); ++i)
-                if (state.packages[i].memberProducts)
+                if (state.packages[i].selectedMember)
                     for (auto const& [name, spec] : state.packages[i].manifest.dependencies)
                         gitDeps.emplace_back(name, spec);
         std::set<std::string> gitLocked;

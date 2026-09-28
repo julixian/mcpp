@@ -335,57 +335,17 @@ static void recordDependencyEdge(
         });
 }
 
-static std::string normalizeDepLdflag(const std::filesystem::path& depRoot,
-                                      const std::string& flag) {
-        auto absolute_path = [&](std::string_view raw) {
-            std::filesystem::path p{std::string(raw)};
-            // A loader token stays as written; see the predicate.
-            if (p.is_absolute() || mcpp::build::is_loader_relative_search_path(raw))
-                return p;
-            return depRoot / p;
-        };
-
-        if (flag.starts_with("-L") && flag.size() > 2) {
-            return "-L" + absolute_path(std::string_view(flag).substr(2)).string();
-        }
-
-        constexpr std::string_view rpathPrefix = "-Wl,-rpath,";
-        if (flag.starts_with(rpathPrefix) && flag.size() > rpathPrefix.size()) {
-            return std::string(rpathPrefix)
-                 + absolute_path(std::string_view(flag).substr(rpathPrefix.size())).string();
-        }
-
-        return flag;
-}
-
-std::vector<std::string> normalized_dependency_ldflags(
-        const std::filesystem::path& depRoot, const std::vector<std::string>& ldflags) {
-        std::vector<std::string> out;
-        for (auto const& word : mcpp::manifest::flag_words(ldflags))
-            out.push_back(mcpp::manifest::flag_element(normalizeDepLdflag(depRoot, word)));
-        return out;
-}
-
 static std::vector<std::string> propagateLinkFlags(
         PrepareState& state,
         const std::filesystem::path& depRoot,
         const mcpp::manifest::Manifest& depManifest)
 {
-        // Word by word (SPEC-004 §8, #703): a search path is made absolute
-        // per word, and each word is written back as an element that reads as
-        // exactly that word, so the consumer's renderer reads the dependency's
-        // flags with the same reading its own flags receive, and an element
-        // that packs several tokens is several words on both sides.
-        //
+        // Word by word (SPEC-004 §8, #703): see normalized_dependency_ldflags.
         // In a workspace plan the pooled list serves the units no member owns
         // (a dependency's shared library); a member's units link with its own
         // closure's flags, which the plan reads from each package (§15).
-        std::vector<std::string> added;
-        for (auto const& word : mcpp::manifest::flag_words(depManifest.buildConfig.ldflags)) {
-            auto normalized = mcpp::manifest::flag_element(normalizeDepLdflag(depRoot, word));
-            state.m->buildConfig.ldflags.push_back(normalized);
-            added.push_back(std::move(normalized));
-        }
+        auto added = normalized_dependency_ldflags(depRoot, depManifest.buildConfig.ldflags);
+        for (auto const& f : added) state.m->buildConfig.ldflags.push_back(f);
         return added;
 }
 
@@ -1562,7 +1522,7 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
             // as a root's are (workspace design 2026-09-29 §15).
             const bool consumerIsMember = item.consumerDepIndex != kMainConsumer
                 && item.consumerDepIndex + 1 < state.packages.size()
-                && state.packages[item.consumerDepIndex + 1].memberProducts.has_value();
+                && state.packages[item.consumerDepIndex + 1].selectedMember;
             if (item.consumerDepIndex == kMainConsumer || consumerIsMember) {
                 // Only root deps are locked: the writer below walks the root
                 // manifest's [dependencies], so a transitive git branch dep
@@ -1835,7 +1795,10 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         const auto depPackageIndex = state.packages.size();
         auto depPackage = makePackageRoot(state, ctx.dep_root, *state.dep_manifests.back());
         if (!depPackage) return std::unexpected(depPackage.error());
-        if (selectedMember) depPackage->memberProducts = state.selectedMembers.at(*selectedMember);
+        if (selectedMember) {
+            depPackage->selectedMember = true;
+            depPackage->memberProducts = state.selectedMembers.at(*selectedMember);
+        }
         state.packages.push_back(std::move(*depPackage));
         recordDependencyEdge(state, item.consumerDepIndex, depPackageIndex, spec,
                              item.buildOnly, name);
@@ -2033,7 +1996,7 @@ static void step4b_define_lookup_closures(PrepareState& state) {
     // this plan ships.
     state.isWorkspaceMemberPackage = [&](std::size_t i) {
         if (i == 0 || i >= state.packages.size() || !state.workspacePlan()) return false;
-        if (state.packages[i].memberProducts) return true;
+        if (state.packages[i].selectedMember) return true;
         const auto& r = state.packages[i].root;
         if (r.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal()) return true;
         return !workspace_member_of(state, r).empty();
@@ -2042,7 +2005,7 @@ static void step4b_define_lookup_closures(PrepareState& state) {
     // (workspace design 2026-09-29 §15).
     state.compilesHere = [&](std::size_t i) {
         return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest)
-            || state.isArtifactPackage(i) || state.packages[i].memberProducts.has_value();
+            || state.isArtifactPackage(i) || state.packages[i].selectedMember;
     };
 
 

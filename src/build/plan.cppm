@@ -2800,11 +2800,11 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     std::set<std::string> memberDevDepPackages;
     for (std::size_t mi = 1; mi < packages.size(); ++mi) {
         auto const& pkg = packages[mi];
-        if (!pkg.memberProducts) continue;
+        if (!pkg.selectedMember) continue;
         const auto owner = qualified_package_name(pkg.manifest);
-        const auto productDir = pkg.memberProducts->empty()
+        const auto productDir = pkg.memberProducts.empty()
             ? std::filesystem::path("bin")
-            : std::filesystem::path("bin") / *pkg.memberProducts;
+            : std::filesystem::path("bin") / pkg.memberProducts;
         auto place = [&](const std::filesystem::path& o) { return productDir / o.filename(); };
 
         // The closure: the member, what it reaches through its dependency

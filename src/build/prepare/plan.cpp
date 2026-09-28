@@ -166,7 +166,7 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
         // the fast path sweeps, the workspace's own package included.
         if (state.workspacePlan())
             for (std::size_t i = 1; i < state.packages.size(); ++i) {
-                if (!state.packages[i].memberProducts) continue;
+                if (!state.packages[i].selectedMember) continue;
                 auto normalized = state.packages[i].root.lexically_normal();
                 if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
                     roots.push_back(normalized);
@@ -181,7 +181,7 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
             if (ec) dir = (state.runtimeWorkspaceRoot / mp).lexically_normal();
             for (std::size_t i = 1; i < state.packages.size(); ++i) {
                 auto const& pkg = state.packages[i];
-                if (!pkg.memberProducts) continue;
+                if (!pkg.selectedMember) continue;
                 std::error_code pec;
                 auto root = std::filesystem::weakly_canonical(pkg.root, pec);
                 if (pec) root = pkg.root.lexically_normal();
@@ -192,7 +192,7 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
                         : pkg.manifest.package.namespace_ + "." + pkg.manifest.package.name,
                     .memberPath = mp,
                     .root = pkg.root,
-                    .productDir = *pkg.memberProducts,
+                    .productDir = pkg.memberProducts,
                     .manifest = pkg.manifest,
                 });
                 break;
@@ -272,7 +272,7 @@ static std::expected<void, std::string> step13_runner_and_xlings(PrepareState& s
                     ? state.activeFeaturesByPackage[i] : std::vector<std::string>{};
                 for (auto const& spec : applicable_xlings_addresses(
                          man, feats, ToolPurpose::Run, /*isRoot=*/i == 0
-                         || state.packages[i].memberProducts.has_value()))
+                         || state.packages[i].selectedMember))
                     if (std::ranges::find(xlingsSpecs, spec) == xlingsSpecs.end())
                         { ctx.runTierPending = true; break; }
             }
