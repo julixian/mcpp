@@ -3752,7 +3752,22 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     if (auto bad = check_action_ordering(manifest, plan))
         return std::unexpected(BuildError{*bad, ninja_path});
     auto goalArg = append_goal_phony(manifest, opts.ninjaTargets);
-    write_file(ninja_path, manifest);
+    // An unchanged build.ninja is not rewritten, but its TIME is moved: the
+    // project fast path compares every source with it, and reads it as "the
+    // graph was confirmed current then". A source edited since the last
+    // rewrite would otherwise stay newer after this build confirmed the graph,
+    // and every later build declined the fast path until the graph's text
+    // changed (#734, measured on Linux: an edit to src/main.cpp, then two
+    // builds, the second planned in full). No edge reads build.ninja's time.
+    {
+        std::error_code tec;
+        const bool existed = std::filesystem::exists(ninja_path, tec);
+        const auto before  = existed ? std::filesystem::last_write_time(ninja_path, tec)
+                                     : std::filesystem::file_time_type{};
+        write_file(ninja_path, manifest);
+        if (existed && !tec && std::filesystem::last_write_time(ninja_path, tec) == before && !tec)
+            std::filesystem::last_write_time(ninja_path, std::filesystem::file_time_type::clock::now(), tec);
+    }
     stage("write-ninja");
 
     // compile_commands.json — via the dedicated module.

@@ -1204,9 +1204,31 @@ bool dep_sources_newer_than(const std::vector<std::string>& depSourceRoots,
         auto tomlTime = std::filesystem::last_write_time(depRoot / "mcpp.toml", ec);
         if (ec) { ec.clear(); return true; }
         if (tomlTime > ninjaTime) return true;
-        for (auto& f : mcpp::modgraph::expand_glob(depRoot, "src/**/*")) {
-            if (!mcpp::affects_graph_shape(mcpp::classify(f, extTable))) continue;
-            auto ft = std::filesystem::last_write_time(f, ec);
+        // THE WHOLE TREE, NOT `src/`. A dependency's units outside `src/` --
+        // a feature's `rules/x.cppm`, a `[build] sources` glob elsewhere --
+        // are as much its sources as those under it, and a host module among
+        // them is compiled into the consumer's BUILD PROGRAM, which no edge of
+        // this build.ninja names: an edit to one was replayed as "no work"
+        // (#734, measured on mcpp-plugins' `deps/vcpkg.cppm`). Version-control,
+        // hidden and build-output directories are skipped, and so is a nested
+        // package (a directory with its own mcpp.toml), whose files are its
+        // own package's sources, not this one's.
+        auto it = std::filesystem::recursive_directory_iterator(
+            depRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+        if (ec) { ec.clear(); return true; }
+        for (; it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); return true; }
+            const auto& path = it->path();
+            if (it->is_directory(ec)) {
+                const auto name = path.filename().string();
+                if (name.starts_with(".") || name == "target"
+                    || std::filesystem::exists(path / "mcpp.toml", ec))
+                    it.disable_recursion_pending();
+                ec.clear();
+                continue;
+            }
+            if (!mcpp::affects_graph_shape(mcpp::classify(path, extTable))) continue;
+            auto ft = std::filesystem::last_write_time(path, ec);
             if (ec || ft > ninjaTime) return true;
         }
     }
@@ -1498,7 +1520,7 @@ std::optional<int> fast_path_declined(std::string_view path, std::string_view wh
 export std::optional<int> try_fast_build(const std::filesystem::path& projectRoot,
                                   bool verbose, bool no_cache,
                                   std::string_view currentTarget = "") {
-    if (no_cache) return fast_path_declined("build", "no_cache");
+    if (no_cache) return fast_path_declined("build", "the build cache is off (--no-cache)");
 
     // `--locked` MUST NOT MEET THE FAST PATH, OR IT ASSERTS NOTHING.
     //
@@ -1512,10 +1534,10 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     // Declining the fast path is the whole fix: `--locked` is for release
     // builds, audits and CI, none of which are the case the fast path serves.
     if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
-        return fast_path_declined("build", "if (mcpp::platform::env::get(\"MCPP_LOCKED\").value_or(\"\") == \"1\")");
+        return fast_path_declined("build", "MCPP_LOCKED=1 asks for a locked resolution");
 
     auto want = fast_path_identity(projectRoot);
-    if (!want) return fast_path_declined("build", "!want");
+    if (!want) return fast_path_declined("build", "the manifest or the request could not be read");
 
     // #496. A project with build hooks always takes the full path. The fast
     // path is defined as "skip preparation", and `build_start` is specified to
@@ -1523,7 +1545,7 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     // not exist until preparation has run. Declining here rather than in
     // cmd_build keeps the decision next to the manifest that answers it; the
     // full path then runs the hooks around run_build_plan.
-    if (want->hooksActive) return fast_path_declined("build", "want->hooksActive");
+    if (want->hooksActive) return fast_path_declined("build", "the project declares [hooks], which run on every build");
 
     // P3: read multi-entry cache and find the entry matching this
     // (target, profile, cache mode) triple. Matching on the target alone served
@@ -1539,8 +1561,8 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
             break;
         }
     }
-    if (!match) return fast_path_declined("build", "!match");
-    if (!match->runtimeBinding) return fast_path_declined("build", "!match->runtimeBinding");
+    if (!match) return fast_path_declined("build", "no recorded build matches this request");
+    if (!match->runtimeBinding) return fast_path_declined("build", "the recorded build predates the runtime binding");
 
     auto outputDirStr = match->outputDir;
     auto ninjaProgram = match->ninjaProgram;
@@ -1552,13 +1574,13 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     auto runtimeEnvKey = match->runtimeEnvKey;
     auto runtimeEnvValue = match->runtimeEnvValue;
     if (runtimeEnvKey.empty())
-        return fast_path_declined("build", "if (runtimeEnvKey.empty())"); // old cache entry; regenerate build.ninja once
+        return fast_path_declined("build", "the recorded build predates the runtime environment key"); // old cache entry; regenerate build.ninja once
 
     // P1: verify fingerprint matches the outputDir basename.
     if (!cachedFingerprint.empty()) {
         auto dirBasename = std::filesystem::path(outputDirStr).filename().string();
         if (dirBasename != cachedFingerprint) {
-            return fast_path_declined("build", "if (dirBasename != cachedFingerprint) {");
+            return fast_path_declined("build", "the recorded build directory is not the one for this fingerprint");
         }
     }
 
@@ -1566,7 +1588,7 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     std::filesystem::path outputDir(outputDirStr);
 
     auto ninjaPath = outputDir / "build.ninja";
-    if (!std::filesystem::exists(ninjaPath, ec)) return fast_path_declined("build", "!std::filesystem::exists(ninjaPath, ec)");
+    if (!std::filesystem::exists(ninjaPath, ec)) return fast_path_declined("build", "build.ninja does not exist");
 
     // #407. Freshness is measured against the SOURCES, which says nothing
     // about what kind of graph this is. `mcpp test` and
@@ -1576,38 +1598,38 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     // that for a plain build linked the tests, never linked the target, and
     // printed `Finished`; and a broken file under tests/ (never scanned here)
     // failed a plain `mcpp build` outright.
-    if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("build", "!mcpp::build::is_plain_build_graph(ninjaPath)");
+    if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("build", "build.ninja was written by another mode (test, pack or a named target)");
 
     auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
-    if (ec) return fast_path_declined("build", "ec");
+    if (ec) return fast_path_declined("build", "the time of build.ninja cannot be read");
 
     auto runtimeManifest = match->runtimeBinding->subosDir / ".xlings.json";
     auto runtimeTime = std::filesystem::last_write_time(runtimeManifest, ec);
-    if (ec || runtimeTime > ninjaTime) return fast_path_declined("build", "ec || runtimeTime > ninjaTime");
+    if (ec || runtimeTime > ninjaTime) return fast_path_declined("build", "the runtime's .xlings.json is newer than build.ninja");
 
     // Check mcpp.toml
     auto tomlPath = projectRoot / "mcpp.toml";
     auto tomlTime = std::filesystem::last_write_time(tomlPath, ec);
-    if (ec || tomlTime > ninjaTime) return fast_path_declined("build", "ec || tomlTime > ninjaTime");
+    if (ec || tomlTime > ninjaTime) return fast_path_declined("build", "mcpp.toml is newer than build.ninja");
 
     // mcpp#225: bounded + vcs/build-dir-excluded walk (see sources_newer_than)
     // instead of a hand-rolled recursive_directory_iterator over src/.
     if (sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,
-                           want->extTable)) return fast_path_declined("build", "if (sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,");
+                           want->extTable)) return fast_path_declined("build", "a project source, build.mcpp, a build-program input or a resource script is newer than build.ninja");
     // A cache written before this field existed cannot say whether the build
     // had `path` dependencies, and answering "assume none" is the wrong
     // half of that guess: it would keep replaying a stale graph for exactly
     // the projects the field was added for. Decline once; the write below
     // records the list and every later invocation is fast again.
-    if (!match->depSourceRootsRecorded) return fast_path_declined("build", "!match->depSourceRootsRecorded");
+    if (!match->depSourceRootsRecorded) return fast_path_declined("build", "the recorded build predates the list of path-dependency roots");
     if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
-        return fast_path_declined("build", "if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))");
-    if (!xlings_payloads_present(*match)) return fast_path_declined("build", "!xlings_payloads_present(*match)");
+        return fast_path_declined("build", "a path dependency's manifest or source is newer than build.ninja");
+    if (!xlings_payloads_present(*match)) return fast_path_declined("build", "a recorded xlings payload is missing");
 
     auto validatedBefore =
         mcpp::build::runtime_validation::validated_artifact_snapshot(
             outputDir, *match->runtimeBinding);
-    if (!validatedBefore) return fast_path_declined("build", "!validatedBefore");
+    if (!validatedBefore) return fast_path_declined("build", "no validated artifact snapshot is recorded for this build");
 
     // All inputs are older than build.ninja → fast-path: just run ninja.
     // C1: this configuration is confirmed current, so the root database is
@@ -1618,11 +1640,11 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     std::chrono::milliseconds elapsed{};
     auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, verbose,
                              runtimeEnvKey, runtimeEnvValue, &elapsed);
-    if (!rc) return fast_path_declined("build", "!rc");
+    if (!rc) return fast_path_declined("build", "ninja reported a stale graph");
     if (*rc != 0) return rc;
     if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(
             *validatedBefore))
-        return fast_path_declined("build", "*validatedBefore))"); // relinked: full path reconstructs + validates closure
+        return fast_path_declined("build", "ninja relinked an artifact, whose closure the full path validates"); // relinked: full path reconstructs + validates closure
 
     mcpp::ui::finished(want->profile, elapsed);
     return 0;
@@ -1642,9 +1664,9 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // Same reason as try_fast_build's: this path skips resolution, and
     // `--locked` is an assertion about resolution.
     if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
-        return fast_path_declined("run", "if (mcpp::platform::env::get(\"MCPP_LOCKED\").value_or(\"\") == \"1\")");
+        return fast_path_declined("run", "MCPP_LOCKED=1 asks for a locked resolution");
     auto want = fast_path_identity(projectRoot);
-    if (!want) return fast_path_declined("run", "!want");
+    if (!want) return fast_path_declined("run", "the manifest or the request could not be read");
 
     // THE precondition of this whole function: it exec's the cached
     // artifact itself, so it is only ever valid when that artifact is for THIS
@@ -1666,7 +1688,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // `mcpp run` alone was correct; only build-then-run reached the cache. So
     // the fast path is off whenever a default target is declared, and the full
     // prepare — which is what resolves the runner — takes over.
-    if (!want->defaultTarget.empty()) return fast_path_declined("run", "!want->defaultTarget.empty()");
+    if (!want->defaultTarget.empty()) return fast_path_declined("run", "the manifest names a default target");
 
     auto entries = read_build_cache(projectRoot);
     const BuildCacheEntry* match = nullptr;
@@ -1678,18 +1700,18 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
             break;
         }
     }
-    if (!match || match->runTargets.empty()) return fast_path_declined("run", "!match || match->runTargets.empty()");
+    if (!match || match->runTargets.empty()) return fast_path_declined("run", "no recorded build has a program to run");
     // A runner declared for the host target (a wrapper such as valgrind, or
     // a triple that is native here but carries an emulator) is consulted on
     // the prepare path through choose_runner. This path has no manifest to
     // read the template from, and executing the artifact bare here while the
     // other door wraps it would make the second `mcpp run` behave differently
     // from the first. The entry records the fact; the fast path declines.
-    if (match->runnerDeclared) return fast_path_declined("run", "match->runnerDeclared");
+    if (match->runnerDeclared) return fast_path_declined("run", "a runner is declared");
     // The same reasoning one axis over: this entry was written by a verb that
     // installed less than a run needs, so taking it would execute with a
     // declared tool absent. prepare_build provisions the difference.
-    if (match->runTierPending) return fast_path_declined("run", "match->runTierPending");
+    if (match->runTierPending) return fast_path_declined("run", "the run tier is not yet decided");
 
     auto outputDirStr = match->outputDir;
     auto ninjaProgram = match->ninjaProgram;
@@ -1698,7 +1720,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
                                  && ninjaProgram.back() == '\'')
         ninjaProgram = ninjaProgram.substr(1, ninjaProgram.size() - 2);
     if (match->runtimeEnvKey.empty())
-        return fast_path_declined("run", "if (match->runtimeEnvKey.empty())"); // old cache entry; go through prepare_build once
+        return fast_path_declined("run", "the recorded build predates the runtime environment key"); // old cache entry; go through prepare_build once
     // Written before this mcpp knew about subos environments (mcpp#352). Taking
     // the fast path here would run the program without them -- which is the
     // defect this field exists to fix, surviving an upgrade.
@@ -1710,12 +1732,12 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // pre-upgrade build until something else happened to invalidate it. Measured
     // on a real upgrade from 2026.8.7.1, not reasoned about.
     if (!match->runtimeBinding)
-        return fast_path_declined("run", "if (!match->runtimeBinding)"); // predates the immutable snapshot; rebuild once
+        return fast_path_declined("run", "the recorded build predates the runtime binding"); // predates the immutable snapshot; rebuild once
 
     // P1: verify fingerprint matches the outputDir basename.
     if (!match->fingerprint.empty()) {
         auto dirBasename = std::filesystem::path(outputDirStr).filename().string();
-        if (dirBasename != match->fingerprint) return fast_path_declined("run", "dirBasename != match->fingerprint");
+        if (dirBasename != match->fingerprint) return fast_path_declined("run", "the recorded build directory is not the one for this fingerprint");
     }
 
     // Locate the requested run-target before doing any filesystem freshness
@@ -1727,52 +1749,52 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
         chosen = &rt;
         if (targetName) break;
     }
-    if (!chosen) return fast_path_declined("run", "!chosen");
+    if (!chosen) return fast_path_declined("run", "the requested program is not among the recorded ones");
 
     std::error_code ec;
     std::filesystem::path outputDir(outputDirStr);
     auto ninjaPath = outputDir / "build.ninja";
-    if (!std::filesystem::exists(ninjaPath, ec)) return fast_path_declined("run", "!std::filesystem::exists(ninjaPath, ec)");
+    if (!std::filesystem::exists(ninjaPath, ec)) return fast_path_declined("run", "build.ninja does not exist");
     // #407, same reason as try_fast_build: a test-shaped graph does not build
     // the run target at all, so running ninja against it would report success
     // and then exec a stale (or absent) binary.
-    if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("run", "!mcpp::build::is_plain_build_graph(ninjaPath)");
+    if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("run", "build.ninja was written by another mode (test, pack or a named target)");
     auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
-    if (ec) return fast_path_declined("run", "ec");
+    if (ec) return fast_path_declined("run", "the time of build.ninja cannot be read");
 
     auto runtimeManifest = match->runtimeBinding->subosDir / ".xlings.json";
     auto runtimeTime = std::filesystem::last_write_time(runtimeManifest, ec);
-    if (ec || runtimeTime > ninjaTime) return fast_path_declined("run", "ec || runtimeTime > ninjaTime");
+    if (ec || runtimeTime > ninjaTime) return fast_path_declined("run", "the runtime's .xlings.json is newer than build.ninja");
 
     auto tomlPath = projectRoot / "mcpp.toml";
     auto tomlTime = std::filesystem::last_write_time(tomlPath, ec);
-    if (ec || tomlTime > ninjaTime) return fast_path_declined("run", "ec || tomlTime > ninjaTime");
+    if (ec || tomlTime > ninjaTime) return fast_path_declined("run", "mcpp.toml is newer than build.ninja");
 
     if (sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,
-                           want->extTable)) return fast_path_declined("run", "if (sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,");
+                           want->extTable)) return fast_path_declined("run", "a project source, build.mcpp, a build-program input or a resource script is newer than build.ninja");
     // Same gate as try_fast_build's, and it has to be BOTH places: `mcpp run`
     // reaches its binary through this path, so a `run` that skipped the check
     // would execute an artifact built from a source set that no longer exists.
-    if (!match->depSourceRootsRecorded) return fast_path_declined("run", "!match->depSourceRootsRecorded");
+    if (!match->depSourceRootsRecorded) return fast_path_declined("run", "the recorded build predates the list of path-dependency roots");
     if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
-        return fast_path_declined("run", "if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))");
-    if (!xlings_payloads_present(*match)) return fast_path_declined("run", "!xlings_payloads_present(*match)");
+        return fast_path_declined("run", "a path dependency's manifest or source is newer than build.ninja");
+    if (!xlings_payloads_present(*match)) return fast_path_declined("run", "a recorded xlings payload is missing");
 
     auto validatedBefore =
         mcpp::build::runtime_validation::validated_artifact_snapshot(
             outputDir, *match->runtimeBinding);
-    if (!validatedBefore) return fast_path_declined("run", "!validatedBefore");
+    if (!validatedBefore) return fast_path_declined("run", "no validated artifact snapshot is recorded for this build");
 
     // Fresh → run ninja (picks up any incremental object/link work) then
     // exec the cached exe path directly. C1, same reason as try_fast_build's.
     restore_root_compile_commands(projectRoot, outputDir);
     auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, /*verbose=*/false,
                              match->runtimeEnvKey, match->runtimeEnvValue);
-    if (!rc) return fast_path_declined("run", "!rc");
+    if (!rc) return fast_path_declined("run", "ninja reported a stale graph");
     if (*rc != 0) return rc;
     if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(
             *validatedBefore))
-        return fast_path_declined("run", "*validatedBefore))"); // never execute an artifact not validated for this binding
+        return fast_path_declined("run", "ninja relinked an artifact, whose closure the full path validates"); // never execute an artifact not validated for this binding
 
     auto exe = outputDir / chosen->second;
     auto pathCtx = mcpp::fetcher::make_path_ctx(/*cfg=*/nullptr, projectRoot);
