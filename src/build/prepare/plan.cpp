@@ -44,6 +44,7 @@ import mcpp.platform.capacity;   // the host fallback handed to schedule::decide
 import mcpp.build.graph_shape;  // #407: the graph says which mode wrote it
 import mcpp.build.runtime_validation;  // declared artifact -> identity verdict
 import mcpp.build.cache_key;
+import mcpp.graph;
 import mcpp.pack.abi_tag;      // the tag a prebuilt dependency is checked against
 import mcpp.pack.prebuilt;     // …and the check itself
 import mcpp.pack.stage_tree;   // where `${mcpp.stage_dir}` points, and its manifest
@@ -161,7 +162,42 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
             if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
                 roots.push_back(std::move(normalized));
         }
+        // A workspace plan's members are its projects: their trees are what
+        // the fast path sweeps, the workspace's own package included.
+        if (state.workspacePlan())
+            for (std::size_t i = 1; i < state.packages.size(); ++i) {
+                if (!state.packages[i].selectedMember) continue;
+                auto normalized = state.packages[i].root.lexically_normal();
+                if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
+                    roots.push_back(normalized);
+            }
         ctx.depSourceRoots = std::move(roots);
+    }
+    // The selected members, in selection order (§15).
+    if (state.workspacePlan()) {
+        for (auto const& mp : state.selectedMemberPaths) {
+            std::error_code ec;
+            auto dir = std::filesystem::weakly_canonical(state.runtimeWorkspaceRoot / mp, ec);
+            if (ec) dir = (state.runtimeWorkspaceRoot / mp).lexically_normal();
+            for (std::size_t i = 1; i < state.packages.size(); ++i) {
+                auto const& pkg = state.packages[i];
+                if (!pkg.selectedMember) continue;
+                std::error_code pec;
+                auto root = std::filesystem::weakly_canonical(pkg.root, pec);
+                if (pec) root = pkg.root.lexically_normal();
+                if (root != dir) continue;
+                ctx.workspaceMembers.push_back({
+                    .name = pkg.manifest.package.namespace_.empty()
+                        ? pkg.manifest.package.name
+                        : pkg.manifest.package.namespace_ + "." + pkg.manifest.package.name,
+                    .memberPath = mp,
+                    .root = pkg.root,
+                    .productDir = pkg.memberProducts,
+                    .manifest = pkg.manifest,
+                });
+                break;
+            }
+        }
     }
     return {};
 }
@@ -235,7 +271,8 @@ static std::expected<void, std::string> step13_runner_and_xlings(PrepareState& s
                 const auto feats = i < state.activeFeaturesByPackage.size()
                     ? state.activeFeaturesByPackage[i] : std::vector<std::string>{};
                 for (auto const& spec : applicable_xlings_addresses(
-                         man, feats, ToolPurpose::Run, /*isRoot=*/i == 0))
+                         man, feats, ToolPurpose::Run, /*isRoot=*/i == 0
+                         || state.packages[i].selectedMember))
                     if (std::ranges::find(xlingsSpecs, spec) == xlingsSpecs.end())
                         { ctx.runTierPending = true; break; }
             }
@@ -363,11 +400,34 @@ static std::expected<void, std::string> step13_link_forms(PrepareState& state, B
 }
 
 static std::expected<void, std::string> step13_make_plan(PrepareState& state, BuildContext& ctx) {
+    // A workspace plan links each member's closure with that closure's own
+    // flags (workspace design 2026-09-29 §15): each package's link flags,
+    // its build program's included, with search paths made absolute against
+    // the package, as the root's pooled list holds them outside a workspace.
+    if (state.workspacePlan())
+        for (std::size_t i = 1; i < state.packages.size(); ++i)
+            state.packages[i].linkUsage.ldflags = normalized_dependency_ldflags(
+                state.packages[i].root, state.packages[i].manifest.buildConfig.ldflags);
     auto planResult = mcpp::build::make_plan(*state.m, *state.tc, state.fp, state.scan.graph, state.report.topoOrder,
                                              state.packages, *state.root, ctx.outputDir,
                                              state.stdBmiPath, state.stdObjectPath, state.storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
+    // The request the graph is planned for (§3, §15): the plan's members and
+    // the requested features, which name no directory.
+    if (state.workspacePlan()) {
+        auto join = [](const std::vector<std::string>& v) {
+            std::string out;
+            for (auto const& x : v) { if (!out.empty()) out += '\x1e'; out += x; }
+            return out;
+        };
+        ctx.workspaceGroup = join(state.selectedMemberPaths);
+        ctx.workspaceRequest = state.overrides.workspace_request.empty()
+            ? ctx.workspaceGroup : join(state.overrides.workspace_request);
+    }
+    ctx.plan.requestTag = mcpp::build::request_tag(
+        ctx.workspaceGroup,
+        state.workspacePlan() ? state.requestedFeatures : state.overrides.features);
     // SPEC-007 R4.3: a declared deploy outranks a search directory's file of
     // the same name, and a difference between the two is stated ONCE, by the
     // post-link placement edge, through the edge-advice channel
@@ -1629,7 +1689,7 @@ static std::expected<void, std::string> step13_windows_resources(PrepareState& s
 
 // The member path (relative to the workspace root) of a package root, when the
 // root is a member of the workspace this build runs in; empty otherwise.
-// Shared by E1 (members built once) and W3 (a member's non-public modules).
+// Read by W3 (a member's non-public modules).
 std::string workspace_member_of(const PrepareState& state, const std::filesystem::path& root) {
     if (!state.wsManifest || state.runtimeWorkspaceRoot.empty()) return {};
     const auto rel = root.lexically_normal()
@@ -1641,185 +1701,6 @@ std::string workspace_member_of(const PrepareState& state, const std::filesystem
         if (m.ends_with("/*") && rel.starts_with(m.substr(0, m.size() - 1))
             && rel.find('/', m.size() - 1) == std::string::npos)
             return rel;
-    }
-    return {};
-}
-
-// #734 E1, split out of step13_dependency_cache: the workspace members this
-// graph reaches by `path` are built in their own directories and served to it
-// through stage edges. `pkgKeys` and `pkgInputs` are this graph's build keys
-// and their inputs, index-aligned with `state.packages`.
-static std::expected<void, std::string>
-step13_serve_workspace_members(PrepareState& state, BuildContext& ctx,
-                               const std::vector<std::string>& pkgKeys,
-                               const std::vector<nlohmann::json>& pkgInputs) {
-    // ── #734 E1: a workspace member used as a path dependency ─────────
-    //
-    // Built once, in its own directory, as the root of its own build, and
-    // taken from there by every member that consumes it. The member's own
-    // ninja decides what is stale, so an input outside the member's root
-    // (a header under `../3rdParty`) counts as it does for the member's
-    // own build; nothing here stamps files. The member's objects and
-    // module interfaces reach this graph through the stage edges the
-    // global cache uses. Equal build keys are the admission rule: the key
-    // holds everything that decides a unit's compile command, so a member
-    // whose key differs here (other features, another profile) is compiled
-    // in this graph as before. A host-tool sub-build and a planning-only
-    // command (`mcpp emit build-database`) never build a member.
-    if (state.overrides.tool_depth == 0 && !state.overrides.plan_only
-        && state.wsManifest && !state.runtimeWorkspaceRoot.empty()) {
-        auto qualified = [](const mcpp::manifest::Manifest& mm) {
-            return mm.package.namespace_.empty() ? mm.package.name
-                                                 : mm.package.namespace_ + "." + mm.package.name;
-        };
-        auto bmiT = mcpp::toolchain::bmi_traits(*state.tc);
-        for (std::size_t i = 1; i < state.packages.size(); ++i) {
-            const auto* depIdent = i - 1 < state.dep_cache_identities.size()
-                ? &state.dep_cache_identities[i - 1] : nullptr;
-            if (!depIdent || depIdent->sourceKind != "path") continue;
-            const auto& pkgRoot = state.packages[i];
-            const auto member = workspace_member_of(state, pkgRoot.root);
-            if (member.empty()) continue;
-
-            BuildOverrides sub;
-            sub.project_root     = state.runtimeWorkspaceRoot;
-            sub.package_filter   = member;
-            sub.target_triple    = state.overrides.target_triple;
-            sub.accel            = state.overrides.accel;
-            sub.force_static     = state.overrides.force_static;
-            sub.profile          = state.overrides.profile;
-            sub.profile_fallback = state.overrides.profile_fallback;
-            sub.capabilities     = state.overrides.capabilities;
-            sub.toolchain        = state.overrides.toolchain;
-            sub.cache_mode       = state.overrides.cache_mode;
-            if (i < state.activeFeaturesByPackage.size())
-                for (auto const& f : state.activeFeaturesByPackage[i]) {
-                    if (!sub.features.empty()) sub.features += ",";
-                    sub.features += f;
-                }
-            auto subCtx = prepare_build(/*print_fingerprint=*/false,
-                                        /*includeDevDeps=*/false, /*extraTargets=*/{}, sub);
-            const auto who = qualified(pkgRoot.manifest);
-            if (!subCtx) {
-                mcpp::log::verbose("workspace-member", std::format(
-                    "{} is compiled in this graph: its own build could not be "
-                    "planned: {}", who, subCtx.error()));
-                continue;
-            }
-            // The admission compares the key's INPUTS, less `package.index`:
-            // that field names where a package came from (the namespace a
-            // dependency is reached under; empty for a root), not how it
-            // compiles. Every other input must be equal.
-            auto compile_inputs = [](nlohmann::json j) {
-                if (j.is_object() && j.contains("package") && j["package"].is_object())
-                    j["package"].erase("index");
-                return j;
-            };
-            const bool sameCompile = !subCtx->plan.packageKeyInputs.empty()
-                && compile_inputs(nlohmann::json::parse(subCtx->plan.packageKeyInputs[0], nullptr, false))
-                   == compile_inputs(pkgInputs[i]);
-            if (!sameCompile) {
-                // Name the inputs that differ: a mismatch is either a
-                // real difference (another feature set) or a key input
-                // that depends on the position, and only the field names
-                // tell which.
-                std::string fields;
-                if (!subCtx->plan.packageKeyInputs.empty()) {
-                    auto own  = nlohmann::json::parse(subCtx->plan.packageKeyInputs[0], nullptr, false);
-                    auto here = pkgInputs[i];
-                    if (own.is_object() && here.is_object())
-                        for (auto it = here.begin(); it != here.end(); ++it) {
-                            if (own.contains(it.key()) && own[it.key()] == it.value()) continue;
-                            if (it.value().is_object() && own.contains(it.key())
-                                && own[it.key()].is_object()) {
-                                auto const& o = own[it.key()];
-                                for (auto jt = it.value().begin(); jt != it.value().end(); ++jt)
-                                    if (!o.contains(jt.key()) || o[jt.key()] != jt.value()) {
-                                        if (!fields.empty()) fields += ", ";
-                                        fields += std::format("{}.{} (here {}, own {})", it.key(),
-                                            jt.key(), jt.value().dump(),
-                                            o.contains(jt.key()) ? o[jt.key()].dump() : "absent");
-                                    }
-                                continue;
-                            }
-                            if (!fields.empty()) fields += ", ";
-                            fields += it.key();
-                        }
-                }
-                mcpp::log::verbose("workspace-member", std::format(
-                    "{} is compiled in this graph: its build key here ({}) differs "
-                    "from its own ({}); differing inputs: {}", who, pkgKeys[i],
-                    subCtx->plan.packageKeys.empty() ? std::string("none")
-                                                     : subCtx->plan.packageKeys[0],
-                    fields.empty() ? std::string("(unknown)") : fields));
-                continue;
-            }
-            // Every unit of the member in this graph must have its
-            // counterpart in the member's own build, or none is taken:
-            // a half-served package is the mixed state the global cache
-            // refuses for the same reason.
-            std::map<std::filesystem::path, const CompileUnit*> own;
-            for (auto const& scu : subCtx->plan.compileUnits)
-                own.emplace(scu.source.lexically_normal(), &scu);
-            std::vector<std::pair<std::size_t, const CompileUnit*>> pairs;
-            bool complete = true;
-            for (std::size_t u = 0; u < ctx.plan.compileUnits.size(); ++u) {
-                auto const& cu = ctx.plan.compileUnits[u];
-                if (cu.packageName != who) continue;
-                auto it = own.find(cu.source.lexically_normal());
-                if (it == own.end()) { complete = false; break; }
-                pairs.push_back({u, it->second});
-            }
-            if (!complete || pairs.empty()) {
-                mcpp::log::verbose("workspace-member", std::format(
-                    "{} is compiled in this graph: its units here and in its own "
-                    "build are not the same set", who));
-                continue;
-            }
-
-            mcpp::ui::status("Building", std::format(
-                "workspace member {} in its own directory, once for every "
-                "member that uses it", who));
-            // Two consumers built at once (two `-p` commands) share this
-            // directory; one ninja runs in it at a time.
-            std::error_code lockEc;
-            std::filesystem::create_directories(subCtx->plan.outputDir, lockEc);
-            std::optional<mcpp::platform::fs::FileLock> memberLock;
-            for (int waited = 0;
-                 !(memberLock = mcpp::platform::fs::FileLock::try_acquire(subCtx->plan.outputDir));
-                 ++waited) {
-                if (waited == 0)
-                    mcpp::ui::status("Waiting", std::format(
-                        "for another build of workspace member {}", who));
-                if (waited >= 3000) return std::unexpected(std::format(
-                    "workspace member {}: another build has held {} for ten minutes",
-                    who, subCtx->plan.outputDir.string()));
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-            auto be = mcpp::build::make_ninja_backend();
-            mcpp::build::BuildOptions bopt;
-            auto br = be->build(subCtx->plan, bopt);
-            memberLock.reset();
-            if (!br) return std::unexpected(std::format(
-                "building workspace member {} failed: {}\n{}", who,
-                br.error().message, br.error().diagnosticOutput));
-            if (br->exitCode != 0) return std::unexpected(std::format(
-                "building workspace member {} failed (exit {})", who, br->exitCode));
-
-            const auto subOut = subCtx->plan.outputDir;
-            for (auto const& [u, scu] : pairs) {
-                auto& cu = ctx.plan.compileUnits[u];
-                cu.servedFromCache  = true;
-                cu.servedFromMember = true;
-                cu.cachedObject = subOut / scu->object;
-                if (!cu.providesModule.empty()) {
-                    std::string bmi;
-                    for (char c : cu.providesModule) bmi.push_back(c == ':' ? '-' : c);
-                    bmi += std::string(bmiT.bmiExt);
-                    cu.cachedBmi = subOut / std::string(bmiT.bmiDir) / bmi;
-                }
-            }
-        }
     }
     return {};
 }
@@ -1914,7 +1795,6 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
         std::vector<std::string>    pkgKeys(state.packages.size());
         std::vector<nlohmann::json> pkgInputs(state.packages.size(),
                                               nlohmann::json::object());
-        std::vector<int>            keyState(state.packages.size(), 0); // 0 new/1 busy/2 done
         std::string                 keyCycleError;
         // Does this package's own transitive upstream contain anything that is
         // not an immutable index payload? If so it cannot be cached either, even
@@ -1929,19 +1809,28 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
         // enforced structurally anyway, because "unreachable today" is how the
         // transitive path-dep leak got in.
         std::vector<char>           localTaint(state.packages.size(), 0);
-        auto compute_key = [&](auto&& self, std::size_t idx) -> const std::string& {
-            static const std::string kEmpty;
-            if (keyState[idx] == 2) return pkgKeys[idx];
-            if (keyState[idx] == 1) {
-                if (keyCycleError.empty()) {
-                    keyCycleError = std::format(
-                        "dependency cycle through package '{}' while computing "
-                        "its build-cache key", state.packages[idx].manifest.package.name);
-                }
-                return kEmpty;
-            }
-            keyState[idx] = 1;
 
+        // Axis F is each direct dependency's OWN key, which forces a
+        // bottom-up order: `dependencyEdges` is a DAG (the modgraph
+        // validator rejects cycles among module imports, but this is the
+        // package graph, which has no such upstream guard), so the fold
+        // below walks `mcpp::graph::topological_order` — dependencies before
+        // dependents — instead of recursing, with an explicit cycle check up
+        // front standing in for the old in-progress guard.
+        mcpp::graph::AdjacencyList pkgDeps(state.packages.size());
+        for (auto& e : state.dependencyEdges)
+            if (e.consumerPackageIndex < pkgDeps.size())
+                pkgDeps[e.consumerPackageIndex].push_back(e.dependencyPackageIndex);
+        auto keyOrder = mcpp::graph::topological_order(pkgDeps);
+        if (!keyOrder) {
+            keyCycleError = std::format(
+                "dependency cycle through package '{}' while computing "
+                "its build-cache key",
+                state.packages[keyOrder.error().cycle.front()].manifest.package.name);
+            return std::unexpected(keyCycleError);
+        }
+
+        for (auto idx : *keyOrder) {
             ck::PackageAxes pa;
             if (idx > 0 && idx - 1 < state.dep_cache_identities.size()) {
                 pa.indexName   = state.dep_cache_identities[idx - 1].indexName;
@@ -1972,7 +1861,9 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
             if (!selfIsIndex) localTaint[idx] = 1;
             for (auto& e : state.dependencyEdges) {
                 if (e.consumerPackageIndex != idx) continue;
-                auto& up = self(self, e.dependencyPackageIndex);
+                // `idx`'s dependencies precede it in `keyOrder`, so their
+                // keys and taint are already folded in below.
+                auto const& up = pkgKeys[e.dependencyPackageIndex];
                 if (!up.empty()) pa.upstreamKeys.push_back(up);
                 if (localTaint[e.dependencyPackageIndex]) localTaint[idx] = 1;
                 for (auto& f : e.requestedFeatures) pa.features.push_back(f);
@@ -1985,20 +1876,9 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
             pa.features.erase(std::unique(pa.features.begin(), pa.features.end()),
                               pa.features.end());
 
-            pkgKeys[idx]     = ck::key_hex(axes, pa);
-            pkgInputs[idx]   = ck::to_json(axes, pa);
-            keyState[idx]    = 2;
-            return pkgKeys[idx];
-        };
-        for (std::size_t i = 0; i < state.packages.size(); ++i)
-            (void)compute_key(compute_key, i);
-        if (!keyCycleError.empty()) return std::unexpected(keyCycleError);
-        ctx.plan.packageKeys = pkgKeys;
-        ctx.plan.packageKeyInputs.clear();
-        for (auto const& j : pkgInputs) ctx.plan.packageKeyInputs.push_back(j.dump());
-
-        if (auto served = step13_serve_workspace_members(state, ctx, pkgKeys, pkgInputs); !served)
-            return std::unexpected(served.error());
+            pkgKeys[idx]   = ck::key_hex(axes, pa);
+            pkgInputs[idx] = ck::to_json(axes, pa);
+        }
 
         for (std::size_t i = 1; i < state.packages.size(); ++i) {  // skip [0] = main
             const auto& pkgRoot   = state.packages[i];
@@ -2305,7 +2185,8 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     ctx.runtimeSelection = state.runtimeSelection;
     ctx.runtimeBinding = state.runtimeBindingSnapshot;
     ctx.profile     = state.effectiveProfile;
-    ctx.activeFeatureRequest = state.overrides.features;
+    ctx.activeFeatureRequest = state.workspacePlan() ? state.requestedFeatures
+                                                     : state.overrides.features;
     ctx.compilerChoice = { std::string(tc_origin_name(state.tcOrigin)),
                            state.graphCompilerRequiredBy,
                            state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
@@ -2334,6 +2215,15 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
 
     ctx.planNotes = std::move(state.planNotes);
     return ctx;
+}
+
+void focus_on_member(BuildContext& ctx) {
+    if (ctx.workspaceMembers.size() != 1) return;
+    auto& m = ctx.workspaceMembers.front();
+    for (auto& g : ctx.plan.linkGroups)
+        if (g.member == m.name) { swap_link_group(ctx.plan, g); break; }
+    ctx.manifest = m.manifest;
+    ctx.projectRoot = m.root;
 }
 
 } // namespace mcpp::build

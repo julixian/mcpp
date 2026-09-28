@@ -334,8 +334,8 @@ mcpp test  --workspace      # test every member (one report per member; continue
 
 At a **virtual** workspace root (only `[workspace]`, no `[package]`), bare
 `mcpp build` / `mcpp test` act on **all** members. At a **rooted** workspace
-(`[package]` + `[workspace]`), they act on the root package; use `--workspace` to
-include all members. `mcpp test --workspace` builds + runs each member's
+(`[package]` + `[workspace]`), they act on the root package; `--workspace`
+acts on the root package and every member. `mcpp test --workspace` builds + runs each member's
 `tests/**/*.cpp` independently — discovery is scoped per member, so two members may
 each have a `tests/main.cpp` without colliding.
 
@@ -346,7 +346,7 @@ cd libs/http
 mcpp build                  # auto-detects the workspace and builds the current member
 ```
 
-mcpp searches upward from the current directory; if it finds an `mcpp.toml` containing `[workspace]` and the current directory is listed in `members`, it automatically enters workspace mode and inherits the workspace configuration.
+mcpp searches upward from the current directory; if it finds an `mcpp.toml` containing `[workspace]` and the current directory is listed in `members`, it automatically enters workspace mode and inherits the workspace configuration. The command then acts as `mcpp build -p <this member>` at the workspace root: it builds in the workspace's build directory (§6).
 
 ### 5.3 The `-p, --package` Option
 
@@ -413,27 +413,34 @@ fan-out continues; a timed-out build fails that member; `--workspace-timeout` st
 the fan-out and lists what did not run instead of leaving the CI job to kill the
 process (which discards everything it had to say).
 
-### 5.4 A member used by other members is built once (mcpp 2026.9.28.3+)
+### 5.4 One graph per configuration (mcpp 2026.9.29.1+)
 
-A member that other members use as a path dependency is built once, in its own
-directory, and every member that uses it takes its objects and module
-interfaces from there. A `--workspace` build and separate `-p` builds of two
-programs therefore compile a shared library member once, where each program
-used to compile it again in its own directory.
+A command on a workspace plans its members together: the selected members and
+everything they depend on are one build graph, with one `build.ninja`, and a
+member that several members use is compiled once.
 
-- **Staleness is the member's own.** Before a consumer builds, the member's
-  own build runs, and its ninja decides what is stale, including an input
-  outside the member's root (a header under `../3rdParty`).
-- **Equal build keys are the condition.** The member's build key in the
-  consumer's graph must equal its key as the root of its own build; the key
-  covers the toolchain, the flags, the profile and the features. A member that
-  a consumer builds differently (another feature set, for example) is compiled
-  in that consumer's graph, as before; `-v` states the input that differs.
-- **One build at a time.** Two consumers built at once take turns on the
-  member's directory.
-- **Scope.** The rule applies in the default cache mode (`--cache off` compiles
-  everything in the graph that asks for it) and to members only; a path
-  dependency outside the workspace has one consumer and keeps its behaviour.
+- **Configurations.** Members are built in one graph when they share their
+  toolchain request, target, C++ standard, `dialect_cxxflags`, C++ runtime,
+  profile and the other `[build]` values that apply to a whole graph. Members
+  that differ in one of them are built in separate graphs, at the same time,
+  sharing the command's jobs.
+- **Selection.** `--workspace`, and a virtual root without `-p`, select every
+  member. `-p X`, and a command run in X's directory, plan X and what X
+  reaches. The two share the build directory, so `mcpp build --workspace`
+  followed by `mcpp build -p X` compiles nothing, and a package is compiled
+  again only when its active features differ between the two commands.
+- **Flags.** A member's `cflags`, `cxxflags`, `ldflags` and defines apply to
+  that member's commands. Editing them recompiles that member and what
+  imports it; the build directory stays the same.
+- **Features.** `--features f` activates `f` in each selected member that
+  declares it, and is refused when no selected member declares it.
+- **Hooks.** The `[hooks]` of every selected member run around the build, in
+  member order.
+- **No-op builds.** A command repeated with nothing changed is answered by one
+  check per configuration, without planning.
+- **Module names.** Members built in one graph share one module namespace:
+  two members that each provide a module of the same name cannot be built in
+  one `--workspace` command; build each with `-p`.
 
 ## 6. Directory Layout
 
@@ -458,7 +465,37 @@ myproject/
             └── main.cpp    # import myproject.http;
 ```
 
-Each member's build artifacts live under its own `target/` subdirectory.
+A workspace builds at its root (2026.9.29.1+):
+
+```
+myproject/
+├── mcpp.lock                               # one lock for the workspace
+└── target/<triple>/<configuration>/
+    ├── build.ninja, compile_commands.json  # one graph and one database per configuration
+    ├── obj/<package>/                      # intermediate objects of every package
+    └── bin/
+        ├── server/                         # a member's products: bin/<package name>/
+        │   ├── server
+        │   └── libfoo.so                   # shared libraries and runtime files it loads
+        └── ...
+```
+
+- A member's programs and shared libraries are in its **product directory**,
+  `bin/<package name>/`, with the shared libraries, DLLs and deployed files
+  its programs load placed beside them. Two members with the same package
+  name use `bin/<namespace>.<name>/`. A rooted workspace's own package keeps
+  `bin/`.
+- A shared library placed in several product directories is one file with
+  several names where the file system supports hard links; elsewhere it is
+  copied.
+- `compile_commands.json` at the workspace root covers every member that has
+  been built or configured.
+- `mcpp.lock` at the workspace root records the resolution of every member.
+  `mcpp build --workspace` writes the whole record; `mcpp build -p X` updates
+  the entries of X's graph.
+- A member's build program writes to `<member>/target/.build-mcpp/`.
+- Build directories a member held under its own `target/` with an earlier mcpp
+  are not read; `mcpp clean --stale` removes them.
 
 A project outside the workspace reaches a member of a git-hosted workspace by
 the member's identity: `myproject.http = { git = "...", rev = "..." }` selects

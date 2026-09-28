@@ -158,8 +158,10 @@ test_bin="$bindir/smoke$exe_suffix"
     exit 1
 }
 
-# A virtual workspace is configured member-by-member, with each member's CDB
-# scoped to its own package. `-p` must select the same scope as normal build.
+# A workspace has one compile database per configuration, at its root
+# (workspace design 2026-09-29 §7.1): configuring every member fills it with
+# every member's units, and `-p` configures that member's closure into the
+# same database.
 mkdir -p "$TMP/ws/a/src" "$TMP/ws/a/tests" "$TMP/ws/b/src" "$TMP/ws/b/tests"
 cat > "$TMP/ws/mcpp.toml" <<'EOF'
 [workspace]
@@ -180,21 +182,24 @@ cd "$TMP/ws"
     cat configure-workspace.log
     exit 1
 }
+cdb=compile_commands.json
+[[ -s "$cdb" ]] || { echo "missing $cdb"; exit 1; }
 for member in a b; do
-    cdb="$member/compile_commands.json"
-    [[ -s "$cdb" ]] || { echo "missing $cdb"; exit 1; }
-    grep -q "src[\\/][\\/]*main.cpp" "$cdb" || { cat "$cdb"; exit 1; }
-    grep -q "tests[\\/][\\/]*main.cpp" "$cdb" || { cat "$cdb"; exit 1; }
+    [[ ! -e "$member/compile_commands.json" ]] || {
+        echo "$member/compile_commands.json written beside the workspace's database"; exit 1; }
+    grep -q "$member[\\/][\\/]*src[\\/][\\/]*main.cpp" "$cdb" || { cat "$cdb"; exit 1; }
+    grep -q "$member[\\/][\\/]*tests[\\/][\\/]*main.cpp" "$cdb" || { cat "$cdb"; exit 1; }
 done
-rm -f a/compile_commands.json
+# From a clean workspace, `-p a` configures a's closure and nothing of b.
+rm -rf target compile_commands.json
 "$MCPP" build --configure-only -p a > configure-member.log 2>&1 || {
     cat configure-member.log
     exit 1
 }
-grep -q 'src[\/][\/]*main.cpp' a/compile_commands.json || { cat a/compile_commands.json; exit 1; }
-if grep -q 'b[\/][\/]*src[\/][\/]*main.cpp' a/compile_commands.json; then
-    echo "-p a leaked member b into the CDB"
-    cat a/compile_commands.json
+grep -q 'a[\/][\/]*src[\/][\/]*main.cpp' compile_commands.json || { cat compile_commands.json; exit 1; }
+if grep -q 'b[\/][\/]*src[\/][\/]*main.cpp' compile_commands.json; then
+    echo "-p a configured member b"
+    cat compile_commands.json
     exit 1
 fi
 

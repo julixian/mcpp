@@ -19,6 +19,7 @@ import mcpp.modgraph.glob;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
+import mcpp.graph;
 import mcpp.toolchain.hostflags;   // the compile-token producer the package std module reuses
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
@@ -334,45 +335,17 @@ static void recordDependencyEdge(
         });
 }
 
-static std::string normalizeDepLdflag(const std::filesystem::path& depRoot,
-                                      const std::string& flag) {
-        auto absolute_path = [&](std::string_view raw) {
-            std::filesystem::path p{std::string(raw)};
-            // A loader token stays as written; see the predicate.
-            if (p.is_absolute() || mcpp::build::is_loader_relative_search_path(raw))
-                return p;
-            return depRoot / p;
-        };
-
-        if (flag.starts_with("-L") && flag.size() > 2) {
-            return "-L" + absolute_path(std::string_view(flag).substr(2)).string();
-        }
-
-        constexpr std::string_view rpathPrefix = "-Wl,-rpath,";
-        if (flag.starts_with(rpathPrefix) && flag.size() > rpathPrefix.size()) {
-            return std::string(rpathPrefix)
-                 + absolute_path(std::string_view(flag).substr(rpathPrefix.size())).string();
-        }
-
-        return flag;
-}
-
 static std::vector<std::string> propagateLinkFlags(
         PrepareState& state,
         const std::filesystem::path& depRoot,
         const mcpp::manifest::Manifest& depManifest)
 {
-        // Word by word (SPEC-004 §8, #703): a search path is made absolute
-        // per word, and each word is written back as an element that reads as
-        // exactly that word, so the consumer's renderer reads the dependency's
-        // flags with the same reading its own flags receive, and an element
-        // that packs several tokens is several words on both sides.
-        std::vector<std::string> added;
-        for (auto const& word : mcpp::manifest::flag_words(depManifest.buildConfig.ldflags)) {
-            auto normalized = mcpp::manifest::flag_element(normalizeDepLdflag(depRoot, word));
-            state.m->buildConfig.ldflags.push_back(normalized);
-            added.push_back(std::move(normalized));
-        }
+        // Word by word (SPEC-004 §8, #703): see normalized_dependency_ldflags.
+        // In a workspace plan the pooled list serves the units no member owns
+        // (a dependency's shared library); a member's units link with its own
+        // closure's flags, which the plan reads from each package (§15).
+        auto added = normalized_dependency_ldflags(depRoot, depManifest.buildConfig.ldflags);
+        for (auto const& f : added) state.m->buildConfig.ldflags.push_back(f);
         return added;
 }
 
@@ -1545,7 +1518,12 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                         "git clone of '{}' failed:\n{}", spec.git, r.output));
                 }
             }
-            if (item.consumerDepIndex == kMainConsumer) {
+            // A selected workspace member's own git dependencies are locked
+            // as a root's are (workspace design 2026-09-29 §15).
+            const bool consumerIsMember = item.consumerDepIndex != kMainConsumer
+                && item.consumerDepIndex + 1 < state.packages.size()
+                && state.packages[item.consumerDepIndex + 1].selectedMember;
+            if (item.consumerDepIndex == kMainConsumer || consumerIsMember) {
                 // Only root deps are locked: the writer below walks the root
                 // manifest's [dependencies], so a transitive git branch dep
                 // has no anchor and still resolves over the network.
@@ -1619,7 +1597,15 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                                        const std::filesystem::path& wsRoot) {
                 return inherit_as_workspace_member(*dep_manifest, ws, wsRoot, dep_root);
             };
-            if (depIsMember) {
+            // A rooted workspace's own package, the member "." of a workspace
+            // plan (§15), is the workspace's manifest: it reads its own
+            // `[workspace.dependencies]`, as it did as the root.
+            const bool depIsWorkspacePackage = state.workspacePlan() && state.wsManifest
+                && dep_root.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal();
+            if (depIsWorkspacePackage) {
+                mcpp::project::merge_workspace_deps(*dep_manifest, *state.wsManifest,
+                                                    state.runtimeWorkspaceRoot);
+            } else if (depIsMember) {
                 if (auto bad = inheritAsMember(*state.wsManifest, state.runtimeWorkspaceRoot))
                     return std::unexpected(*bad);
             } else if (!gitMember.empty()) {
@@ -1731,7 +1717,15 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         // answered it; otherwise two indices containing the same short name
         // collapse in runtime provenance even though resolution distinguished
         // them correctly.
-        if (ctx.dep_manifest->package.namespace_.empty()) {
+        //
+        // A workspace member of a workspace plan is the project being
+        // developed, and keeps the identity its own manifest states, as when
+        // it was the root of its own build (workspace design 2026-09-29 §15):
+        // a member that declares no namespace is named by its bare name.
+        const bool workspaceMemberHere = state.workspacePlan() && sourceKind == "path"
+            && (ctx.dep_root.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal()
+                || !workspace_member_of(state, ctx.dep_root).empty());
+        if (ctx.dep_manifest->package.namespace_.empty() && !workspaceMemberHere) {
             ctx.dep_manifest->package.namespace_ = key.ns.empty()
                 ? std::string(mcpp::pm::kDefaultNamespace) : key.ns;
         }
@@ -1762,8 +1756,23 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         // application `z.o`), compiled its sources in the consumer's build, and
         // made a tool that depends on the package declaring it a cycle of the
         // consumer's graph although the two builds never meet.
+        // A selected workspace member is built in this plan whatever its
+        // targets are (workspace design 2026-09-29 §15).
+        const auto selectedMember = state.selectedMemberAt(ctx.dep_root);
         const bool depProgramOnly = state.isProgramOnlyPackage(*ctx.dep_manifest)
-                                 && spec.artifacts.empty();
+                                 && spec.artifacts.empty() && !selectedMember;
+        // A root receives the profile's own compile flags; in a workspace plan
+        // each selected member does, as it did when it was the root. The
+        // tests `mcpp test` discovered are the selected member's targets.
+        if (selectedMember && state.selectedMembers.size() == 1)
+            for (auto const& t : state.extraTargets) ctx.dep_manifest->targets.push_back(t);
+        if (selectedMember) {
+            auto& mbc = ctx.dep_manifest->buildConfig;
+            mbc.cflags.insert(mbc.cflags.end(), state.profileCflags.begin(),
+                              state.profileCflags.end());
+            mbc.cxxflags.insert(mbc.cxxflags.end(), state.profileCxxflags.begin(),
+                                state.profileCxxflags.end());
+        }
         auto linkFlagsAdded = depProgramOnly
             ? std::vector<std::string>{}
             : propagateLinkFlags(state, ctx.dep_root, *ctx.dep_manifest);
@@ -1786,6 +1795,10 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         const auto depPackageIndex = state.packages.size();
         auto depPackage = makePackageRoot(state, ctx.dep_root, *state.dep_manifests.back());
         if (!depPackage) return std::unexpected(depPackage.error());
+        if (selectedMember) {
+            depPackage->selectedMember = true;
+            depPackage->memberProducts = state.selectedMembers.at(*selectedMember);
+        }
         state.packages.push_back(std::move(*depPackage));
         recordDependencyEdge(state, item.consumerDepIndex, depPackageIndex, spec,
                              item.buildOnly, name);
@@ -1835,12 +1848,37 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         if (auto fe = validateForwards(state, *state.dep_manifests.back(), depActive,
                                        state.dep_manifests.back()->package.name); !fe)
             return std::unexpected(fe.error());
+        // `--features <dependency>/<feature>` for a selected member: a forward
+        // of that member, applied to its edges as the root's are.
+        auto injectMemberCliForwards = [&](const std::string& childKey,
+                                           mcpp::manifest::DependencySpec& childSpec) {
+            if (!selectedMember) return;
+            auto fw = state.memberCliForwards.find(*selectedMember);
+            if (fw == state.memberCliForwards.end()) return;
+            for (auto const& [depKey, depFeat] : fw->second)
+                if (depKey == childKey
+                    && std::ranges::find(childSpec.features, depFeat) == childSpec.features.end())
+                    childSpec.features.push_back(depFeat);
+        };
         for (auto& [child_name, child_spec] : state.dep_manifests.back()->dependencies) {
             auto childReq = child_spec;
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
+            injectMemberCliForwards(child_name, childReq);
             state.worklist.push_back({child_name, childReq, thisDepLabel,
                                 childReq.version, selfIdx, ctx.dep_root,
                                 item.devOnly, item.buildOnly});
+        }
+        // A selected member's `[dev-dependencies]` under `mcpp test`, as a
+        // root's: its own, and never walked into its dependencies' tests.
+        if (selectedMember && state.includeDevDeps) {
+            for (auto& [child_name, child_spec] : state.dep_manifests.back()->devDependencies) {
+                auto childReq = child_spec;
+                injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
+                injectMemberCliForwards(child_name, childReq);
+                state.worklist.push_back({child_name, childReq, thisDepLabel + " (dev-dep)",
+                                    childReq.version, selfIdx, ctx.dep_root,
+                                    /*devOnly=*/true, item.buildOnly});
+            }
         }
         // A dependency's own `[build-dependencies]` — the only channel through
         // which a package can speak about what IT needs at build time. Both
@@ -1856,6 +1894,7 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
                  state.dep_manifests.back()->buildDependencies) {
             auto childReq = child_spec;
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
+            injectMemberCliForwards(child_name, childReq);
             state.worklist.push_back({child_name, childReq,
                                 thisDepLabel + " (build-dep)",
                                 childReq.version, selfIdx, ctx.dep_root,
@@ -1871,33 +1910,15 @@ static std::expected<void, std::string> step4b_cycle_check(PrepareState& state) 
     // refused by default and built under `--cache=local`. Every edge counts,
     // build-only ones included, as the key walk counts them.
     {
-        // Named visitState, not state: `state` is this function's PrepareState
-        // parameter, which the loop below also reads.
-        std::vector<int> visitState(state.packages.size(), 0);   // 0 new / 1 on stack / 2 done
-        std::vector<std::size_t> stack, cycle;
-        auto visit = [&](auto&& self, std::size_t u) -> bool {
-            visitState[u] = 1;
-            stack.push_back(u);
-            for (auto const& e : state.dependencyEdges) {
-                if (e.consumerPackageIndex != u) continue;
-                const auto v = e.dependencyPackageIndex;
-                if (v >= state.packages.size()) continue;
-                if (visitState[v] == 1) {
-                    cycle.assign(std::ranges::find(stack, v), stack.end());
-                    cycle.push_back(v);
-                    return true;
-                }
-                if (visitState[v] == 0 && self(self, v)) return true;
-            }
-            stack.pop_back();
-            visitState[u] = 2;
-            return false;
-        };
-        for (std::size_t i = 0; i < state.packages.size() && cycle.empty(); ++i)
-            if (visitState[i] == 0) (void)visit(visit, i);
-        if (!cycle.empty()) {
+        mcpp::graph::AdjacencyList deps(state.packages.size());
+        for (auto const& e : state.dependencyEdges) {
+            if (e.consumerPackageIndex >= deps.size()) continue;
+            if (e.dependencyPackageIndex >= state.packages.size()) continue;
+            deps[e.consumerPackageIndex].push_back(e.dependencyPackageIndex);
+        }
+        if (auto order = mcpp::graph::topological_order(deps); !order) {
             std::string path;
-            for (auto p : cycle) {
+            for (auto p : order.error().cycle) {
                 if (!path.empty()) path += " -> ";
                 path += std::format("'{}'",
                     mcpp::build::qualified_package_name(state.packages[p].manifest));
@@ -1973,8 +1994,18 @@ static void step4b_define_lookup_closures(PrepareState& state) {
     };
     // Compiled in this plan: not a package of programs, or one whose programs
     // this plan ships.
+    state.isWorkspaceMemberPackage = [&](std::size_t i) {
+        if (i == 0 || i >= state.packages.size() || !state.workspacePlan()) return false;
+        if (state.packages[i].selectedMember) return true;
+        const auto& r = state.packages[i].root;
+        if (r.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal()) return true;
+        return !workspace_member_of(state, r).empty();
+    };
+    // A selected workspace member is compiled here whatever its targets are
+    // (workspace design 2026-09-29 §15).
     state.compilesHere = [&](std::size_t i) {
-        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest) || state.isArtifactPackage(i);
+        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest)
+            || state.isArtifactPackage(i) || state.packages[i].selectedMember;
     };
 
 

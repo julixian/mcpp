@@ -47,16 +47,101 @@ import mcpp.project;
 
 namespace mcpp::build {
 
-// STEP FUNCTION (mcpp#722 / T6 follow-on): phase0's own "Workspace
-// handling" section, extracted verbatim.
-static std::expected<void, std::string> step0_workspace_handling(PrepareState& state) {
-    // ─── Workspace handling ────────────────────────────────────────────
-    // If the manifest has [workspace] and is a virtual workspace (no [package]),
-    // or if -p filter is set, switch to the target member's manifest.
-    if (state.m->workspace.present) {
-        std::string targetMember;
+// The plan's root for a selection of workspace members (workspace design
+// 2026-09-29 §15): a virtual root that holds the values the plan shares, and a
+// member edge to each selected member, which puts the member in the graph and
+// links nothing into the root. A rooted workspace's own package is a member
+// like any other ("."), so it is the same node, with the same commands, in
+// every selection that reaches it.
+static std::expected<void, std::string>
+select_workspace_members(PrepareState& state, const std::filesystem::path& wsRoot,
+                         mcpp::manifest::Manifest ws,
+                         const std::vector<std::string>& selection) {
+    const auto all = mcpp::project::workspace_members(ws, wsRoot);
+    {
+        auto first = mcpp::project::load_member_manifest(ws, wsRoot, selection.front());
+        if (!first) return std::unexpected(first.error());
+        state.m = mcpp::project::virtual_workspace_root(ws, *first, wsRoot);
+    }
+    state.runtimeWorkspaceRoot = wsRoot;
+    state.wsManifest = std::move(ws);
+    state.root = wsRoot;
+    state.selectedMemberPaths = selection;
 
-        if (!state.overrides.package_filter.empty()) {
+    // `--features` names features of the selected members: each member takes
+    // the tokens it declares, and a token no selected member declares is
+    // refused.
+    state.requestedFeatures = state.overrides.features;
+    std::vector<std::string> tokens;
+    for (auto const& t : mcpp::build::feature_request_tokens(state.overrides.features))
+        tokens.push_back(t);
+    std::set<std::string> claimed;
+
+    for (auto const& mp : selection) {
+        const auto dir = (wsRoot / mp).lexically_normal();
+        std::error_code canonEc;
+        auto canonical = std::filesystem::weakly_canonical(dir, canonEc);
+        if (canonEc) canonical = dir;
+        state.selectedMembers[canonical] = mcpp::project::product_directory_name(all, mp);
+        auto member = mcpp::project::load_member_manifest(*state.wsManifest, wsRoot, mp);
+        if (!member) return std::unexpected(member.error());
+        std::vector<std::string> requested;
+        for (auto const& t : tokens) {
+            if (auto fwd = mcpp::pm::split_feature_forward_token(t)) {
+                // `<dependency>/<feature>`: a forward of each selected member
+                // that declares the dependency key, applied to its edges.
+                const bool declares = member->dependencies.contains(fwd->first)
+                    || member->devDependencies.contains(fwd->first)
+                    || member->buildDependencies.contains(fwd->first);
+                if (declares) {
+                    state.memberCliForwards[canonical].push_back(*fwd);
+                    claimed.insert(t);
+                }
+                continue;
+            }
+            if (member->featuresMap.contains(t) || t == "default") {
+                requested.push_back(t);
+                claimed.insert(t);
+            }
+        }
+        mcpp::manifest::DependencySpec spec;
+        spec.path = dir.string();
+        spec.namespace_ = member->package.namespace_;
+        spec.shortName = member->package.name;
+        spec.workspaceMember = true;
+        spec.features = std::move(requested);
+        spec.declaredIn = "workspace";
+        const auto key = member->package.namespace_.empty()
+            ? member->package.name
+            : member->package.namespace_ + "." + member->package.name;
+        state.m->dependencies[key] = std::move(spec);
+    }
+    for (auto const& t : tokens) {
+        if (claimed.contains(t)) continue;
+        return std::unexpected(std::format(
+            "--features requests '{}', which no selected workspace member "
+            "declares", t));
+    }
+    state.overrides.features.clear();
+
+    std::string shown;
+    for (auto const& [key, spec] : state.m->dependencies)
+        shown += (shown.empty() ? "" : ", ") + key;
+    mcpp::ui::status("Workspace", selection.size() == 1
+        ? std::format("building member '{}'", shown)
+        : std::format("building {} members: {}", selection.size(), shown));
+    return {};
+}
+
+// STEP FUNCTION (mcpp#722 / T6 follow-on): phase0's own "Workspace
+// handling" section.
+static std::expected<void, std::string> step0_workspace_handling(PrepareState& state) {
+    // A command at a workspace's root selects members: the command's own list
+    // (`--workspace`, one group of it per plan), `-p`, the first member with a
+    // program at a virtual root, or the workspace's own package.
+    if (state.m->workspace.present) {
+        std::vector<std::string> selection = state.overrides.workspace_members;
+        if (selection.empty() && !state.overrides.package_filter.empty()) {
             // `-p <name>`: the package identity first, the member's
             // directory as a fallback -- one resolver shared with every
             // other `-p`/`--package` command
@@ -64,95 +149,81 @@ static std::expected<void, std::string> step0_workspace_handling(PrepareState& s
             auto matched = mcpp::project::resolve_member_dir(
                 *state.m, *state.root, state.overrides.package_filter);
             if (!matched) return std::unexpected(matched.error());
-            targetMember = matched->lexically_relative(*state.root).generic_string();
-        } else if (state.m->package.name.empty()) {
+            auto rel = matched->empty() ? std::string(".")
+                : matched->lexically_normal().lexically_relative(
+                      state.root->lexically_normal()).generic_string();
+            if (rel.empty()) rel = ".";
+            selection.push_back(rel);
+        } else if (selection.empty() && state.m->package.name.empty()) {
             // Virtual workspace: find a member with a program target ("is
             // this the program", #622 A3's `is_program()`, so a member whose
             // only target is `kind = "app"` is picked exactly as one whose
             // target is `bin` is), or use last member.
             for (auto& mp : state.m->workspace.members) {
-                auto memberDir = *state.root / mp;
-                auto mm = mcpp::manifest::load(memberDir / "mcpp.toml",
+                auto mm = mcpp::manifest::load(*state.root / mp / "mcpp.toml",
                                                {.insideWorkspace = true});
                 if (!mm) continue;
-                for (auto& t : mm->targets) {
-                    if (t.is_program()) {
-                        targetMember = mp;
-                        break;
-                    }
-                }
-                if (!targetMember.empty()) break;
-            }
-            if (targetMember.empty() && !state.m->workspace.members.empty()) {
-                targetMember = state.m->workspace.members.back();
-            }
-        }
-        // else: rooted workspace with [package] — build root normally. Its own
-        // `x.workspace = true` entries name its own [workspace.dependencies].
-        // The workspace context is set here too (#725): it is a property of
-        // where the manifest lives, not of the branch that was taken, so a
-        // member this package reaches through its OWN `path` dependencies
-        // (`depIsMember`, graph.cpp) is recognised as a member and receives
-        // `[workspace.package]`, `[workspace.build]` and `x.workspace = true`
-        // the same way a sibling's `path` dependency does.
-        else if (state.m->workspace.present) {
-            state.runtimeWorkspaceRoot = *state.root;
-            state.wsManifest = *state.m;
-            mcpp::project::merge_workspace_deps(*state.m, *state.m, *state.root);
-        }
-
-        if (!targetMember.empty()) {
-            auto memberDir = *state.root / targetMember;
-            if (!std::filesystem::exists(memberDir / "mcpp.toml")) {
-                return std::unexpected(std::format(
-                    "workspace member '{}' has no mcpp.toml", targetMember));
-            }
-            state.runtimeWorkspaceRoot = *state.root;
-            state.wsManifest = std::move(*state.m);  // preserve workspace manifest
-            auto memberManifest = mcpp::manifest::load(memberDir / "mcpp.toml",
-                                                       {.insideWorkspace = true});
-            if (!memberManifest) return std::unexpected(std::format(
-                "workspace member '{}': {}", targetMember,
-                memberManifest.error().format()));
-            state.m = std::move(*memberManifest);
-
-            // ONE call, not a hand-copied list. `*root` is still the WORKSPACE
-            // root here (the `root = memberDir` reassignment below has not
-            // happened yet), which is what a relative `[indices].path` or
-            // `[workspace.dependencies] path` was written against (#224).
-            mcpp::project::inherit_workspace_config(*state.m, *state.wsManifest, *state.root);
-            if (auto bad = mcpp::project::workspace_inheritance_error(*state.m, memberDir))
-                return std::unexpected(*bad);
-
-            mcpp::ui::status("Workspace", std::format("building member '{}'", targetMember));
-            state.root = memberDir;
-        }
-    } else {
-        // Not at workspace root: inside a member, the loader above has
-        // already inherited (#224 anchoring included). Only the workspace is
-        // recorded here, for the membership test of this member's own `path`
-        // dependencies.
-        if (state.effective && state.effective->member) {
-            state.runtimeWorkspaceRoot = state.effective->workspaceRoot;
-            state.wsManifest = std::move(*state.effective->workspace);
-        } else if (state.overrides.preloaded_manifest) {
-            auto wsRoot = mcpp::project::find_workspace_root(*state.root);
-            if (!wsRoot.empty()) {
-                if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
-                    wsm && wsm->workspace.present) {
-                    state.runtimeWorkspaceRoot = wsRoot;
-                    state.wsManifest = std::move(*wsm);
+                if (std::ranges::any_of(mm->targets, [](auto const& t) { return t.is_program(); })) {
+                    selection.push_back(mp);
+                    break;
                 }
             }
-            // A preloaded manifest was inherited at its dependency load site,
-            // which gives a member everything but the root-position keys. This
-            // build IS rooted at it (a host-tool sub-build), so it takes those
-            // too, from the workspace that lists it (#710).
-            if (state.wsManifest
-                && mcpp::project::is_workspace_member(*state.wsManifest, state.runtimeWorkspaceRoot, *state.root))
-                mcpp::project::inherit_workspace_root_position(
-                    *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
+            if (selection.empty() && !state.m->workspace.members.empty())
+                selection.push_back(state.m->workspace.members.back());
+        } else if (selection.empty()) {
+            selection.push_back(".");
         }
+        if (selection.empty())
+            return std::unexpected(std::string("the workspace lists no members"));
+        const auto wsRoot = *state.root;
+        auto ws = std::move(*state.m);
+        return select_workspace_members(state, wsRoot, std::move(ws), selection);
+    }
+    // Inside a member: the command selects that member, planned from the
+    // workspace's root like every other selection (§15), so its products and
+    // its build directory are the ones `-p` and `--workspace` use.
+    if (state.effective && state.effective->member && state.effective->workspace
+        && !state.overrides.preloaded_manifest) {
+        const auto wsRoot = state.effective->workspaceRoot;
+        auto ws = std::move(*state.effective->workspace);
+        std::vector<std::string> selection = state.overrides.workspace_members;
+        if (selection.empty() && !state.overrides.package_filter.empty()) {
+            auto matched = mcpp::project::resolve_member_dir(
+                ws, wsRoot, state.overrides.package_filter);
+            if (!matched) return std::unexpected(matched.error());
+            auto rel = matched->empty() ? std::string(".")
+                : matched->lexically_normal().lexically_relative(
+                      wsRoot.lexically_normal()).generic_string();
+            selection.push_back(rel.empty() ? std::string(".") : rel);
+        } else if (selection.empty()) {
+            auto rel = state.root->lexically_normal()
+                           .lexically_relative(wsRoot.lexically_normal()).generic_string();
+            // The member as `[workspace] members` spells it, so the
+            // selection, the product directory and the header agree.
+            for (auto const& mp : ws.workspace.members)
+                if (std::filesystem::path(mp).lexically_normal()
+                    == std::filesystem::path(rel).lexically_normal()) { rel = mp; break; }
+            selection.push_back(rel);
+        }
+        return select_workspace_members(state, wsRoot, std::move(ws), selection);
+    }
+    if (state.overrides.preloaded_manifest) {
+        auto wsRoot = mcpp::project::find_workspace_root(*state.root);
+        if (!wsRoot.empty()) {
+            if (auto wsm = mcpp::manifest::load(wsRoot / "mcpp.toml");
+                wsm && wsm->workspace.present) {
+                state.runtimeWorkspaceRoot = wsRoot;
+                state.wsManifest = std::move(*wsm);
+            }
+        }
+        // A preloaded manifest was inherited at its dependency load site,
+        // which gives a member everything but the root-position keys. This
+        // build IS rooted at it (a host-tool sub-build), so it takes those
+        // too, from the workspace that lists it (#710).
+        if (state.wsManifest
+            && mcpp::project::is_workspace_member(*state.wsManifest, state.runtimeWorkspaceRoot, *state.root))
+            mcpp::project::inherit_workspace_root_position(
+                *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
     }
     return {};
 }
@@ -418,8 +489,11 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
         }
     }
 
-    // Inject synthetic targets (e.g. test binaries from `mcpp test`).
-    for (auto& t : state.extraTargets) state.m->targets.push_back(t);
+    // Inject synthetic targets (e.g. test binaries from `mcpp test`). In a
+    // workspace plan they are the selected member's tests, and that member
+    // takes them when it is loaded (graph.cpp).
+    if (!state.workspacePlan())
+        for (auto& t : state.extraTargets) state.m->targets.push_back(t);
 
     // #540: a cfg() predicate mcpp cannot evaluate must say so.
     //
@@ -503,6 +577,15 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
         // Read where the project keeps it. A planning pass that writes
         // elsewhere (plan_only) still resolves against the project's lock.
         auto lockPath = (state.overrides.plan_only ? *state.root : state.workRoot) / "mcpp.lock";
+        // A workspace keeps one lock at its root (§15). Until its first build
+        // has written it, a selected member's own lock from before is read in
+        // its place, so the upgrade does not move a git dependency.
+        if (state.workspacePlan() && !std::filesystem::exists(lockPath))
+            for (auto const& mp : state.selectedMemberPaths)
+                if (std::filesystem::exists(state.runtimeWorkspaceRoot / mp / "mcpp.lock")) {
+                    lockPath = state.runtimeWorkspaceRoot / mp / "mcpp.lock";
+                    break;
+                }
         if (std::filesystem::exists(lockPath)) {
             if (auto lock = mcpp::pm::load(lockPath); lock) {
                 for (auto const& p : lock->packages) {

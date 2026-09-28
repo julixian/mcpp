@@ -4,6 +4,94 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.9.29.1] - 2026-09-29
+
+This release builds a workspace as one graph per configuration. The selected
+members and everything they depend on are planned together under a virtual
+root, so a member that several members use is compiled once; each member's
+products are placed in its own product directory. It also fixes the planning
+regression of 2026.9.28.3. The design, its readings and the task plan are in
+`.agents/docs/2026-09-29-workspace-build-graph-design.md`. The xlings pin moves
+to 2026.9.29.1.
+
+### Fixed
+
+- **Planning a workspace no longer grows with the length of its dependency
+  chains (2026.9.28.3 only).** E1 planned a shared member as the root of a
+  nested build, and the nested build met the same condition again, so a chain
+  of n members cost 2^n plans: a nine-member workspace with nothing to build
+  took 79 s instead of 6.3 s, and a chain of five libraries and a program took
+  36.8 s for `--workspace`. E1 is removed. The same chain now plans once
+  (0.5 s), and with nothing changed `--workspace`, `-p app` and a build inside
+  the member are each answered by the fast path in a few milliseconds (e2e
+  834).
+
+### Behaviour changes
+
+- **A workspace is one graph per configuration.** A command on a workspace
+  plans its selected members together: `--workspace`, and a virtual root
+  without `-p`, select every member (a rooted workspace's own package
+  included); `-p X`, and a command in X's directory, select X; a command at a
+  rooted workspace's root selects its own package. Members that share their
+  toolchain request, target, C++ standard and the other values that apply to a
+  whole graph are one plan, with one `build.ninja`; members that differ are
+  separate plans, built at the same time under a static share of the jobs. A
+  member used by several members is compiled once (e2e 833).
+- **Build directories are at the workspace root.** A member builds in
+  `<workspace>/target/<triple>/<configuration>/` instead of its own `target/`.
+  Its programs and shared libraries are in its product directory,
+  `bin/<package name>/` (`bin/<namespace>.<name>/` when two members share a
+  name; a rooted workspace's own package keeps `bin/`), with the shared
+  libraries and runtime files its programs load beside them. The first build
+  after the upgrade is a full build; `mcpp clean --stale` removes the build
+  directories members held under their own `target/`. A member's build program
+  still writes to `<member>/target/.build-mcpp/`.
+- **`-p X` plans X and what X reaches, in the shared build directory.**
+  `mcpp build --workspace` followed by `mcpp build -p X` compiles nothing; a
+  package is compiled again only when its active features differ between the
+  two commands.
+- **The directory name is the configuration.** It hashes the toolchain, the
+  target, the standard library, the runtime contract, the C++ standard, the
+  dialect flags, the profile and the other values every node of one graph
+  shares. A package's own `cflags`, `cxxflags`, `ldflags`, defines, sources and
+  include directories reach its commands instead: editing them recompiles that
+  package and what imports it, in the same directory, rather than moving the
+  whole graph to a new one. This holds for single-package projects as well.
+- **One lock and one compile database per workspace.** `mcpp.lock` is at the
+  workspace root, as it already was for a rooted workspace; `--workspace`
+  writes the whole record and `-p X` updates the entries of X's graph. Where
+  the workspace has no lock yet, a selected member's own lock supplies the
+  git commits. The workspace root's `compile_commands.json` covers every member
+  that has been built or configured.
+- **A member keeps its duties as the project being developed.** Its targets
+  are built, its `[dev-dependencies]` are loaded under `mcpp test`, its
+  `[hooks]` run around the build, its `[xlings]` entries with `when = "dev"` are
+  installed, and its build program runs after every dependency's program with
+  the graph document of what it reaches (in which it is the `root`) and the
+  dependencies' link forms. `--features f` activates `f` in each selected
+  member that declares it and is refused when none does.
+- **Each member links its own closure.** A member's programs link the flags of
+  the packages they reach and place the runtime files of those packages, never
+  another member's.
+- **Shared libraries are placed by a hard link.** A shared library placed
+  beside several programs is one file with several names where the file system
+  supports links, and a copy elsewhere. Other deployed files are copied, since
+  a program may write a file beside itself (e2e 835).
+- **Files served from the global cache are staged by a ninja pass of their
+  own**, before the build that reads them. ninja 1.12.1 crashed when a cached
+  dependency was staged again in a directory whose scans were current
+  (ninja-build/ninja#2662); a directory named by its configuration makes that
+  the ordinary case of a dependency upgrade.
+- **The fast path records the request.** `build.ninja` states the workspace
+  members and the features it was planned for, and a fast path replays it only
+  for the same request; one record is kept per selection and configuration.
+- **`mcpp.graph`.** One module holds the engine's graph algorithms: the
+  topological orders the engine uses, dependency levels and the transitive
+  closure. Module order, host-module order, unit order by imports, the
+  dependency closure, the package-cycle check and the build-key fold use it,
+  each with the order it had, so no compile or link order changes; a cycle of
+  modules is now reported as `a -> b -> a`.
+
 ## [2026.9.28.3] - 2026-09-28
 
 This release implements mcpp's part of the #734 design: the three layers of the

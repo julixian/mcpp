@@ -80,9 +80,11 @@ x = { path = "local-index" }
 ylib = { path = "ylib" }
 EOF
 
+# A workspace's project-local payloads and its lock live at its root: the
+# workspace is the unit of build (workspace design 2026-09-29 §15).
 mkdir -p member-a/src \
-         member-a/.mcpp/.xlings/data/xpkgs/x.widget2/1.0.0/src
-cat > member-a/.mcpp/.xlings/data/xpkgs/x.widget2/1.0.0/src/widget2.cppm <<'EOF'
+         .mcpp/.xlings/data/xpkgs/x.widget2/1.0.0/src
+cat > .mcpp/.xlings/data/xpkgs/x.widget2/1.0.0/src/widget2.cppm <<'EOF'
 export module widget2;
 
 export int widget2_value() {
@@ -129,8 +131,8 @@ EOF
     exit 1
 }
 
-grep -q '\[package\."x.widget2"\]' member-a/mcpp.lock || {
-    cat member-a/mcpp.lock 2>/dev/null || true
+grep -q '\[package\."x.widget2"\]' mcpp.lock || {
+    cat mcpp.lock 2>/dev/null || true
     echo "FAIL: expected x.widget2 lock entry"
     exit 1
 }

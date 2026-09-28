@@ -254,6 +254,10 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
                                      pr.cflags.begin(), pr.cflags.end());
         state.m->buildConfig.cxxflags.insert(state.m->buildConfig.cxxflags.end(),
                                        pr.cxxflags.begin(), pr.cxxflags.end());
+        // A workspace plan's root compiles nothing; its selected members take
+        // these as they are loaded (graph.cpp).
+        state.profileCflags   = pr.cflags;
+        state.profileCxxflags = pr.cxxflags;
         state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
                                       pr.ldflags.begin(), pr.ldflags.end());
     }

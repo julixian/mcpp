@@ -1242,9 +1242,9 @@ static std::expected<void, std::string> step9_layer_conditional_config(PrepareSt
     // runtime over several C libraries — so patching only the root would leave
     // the one package this feature exists for unserved.
     //
-    // `*m` as well as the snapshots: `canonical_compile_flags(*m)` feeds the
-    // fingerprint, so a contribution reaching the snapshots and not the
-    // manifest would compile with flags the fingerprint does not describe.
+    // `*m` as well as the snapshots: the plan reads the root's flags from
+    // both, so a contribution reaching only one of them would reach some of
+    // the root's commands and not others.
     // MUTATING `pkg.manifest` IS NOT ENOUGH, AND THAT IS THE WHOLE
     // DIFFICULTY OF A LATE PRODUCER. `makePackageRoot` snapshots the manifest's
     // build inputs into `privateBuild` / `linkUsage`, and the compile and link
@@ -1261,10 +1261,9 @@ static std::expected<void, std::string> step9_layer_conditional_config(PrepareSt
         layerCtx.kernelAbi       = state.resolvedTargetSide.kernelAbi.interfaceName;
         layerCtx.cAbi            = state.resolvedTargetSide.cAbi.interfaceName;
         layerCtx.cxxAbi          = state.resolvedTargetSide.cxx.interfaceName;
-        // The root manifest feeds `canonical_compile_flags`, and therefore the
-        // fingerprint: a contribution reaching the snapshots but not `*m` would
-        // compile with flags the fingerprint does not describe, and the next
-        // build would call that a cache hit.
+        // The root manifest and its snapshots are both read by the plan, so a
+        // contribution reaching the snapshots but not `*m` would reach some of
+        // the root's commands and not others.
         merge_layer_conditional_config(*state.m, layerCtx);
         for (auto& pkg : state.packages) {
             const auto mark  = state.markDirectiveTail(pkg.manifest);
@@ -1522,6 +1521,9 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
     // and a guard that asked only about the file left the synthesis unreachable
     // -- the shaders went uncompiled and the refusal named the missing program
     // rather than the guard. Measured.
+    // A workspace plan's virtual root has no program; its members' programs
+    // run in `step9_member_build_programs`, below.
+    if (state.m->package.virtualRoot) return {};
     if (std::filesystem::exists(*state.root / "build.mcpp")
         || !state.m->buildConfig.ruleModules.empty()) {
         auto host = state.host_tc_for_build_program();
@@ -1756,9 +1758,9 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
             pkg0.manifest.modules.sources.insert(
                 pkg0.manifest.modules.sources.end(),
                 state.m->modules.sources.begin() + rmodN, state.m->modules.sources.end());
-            // Fingerprint metadata (canonical_package_build_metadata folds
-            // packages[].manifest.buildConfig) — mirror the flag/include tails,
-            // as the old pre-snapshot ordering implicitly did.
+            // The snapshot's manifest is what later readers of the root's
+            // flags see -- mirror the flag/include tails, as the old
+            // pre-snapshot ordering implicitly did.
             pkg0.manifest.buildConfig.cflags.insert(
                 pkg0.manifest.buildConfig.cflags.end(),
                 bcRoot.cflags.begin() + static_cast<std::ptrdiff_t>(mark.cflags),
@@ -1803,6 +1805,196 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
                 state.m->runtimeConfig.linkIntent.runtimeSearchDirs.end());
         }
     }
+    return {};
+}
+
+// The graph document a build program reads (#647 E1): every package the
+// program's own package reaches, itself included, dependencies before the
+// packages that request them (ties in discovery order), with `root` marking
+// the package whose program reads it. For a root that is the whole graph.
+static std::expected<std::pair<std::filesystem::path, std::string>, std::string>
+write_graph_document(PrepareState& state, std::size_t subject,
+                     const std::filesystem::path& artifactsDir) {
+    std::vector<bool> reached(state.packages.size(), subject == 0);
+    reached[subject] = true;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (auto const& r : state.graphRequests)
+            if (r.consumerPackageIndex < reached.size() && reached[r.consumerPackageIndex]
+                && r.dependencyPackageIndex < reached.size()
+                && !reached[r.dependencyPackageIndex]) {
+                reached[r.dependencyPackageIndex] = true;
+                grew = true;
+            }
+    }
+    std::vector<std::size_t> order;
+    std::vector<bool> placed(state.packages.size(), false);
+    std::size_t wanted = 0;
+    for (bool b : reached) wanted += b ? 1 : 0;
+    while (order.size() < wanted) {
+        std::size_t pick = state.packages.size();
+        for (std::size_t i = 0; i < state.packages.size() && pick == state.packages.size(); ++i) {
+            if (placed[i] || !reached[i]) continue;
+            bool ready = true;
+            for (auto const& r : state.graphRequests)
+                if (r.consumerPackageIndex == i && r.dependencyPackageIndex != i
+                    && r.dependencyPackageIndex < state.packages.size()
+                    && reached[r.dependencyPackageIndex]
+                    && !placed[r.dependencyPackageIndex]) { ready = false; break; }
+            if (ready) pick = i;
+        }
+        // A cycle leaves nothing ready; its first member in discovery
+        // order is taken so the document is still complete.
+        if (pick == state.packages.size())
+            for (std::size_t i = 0; i < state.packages.size(); ++i)
+                if (!placed[i] && reached[i]) { pick = i; break; }
+        placed[pick] = true;
+        order.push_back(pick);
+    }
+    nlohmann::json doc;
+    doc["kind"] = "mcpp.graph";
+    doc["version"] = 1;
+    nlohmann::json list = nlohmann::json::array();
+    for (auto i : order) {
+        auto entry = state.graph_package_entry(i, true);
+        entry["root"] = i == subject;
+        list.push_back(std::move(entry));
+    }
+    doc["packages"] = std::move(list);
+    const auto text = doc.dump(2) + "\n";
+    const auto graphPath = artifactsDir / "graph.json";
+    std::error_code gec;
+    std::filesystem::create_directories(graphPath.parent_path(), gec);
+    const auto tmp = graphPath.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out << text;
+    }
+    std::filesystem::rename(tmp, graphPath, gec);
+    if (gec)
+        return std::unexpected(std::format(
+            "cannot write the graph document '{}': {}",
+            graphPath.string(), gec.message()));
+    return std::pair{graphPath, mcpp::toolchain::hash_string(text)};
+}
+
+// The build programs of a workspace plan's members (workspace design
+// 2026-09-29 §15). A member is the project being developed, so its program
+// runs where a root's does: after every dependency's program, with the link
+// form of each dependency and the graph document of what it reaches, and with
+// its own artifacts directory, `<member>/target/.build-mcpp`, where it was
+// when the member was the root of its own build. A workspace member reached as
+// a dependency of another member runs here too, so its program sees the same
+// environment in every selection.
+static std::expected<void, std::string> step9_member_build_programs(PrepareState& state) {
+    if (!state.m->package.virtualRoot) return {};
+    for (std::size_t i = 1; i < state.packages.size(); ++i) {
+        if (!state.isWorkspaceMemberPackage(i)) continue;
+        if (!state.compilesHere(i)) continue;
+        auto& pkg = state.packages[i];
+        std::error_code bpEc;
+        if (!std::filesystem::exists(pkg.root / "build.mcpp", bpEc)
+            && pkg.manifest.buildConfig.ruleModules.empty()) continue;
+        auto host = state.host_tc_for_build_program();
+        if (!host) return std::unexpected(host.error());
+        mcpp::build::BuildProgramEnv bpEnv;
+        bpEnv.targetTriple = state.resolvedTargetCanonical;
+        fill_target_build_env(bpEnv, *state.m, state.tc ? &*state.tc : nullptr,
+                              state.cfg_opt ? &*state.cfg_opt : nullptr);
+        bpEnv.toolsBin = state.projectSubosBin;
+        bpEnv.profile  = state.effectiveProfile;
+        bpEnv.accel    = state.resolvedAccel();
+        fill_package_build_env(bpEnv, pkg.manifest);
+        bpEnv.packFormat   = state.overrides.pack_format;
+        bpEnv.packStageDir = state.overrides.pack_stage_dir;
+        bpEnv.packStrip           = state.overrides.pack_strip;
+        bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
+        bpEnv.languageModules = pkg.manifest.language.modules;
+        bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;
+        if (auto dit = state.deviceSourcesByPackage.find(pkg.root.string());
+            dit != state.deviceSourcesByPackage.end())
+            bpEnv.deviceSources = dit->second;
+        bpEnv.artifactsDir = pkg.root / "target" / ".build-mcpp";
+        if (i < state.activeFeaturesByPackage.size())
+            bpEnv.features = state.activeFeaturesByPackage[i];
+        {
+            std::map<std::size_t, std::string> linkForms;
+            for (auto const& [idx, form] : state.dependencyLinkForms)
+                if (form.recorded)
+                    linkForms.emplace(idx, std::string(
+                        mcpp::build::linkage_form::to_string(form.answer.linkage)));
+            state.fillDepDirs(bpEnv, i, &linkForms);
+        }
+        state.fillXpkgDirs(bpEnv, pkg.manifest, i);
+        if (auto tit = state.toolEnvByConsumer.find(i); tit != state.toolEnvByConsumer.end())
+            bpEnv.toolPaths = tit->second;
+        bpEnv.hostModules = state.hostModulesByConsumer.count(i)
+            ? state.hostModulesByConsumer.at(i) : decltype(bpEnv.hostModules){};
+        bpEnv.dormantFeatures = state.dormantFeaturesByConsumer.count(i)
+            ? state.dormantFeaturesByConsumer.at(i) : decltype(bpEnv.dormantFeatures){};
+        auto graph = write_graph_document(state, i, bpEnv.artifactsDir);
+        if (!graph) return std::unexpected(graph.error());
+        bpEnv.graphFile   = graph->first;
+        bpEnv.graphDigest = graph->second;
+
+        auto& bc = pkg.manifest.buildConfig;
+        const auto mark = state.markDirectiveTail(pkg.manifest);
+        const auto actN = bc.actions.size();
+        const auto runnerN = bc.runner.size();
+        auto namedBefore = bc.namedRunners;
+        const bool exclusiveBefore = bc.runExclusive;
+        auto bp = mcpp::build::run_build_program(
+            pkg.manifest, pkg.root, host->first, host->second,
+            pkg.manifest.cppStandard, bpEnv);
+        if (!bp) {
+            if (!state.overrides.plan_only)
+                return std::unexpected(std::format(
+                    "workspace member '{}': {}", pkg.manifest.package.name, bp.error()));
+            state.planNotes.push_back({"MCPP_BUILD_DATABASE_PROGRAM_FAILED",
+                std::format("workspace member '{}': {}", pkg.manifest.package.name, bp.error()),
+                mcpp::wire::Severity::Error, (pkg.root / "build.mcpp").string()});
+            state.programFailedPackages.insert(pkg.root.string());
+            continue;
+        }
+        state.foldDirectiveTailIntoPrivateBuild(pkg, pkg.manifest, mark);
+        state.adoptActionOutputs(pkg.manifest, pkg.root, actN);
+        // How the artifact is executed reaches the plan's root, where `mcpp
+        // run` reads it, by the rule the dependencies' runners follow: one
+        // supplier per runner.
+        auto& rootBc = state.m->buildConfig;
+        if (bc.runner.size() > runnerN) {
+            if (!rootBc.runner.empty() && !state.runnerProvider.empty())
+                return std::unexpected(std::format(
+                    "'{}' and '{}' both supply a runner for this target.\n"
+                    "       Drop one of them, or state the runner in "
+                    "[target.<triple>].runner.",
+                    state.runnerProvider, pkg.manifest.package.name));
+            rootBc.runner.assign(bc.runner.begin() + static_cast<std::ptrdiff_t>(runnerN),
+                                 bc.runner.end());
+            state.runnerProvider = pkg.manifest.package.name;
+        }
+        for (auto const& [name, nr] : bc.namedRunners) {
+            auto before = namedBefore.find(name);
+            const bool grew = before == namedBefore.end()
+                           || nr.argv.size() > before->second.argv.size()
+                           || (nr.longLived && !before->second.longLived);
+            if (!grew) continue;
+            auto& slot = rootBc.namedRunners[name];
+            auto& who  = state.namedRunnerProvider[name];
+            if (!slot.argv.empty() && !who.empty())
+                return std::unexpected(std::format(
+                    "'{}' and '{}' both supply a runner named '{}' for this target.",
+                    who, pkg.manifest.package.name, name));
+            slot = nr;
+            who  = pkg.manifest.package.name;
+        }
+        if (bc.runExclusive && !exclusiveBefore) rootBc.runExclusive = true;
+    }
+    if (auto err = state.checkVersionFloors(); err) return std::unexpected(*err);
+    // What the programs published (an include directory, an interface
+    // define) reaches the members' consumers, as after the dependencies'
+    // programs.
+    state.computeUsageRequirements();
     return {};
 }
 
@@ -2029,6 +2221,7 @@ std::expected<void, std::string> phase9_target_side(PrepareState& state) {
     if (auto r = step9_dependency_link_forms(state); !r) return std::unexpected(r.error());
     step9_define_graph_package_entry_closure(state);
     if (auto r = step9_root_build_program(state); !r) return std::unexpected(r.error());
+    if (auto r = step9_member_build_programs(state); !r) return std::unexpected(r.error());
     if (auto r = step9_device_sources_reach_an_action(state); !r) return std::unexpected(r.error());
     if (auto r = step9_rerun_input_prepare_dir(state); !r) return std::unexpected(r.error());
 

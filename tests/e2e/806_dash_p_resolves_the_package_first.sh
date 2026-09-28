@@ -45,12 +45,20 @@ cat > mcpp.toml <<'EOF'
 members = ["modules/base", "ns1/common", "ns2/common"]
 EOF
 
+# Which member a `-p` selected is read from the workspace's compile database,
+# which a build from a clean workspace fills with that member's closure alone
+# (workspace design 2026-09-29 §7.1).
+fresh() { rm -rf target compile_commands.json; }
+built() {  # built <member dir>: the member's source is in the database
+    [ -f compile_commands.json ] && grep -q "$1/x.cpp" compile_commands.json
+}
+
 # ── package name, directory basename, and full path all select the member ──
 for filter in ws-base base modules/base; do
-    rm -rf modules/base/compile_commands.json
+    fresh
     "$MCPP" build -p "$filter" > "sel-$(basename "$filter").log" 2>&1 \
         || fail "-p $filter did not build" "sel-$(basename "$filter").log"
-    [ -f modules/base/compile_commands.json ] \
+    built modules/base \
         || fail "-p $filter did not select modules/base"
     grep -qi 'warning' "sel-$(basename "$filter").log" \
         && fail "-p $filter warned when no other member could conflict" \
@@ -66,10 +74,12 @@ grep -q 'ns1.ws-common' ambiguous.log \
 grep -q 'ns2.ws-common' ambiguous.log \
     || fail "the ambiguity refusal must name 'ns2.ws-common'" ambiguous.log
 
+fresh
 "$MCPP" build -p ns1.ws-common > qns1.log 2>&1 || fail "-p ns1.ws-common did not build" qns1.log
-[ -f ns1/common/compile_commands.json ] || fail "-p ns1.ws-common did not select ns1/common"
+built ns1/common || fail "-p ns1.ws-common did not select ns1/common"
+fresh
 "$MCPP" build -p ns2.ws-common > qns2.log 2>&1 || fail "-p ns2.ws-common did not build" qns2.log
-[ -f ns2/common/compile_commands.json ] || fail "-p ns2.ws-common did not select ns2/common"
+built ns2/common || fail "-p ns2.ws-common did not select ns2/common"
 echo "ok: the bare name is refused; each qualified name selects its own member"
 
 # ── a second member's directory basename collides with the first's package ─
@@ -78,13 +88,13 @@ cat > mcpp.toml <<'EOF'
 [workspace]
 members = ["modules/base", "ns1/common", "ns2/common", "dup/ws-base"]
 EOF
-rm -rf modules/base/compile_commands.json
+fresh
 
 "$MCPP" build -p ws-base > name-vs-dir.log 2>&1 \
     || fail "-p ws-base did not build once a same-named directory existed" name-vs-dir.log
-[ -f modules/base/compile_commands.json ] \
+built modules/base \
     || fail "-p ws-base must still select the package 'ws-base' (modules/base)"
-[ -f dup/ws-base/compile_commands.json ] \
+built dup/ws-base \
     && fail "-p ws-base must not have built dup/ws-base"
 grep -qi 'warning' name-vs-dir.log \
     || fail "-p ws-base must warn once a directory shares its spelling" name-vs-dir.log

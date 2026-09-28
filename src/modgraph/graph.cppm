@@ -4,6 +4,7 @@ export module mcpp.modgraph.graph;
 
 import std;
 import mcpp.source_kind;
+import mcpp.graph;
 
 export namespace mcpp::modgraph {
 
@@ -121,7 +122,8 @@ struct Graph {
 };
 
 // Topological order: returns indices of units in producer-before-consumer order.
-// Returns std::unexpected with the cycle if any.
+// Returns std::unexpected with the cycle if any, as the ordered path that
+// walks it (see mcpp.graph) rather than merely the units left over.
 struct CycleError {
     std::vector<std::size_t> cycle;
 };
@@ -132,38 +134,14 @@ std::expected<std::vector<std::size_t>, CycleError> topo_sort(const Graph& g);
 namespace mcpp::modgraph {
 
 std::expected<std::vector<std::size_t>, CycleError> topo_sort(const Graph& g) {
-    std::vector<std::size_t> indeg(g.units.size(), 0);
-    std::vector<std::vector<std::size_t>> adj(g.units.size());
-    for (auto [c, p] : g.edges) {
-        // edge means: consumer depends on producer. So producer must come first.
-        // indegree of consumer counts unmet producer dependencies.
-        indeg[c]++;
-        adj[p].push_back(c);
-    }
-
-    std::vector<std::size_t> order;
-    order.reserve(g.units.size());
-    std::vector<std::size_t> queue;
-    for (std::size_t i = 0; i < indeg.size(); ++i) {
-        if (indeg[i] == 0) queue.push_back(i);
-    }
-    while (!queue.empty()) {
-        std::size_t u = queue.back();
-        queue.pop_back();
-        order.push_back(u);
-        for (auto v : adj[u]) {
-            if (--indeg[v] == 0) queue.push_back(v);
-        }
-    }
-    if (order.size() != g.units.size()) {
-        // Cycle remains. Report units still with positive indegree.
-        CycleError err;
-        for (std::size_t i = 0; i < indeg.size(); ++i) {
-            if (indeg[i] > 0) err.cycle.push_back(i);
-        }
-        return std::unexpected(err);
-    }
-    return order;
+    // g.edges: (consumer, producer) pairs, "consumer depends on producer".
+    // The unit order is the order of the objects on a link line, which
+    // Mach-O uses as the initializer order, so this is the order the module
+    // graph has always had: Kahn's algorithm with the ready units on a stack,
+    // over the edges in the order the graph records them (see mcpp.graph).
+    auto order = mcpp::graph::stack_topological_order(g.units.size(), g.edges);
+    if (!order) return std::unexpected(CycleError{std::move(order.error().cycle)});
+    return std::move(*order);
 }
 
 } // namespace mcpp::modgraph

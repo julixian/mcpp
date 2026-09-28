@@ -67,6 +67,11 @@ struct Package {
     // author asked for it" outside author-owned manifests — see the scope gate
     // in prepare.cppm.
     bool                        standardDeclared = false;
+    // The root of a workspace plan (workspace design 2026-09-29 §15): a
+    // manifest the engine synthesises, never parsed, that holds the values
+    // one plan shares and depends on the selected members. It has no sources,
+    // targets, hooks or build program of its own.
+    bool                        virtualRoot = false;
     std::string                 description;
     std::string                 license;
     std::vector<std::string>    authors;

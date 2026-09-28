@@ -39,14 +39,29 @@ std::filesystem::path write_graph(const std::string& first) {
 
 TEST(GraphShape, TheHeaderNamesShapeScheduleSelectionAndFormat) {
     EXPECT_EQ(mcpp::build::header_line(mcpp::build::GraphShape::Normal, "none", false),
-              "# mcpp:graph=normal;schedule=none;accel=default;dist=none");
+              "# mcpp:graph=normal;schedule=none;accel=default;dist=none;request=");
     EXPECT_EQ(mcpp::build::header_line(mcpp::build::GraphShape::WithTests, "two-phase", true),
-              "# mcpp:graph=test;schedule=two-phase;accel=override;dist=none");
+              "# mcpp:graph=test;schedule=two-phase;accel=override;dist=none;request=");
     // An empty format reads as "none" rather than as an empty field: the value
     // has to be a word, because `read_pack_format` returning "" already means
     // "this file predates the field", and the two must not collide.
     EXPECT_EQ(mcpp::build::header_line(mcpp::build::GraphShape::Normal, "none", false, "appimage"),
-              "# mcpp:graph=normal;schedule=none;accel=default;dist=appimage");
+              "# mcpp:graph=normal;schedule=none;accel=default;dist=appimage;request=");
+}
+
+// Workspace design 2026-09-29 §3: the request a graph was planned for rides
+// the same line, because the features and the workspace members no longer
+// name the directory. One tag per request, whatever the spelling.
+TEST(GraphShape, TheHeaderNamesTheRequest) {
+    using namespace mcpp::build;
+    const auto tag = request_tag("cli\x1egui", "b, a");
+    EXPECT_EQ(tag, request_tag("cli\x1egui", "a,b"));
+    EXPECT_NE(tag, request_tag("cli", "a,b"));
+    EXPECT_NE(tag, request_tag("cli\x1egui", "a"));
+    EXPECT_EQ(read_request(write_graph(header_line(GraphShape::Normal, "none", false, {}, tag))),
+              tag);
+    EXPECT_EQ(read_request(write_graph("# mcpp:graph=normal;schedule=none;accel=default;dist=none")),
+              "");
 }
 
 TEST(GraphShape, OnlyAPlainGraphWithTheManifestsVariantIsReplayed) {

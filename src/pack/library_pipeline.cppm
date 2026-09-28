@@ -153,12 +153,16 @@ export int build_and_pack_library(const std::string& targetName,
         if (!ctx) { mcpp::ui::error(ctx.error()); return 2; }
 
         // ── the target, and what its kind means here ──────────────────
+        // In a workspace plan the package is its one selected member
+        // (workspace design 2026-09-29 §15).
+        const auto& subject = ctx->workspaceMembers.size() == 1
+            ? ctx->workspaceMembers.front().manifest : ctx->manifest;
         const mcpp::manifest::Target* target = nullptr;
-        for (auto const& t : ctx->manifest.targets)
+        for (auto const& t : subject.targets)
             if (t.name == targetName) { target = &t; break; }
         if (!target) {
             std::string names;
-            for (auto const& t : ctx->manifest.targets) {
+            for (auto const& t : subject.targets) {
                 if (!names.empty()) names += ", ";
                 names += t.name;
             }
@@ -195,6 +199,10 @@ export int build_and_pack_library(const std::string& targetName,
             mcpp::ui::error(br.error().message);
             return 1;
         }
+        // Everything below reads the package being packed.
+        const auto kept = *target;
+        mcpp::build::focus_on_member(*ctx);
+        target = &kept;
         std::filesystem::path artifact;
         std::filesystem::path importLib;
         for (auto const& lu : ctx->plan.linkUnits) {

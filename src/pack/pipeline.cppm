@@ -275,8 +275,11 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
 
     // Manifest may override mode only when neither --mode nor an
     // equivalent flag (--target *-musl → static) was given.
-    if (!modeFromUser && !ctx->manifest.packConfig.defaultMode.empty()) {
-        if (auto m = mcpp::pack::parse_mode(ctx->manifest.packConfig.defaultMode))
+    // A workspace plan's subject is its one selected member (§15).
+    const auto& subjectManifest = ctx->workspaceMembers.size() == 1
+        ? ctx->workspaceMembers.front().manifest : ctx->manifest;
+    if (!modeFromUser && !subjectManifest.packConfig.defaultMode.empty()) {
+        if (auto m = mcpp::pack::parse_mode(subjectManifest.packConfig.defaultMode))
             opts.mode = *m;
     }
 
@@ -370,6 +373,9 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
         mcpp::ui::error(br.error().message);
         return PackOutcome{1};
     }
+    // Everything below reads the package being packed: in a workspace plan,
+    // its selected member (workspace design 2026-09-29 §15).
+    mcpp::build::focus_on_member(*ctx);
 
     // ─── Pick the main binary target ─────────────────────────────────
     //
@@ -494,20 +500,26 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
         // package that the contract says the host serves.
         namespace rp = mcpp::build::runtime_placement;
         const bool msvcAbi = mcpp::toolchain::is_msvc_target(ctx->plan.toolchain);
+        // Relative to the program's directory: `bin`, or a workspace member's
+        // product directory (§15 of the 2026-09-29 workspace design).
+        const auto& productDir = ctx->plan.productDir;
         for (auto const& d : flags.runtimeDeploy) {
-            if (msvcAbi && d.dest.parent_path() == "bin"
+            if (msvcAbi && d.dest.parent_path() == productDir
                 && rp::is_msvc_crt_name(d.dest.filename().string()))
                 continue;
-            opts.runtimeFiles.push_back(d.dest.lexically_relative("bin"));
+            opts.runtimeFiles.push_back(d.dest.lexically_relative(productDir));
         }
         if (msvcAbi && !opts.carryToolchainRuntime && flags.runtimeCrtPolicy != "static")
             for (auto n : rp::kMsvcCrtNames) opts.hostProvidedLibs.emplace_back(n);
         // A dependency's program the manifest ships with this one (mcpp#711,
         // `artifacts = [...]`) is linked into `bin/` beside the executable, so
         // it is staged the way a deployed file is.
+        // In a workspace member's product directory it is the placed copy.
         for (auto const& u : ctx->plan.linkUnits)
             if (!u.artifactOf.empty())
-                opts.runtimeFiles.push_back(u.output.lexically_relative("bin"));
+                opts.runtimeFiles.push_back(productDir == "bin"
+                    ? u.output.lexically_relative("bin")
+                    : std::filesystem::path(u.output.filename()));
         // #634 A3: the Android row reads its closure against the directories
         // its link declared -- a prebuilt library named through `[runtime]
         // link_library_dirs` is a file the link used and the device does not

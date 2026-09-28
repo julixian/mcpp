@@ -154,14 +154,40 @@ std::filesystem::path temp_sibling(const std::filesystem::path& dst) {
     return dst.parent_path() / name;
 }
 
+// A shared library is placed by a hard link where the file system allows one
+// (workspace design 2026-09-29 §5.3): several product directories that load
+// the same DLL or shared object then hold one copy of its bytes. Only shared
+// libraries are linked. A program may write a data file that lies beside it,
+// and through a link that write would reach the file's source, a package's own
+// tree or a payload store; a loader never writes the libraries it loads.
+bool links_on_placement(const std::filesystem::path& p) {
+    const auto name = p.filename().generic_string();
+    auto lower = name;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return lower.ends_with(".dll") || lower.ends_with(".dylib")
+        || lower.ends_with(".so") || lower.find(".so.") != std::string::npos;
+}
+
 // One full write attempt: temp+rename first, in-place overwrite as fallback.
+// The temporary is a hard link to the source when `links_on_placement` admits
+// it and the link can be made, and a copy otherwise (another volume, FAT or
+// exFAT, a permission), so the fallback is today's behaviour.
 // Returns an empty error_code on success; otherwise the most informative error
-// (the in-place one — that's where 1224 / 32 shows up).
+// (the in-place one — that's where 1224 / 32 shows up), or the rename's when
+// the destination shares its bytes with another name and is not written in
+// place.
 std::error_code write_once(const std::filesystem::path& src,
                            const std::filesystem::path& dst) {
     auto tmp = temp_sibling(dst);
     std::error_code ec;
-    std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+    bool linked = false;
+    if (links_on_placement(src)) {
+        std::error_code lec;
+        std::filesystem::create_hard_link(src, tmp, lec);
+        linked = !lec;
+    }
+    if (!linked)
+        std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
     if (!ec) {
         std::error_code rec;
         std::filesystem::rename(tmp, dst, rec);
@@ -172,10 +198,17 @@ std::error_code write_once(const std::filesystem::path& src,
         // deletes.
         std::error_code rmec;
         std::filesystem::remove(tmp, rmec);
+        ec = rec;
     } else {
         std::error_code rmec;
         std::filesystem::remove(tmp, rmec);
     }
+
+    // A destination placed earlier by a link shares its bytes with that
+    // placement's source, so it is never written in place.
+    std::error_code nec;
+    if (const auto links = std::filesystem::hard_link_count(dst, nec); !nec && links > 1)
+        return ec;
 
     std::error_code cec;
     std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, cec);

@@ -71,10 +71,6 @@ struct CompileUnit {
     bool                            servedFromCache = false;
     std::filesystem::path           cachedObject;   // absolute, inside the cache
     std::filesystem::path           cachedBmi;      // absolute; empty if no module
-    // #734 E1: served from a workspace member's own build directory rather
-    // than from an immutable cache entry. Its bytes change under an unchanged
-    // name, so its stage edges compare content, not size.
-    bool                            servedFromMember = false;
     // mcpp#344: this object's address INSIDE a global-cache entry — relative to
     // `<entry>/obj/`, and a pure function of the owning package (its source's
     // path relative to its own package root). Distinct from `object`, which is
@@ -111,6 +107,13 @@ struct LinkUnit {
     // every other unit. A dependency-owned `Binary` is always one of these; the
     // name is what `${mcpp.artifact:<package>/<target>}` is resolved against.
     std::string                     artifactOf;
+    // A workspace plan's link unit of a selected member (workspace design
+    // 2026-09-29 §15): the member's qualified package name, and the index of
+    // its link group in `BuildPlan::linkGroups`, which holds the link flags
+    // and the runtime files of the member's closure. Empty and -1 on every
+    // other unit.
+    std::string                     memberOf;
+    int                             linkGroup = -1;
     // Normally relative to plan.outputDir. A `role = "object"` action's outputs
     // land here ABSOLUTE, on purpose: ninja identifies a file by the string an
     // edge declares, and the action edge declares whatever prepare_actions
@@ -328,6 +331,12 @@ struct BuildPlan {
     // library over a static package that something else reaches too.
     std::vector<StaticPlacementConflict> staticPlacementConflicts;
     std::string                     scheduleTag = "none";
+    // What this graph was planned FOR, beyond what names its directory: the
+    // workspace members of the plan and the requested features, as one tag
+    // (`request_tag`). Neither moves the build directory (workspace design
+    // 2026-09-29 §3), so build.ninja records the tag and the fast paths
+    // compare it before replaying the file.
+    std::string                     requestTag;
     // Whether `--accel` / `--no-accel` selected this graph's device variant
     // over `[build] accel`. The variant is in the fingerprint, so the two
     // builds land in different directories -- and the fast path, which runs
@@ -388,12 +397,6 @@ struct BuildPlan {
     std::vector<std::string>        rcFlags;         // -I / -D, target-shaped
 
     std::vector<CompileUnit>        compileUnits;     // topologically sorted
-    // Each package's build key (`cache_key::key_hex`), indexed as the graph's
-    // packages, [0] the root. Set in the global cache mode. #734 E1 compares a
-    // workspace member's key in a consumer's graph with the member's key as the
-    // root of its own build: equal keys are equal compile commands.
-    std::vector<std::string>        packageKeys;
-    std::vector<std::string>        packageKeyInputs;   // each key's inputs, as JSON text
     std::vector<LinkUnit>           linkUnits;
     // Build-graph nodes declared by build programs (`mcpp:action=`). Paths are
     // absolute and engine variables already substituted by the time they get
@@ -490,7 +493,59 @@ struct BuildPlan {
     // musl-gcc 15.1 modules failed to emit vector<pair<string,string>>'s
     // move-ctor instantiation across the module boundary (release link error).
     std::vector<RuntimeCapabilityProvider> runtimeProviders;
+    // Where the files the runtime needs are placed beside the programs,
+    // relative to outputDir: `bin`, or a workspace member's product directory
+    // while its link group is swapped in (§15).
+    std::filesystem::path              productDir = "bin";
+
+    // A workspace plan's per-member link data (workspace design 2026-09-29
+    // §15). A selected member's link units link the member's closure -- the
+    // member and what it reaches without an `artifacts` or member edge -- with
+    // that closure's own link flags, and the files its runtime needs are
+    // placed in its product directory. The fields repeat the plan's own, so a
+    // group is read by swapping it into a copy of the plan
+    // (`swap_link_group`). Empty outside a workspace plan, where the plan's
+    // own fields serve the root's units.
+    struct Placement {
+        std::filesystem::path source;   // relative to outputDir
+        std::filesystem::path dest;     // relative to outputDir
+    };
+    struct LinkGroup {
+        std::string                      member;      // qualified package name
+        std::filesystem::path            productDir;  // relative to outputDir
+        std::vector<std::string>         ldflags;     // the plan's, then the closure's
+        std::vector<std::filesystem::path> runtimeLibraryDirs;
+        std::vector<std::filesystem::path> depRuntimeLibraryDirs;
+        std::vector<mcpp::manifest::RuntimeRequirement> runtimeRequirements;
+        std::vector<mcpp::manifest::RuntimeArtifact>    runtimeArtifacts;
+        mcpp::manifest::LinkIntent       linkIntent;
+        std::vector<DeployFile>          runtimeDeployFiles;
+        std::vector<std::string>         runtimeDlopenLibs;
+        std::vector<std::string>         runtimeCapabilities;
+        std::vector<RuntimeCapabilityProvider> runtimeProviders;
+        // The graph-built shared libraries the member's units load, placed
+        // beside them (a hard link where the file system allows, §5.3).
+        std::vector<Placement>           placements;
+    };
+    std::vector<LinkGroup>             linkGroups;
 };
+
+// Exchange a link group's fields with the plan's own. Called twice, it
+// restores both; between the calls, the plan describes the group's units to
+// every reader of those fields (`compute_flags` in particular).
+void swap_link_group(BuildPlan& plan, BuildPlan::LinkGroup& g) {
+    std::swap(plan.manifest.buildConfig.ldflags, g.ldflags);
+    std::swap(plan.runtimeLibraryDirs, g.runtimeLibraryDirs);
+    std::swap(plan.depRuntimeLibraryDirs, g.depRuntimeLibraryDirs);
+    std::swap(plan.runtimeRequirements, g.runtimeRequirements);
+    std::swap(plan.runtimeArtifacts, g.runtimeArtifacts);
+    std::swap(plan.linkIntent, g.linkIntent);
+    std::swap(plan.runtimeDeployFiles, g.runtimeDeployFiles);
+    std::swap(plan.runtimeDlopenLibs, g.runtimeDlopenLibs);
+    std::swap(plan.runtimeCapabilities, g.runtimeCapabilities);
+    std::swap(plan.runtimeProviders, g.runtimeProviders);
+    std::swap(plan.productDir, g.productDir);
+}
 
 // Merge the generic facts exported by the already-selected xlings
 // RuntimeBinding.  This is data ingestion only: xlings has already selected
@@ -1443,147 +1498,156 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     plan.stdBmiPath     = stdBmiPath;
     plan.stdObjectPath  = stdObjectPath;
 
-    auto runtimeContract = resolve_runtime_contract(packages);
-    plan.runtimeRequirements = std::move(runtimeContract.requirements);
-    plan.runtimeArtifacts = std::move(runtimeContract.artifacts);
-    plan.linkIntent = std::move(runtimeContract.linkIntent);
-    plan.runtimeProviders = std::move(runtimeContract.providers);
+    // What the runtime needs beside and around the artifacts of a set of
+    // packages: the plan's, over every package, and a workspace member's,
+    // over the member's closure, placed in its product directory (workspace
+    // design 2026-09-29 §15). `out` is the plan or a link group; both carry
+    // the same fields.
+    auto derive_runtime = [&](const std::vector<mcpp::modgraph::PackageRoot>& pkgs,
+                              const std::filesystem::path& binDir, auto& out) {
+        auto runtimeContract = resolve_runtime_contract(pkgs);
+        out.runtimeRequirements = std::move(runtimeContract.requirements);
+        out.runtimeArtifacts = std::move(runtimeContract.artifacts);
+        out.linkIntent = std::move(runtimeContract.linkIntent);
+        out.runtimeProviders = std::move(runtimeContract.providers);
 
-    for (auto const& dir : plan.linkIntent.runtimeSearchDirs) {
-        append_unique_path(plan.runtimeLibraryDirs, dir);
-        append_unique_path(plan.depRuntimeLibraryDirs, dir);
-    }
-    for (auto const& requirement : plan.runtimeRequirements) {
-        // Optional requirements remain first-class provenance in
-        // resolution.json, but they cannot become hard ABI/doctor inputs.
-        if (!requirement.required) continue;
-        if (requirement.kind == "soname") {
-            if (std::ranges::find(plan.runtimeDlopenLibs, requirement.value)
-                == plan.runtimeDlopenLibs.end())
-                plan.runtimeDlopenLibs.push_back(requirement.value);
-        } else if (requirement.kind == "capability") {
-            if (std::ranges::find(plan.runtimeCapabilities, requirement.value)
-                == plan.runtimeCapabilities.end())
-                plan.runtimeCapabilities.push_back(requirement.value);
+        for (auto const& dir : out.linkIntent.runtimeSearchDirs) {
+            append_unique_path(out.runtimeLibraryDirs, dir);
+            append_unique_path(out.depRuntimeLibraryDirs, dir);
         }
-    }
+        for (auto const& requirement : out.runtimeRequirements) {
+            // Optional requirements remain first-class provenance in
+            // resolution.json, but they cannot become hard ABI/doctor inputs.
+            if (!requirement.required) continue;
+            if (requirement.kind == "soname") {
+                if (std::ranges::find(out.runtimeDlopenLibs, requirement.value)
+                    == out.runtimeDlopenLibs.end())
+                    out.runtimeDlopenLibs.push_back(requirement.value);
+            } else if (requirement.kind == "capability") {
+                if (std::ranges::find(out.runtimeCapabilities, requirement.value)
+                    == out.runtimeCapabilities.end())
+                    out.runtimeCapabilities.push_back(requirement.value);
+            }
+        }
 
-    // `toDir` is a `runtime.deploy` destination, relative to the executable's
-    // directory; empty and "." both mean that directory itself, which is where
-    // every `deploy_files` entry goes. The check keys on the full relative
-    // destination, so two files of one name in two directories do not
-    // collide.
-    //
-    // Two sources for one destination are no longer refused HERE (SPEC-007
-    // R4.2, #723): at planning time a generated source may not exist yet, so
-    // its content cannot be compared. Both stay as inputs of the one
-    // `stage_file` edge this destination becomes (ninja_backend.cppm), and
-    // `mcpp stage` (mcpp.build.stage) is where the invariant — one
-    // destination, one content — is actually checked, once the sources exist.
-    // A source already listed for this destination (the ordinary case: the
-    // same file reached through two graph edges) is not duplicated.
-    // On a PE target a destination is compared without case
-    // (DeployFile::is_destination).
-    const bool peTarget = targetTriple.empty() ? bool(mcpp::platform::is_windows)
-                                               : targetTriple.is_pe();
-    auto add_deploy = [&](const std::filesystem::path& source,
-                          std::string_view toDir = {}) {
-        const auto normalized = source.lexically_normal();
-        auto destDir = std::filesystem::path("bin");
-        if (!toDir.empty() && toDir != ".") destDir /= std::filesystem::path(toDir);
-        const auto dest = destDir / source.filename();
-        auto existing = std::ranges::find_if(plan.runtimeDeployFiles,
-            [&](auto const& value) { return value.is_destination(dest, peTarget); });
-        if (existing != plan.runtimeDeployFiles.end()) {
-            if (std::ranges::find(existing->sources, normalized)
-                == existing->sources.end())
-                existing->sources.push_back(normalized);
-            return;
+        // `toDir` is a `runtime.deploy` destination, relative to the executable's
+        // directory; empty and "." both mean that directory itself, which is where
+        // every `deploy_files` entry goes. The check keys on the full relative
+        // destination, so two files of one name in two directories do not
+        // collide.
+        //
+        // Two sources for one destination are no longer refused HERE (SPEC-007
+        // R4.2, #723): at planning time a generated source may not exist yet, so
+        // its content cannot be compared. Both stay as inputs of the one
+        // `stage_file` edge this destination becomes (ninja_backend.cppm), and
+        // `mcpp stage` (mcpp.build.stage) is where the invariant — one
+        // destination, one content — is actually checked, once the sources exist.
+        // A source already listed for this destination (the ordinary case: the
+        // same file reached through two graph edges) is not duplicated.
+        // On a PE target a destination is compared without case
+        // (DeployFile::is_destination).
+        const bool peTarget = targetTriple.empty() ? bool(mcpp::platform::is_windows)
+                                                   : targetTriple.is_pe();
+        auto add_deploy = [&](const std::filesystem::path& source,
+                              std::string_view toDir = {}) {
+            const auto normalized = source.lexically_normal();
+            auto destDir = binDir;
+            if (!toDir.empty() && toDir != ".") destDir /= std::filesystem::path(toDir);
+            const auto dest = destDir / source.filename();
+            auto existing = std::ranges::find_if(out.runtimeDeployFiles,
+                [&](auto const& value) { return value.is_destination(dest, peTarget); });
+            if (existing != out.runtimeDeployFiles.end()) {
+                if (std::ranges::find(existing->sources, normalized)
+                    == existing->sources.end())
+                    existing->sources.push_back(normalized);
+                return;
+            }
+            out.runtimeDeployFiles.push_back({{normalized}, dest});
+        };
+        // Structured deploy files are explicit and platform-neutral.  Legacy
+        // library_dirs keeps its one-train DLL discovery behavior below.
+        for (auto const& source : out.linkIntent.deployFiles) {
+            add_deploy(source);
         }
-        plan.runtimeDeployFiles.push_back({{normalized}, dest});
+        for (auto const& entry : out.linkIntent.deploy) {
+            add_deploy(entry.from, entry.to);
+        }
+        // A DLL found in a runtime search directory is a DERIVED candidate
+        // (SPEC-007 R4.3). The plan lists it and does not decide: which file sits
+        // beside the program -- a declaration, the toolset's C++ runtime, or this
+        // one -- is mcpp.build.runtime_placement's answer, read through
+        // `CompileFlags::runtimeDeploy`. A difference between a declared file and
+        // a search directory's copy is stated by the post-link placement edge,
+        // once, through the edge-advice channel (mcpp.build.advice).
+        //
+        // Sorted within each directory: directory order is not a stable input, and
+        // this list reaches build.ninja.
+        for (auto const& dir : out.linkIntent.runtimeSearchDirs) {
+            std::error_code dirEc;
+            if (!std::filesystem::is_directory(dir, dirEc)) continue;
+            std::vector<std::filesystem::path> dlls;
+            for (auto const& entry : std::filesystem::directory_iterator(dir, dirEc)) {
+                if (!entry.is_regular_file()) continue;
+                auto ext = entry.path().extension().string();
+                std::ranges::transform(ext, ext.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+                if (ext == ".dll") dlls.push_back(entry.path().lexically_normal());
+            }
+            std::ranges::sort(dlls);
+            for (auto const& dll : dlls)
+                out.runtimeDeployFiles.push_back(
+                    {{dll}, binDir / dll.filename(),
+                     BuildPlan::DeployFile::Origin::Derived});
+        }
+        // The same private runtime directories embedded as executable RUNPATH are
+        // also needed in the process environment for libraries reached only via
+        // dlopen(), because their own DT_NEEDED closure does not consult the main
+        // executable's RUNPATH.
+        for (auto const& dir : tc.linkRuntimeDirs) {
+            append_unique_path(out.runtimeLibraryDirs, dir);
+        }
+        // The MSVC toolset's own redistributable CRT (#718), on the `mcpp run`/
+        // `mcpp test` search path exactly as the staged copy is beside the
+        // artifact (`flags.cppm`'s toolchain-coupled staging) — the two are the
+        // same directory for both the cl.exe row (already inside
+        // `linkRuntimeDirs` above, so this is a harmless duplicate there) and the
+        // LLVM row (where `linkRuntimeDirs` holds LLVM's own directories instead
+        // and would otherwise never mention it).
+        if (!tc.msvcRedistDir.empty())
+            append_unique_path(out.runtimeLibraryDirs, tc.msvcRedistDir);
+        // The private glibc payload exists here for ONE reason: a dlopen()'d
+        // library, whose own DT_NEEDED closure never consults the main
+        // executable's RUNPATH, must still resolve the same libc the executable
+        // was linked against. So it is only published when this build actually has
+        // such a library.
+        //
+        // It is published through the ARTIFACT — the link model already emits
+        // `-Wl,-rpath,<glibc>` alongside --dynamic-linker wherever a payload
+        // exists — and never through the environment.
+        // LD_LIBRARY_PATH is inherited by the whole process subtree, and a child
+        // that is a HOST binary (/bin/sh, reached via popen()) loads the HOST
+        // loader — PT_INTERP is baked in and no environment variable overrides it
+        // — while the variable hands it the payload libc.so.6. libc and ld.so are
+        // version-locked through GLIBC_PRIVATE, so the shell dies during
+        // relocation, before main: glibc 2.44's libc.so.6 needs
+        // `__pointer_chk_guard` from its own loader (mcpp#401), and older payloads
+        // segfault in the linker instead (mcpp#291). It does NOT reproduce when
+        // host and payload glibc happen to match, which is how it survived.
+        //
+        // process.cppm's strip_private_glibc already removes this entry from
+        // mcpp's OWN children. It cannot help one hop further out — what the
+        // target spawns is beyond mcpp's reach. Putting the directory in the
+        // artifact's RUNPATH instead is: DT_RUNPATH reaches the object that
+        // carries it and the dlopen() it performs, and nothing else.
+        if constexpr (mcpp::platform::publishes_via_environment(
+                          mcpp::platform::kPrivateLibcSearchScope)) {
+            if (tc.payloadPaths && !out.depRuntimeLibraryDirs.empty()) {
+                append_unique_path(out.runtimeLibraryDirs,
+                                   tc.payloadPaths->glibcLib);
+            }
+        }
     };
-    // Structured deploy files are explicit and platform-neutral.  Legacy
-    // library_dirs keeps its one-train DLL discovery behavior below.
-    for (auto const& source : plan.linkIntent.deployFiles) {
-        add_deploy(source);
-    }
-    for (auto const& entry : plan.linkIntent.deploy) {
-        add_deploy(entry.from, entry.to);
-    }
-    // A DLL found in a runtime search directory is a DERIVED candidate
-    // (SPEC-007 R4.3). The plan lists it and does not decide: which file sits
-    // beside the program -- a declaration, the toolset's C++ runtime, or this
-    // one -- is mcpp.build.runtime_placement's answer, read through
-    // `CompileFlags::runtimeDeploy`. A difference between a declared file and
-    // a search directory's copy is stated by the post-link placement edge,
-    // once, through the edge-advice channel (mcpp.build.advice).
-    //
-    // Sorted within each directory: directory order is not a stable input, and
-    // this list reaches build.ninja.
-    for (auto const& dir : plan.linkIntent.runtimeSearchDirs) {
-        std::error_code dirEc;
-        if (!std::filesystem::is_directory(dir, dirEc)) continue;
-        std::vector<std::filesystem::path> dlls;
-        for (auto const& entry : std::filesystem::directory_iterator(dir, dirEc)) {
-            if (!entry.is_regular_file()) continue;
-            auto ext = entry.path().extension().string();
-            std::ranges::transform(ext, ext.begin(),
-                [](unsigned char c){ return std::tolower(c); });
-            if (ext == ".dll") dlls.push_back(entry.path().lexically_normal());
-        }
-        std::ranges::sort(dlls);
-        for (auto const& dll : dlls)
-            plan.runtimeDeployFiles.push_back(
-                {{dll}, std::filesystem::path("bin") / dll.filename(),
-                 BuildPlan::DeployFile::Origin::Derived});
-    }
-    // The same private runtime directories embedded as executable RUNPATH are
-    // also needed in the process environment for libraries reached only via
-    // dlopen(), because their own DT_NEEDED closure does not consult the main
-    // executable's RUNPATH.
-    for (auto const& dir : tc.linkRuntimeDirs) {
-        append_unique_path(plan.runtimeLibraryDirs, dir);
-    }
-    // The MSVC toolset's own redistributable CRT (#718), on the `mcpp run`/
-    // `mcpp test` search path exactly as the staged copy is beside the
-    // artifact (`flags.cppm`'s toolchain-coupled staging) — the two are the
-    // same directory for both the cl.exe row (already inside
-    // `linkRuntimeDirs` above, so this is a harmless duplicate there) and the
-    // LLVM row (where `linkRuntimeDirs` holds LLVM's own directories instead
-    // and would otherwise never mention it).
-    if (!tc.msvcRedistDir.empty())
-        append_unique_path(plan.runtimeLibraryDirs, tc.msvcRedistDir);
-    // The private glibc payload exists here for ONE reason: a dlopen()'d
-    // library, whose own DT_NEEDED closure never consults the main
-    // executable's RUNPATH, must still resolve the same libc the executable
-    // was linked against. So it is only published when this build actually has
-    // such a library.
-    //
-    // It is published through the ARTIFACT — the link model already emits
-    // `-Wl,-rpath,<glibc>` alongside --dynamic-linker wherever a payload
-    // exists — and never through the environment.
-    // LD_LIBRARY_PATH is inherited by the whole process subtree, and a child
-    // that is a HOST binary (/bin/sh, reached via popen()) loads the HOST
-    // loader — PT_INTERP is baked in and no environment variable overrides it
-    // — while the variable hands it the payload libc.so.6. libc and ld.so are
-    // version-locked through GLIBC_PRIVATE, so the shell dies during
-    // relocation, before main: glibc 2.44's libc.so.6 needs
-    // `__pointer_chk_guard` from its own loader (mcpp#401), and older payloads
-    // segfault in the linker instead (mcpp#291). It does NOT reproduce when
-    // host and payload glibc happen to match, which is how it survived.
-    //
-    // process.cppm's strip_private_glibc already removes this entry from
-    // mcpp's OWN children. It cannot help one hop further out — what the
-    // target spawns is beyond mcpp's reach. Putting the directory in the
-    // artifact's RUNPATH instead is: DT_RUNPATH reaches the object that
-    // carries it and the dlopen() it performs, and nothing else.
-    if constexpr (mcpp::platform::publishes_via_environment(
-                      mcpp::platform::kPrivateLibcSearchScope)) {
-        if (tc.payloadPaths && !plan.depRuntimeLibraryDirs.empty()) {
-            append_unique_path(plan.runtimeLibraryDirs,
-                               tc.payloadPaths->glibcLib);
-        }
-    }
+    derive_runtime(packages, std::filesystem::path("bin"), plan);
 
     // 1a. Object addressing.
     //
@@ -1654,7 +1718,11 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             if (ec || rel.empty()) continue;
             if (rel.generic_string().starts_with("..")) continue;
             auto len = packages[p].root.generic_string().size();
-            if (!found || len > bestLen) { best = p; bestLen = len; found = true; }
+            // Equal roots are a workspace plan's virtual root and the rooted
+            // workspace's own package, which owns the sources (§15).
+            if (!found || len > bestLen || (len == bestLen && best == 0)) {
+                best = p; bestLen = len; found = true;
+            }
         }
         if (!found) return std::nullopt;
         return best;
@@ -2633,6 +2701,12 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         lu.dependencyOwned = true;
         lu.artifactOf      = owner;
         lu.output          = target_output(r.target, naming);
+        // In a workspace plan `bin/` holds products only: the workspace's own
+        // package's, and each member's directory. The program is linked with
+        // its package's intermediate files and placed beside each member
+        // program that ships it (step 6, §15 of the 2026-09-29 design).
+        if (manifest.package.virtualRoot)
+            lu.output = std::filesystem::path("obj") / sanitize(owner) / lu.output.filename();
         lu.windowsSubsystem = r.target.windowsSubsystem;
         lu.windowsEntry     = r.target.windowsEntry;
         lu.loaderTagFlag    = loader_tag_flag(lu.kind);
@@ -2715,6 +2789,266 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         }
         append_shared_deps_for_linked_objects(lu);
         plan.linkUnits.push_back(std::move(lu));
+    }
+
+    // 6. The targets of the selected workspace members (workspace design
+    //    2026-09-29 §15).
+    //
+    // Each target of a selected member is a link unit of this plan, linked
+    // from the member's closure the way the member's own build linked it when
+    // it was a root: its objects, those of every package it reaches, and its
+    // entry. Its output is in the member's product directory, `bin/<name>/`
+    // (`bin/` for a rooted workspace's own package), with the files its
+    // runtime needs beside it: the deploy set of its closure and the
+    // graph-built shared libraries it loads. The link flags and the runtime
+    // files are the closure's, held in the member's link group, so a member
+    // links nothing that only another member needs.
+    std::set<std::string> memberDevDepPackages;
+    for (std::size_t mi = 1; mi < packages.size(); ++mi) {
+        auto const& pkg = packages[mi];
+        if (!pkg.selectedMember) continue;
+        const auto owner = qualified_package_name(pkg.manifest);
+        const auto productDir = pkg.memberProducts.empty()
+            ? std::filesystem::path("bin")
+            : std::filesystem::path("bin") / pkg.memberProducts;
+        auto place = [&](const std::filesystem::path& o) { return productDir / o.filename(); };
+
+        // The closure: the member, what it reaches through its dependency
+        // edges (no `artifacts` edge), and under `mcpp test` its
+        // dev-dependencies, which are its own and are not walked further
+        // than their own dependencies.
+        std::set<std::size_t> closureIdx{mi};
+        {
+            std::vector<std::size_t> work{mi};
+            auto push = [&](std::size_t j) {
+                if (closureIdx.insert(j).second) work.push_back(j);
+            };
+            for (auto const& [depName, spec] : pkg.manifest.devDependencies)
+                for (auto const& candidate : dependency_name_candidates(depName, spec))
+                    if (auto it = packageIndexByName.find(candidate);
+                        it != packageIndexByName.end() && it->second != mi) {
+                        memberDevDepPackages.insert(
+                            qualified_package_name(packages[it->second].manifest));
+                        push(it->second);
+                        break;
+                    }
+            while (!work.empty()) {
+                const auto i = work.back(); work.pop_back();
+                if (auto it = directPackageDeps.find(i); it != directPackageDeps.end())
+                    for (auto j : it->second) {
+                        if (artifactEdges.contains({i, j})) continue;
+                        push(j);
+                    }
+            }
+        }
+        std::set<std::string> closure;
+        for (auto i : closureIdx) closure.insert(qualified_package_name(packages[i].manifest));
+
+        // The member's link group: the closure's link flags after the
+        // root's own (`packages[0]` is snapshotted before any dependency is
+        // loaded, so it holds the profile's flags and nothing pooled), in the
+        // order a root build gives them (the member, then its dependencies in
+        // discovery order), and the closure's runtime.
+        BuildPlan::LinkGroup group;
+        group.member = owner;
+        group.productDir = productDir;
+        group.ldflags = packages[0].linkUsage.ldflags;
+        for (auto i : closureIdx)
+            for (auto const& f : packages[i].linkUsage.ldflags)
+                group.ldflags.push_back(f);
+        {
+            std::vector<mcpp::modgraph::PackageRoot> closurePackages;
+            for (auto i : closureIdx) closurePackages.push_back(packages[i]);
+            derive_runtime(closurePackages, productDir, group);
+        }
+        const int groupIndex = static_cast<int>(plan.linkGroups.size());
+
+        bool memberTestMode = std::ranges::any_of(pkg.manifest.targets, [](auto const& t) {
+            return t.kind == mcpp::manifest::Target::TestBinary;
+        });
+        const auto memberExtTable = mcpp::extension_table_for(
+            pkg.manifest.buildConfig.moduleExtensions,
+            pkg.manifest.buildConfig.deviceExtensions);
+        std::vector<LinkUnit> units;
+        for (auto const& t : pkg.manifest.targets) {
+            if (memberTestMode && t.kind != mcpp::manifest::Target::TestBinary) continue;
+            // A member's shared libraries are linked once, with the graph's
+            // shared libraries (above), and placed in its product directory.
+            if (t.kind == mcpp::manifest::Target::SharedLibrary) {
+                const auto out = target_output(t, naming);
+                group.placements.push_back({out, place(out)});
+                for (auto const& alias : runtime_aliases_for_target(t, naming))
+                    group.placements.push_back({alias, place(alias)});
+                continue;
+            }
+            LinkUnit lu;
+            lu.targetName = t.name;
+            lu.memberOf   = owner;
+            lu.linkGroup  = groupIndex;
+            if (t.kind == mcpp::manifest::Target::Library) {
+                lu.kind   = LinkUnit::StaticLibrary;
+                lu.output = place(target_output(t, naming));
+            } else if (t.kind == mcpp::manifest::Target::Application
+                       && mcpp::toolchain::triple::application_form(targetTriple)
+                          == mcpp::toolchain::triple::ApplicationForm::SharedObject) {
+                lu.kind   = LinkUnit::SharedLibrary;
+                lu.output = place(target_output(t, naming, /*asSharedObject=*/true));
+                lu.importLibrary = import_library_for(t, naming);
+                if (!lu.importLibrary.empty()) lu.importLibrary = place(lu.importLibrary);
+                lu.soname = t.soname;
+                lu.exportPatterns = t.exportPatterns;
+                for (auto const& alias : runtime_aliases_for_target(t, naming))
+                    lu.runtimeAliases.push_back(place(alias));
+            } else {
+                lu.kind   = t.kind == mcpp::manifest::Target::TestBinary
+                          ? LinkUnit::TestBinary : LinkUnit::Binary;
+                lu.output = t.kind == mcpp::manifest::Target::TestBinary
+                          ? productDir / target_output(t, naming).lexically_relative("bin")
+                          : place(target_output(t, naming));
+                lu.windowsSubsystem = t.windowsSubsystem;
+                lu.windowsEntry     = t.windowsEntry;
+            }
+            lu.loaderTagFlag = loader_tag_flag(lu.kind);
+            for (auto const& other : plan.linkUnits)
+                if (other.output == lu.output)
+                    return std::unexpected(std::format(
+                        "target '{}' of workspace member '{}' would be written to "
+                        "'{}', which target '{}' of this build also produces",
+                        t.name, owner, lu.output.generic_string(), other.targetName));
+
+            for (auto const& cu : plan.compileUnits) {
+                if (!closure.contains(cu.packageName)) continue;
+                if (sharedDepPackages.contains(cu.packageName)) continue;
+                if (mcpp::links_unconditionally(cu.kind)) lu.objects.push_back(cu.object);
+            }
+            if (!t.main.empty() && lu.kind != LinkUnit::StaticLibrary) {
+                const auto entry = pkg.root / t.main;
+                lu.entryMain = entry;
+                std::optional<std::filesystem::path> entryObject;
+                for (auto const& cu : plan.compileUnits)
+                    if (cu.source == entry) { entryObject = cu.object; break; }
+                if (!entryObject) {
+                    CompileUnit main_cu;
+                    main_cu.source      = entry;
+                    main_cu.packageName = owner;
+                    main_cu.kind        = mcpp::classify(entry, memberExtTable);
+                    if (pkg.usageResolved) {
+                        main_cu.localIncludeDirs      = pkg.privateBuild.includeDirs;
+                        main_cu.localIncludeDirsAfter = pkg.privateBuild.includeDirsAfter;
+                        main_cu.packageCflags         = pkg.privateBuild.cflags;
+                        main_cu.packageCxxflags       = pkg.privateBuild.cxxflags;
+                    } else {
+                        main_cu.localIncludeDirs = local_include_dirs_for_manifest(pkg.root, pkg.manifest);
+                        main_cu.localIncludeDirsAfter =
+                            local_include_dirs_after_for_manifest(pkg.root, pkg.manifest);
+                        main_cu.packageCflags   = pkg.manifest.buildConfig.cflags;
+                        main_cu.packageCxxflags = pkg.manifest.buildConfig.cxxflags;
+                    }
+                    mcpp::modgraph::normalize_include_flags(pkg.root, main_cu.packageCflags);
+                    mcpp::modgraph::normalize_include_flags(pkg.root, main_cu.packageCxxflags);
+                    apply_c_standard(main_cu);
+                    const auto scanned = mcpp::modgraph::scan_entry_file(entry, owner, memberExtTable);
+                    for (auto const& req : scanned.requires_) main_cu.imports.push_back(req.logicalName);
+                    main_cu.declaration = scanned.provides
+                        ? mcpp::modgraph::ModuleDeclaration::Unknown : scanned.declaration;
+                    main_cu.object = object_for(entry, owner,
+                        std::filesystem::relative(entry, pkg.root), mi).object;
+                    plan.compileUnits.push_back(main_cu);
+                    entryObject = main_cu.object;
+                }
+                lu.objects.push_back(*entryObject);
+                // Per-target entry-scoped flags (issue #131), on the unit that
+                // builds this target's entry, as for a root's target.
+                if (!t.defines.empty() || !t.cflags.empty() || !t.cxxflags.empty()) {
+                    for (auto& cu : plan.compileUnits) {
+                        if (cu.source != entry) continue;
+                        for (auto const& d : t.defines) {
+                            const auto element = mcpp::manifest::flag_element("-D" + d);
+                            cu.packageCflags.push_back(element);
+                            cu.packageCxxflags.push_back(element);
+                        }
+                        for (auto const& f : t.cflags)   cu.packageCflags.push_back(f);
+                        for (auto const& f : t.cxxflags) cu.packageCxxflags.push_back(f);
+                        break;
+                    }
+                }
+            }
+            const bool entryDefinesMain = lu.entryMain && source_defines_main(*lu.entryMain);
+            for (auto const& cu : plan.compileUnits) {
+                if (!closure.contains(cu.packageName)) continue;
+                if (sharedDepPackages.contains(cu.packageName)) continue;
+                if (!is_implementation_source(cu.kind)) continue;
+                if (lu.entryMain && cu.source == *lu.entryMain) continue;
+                if (entryFilesAcrossTargets.contains(cu.source)) continue;
+                // A dev-dependency's own main-providing object (gtest_main.o)
+                // only for a test with no main of its own, as for a root.
+                if (entryDefinesMain && memberDevDepPackages.contains(cu.packageName)
+                    && source_defines_main(cu.source)) continue;
+                lu.objects.push_back(cu.object);
+            }
+            if (lu.kind != LinkUnit::StaticLibrary) {
+                const auto before = lu.implicitInputs.size();
+                // The shared libraries the closure's packages link, and no
+                // other member's.
+                for (auto i : closureIdx)
+                    if (!sharedDepPackages.contains(qualified_package_name(packages[i].manifest))
+                        && !placedInImage.contains(qualified_package_name(packages[i].manifest)))
+                        append_direct_shared_deps(lu, i);
+                // The graph-built shared libraries this unit loads are placed
+                // beside it.
+                for (std::size_t k = before; k < lu.implicitInputs.size(); ++k) {
+                    auto const& in = lu.implicitInputs[k];
+                    if (in.parent_path() == productDir) continue;
+                    // What a PE consumer links is the import library; the
+                    // loader reads the `.dll` beside it.
+                    if (naming.sharedNeedsImportLib
+                        && in.filename().string().ends_with(naming.staticLibExt))
+                        continue;
+                    const bool seen = std::ranges::any_of(group.placements,
+                        [&](auto const& pl) { return pl.source == in; });
+                    if (!seen) group.placements.push_back({in, place(in)});
+                }
+            }
+            units.push_back(std::move(lu));
+        }
+        // A program the closure ships through `artifacts` (mcpp#711) is linked
+        // once, at `bin/`, and placed beside the member's programs, where a
+        // program that launches it looks for it.
+        for (auto const& r : artifactRequests) {
+            const bool requested = std::ranges::any_of(artifactEdges, [&](auto const& e) {
+                return closureIdx.contains(e.first) && e.second == r.packageIndex;
+            });
+            if (!requested) continue;
+            std::filesystem::path out;
+            for (auto const& u : plan.linkUnits)
+                if (u.artifactOf == qualified_package_name(packages[r.packageIndex].manifest)
+                    && u.targetName == r.target.name) { out = u.output; break; }
+            if (out.empty()) continue;
+            const bool seen = std::ranges::any_of(group.placements,
+                [&](auto const& pl) { return pl.source == out; });
+            if (!seen && out.parent_path() != productDir)
+                group.placements.push_back({out, place(out)});
+        }
+        plan.linkGroups.push_back(std::move(group));
+        for (auto& u : units) plan.linkUnits.push_back(std::move(u));
+    }
+
+    // A product directory is a directory: nothing this plan writes may take
+    // its path as a file (a program of the workspace's own package named as a
+    // member, say).
+    for (auto const& g : plan.linkGroups) {
+        if (g.productDir == std::filesystem::path("bin")) continue;
+        for (auto const& u : plan.linkUnits) {
+            bool clash = u.output == g.productDir;
+            for (auto const& a : u.runtimeAliases) clash = clash || a == g.productDir;
+            if (clash)
+                return std::unexpected(std::format(
+                    "target '{}' would be written to '{}', which is the product "
+                    "directory of workspace member '{}'.\n"
+                    "       Rename the target, or give the member a namespace so "
+                    "that its directory is qualified.",
+                    u.targetName, u.output.generic_string(), g.member));
+        }
     }
 
     // The single derivation. Deliberately at the END of make_plan, after every

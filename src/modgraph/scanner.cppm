@@ -148,6 +148,14 @@ struct PackageRoot {
     UsageRequirements               publicUsage;
     UsageRequirements               linkUsage;
     bool                            usageResolved = false;
+    // A selected workspace member that the plan builds (workspace design
+    // 2026-09-29 §15), and the directory below `bin/` its products are placed
+    // in (empty: `bin/` itself). False on the plan's root and on every
+    // dependency. Two fields rather than an optional string: a
+    // `std::optional<std::string>` member makes this type uncopyable under
+    // clang with the MSVC STL.
+    bool                            selectedMember = false;
+    std::string                     memberProducts;
 };
 ScanResult scan_packages(const std::vector<PackageRoot>& packages);
 

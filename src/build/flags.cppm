@@ -1668,7 +1668,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             // same build re-runs edges for no reason.
             std::ranges::sort(sources);
             for (auto const& src : sources)
-                in.candidates.push_back({{src}, std::filesystem::path("bin") / src.filename(),
+                in.candidates.push_back({{src}, plan.productDir / src.filename(),
                                          rp::Kind::Toolchain});
         }
         auto decision = rp::resolve(in);

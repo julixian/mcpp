@@ -38,58 +38,156 @@ import mcpp.wire;
 
 namespace mcpp::cli {
 
-// Decide whether a build/test invocation fans out over workspace members, and
-// if so which. Fan out when `--workspace` is given, or at a *virtual* workspace
+// Decide whether a build/test invocation acts on several workspace members, and
+// if so which. It does when `--workspace` is given, or at a *virtual* workspace
 // root with no `-p` (the intuitive "act on the whole workspace"). Returns the
-// member paths to iterate, or nullopt for the single-package / single-`-p` /
-// rooted-bare path (handled by the existing per-package pipeline).
+// member paths as `[workspace] members` writes them -- a rooted workspace's own
+// package first, as "." (workspace design 2026-09-29 §7.1) -- or nullopt for
+// the single-package / single-`-p` / rooted-bare path. Inside a member, the
+// workspace is the one that lists it.
 std::optional<std::vector<std::string>>
 workspace_fanout_members(bool wantAll, const std::string& package_filter) {
     auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
     if (!root) return std::nullopt;
     auto m = mcpp::manifest::load(*root / "mcpp.toml");
+    if (m && !m->workspace.present && wantAll) {
+        auto wsRoot = mcpp::project::find_workspace_root(*root);
+        if (wsRoot.empty()) return std::nullopt;
+        m = mcpp::manifest::load(wsRoot / "mcpp.toml");
+    }
     if (!m || !m->workspace.present || m->workspace.members.empty()) return std::nullopt;
     bool virtualWs = m->package.name.empty();
-    if (wantAll || (virtualWs && package_filter.empty()))
-        return m->workspace.members;
-    return std::nullopt;
+    if (!(wantAll || (virtualWs && package_filter.empty()))) return std::nullopt;
+    std::vector<std::string> members;
+    if (!virtualWs) members.push_back(".");
+    members.insert(members.end(), m->workspace.members.begin(), m->workspace.members.end());
+    return members;
+}
+
+// The workspace a build command acts on and the members it selects (workspace
+// design 2026-09-29 §7.1, §15): `--workspace`, and a virtual root without
+// `-p`, select every member (a rooted workspace's own package first, as ".");
+// `-p X` selects X; a command in a member's directory selects that member; a
+// command at a rooted workspace's root selects the workspace's own package.
+// nullopt outside a workspace.
+struct WorkspaceSelection {
+    std::filesystem::path    root;
+    std::vector<std::string> members;
+};
+std::expected<std::optional<WorkspaceSelection>, std::string>
+workspace_selection(bool wantAll, const std::string& package_filter) {
+    auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
+    if (!root) return std::optional<WorkspaceSelection>{};
+    auto m = mcpp::manifest::load(*root / "mcpp.toml", {.insideWorkspace = true});
+    if (!m) return std::optional<WorkspaceSelection>{};
+    WorkspaceSelection sel{*root, {}};
+    std::string inside;
+    if (!m->workspace.present) {
+        auto wsRoot = mcpp::project::find_workspace_root(*root);
+        if (wsRoot.empty()) return std::optional<WorkspaceSelection>{};
+        sel.root = wsRoot;
+        m = mcpp::manifest::load(wsRoot / "mcpp.toml");
+        if (!m || !m->workspace.present) return std::optional<WorkspaceSelection>{};
+        const auto rel = root->lexically_normal()
+                             .lexically_relative(wsRoot.lexically_normal());
+        for (auto const& mp : m->workspace.members)
+            if (std::filesystem::path(mp).lexically_normal() == rel) inside = mp;
+        if (inside.empty()) return std::optional<WorkspaceSelection>{};
+    }
+    const bool rooted = !m->package.name.empty();
+    std::vector<std::string> all;
+    if (rooted) all.push_back(".");
+    all.insert(all.end(), m->workspace.members.begin(), m->workspace.members.end());
+    if (wantAll) { sel.members = std::move(all); return sel; }
+    if (!package_filter.empty()) {
+        auto dir = mcpp::project::resolve_member_dir(*m, sel.root, package_filter);
+        if (!dir) return std::unexpected(dir.error());
+        auto rel = dir->empty() ? std::string(".")
+            : dir->lexically_normal().lexically_relative(sel.root.lexically_normal()).generic_string();
+        if (rel.empty()) rel = ".";
+        for (auto const& mp : m->workspace.members)
+            if (std::filesystem::path(mp).lexically_normal() == std::filesystem::path(rel))
+                rel = mp;
+        sel.members = {rel};
+        return sel;
+    }
+    if (!inside.empty()) { sel.members = {inside}; return sel; }
+    if (!rooted) { sel.members = std::move(all); return sel; }
+    sel.members = {"."};
+    return sel;
+}
+
+// The workspace a fan-out acts on, and its members grouped by configuration
+// (workspace design 2026-09-29 §15): members whose root-position values are
+// equal are planned together, in one graph, in one build directory.
+std::expected<std::vector<std::vector<std::string>>, std::string>
+workspace_groups(const std::filesystem::path& wsRoot, const std::vector<std::string>& members) {
+    auto ws = mcpp::manifest::load(wsRoot / "mcpp.toml");
+    if (!ws) return std::unexpected(ws.error().format());
+    std::vector<std::vector<std::string>> groups;
+    std::map<std::string, std::size_t> byKey;
+    for (auto const& mp : members) {
+        auto mm = mcpp::project::load_member_manifest(*ws, wsRoot, mp);
+        if (!mm) return std::unexpected(mm.error());
+        const auto key = mcpp::project::root_position_key(*mm);
+        auto [it, fresh] = byKey.try_emplace(key, groups.size());
+        if (fresh) groups.emplace_back();
+        groups[it->second].push_back(mp);
+    }
+    return groups;
 }
 
 // run_build_plan, wrapped in the project's `[hooks]` lifecycle (#496).
 //
-// The hooks come off the context's own manifest, so they are the ones belonging
-// to the package being built — which in a workspace fan-out is the MEMBER, once
-// per member. The lifecycle is deliberately paired: build_finished/build_failed
-// are only ever reached after build_start has run, so a project that could not
-// be prepared at all (bad manifest, unresolvable dependency, no toolchain)
-// fires nothing — its hook programs may be exactly what preparation failed to
-// install.
+// The hooks are those of the package being built: the root's, or in a
+// workspace plan those of each selected member, in selection order (workspace
+// design 2026-09-29 §15), around the one build of the plan. The lifecycle is
+// deliberately paired: build_finished/build_failed are only ever reached after
+// build_start has run, so a project that could not be prepared at all (bad
+// manifest, unresolvable dependency, no toolchain) fires nothing — its hook
+// programs may be exactly what preparation failed to install.
 int run_build_with_hooks(mcpp::build::BuildContext& ctx, bool verbose,
                          bool no_cache, std::string_view targetOverride) {
-    auto const& hooks = ctx.manifest.hooks;
+    struct Subject {
+        const mcpp::manifest::Hooks* hooks;
+        std::filesystem::path        root;
+    };
+    std::vector<Subject> subjects;
+    if (ctx.workspaceMembers.empty())
+        subjects.push_back({&ctx.manifest.hooks, ctx.projectRoot});
+    else
+        for (auto const& m : ctx.workspaceMembers) subjects.push_back({&m.manifest.hooks, m.root});
 
     // `during_build` opens first and closes last: its interval is the one that
     // spans everything below. Its output is discarded unless --verbose, which
     // is the only way it could interleave into a compiler diagnostic.
-    mcpp::hooks::Span span(hooks, ctx.projectRoot, /*inheritOutput=*/verbose);
-    if (!span.ok()) return 1;
+    std::vector<std::unique_ptr<mcpp::hooks::Span>> spans;
+    for (auto const& sub : subjects) {
+        spans.push_back(std::make_unique<mcpp::hooks::Span>(
+            *sub.hooks, sub.root, /*inheritOutput=*/verbose));
+        if (!spans.back()->ok()) return 1;
+    }
 
-    if (!mcpp::hooks::invoke(hooks, mcpp::hooks::Event::BuildStart,
-                             ctx.projectRoot))
-        return 1;
+    for (auto const& sub : subjects)
+        if (!mcpp::hooks::invoke(*sub.hooks, mcpp::hooks::Event::BuildStart, sub.root))
+            return 1;
 
     int rc = mcpp::build::run_build_plan(ctx, verbose, no_cache, targetOverride);
 
     // Closed BEFORE the terminal hook. A "build finished" sound competing with
     // the background music it replaces is the ordering this line settles.
-    bool spanOk = span.finish();
+    bool spanOk = true;
+    for (auto it = spans.rbegin(); it != spans.rend(); ++it)
+        spanOk = (*it)->finish() && spanOk;
 
     auto terminalEvent = rc == 0 ? mcpp::hooks::Event::BuildFinished
                                  : mcpp::hooks::Event::BuildFailed;
     // The build's own exit code outranks the hook's: `mcpp build` returning
     // "the notifier failed" for a compile error would answer a question nobody
     // asked. A hook failure only decides the exit code of a build that worked.
-    bool hookOk = mcpp::hooks::invoke(hooks, terminalEvent, ctx.projectRoot);
+    bool hookOk = true;
+    for (auto const& sub : subjects)
+        hookOk = mcpp::hooks::invoke(*sub.hooks, terminalEvent, sub.root) && hookOk;
     return rc != 0 ? rc : ((spanOk && hookOk) ? 0 : 1);
 }
 
@@ -173,26 +271,89 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
         return mcpp::build::run_configure_plan(*ctx, verbose);
     };
 
-    // Workspace fan-out: build every member, one per the existing per-package
-    // pipeline (continue-on-failure; first non-zero exit wins). Checked before
-    // the fast path, which is single-package only.
-    if (auto members = workspace_fanout_members(parsed.is_flag_set("workspace"),
-                                                ov.package_filter)) {
-        int rc = 0;
-        for (auto& mp : *members) {
-            mcpp::build::BuildOverrides mo = ov;
-            mo.package_filter = mp;
-            if (configure_only) {
-                int r = configure_member(std::move(mo), mp);
+    // A workspace: the selected members, planned by configuration group
+    // (workspace design 2026-09-29 §15). Each group is one plan, one graph and
+    // one build directory, so a member that others use is compiled once.
+    // Groups are independent (a member reached from two groups is a node of
+    // each), and a failed group does not stop the others; the first non-zero
+    // exit wins.
+    auto selection = workspace_selection(parsed.is_flag_set("workspace"), ov.package_filter);
+    if (!selection) { std::println(stderr, "error: {}", selection.error()); return 2; }
+    if (*selection) {
+        auto const& members = (*selection)->members;
+        if (configure_only) {
+            int rc = 0;
+            for (auto const& mp : members) {
+                mcpp::build::BuildOverrides mo = ov;
+                mo.package_filter = mp;
+                int r = configure_member(std::move(mo), members.size() > 1 ? mp : "");
                 if (r != 0) rc = r;
-                continue;
             }
+            return rc;
+        }
+        auto groups = workspace_groups((*selection)->root, members);
+        if (!groups) { std::println(stderr, "error: {}", groups.error()); return 2; }
+        std::vector<std::string> request;
+        for (auto const& g : *groups)
+            for (auto const& mp : g) request.push_back(mp);
+        const bool plain = !print_fp && ov.target_triple.empty() && !ov.force_static
+            && ov.profile.empty() && ov.features.empty() && !ov.strict
+            && ov.capabilities.empty() && ov.cache_mode.empty() && ov.accel.empty();
+        if (plain) {
+            if (auto rc = mcpp::build::try_fast_workspace_build(
+                    (*selection)->root, *groups, verbose, no_cache))
+                return *rc;
+        }
+        // Every group is planned first, one after another: planning runs
+        // build programs and narrates what it resolves. The groups' builds
+        // are then independent (§6), and run at the same time, each with a
+        // static share of the machine's jobs, so the total stays within what
+        // one build would use.
+        int rc = 0;
+        std::vector<mcpp::build::BuildContext> contexts;
+        for (auto const& g : *groups) {
+            mcpp::build::BuildOverrides mo = ov;
+            mo.package_filter.clear();
+            mo.project_root = (*selection)->root;
+            mo.workspace_members = g;
+            mo.workspace_request = request;
             auto ctx = mcpp::build::prepare_build(print_fp, /*includeDevDeps=*/false,
                                                   /*extraTargets=*/{}, mo);
-            if (!ctx) { std::println(stderr, "error: {}: {}", mp, ctx.error()); rc = 2; continue; }
-            int r = run_build_with_hooks(*ctx, verbose, no_cache, mo.target_triple);
-            if (r != 0) rc = r;
+            if (!ctx) { std::println(stderr, "error: {}", ctx.error()); rc = 2; continue; }
+            contexts.push_back(std::move(*ctx));
         }
+        if (contexts.size() == 1) {
+            const int r = run_build_with_hooks(contexts.front(), verbose, no_cache,
+                                               ov.target_triple);
+            return r != 0 ? r : rc;
+        }
+        const std::size_t hw = std::max(1u, std::thread::hardware_concurrency());
+        std::set<std::filesystem::path> directories;
+        for (auto const& c : contexts) directories.insert(c.outputDir.lexically_normal());
+        for (auto& c : contexts) {
+            const std::size_t want = c.plan.scheduleNinjaJobs > 0
+                ? static_cast<std::size_t>(c.plan.scheduleNinjaJobs) : hw + 2;
+            c.plan.scheduleNinjaJobs = static_cast<int>(
+                std::max<std::size_t>(1, want / directories.size()));
+        }
+        // Concurrency is across build directories. Two groups whose values
+        // resolve to one directory (one toolchain spelled two ways) are built
+        // one after the other in it, since one ninja owns a directory.
+        std::map<std::filesystem::path, std::vector<std::size_t>> byDirectory;
+        for (std::size_t i = 0; i < contexts.size(); ++i)
+            byDirectory[contexts[i].outputDir.lexically_normal()].push_back(i);
+        std::vector<int> results(contexts.size(), 0);
+        {
+            std::vector<std::jthread> builds;
+            for (auto const& [dir, indices] : byDirectory)
+                builds.emplace_back([&, indices] {
+                    for (auto i : indices)
+                        results[i] = run_build_with_hooks(contexts[i], verbose, no_cache,
+                                                          ov.target_triple);
+                });
+        }
+        for (int r : results)
+            if (r != 0 && rc == 0) rc = r;
         return rc;
     }
 

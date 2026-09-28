@@ -290,6 +290,39 @@ struct PrepareState {
     std::optional<mcpp::project::EffectiveManifest> effective;
     std::expected<mcpp::manifest::Manifest, std::string> m = std::unexpected(std::string{});
     std::optional<mcpp::manifest::Manifest> wsManifest;  // keep workspace manifest alive
+    // The members this plan builds (workspace design 2026-09-29 §15), by
+    // normalised directory, each with the directory below `bin/` its products
+    // are placed in. Empty outside a workspace plan. The members as written in
+    // `[workspace] members`, in selection order, beside it.
+    std::map<std::filesystem::path, std::string> selectedMembers;
+    std::vector<std::string> selectedMemberPaths;
+    // `--features <dependency>/<feature>` tokens, by the selected member that
+    // declares the dependency key: the forwards its edges receive.
+    std::map<std::filesystem::path, std::vector<std::pair<std::string, std::string>>>
+        memberCliForwards;
+    // The profile's own compile flags (`[profile.<name>] cflags`/`cxxflags`),
+    // which a root receives; in a workspace plan every selected member does.
+    std::vector<std::string> profileCflags, profileCxxflags;
+    bool workspacePlan() const { return !selectedMemberPaths.empty(); }
+    // `--features` as the command gave it. A workspace plan hands the tokens to
+    // its members and clears `overrides.features`; the request is still what
+    // the build was asked for, and what its fast-path record names.
+    std::string requestedFeatures;
+    // A package of a workspace plan that is a member of the workspace, selected
+    // or reached as another member's dependency (the workspace's own package
+    // included): its build program runs where a root's does (§15).
+    std::function<bool(std::size_t)> isWorkspaceMemberPackage;
+    // The selected member whose directory is `dir`, when there is one: the
+    // key into `selectedMembers` and `memberCliForwards` (weakly canonical,
+    // so a symbolic link in the path names the same member).
+    std::optional<std::filesystem::path> selectedMemberAt(const std::filesystem::path& dir) const {
+        if (selectedMembers.empty()) return std::nullopt;
+        std::error_code ec;
+        auto key = std::filesystem::weakly_canonical(dir, ec);
+        if (ec) key = dir.lexically_normal();
+        if (selectedMembers.contains(key)) return key;
+        return std::nullopt;
+    }
     std::filesystem::path runtimeWorkspaceRoot;
     mcpp::xlings::runtime::RuntimeSelection runtimeSelection;
     std::filesystem::path workRoot;
@@ -504,8 +537,12 @@ struct PrepareState {
 std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& state);
 
 // plan.cpp: the member path of a package root within the workspace this build
-// runs in, or empty (#734 E1, W3).
+// runs in, or empty (W3).
 std::string workspace_member_of(const PrepareState& state, const std::filesystem::path& root);
+// graph.cpp: a dependency's link flags as its consumer's link reads them --
+// word by word, each search path made absolute against the package.
+std::vector<std::string> normalized_dependency_ldflags(
+    const std::filesystem::path& depRoot, const std::vector<std::string>& ldflags);
 std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state);
 std::expected<void, std::string> phase2_define_toolchain_resolver(PrepareState& state);
 std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state);

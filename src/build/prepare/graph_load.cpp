@@ -109,7 +109,8 @@ static void step4a_define_split_and_identity_closures(PrepareState& state) {
             const auto feats = i < state.activeFeaturesByPackage.size()
                 ? state.activeFeaturesByPackage[i] : std::vector<std::string>{};
             for (auto const& spec : applicable_xlings_addresses(
-                     man, feats, state.toolPurpose, /*isRoot=*/i == 0))
+                     man, feats, state.toolPurpose, /*isRoot=*/i == 0
+                         || state.packages[i].selectedMember))
                 claims.push_back({spec, describe(i), i == 0 ? 0 : 1});
         }
         auto unified = addrset::unify(claims);
