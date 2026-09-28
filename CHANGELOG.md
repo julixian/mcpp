@@ -77,6 +77,11 @@ to 2026.9.29.1.
   beside several programs is one file with several names where the file system
   supports links, and a copy elsewhere. Other deployed files are copied, since
   a program may write a file beside itself (e2e 835).
+- **Files served from the global cache are staged by a ninja pass of their
+  own**, before the build that reads them. ninja 1.12.1 crashed when a cached
+  dependency was staged again in a directory whose scans were current
+  (ninja-build/ninja#2662); a directory named by its configuration makes that
+  the ordinary case of a dependency upgrade.
 - **The fast path records the request.** `build.ninja` states the workspace
   members and the features it was planned for, and a fast path replays it only
   for the same request; one record is kept per selection and configuration.
