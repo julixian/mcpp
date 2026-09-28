@@ -358,6 +358,14 @@ static std::string normalizeDepLdflag(const std::filesystem::path& depRoot,
         return flag;
 }
 
+std::vector<std::string> normalized_dependency_ldflags(
+        const std::filesystem::path& depRoot, const std::vector<std::string>& ldflags) {
+        std::vector<std::string> out;
+        for (auto const& word : mcpp::manifest::flag_words(ldflags))
+            out.push_back(mcpp::manifest::flag_element(normalizeDepLdflag(depRoot, word)));
+        return out;
+}
+
 static std::vector<std::string> propagateLinkFlags(
         PrepareState& state,
         const std::filesystem::path& depRoot,
@@ -1550,7 +1558,12 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                         "git clone of '{}' failed:\n{}", spec.git, r.output));
                 }
             }
-            if (item.consumerDepIndex == kMainConsumer) {
+            // A selected workspace member's own git dependencies are locked
+            // as a root's are (workspace design 2026-09-29 §15).
+            const bool consumerIsMember = item.consumerDepIndex != kMainConsumer
+                && item.consumerDepIndex + 1 < state.packages.size()
+                && state.packages[item.consumerDepIndex + 1].memberProducts.has_value();
+            if (item.consumerDepIndex == kMainConsumer || consumerIsMember) {
                 // Only root deps are locked: the writer below walks the root
                 // manifest's [dependencies], so a transitive git branch dep
                 // has no anchor and still resolves over the network.
@@ -1736,7 +1749,15 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         // answered it; otherwise two indices containing the same short name
         // collapse in runtime provenance even though resolution distinguished
         // them correctly.
-        if (ctx.dep_manifest->package.namespace_.empty()) {
+        //
+        // A workspace member of a workspace plan is the project being
+        // developed, and keeps the identity its own manifest states, as when
+        // it was the root of its own build (workspace design 2026-09-29 §15):
+        // a member that declares no namespace is named by its bare name.
+        const bool workspaceMemberHere = state.workspacePlan() && sourceKind == "path"
+            && (ctx.dep_root.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal()
+                || !workspace_member_of(state, ctx.dep_root).empty());
+        if (ctx.dep_manifest->package.namespace_.empty() && !workspaceMemberHere) {
             ctx.dep_manifest->package.namespace_ = key.ns.empty()
                 ? std::string(mcpp::pm::kDefaultNamespace) : key.ns;
         }

@@ -304,6 +304,10 @@ struct PrepareState {
     // which a root receives; in a workspace plan every selected member does.
     std::vector<std::string> profileCflags, profileCxxflags;
     bool workspacePlan() const { return !selectedMemberPaths.empty(); }
+    // `--features` as the command gave it. A workspace plan hands the tokens to
+    // its members and clears `overrides.features`; the request is still what
+    // the build was asked for, and what its fast-path record names.
+    std::string requestedFeatures;
     // A package of a workspace plan that is a member of the workspace, selected
     // or reached as another member's dependency (the workspace's own package
     // included): its build program runs where a root's does (§15).
@@ -535,6 +539,10 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
 // plan.cpp: the member path of a package root within the workspace this build
 // runs in, or empty (W3).
 std::string workspace_member_of(const PrepareState& state, const std::filesystem::path& root);
+// graph.cpp: a dependency's link flags as its consumer's link reads them --
+// word by word, each search path made absolute against the package.
+std::vector<std::string> normalized_dependency_ldflags(
+    const std::filesystem::path& depRoot, const std::vector<std::string>& ldflags);
 std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state);
 std::expected<void, std::string> phase2_define_toolchain_resolver(PrepareState& state);
 std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state);

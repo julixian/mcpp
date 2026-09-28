@@ -56,13 +56,24 @@ for m in silent pinned adds; do
     printf '#include <shared.h>\n#if !defined(FROM_WORKSPACE) || !defined(SHARED_HEADER_FOUND)\n#error "workspace [build] did not reach the member"\n#endif\nint main(){return 0;}\n' > "$m/src/main.cpp"
 done
 
+# The workspace keeps one compile database per configuration at its root
+# (workspace design 2026-09-29 §7.1); a member's command is its entry there.
+entry_of() {  # $1 = member dir: the member's main.cpp entry, one word per line
+    python3 -c '
+import json, sys
+for e in json.load(open("compile_commands.json")):
+    if e["file"].replace(chr(92), "/").endswith(sys.argv[1] + "/src/main.cpp"):
+        print("\n".join(e.get("arguments") or e["command"].split()))
+        break
+' "$1"
+}
 flags_of() {  # $1 = member dir
-    grep -oE '\-std=c\+\+[0-9a-z]+|\-DFROM_[A-Z]+=1' "$1/compile_commands.json" \
-        | sort -u | tr '\n' ' '
+    grep -oE '\-std=c\+\+[0-9a-z]+|\-DFROM_[A-Z]+=1' "$1.entry" | sort -u | tr '\n' ' '
 }
 
 for m in silent pinned adds; do
     "$MCPP" build -p "$m" > "build_$m.log" 2>&1 || { cat "build_$m.log"; exit 1; }
+    entry_of "$m" > "$m.entry"
 done
 
 # ── silent: inherits both ───────────────────────────────────────────────────
@@ -77,7 +88,7 @@ case "$got" in
     *) echo "FAIL: member 'silent' did not inherit [workspace.package] standard"
        echo "      got: $got"; exit 1 ;;
 esac
-grep -q '"version": *"0.4.2"' silent/target/*/*/resolution.json 2>/dev/null \
+grep -q '"version": *"0.4.2"' target/*/*/resolution.json 2>/dev/null \
     || grep -q "0.4.2" build_silent.log \
     || { echo "FAIL: member 'silent' did not inherit [workspace.package] version"
          cat build_silent.log; exit 1; }
@@ -112,8 +123,8 @@ done
 # own flag has to come after the workspace's. The CDB is pretty-printed with one
 # argument per line, so the question is which line number comes first — matching
 # both on a single line would silently never fire.
-ws_at=$(grep -n 'FROM_WORKSPACE=1' adds/compile_commands.json | head -1 | cut -d: -f1)
-mem_at=$(grep -n 'FROM_MEMBER=1' adds/compile_commands.json | head -1 | cut -d: -f1)
+ws_at=$(grep -n 'FROM_WORKSPACE=1' adds.entry | head -1 | cut -d: -f1)
+mem_at=$(grep -n 'FROM_MEMBER=1' adds.entry | head -1 | cut -d: -f1)
 [ -n "$ws_at" ] && [ -n "$mem_at" ] || {
     echo "FAIL: could not locate both flags in the compile command"; exit 1; }
 [ "$ws_at" -lt "$mem_at" ] || {
@@ -123,6 +134,7 @@ mem_at=$(grep -n 'FROM_MEMBER=1' adds/compile_commands.json | head -1 | cut -d: 
 # ── inside: the second inheritance site ─────────────────────────────────────
 ( cd silent && "$MCPP" build > ../build_inside.log 2>&1 ) \
     || { cat build_inside.log; exit 1; }
+entry_of silent > silent.entry
 got=$(flags_of silent)
 case "$got" in
     *"-DFROM_WORKSPACE=1"*"-std=c++26"* | *"-std=c++26"*"-DFROM_WORKSPACE=1"*) ;;

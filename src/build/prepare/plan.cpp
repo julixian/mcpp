@@ -162,7 +162,42 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
             if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
                 roots.push_back(std::move(normalized));
         }
+        // A workspace plan's members are its projects: their trees are what
+        // the fast path sweeps, the workspace's own package included.
+        if (state.workspacePlan())
+            for (std::size_t i = 1; i < state.packages.size(); ++i) {
+                if (!state.packages[i].memberProducts) continue;
+                auto normalized = state.packages[i].root.lexically_normal();
+                if (std::find(roots.begin(), roots.end(), normalized) == roots.end())
+                    roots.push_back(normalized);
+            }
         ctx.depSourceRoots = std::move(roots);
+    }
+    // The selected members, in selection order (§15).
+    if (state.workspacePlan()) {
+        for (auto const& mp : state.selectedMemberPaths) {
+            std::error_code ec;
+            auto dir = std::filesystem::weakly_canonical(state.runtimeWorkspaceRoot / mp, ec);
+            if (ec) dir = (state.runtimeWorkspaceRoot / mp).lexically_normal();
+            for (std::size_t i = 1; i < state.packages.size(); ++i) {
+                auto const& pkg = state.packages[i];
+                if (!pkg.memberProducts) continue;
+                std::error_code pec;
+                auto root = std::filesystem::weakly_canonical(pkg.root, pec);
+                if (pec) root = pkg.root.lexically_normal();
+                if (root != dir) continue;
+                ctx.workspaceMembers.push_back({
+                    .name = pkg.manifest.package.namespace_.empty()
+                        ? pkg.manifest.package.name
+                        : pkg.manifest.package.namespace_ + "." + pkg.manifest.package.name,
+                    .memberPath = mp,
+                    .root = pkg.root,
+                    .productDir = *pkg.memberProducts,
+                    .manifest = pkg.manifest,
+                });
+                break;
+            }
+        }
     }
     return {};
 }
@@ -365,11 +400,34 @@ static std::expected<void, std::string> step13_link_forms(PrepareState& state, B
 }
 
 static std::expected<void, std::string> step13_make_plan(PrepareState& state, BuildContext& ctx) {
+    // A workspace plan links each member's closure with that closure's own
+    // flags (workspace design 2026-09-29 §15): each package's link flags,
+    // its build program's included, with search paths made absolute against
+    // the package, as the root's pooled list holds them outside a workspace.
+    if (state.workspacePlan())
+        for (std::size_t i = 1; i < state.packages.size(); ++i)
+            state.packages[i].linkUsage.ldflags = normalized_dependency_ldflags(
+                state.packages[i].root, state.packages[i].manifest.buildConfig.ldflags);
     auto planResult = mcpp::build::make_plan(*state.m, *state.tc, state.fp, state.scan.graph, state.report.topoOrder,
                                              state.packages, *state.root, ctx.outputDir,
                                              state.stdBmiPath, state.stdObjectPath, state.storeRoots);
     if (!planResult) return std::unexpected(planResult.error());
     ctx.plan        = std::move(*planResult);
+    // The request the graph is planned for (§3, §15): the plan's members and
+    // the requested features, which name no directory.
+    if (state.workspacePlan()) {
+        auto join = [](const std::vector<std::string>& v) {
+            std::string out;
+            for (auto const& x : v) { if (!out.empty()) out += '\x1e'; out += x; }
+            return out;
+        };
+        ctx.workspaceGroup = join(state.selectedMemberPaths);
+        ctx.workspaceRequest = state.overrides.workspace_request.empty()
+            ? ctx.workspaceGroup : join(state.overrides.workspace_request);
+    }
+    ctx.plan.requestTag = mcpp::build::request_tag(
+        ctx.workspaceGroup,
+        state.workspacePlan() ? state.requestedFeatures : state.overrides.features);
     // SPEC-007 R4.3: a declared deploy outranks a search directory's file of
     // the same name, and a difference between the two is stated ONCE, by the
     // post-link placement edge, through the edge-advice channel
@@ -2127,7 +2185,8 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     ctx.runtimeSelection = state.runtimeSelection;
     ctx.runtimeBinding = state.runtimeBindingSnapshot;
     ctx.profile     = state.effectiveProfile;
-    ctx.activeFeatureRequest = state.overrides.features;
+    ctx.activeFeatureRequest = state.workspacePlan() ? state.requestedFeatures
+                                                     : state.overrides.features;
     ctx.compilerChoice = { std::string(tc_origin_name(state.tcOrigin)),
                            state.graphCompilerRequiredBy,
                            state.graphCompilerReplaced.empty() ? state.pinReplacedDefault
@@ -2156,6 +2215,15 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
 
     ctx.planNotes = std::move(state.planNotes);
     return ctx;
+}
+
+void focus_on_member(BuildContext& ctx) {
+    if (ctx.workspaceMembers.size() != 1) return;
+    auto& m = ctx.workspaceMembers.front();
+    for (auto& g : ctx.plan.linkGroups)
+        if (g.member == m.name) { swap_link_group(ctx.plan, g); break; }
+    ctx.manifest = m.manifest;
+    ctx.projectRoot = m.root;
 }
 
 } // namespace mcpp::build

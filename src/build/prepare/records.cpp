@@ -121,8 +121,19 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
         }
 
         // Git deps: root-declared only, unchanged (see the note above).
-        for (auto const& [name, spec] : state.m->dependencies) {
+        // The root's git dependencies, and in a workspace plan each selected
+        // member's (§15).
+        std::vector<std::pair<std::string, mcpp::manifest::DependencySpec>> gitDeps;
+        for (auto const& [name, spec] : state.m->dependencies) gitDeps.emplace_back(name, spec);
+        if (state.workspacePlan())
+            for (std::size_t i = 1; i < state.packages.size(); ++i)
+                if (state.packages[i].memberProducts)
+                    for (auto const& [name, spec] : state.packages[i].manifest.dependencies)
+                        gitDeps.emplace_back(name, spec);
+        std::set<std::string> gitLocked;
+        for (auto const& [name, spec] : gitDeps) {
             if (!spec.isGit()) continue;
+            if (!gitLocked.insert(name).second) continue;
             mcpp::lockfile::LockedPackage lp;
             lp.name    = name;
             lp.version = spec.gitRev;
@@ -169,6 +180,35 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
             lp.hash = mcpp::pm::index_package_digest(sourceIndex, lp.name, lp.version);
             lock.packages.push_back(std::move(lp));
         }
+        // A workspace's lock is at its root and records every member's
+        // resolution (§15). A plan of some of its members updates the entries
+        // it resolved and keeps the others; a plan of all of them writes the
+        // whole record.
+        bool partialWorkspace = false;
+        if (state.workspacePlan() && state.wsManifest) {
+            std::set<std::string> all(state.wsManifest->workspace.members.begin(),
+                                      state.wsManifest->workspace.members.end());
+            if (!state.wsManifest->package.name.empty()) all.insert(".");
+            std::set<std::string> planned(state.selectedMemberPaths.begin(),
+                                          state.selectedMemberPaths.end());
+            for (auto const& mp : state.overrides.workspace_request) planned.insert(mp);
+            partialWorkspace = !std::ranges::includes(planned, all);
+        }
+        if (partialWorkspace) {
+            if (auto prior = mcpp::lockfile::load(state.workRoot / "mcpp.lock")) {
+                auto keyOf = [](const mcpp::lockfile::LockedPackage& p) {
+                    return p.namespace_ + "\x1f" + p.name;
+                };
+                std::set<std::string> resolvedHere;
+                for (auto const& p : lock.packages) resolvedHere.insert(keyOf(p));
+                for (auto const& p : prior->packages)
+                    if (!resolvedHere.contains(keyOf(p))) lock.packages.push_back(p);
+                std::set<std::string> indicesHere;
+                for (auto const& i : lock.indices) indicesHere.insert(i.name);
+                for (auto const& i : prior->indices)
+                    if (!indicesHere.contains(i.name)) lock.indices.push_back(i);
+            }
+        }
         if (!lock.packages.empty() || !lock.indices.empty()) {
             auto lockPath = state.workRoot / "mcpp.lock";
             // `--locked` ASSERTS THAT THIS RESOLUTION IS THE RECORDED ONE.
@@ -206,8 +246,11 @@ std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildConte
                     if (it == was.end())      drift.push_back(k + " " + v + " (not in the lock)");
                     else if (it->second != v) drift.push_back(k + " " + it->second + " -> " + v);
                 }
-                for (auto const& [k, v] : was)
-                    if (!now.contains(k)) drift.push_back(k + " " + v + " (no longer resolved)");
+                // A plan of some of a workspace's members resolves some of
+                // the lock; what it did not resolve is not drift.
+                if (!partialWorkspace)
+                    for (auto const& [k, v] : was)
+                        if (!now.contains(k)) drift.push_back(k + " " + v + " (no longer resolved)");
                 if (!drift.empty()) {
                     std::string msg = "--locked was given and this resolution "
                                       "differs from mcpp.lock:";

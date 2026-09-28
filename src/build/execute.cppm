@@ -96,7 +96,7 @@ constexpr std::string_view kBuildCacheFile = "target/.build_cache";
 // working set is now targets × profiles rather than targets alone — 4 was
 // enough for one profile, not for a dev/release/dist rotation across a host
 // and a cross target.
-constexpr int kBuildCacheMaxEntries = 8;
+constexpr int kBuildCacheMaxEntries = 32;
 
 // P3: one entry per (target, fingerprint) pair.
 // THE INPUTS THAT CHOOSE A TOOLCHAIN AND ARE NOT IN THE MANIFEST.
@@ -246,6 +246,13 @@ struct BuildCacheEntry {
     // the list for the reason `depSourceRootsRecorded` is.
     std::vector<std::string> xlingsPayloads;
     bool                     xlingsPayloadsRecorded = false;
+    // The workspace selection of the command that wrote the entry, and the
+    // members of the entry's own plan, each joined by a unit separator
+    // (workspace design 2026-09-29 §15). Empty outside a workspace. One
+    // command on a workspace writes one entry per configuration group, and a
+    // fast path matches every entry of its selection.
+    std::string              selection;
+    std::string              group;
 };
 
 std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& projectRoot) {
@@ -383,6 +390,15 @@ std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& proje
             e.xlingsPayloadsRecorded = true;
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
+        // Optional `selection=` and `group=`; absent outside a workspace.
+        if (haveNextLine && line.starts_with("selection=")) {
+            e.selection = line.substr(10);
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
+        if (haveNextLine && line.starts_with("group=")) {
+            e.group = line.substr(6);
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
         entries.push_back(std::move(e));
         if (!haveNextLine || line.empty()) break;
     }
@@ -431,7 +447,14 @@ void write_build_cache(const std::filesystem::path& projectRoot,
                        bool runTierPending = false,
                        const std::string& features = {},
                        const std::string& toolchainRequest = {},
-                       std::vector<std::string> xlingsPayloads = {}) {
+                       std::vector<std::string> xlingsPayloads = {},
+                       const std::string& selection = {},
+                       const std::string& group = {}) {
+    // The configuration groups of one workspace command build at the same
+    // time (workspace design 2026-09-29 §6) and record into one file; the
+    // read, the edit and the write are one step.
+    static std::mutex cacheWrite;
+    std::lock_guard lock(cacheWrite);
     auto path = projectRoot / kBuildCacheFile;
     auto entries = read_build_cache(projectRoot);
 
@@ -440,7 +463,8 @@ void write_build_cache(const std::filesystem::path& projectRoot,
     // switching profiles back and forth could never be incremental AND the
     // surviving entry pointed at the other profile's build dir.
     std::erase_if(entries, [&](const BuildCacheEntry& e) {
-        return e.targetTriple == targetTriple && e.profile == profile;
+        return e.targetTriple == targetTriple && e.profile == profile
+            && e.selection == selection && e.group == group;
     });
 
     // Insert at front (MRU).
@@ -459,6 +483,8 @@ void write_build_cache(const std::filesystem::path& projectRoot,
     newEntry.toolchainRecorded = true;
     newEntry.xlingsPayloads = std::move(xlingsPayloads);
     newEntry.xlingsPayloadsRecorded = true;
+    newEntry.selection = selection;
+    newEntry.group = group;
     entries.insert(entries.begin(), std::move(newEntry));
 
     // Trim to LRU capacity.
@@ -505,6 +531,10 @@ void write_build_cache_entries(const std::filesystem::path& path,
         f << "toolchain=" << e.toolchainRequest << '\n';
         f << "xlingsPayloads=" << e.xlingsPayloads.size() << '\n';
         for (auto& p : e.xlingsPayloads) f << p << '\n';
+        if (!e.selection.empty() || !e.group.empty()) {
+            f << "selection=" << e.selection << '\n';
+            f << "group=" << e.group << '\n';
+        }
     }
 }
 
@@ -889,6 +919,11 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
     for (auto& note : ctx.manifest.inferredNotes) {
         mcpp::ui::status("Inferred", note);
     }
+    // A plan of one workspace member reports what was inferred about the
+    // member, as its own build did (§15).
+    if (ctx.workspaceMembers.size() == 1)
+        for (auto& note : ctx.workspaceMembers.front().manifest.inferredNotes)
+            mcpp::ui::status("Inferred", note);
 
     // Announce the package being built (and any deps). A dep served from the
     // global cache says "Cached" and HOW MANY translation units that saved. The
@@ -900,9 +935,12 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
     for (auto& dep : ctx.cachedDeps) cachedUnits[dep.name] = dep.units;
     std::set<std::string> announced;
     announced.insert(ctx.manifest.package.name);
-    mcpp::ui::status("Compiling",
-        std::format("{} v{} (.)",
-                    ctx.manifest.package.name, ctx.manifest.package.version));
+    // A workspace plan's virtual root compiles nothing; its members are
+    // announced as its dependencies, by their directories (§15).
+    if (!ctx.manifest.package.virtualRoot)
+        mcpp::ui::status("Compiling",
+            std::format("{} v{} (.)",
+                        ctx.manifest.package.name, ctx.manifest.package.version));
     for (auto& [name, spec] : ctx.manifest.dependencies) {
         if (announced.contains(name)) continue;
         announced.insert(name);
@@ -928,7 +966,14 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
             return std::format("(git {} {})",
                                spec.gitRefKind.empty() ? "rev" : spec.gitRefKind, ref);
         };
-        std::string ver = spec.isPath()
+        auto memberDir = [&] {
+            auto rel = std::filesystem::path(spec.path).lexically_normal()
+                           .lexically_relative(ctx.projectRoot.lexically_normal()).generic_string();
+            return std::format("({})", rel.empty() ? std::string(".") : rel);
+        };
+        std::string ver = spec.workspaceMember
+            ? memberDir()
+            : spec.isPath()
             ? "(path)"
             : spec.isGit()
             ? gitReference()
@@ -1007,6 +1052,7 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
         for (auto& e : entries) {
             if (e.targetTriple == targetOverride && e.profile == ctx.profile
                 && e.cacheMode == cache_mode_name(ctx.cacheMode)
+                && e.selection == ctx.workspaceRequest && e.group == ctx.workspaceGroup
                 && !e.fingerprint.empty()) {
                 auto newFp = ctx.outputDir.filename().string();
                 if (e.fingerprint != newFp) {
@@ -1060,7 +1106,8 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
                               for (auto const& p : ctx.xlingsPayloads)
                                   v.push_back(p.generic_string());
                               return v;
-                          }());
+                          }(),
+                          ctx.workspaceRequest, ctx.workspaceGroup);
     }
 
     // The one place the --strict policy is settled. Degradations reported by
@@ -1556,7 +1603,8 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     for (auto& e : entries) {
         if (e.targetTriple == currentTarget && e.profile == want->profile
             && e.cacheMode == want->cacheMode && e.features == want->features
-            && e.toolchainRecorded && e.toolchainRequest == want->toolchainRequest) {
+            && e.toolchainRecorded && e.toolchainRequest == want->toolchainRequest
+            && e.selection.empty()) {
             match = &e;
             break;
         }
@@ -1599,6 +1647,10 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     // printed `Finished`; and a broken file under tests/ (never scanned here)
     // failed a plain `mcpp build` outright.
     if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("build", "build.ninja was written by another mode (test, pack or a named target)");
+    // What the graph was planned for (workspace design 2026-09-29 §3): the
+    // features no longer name the directory, so the graph says which it has.
+    if (mcpp::build::read_request(ninjaPath) != mcpp::build::request_tag({}, want->features))
+        return fast_path_declined("build", "build.ninja was written for another request (features or workspace members)");
 
     auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
     if (ec) return fast_path_declined("build", "the time of build.ninja cannot be read");
@@ -1650,6 +1702,111 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     return 0;
 }
 
+// The fast path of a command on a workspace (workspace design 2026-09-29
+// §15): one record per configuration group of the command's selection, each
+// checked the way `try_fast_build` checks a project's record, and the groups'
+// graphs replayed when every one is current. A build with nothing to do then
+// costs one check per group instead of a plan. The freshness sweep covers the
+// trees of the members and of the `path` dependencies each record names, not
+// the workspace's whole tree.
+export std::optional<int> try_fast_workspace_build(
+        const std::filesystem::path& wsRoot,
+        const std::vector<std::vector<std::string>>& groups,
+        bool verbose, bool no_cache) {
+    if (no_cache) return fast_path_declined("workspace", "the build cache is off (--no-cache)");
+    if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
+        return fast_path_declined("workspace", "MCPP_LOCKED=1 asks for a locked resolution");
+    auto join = [](const std::vector<std::string>& v) {
+        std::string out;
+        for (auto const& x : v) { if (!out.empty()) out += '\x1e'; out += x; }
+        return out;
+    };
+    std::vector<std::string> request;
+    for (auto const& g : groups) request.insert(request.end(), g.begin(), g.end());
+    const auto selection = join(request);
+    const auto entries = read_build_cache(wsRoot);
+
+    struct Ready {
+        std::filesystem::path outputDir;
+        std::string ninjaProgram, runtimeEnvKey, runtimeEnvValue;
+        mcpp::build::runtime_validation::ArtifactSnapshot validated;
+    };
+    std::vector<Ready> ready;
+    std::string profile;
+    std::error_code ec;
+    const auto wsToml = std::filesystem::last_write_time(wsRoot / "mcpp.toml", ec);
+    if (ec) return fast_path_declined("workspace", "the workspace's mcpp.toml cannot be read");
+    for (auto const& g : groups) {
+        auto want = fast_path_identity(wsRoot / g.front());
+        if (!want) return fast_path_declined("workspace", "a member's manifest could not be read");
+        for (auto const& mp : g) {
+            auto w = mp == g.front() ? want : fast_path_identity(wsRoot / mp);
+            if (!w) return fast_path_declined("workspace", "a member's manifest could not be read");
+            if (w->hooksActive)
+                return fast_path_declined("workspace", "a member declares [hooks], which run on every build");
+        }
+        const auto group = join(g);
+        const BuildCacheEntry* match = nullptr;
+        for (auto const& e : entries)
+            if (e.targetTriple.empty() && e.profile == want->profile
+                && e.cacheMode == want->cacheMode && e.features.empty()
+                && e.toolchainRecorded && e.toolchainRequest == want->toolchainRequest
+                && e.selection == selection && e.group == group) { match = &e; break; }
+        if (!match) return fast_path_declined("workspace", "no recorded build matches this selection");
+        if (!match->runtimeBinding || match->runtimeEnvKey.empty())
+            return fast_path_declined("workspace", "the recorded build predates the runtime binding");
+        const std::filesystem::path outputDir(match->outputDir);
+        if (!match->fingerprint.empty() && outputDir.filename().string() != match->fingerprint)
+            return fast_path_declined("workspace", "the recorded build directory is not the one for this fingerprint");
+        const auto ninjaPath = outputDir / "build.ninja";
+        if (!std::filesystem::exists(ninjaPath, ec))
+            return fast_path_declined("workspace", "build.ninja does not exist");
+        if (!mcpp::build::is_plain_build_graph(ninjaPath))
+            return fast_path_declined("workspace", "build.ninja was written by another mode (test, pack or a named target)");
+        if (mcpp::build::read_request(ninjaPath) != mcpp::build::request_tag(group, {}))
+            return fast_path_declined("workspace", "build.ninja was written for another request (features or workspace members)");
+        const auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
+        if (ec) return fast_path_declined("workspace", "the time of build.ninja cannot be read");
+        const auto runtimeTime = std::filesystem::last_write_time(
+            match->runtimeBinding->subosDir / ".xlings.json", ec);
+        if (ec || runtimeTime > ninjaTime)
+            return fast_path_declined("workspace", "the runtime's .xlings.json is newer than build.ninja");
+        if (wsToml > ninjaTime)
+            return fast_path_declined("workspace", "the workspace's mcpp.toml is newer than build.ninja");
+        if (!match->depSourceRootsRecorded
+            || dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
+            return fast_path_declined("workspace", "a member's or a path dependency's manifest or source is newer than build.ninja");
+        if (!xlings_payloads_present(*match))
+            return fast_path_declined("workspace", "a recorded xlings payload is missing");
+        auto validated = mcpp::build::runtime_validation::validated_artifact_snapshot(
+            outputDir, *match->runtimeBinding);
+        if (!validated)
+            return fast_path_declined("workspace", "no validated artifact snapshot is recorded for this build");
+        auto ninjaProgram = match->ninjaProgram;
+        if (ninjaProgram.size() >= 2 && ninjaProgram.front() == '\''
+                                     && ninjaProgram.back() == '\'')
+            ninjaProgram = ninjaProgram.substr(1, ninjaProgram.size() - 2);
+        ready.push_back({outputDir, ninjaProgram, match->runtimeEnvKey,
+                         match->runtimeEnvValue, std::move(*validated)});
+        profile = want->profile;
+    }
+
+    std::chrono::milliseconds total{};
+    for (auto& r : ready) {
+        restore_root_compile_commands(wsRoot, r.outputDir);
+        std::chrono::milliseconds elapsed{};
+        auto rc = run_ninja_fast(r.ninjaProgram, r.outputDir, r.outputDir / "build.ninja",
+                                 verbose, r.runtimeEnvKey, r.runtimeEnvValue, &elapsed);
+        if (!rc) return fast_path_declined("workspace", "ninja reported a stale graph");
+        if (*rc != 0) return rc;
+        if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(r.validated))
+            return fast_path_declined("workspace", "ninja relinked an artifact, whose closure the full path validates");
+        total += elapsed;
+    }
+    mcpp::ui::finished(profile, total);
+    return 0;
+}
+
 // mcpp#225 (E2): `mcpp run`'s fast path. Mirrors try_fast_build's
 // fingerprint/freshness gate against the SAME cache entry `mcpp build`
 // wrote (targetTriple == "" — a HOST build; see the precondition below), then
@@ -1695,7 +1852,8 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     for (auto& e : entries) {
         if (e.targetTriple.empty() && e.profile == want->profile
             && e.cacheMode == want->cacheMode && e.features == want->features
-            && e.toolchainRecorded && e.toolchainRequest == want->toolchainRequest) {
+            && e.toolchainRecorded && e.toolchainRequest == want->toolchainRequest
+            && e.selection.empty()) {
             match = &e;
             break;
         }
@@ -1759,6 +1917,10 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // the run target at all, so running ninja against it would report success
     // and then exec a stale (or absent) binary.
     if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("run", "build.ninja was written by another mode (test, pack or a named target)");
+    // What the graph was planned for (workspace design 2026-09-29 §3): the
+    // features no longer name the directory, so the graph says which it has.
+    if (mcpp::build::read_request(ninjaPath) != mcpp::build::request_tag({}, want->features))
+        return fast_path_declined("run", "build.ninja was written for another request (features or workspace members)");
     auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
     if (ec) return fast_path_declined("run", "the time of build.ninja cannot be read");
 
@@ -2256,6 +2418,9 @@ export int build_run_target(const std::optional<std::string>& targetName,
     if (auto rc = run_build_plan(*ctx, /*verbose=*/false, no_cache, target_triple);
         rc != 0)
         return rc;
+    // The program run is the selected member's (workspace design 2026-09-29
+    // §15), with its closure's runtime.
+    focus_on_member(*ctx);
 
     // Find binary target
     const mcpp::build::LinkUnit* chosen = nullptr;
@@ -3203,10 +3368,29 @@ export int clean_project(bool wipe_bmi) {
 //
 // With no record at all there is nothing to compare against, and the command
 // refuses rather than guess.
+//
+// A WORKSPACE builds at its root (workspace design 2026-09-29 §15), so the
+// command acts on the workspace's `target/` from anywhere inside it, and it
+// also removes the build directories each member held under its own
+// `target/` before that: none of them is read by a workspace build. A
+// member's `target/.build-mcpp/`, where its build program's outputs are, is
+// kept.
 export int clean_stale(bool dryRun, std::int64_t keepWithinSecs) {
     namespace fs = std::filesystem;
     auto root = mcpp::project::find_manifest_root(fs::current_path());
     if (!root) { std::println(stderr, "error: not in an mcpp package"); return 2; }
+    std::vector<fs::path> memberDirs;
+    {
+        auto m = mcpp::manifest::load(*root / "mcpp.toml", {.insideWorkspace = true});
+        if (m && !m->workspace.present) {
+            if (auto ws = mcpp::project::find_workspace_root(*root); !ws.empty()) {
+                root = ws;
+                m = mcpp::manifest::load(*root / "mcpp.toml");
+            }
+        }
+        if (m && m->workspace.present)
+            for (auto const& mp : m->workspace.members) memberDirs.push_back(*root / mp);
+    }
     const fs::path target = *root / "target";
 
     // Triple directory -> the fingerprints recorded under it. One container
@@ -3287,6 +3471,50 @@ export int clean_stale(bool dryRun, std::int64_t keepWithinSecs) {
     if (ec) {
         std::println(stderr, "error: cannot read {}: {}", target.string(), ec.message());
         return 1;
+    }
+
+    // The members' own build directories from before the workspace was the
+    // unit of build: `<member>/target/<triple>/<16 hex digits>/`.
+    auto isFingerprint = [](const std::string& name) {
+        return name.size() == 16 && std::ranges::all_of(name, [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        });
+    };
+    for (auto const& memberDir : memberDirs) {
+        std::error_code mec;
+        const auto memberTarget = memberDir / "target";
+        if (!fs::is_directory(memberTarget, mec)) continue;
+        for (fs::directory_iterator tripleIt(memberTarget, mec), end; tripleIt != end;
+             tripleIt.increment(mec)) {
+            std::error_code tec;
+            if (!tripleIt->is_directory(tec) || tec) continue;
+            if (tripleIt->path().filename().string().starts_with(".")) continue;
+            for (fs::directory_iterator fpIt(tripleIt->path(), tec), fend; fpIt != fend;
+                 fpIt.increment(tec)) {
+                std::error_code fec;
+                if (!fpIt->is_directory(fec) || fec) continue;
+                if (!isFingerprint(fpIt->path().filename().string())) continue;
+                const auto dir = fpIt->path();
+                const std::string shown = dir.lexically_relative(*root).generic_string();
+                const auto size = mcpp::bmi_cache::dir_size(dir);
+                if (dryRun) {
+                    std::println("would remove {}  ({}; the workspace builds in {})", shown,
+                                 mcpp::bmi_cache::human_bytes(size), target.string());
+                } else {
+                    std::error_code rec;
+                    fs::remove_all(dir, rec);
+                    if (rec) {
+                        std::println(stderr, "error: cannot remove {}: {}", shown, rec.message());
+                        ++failed;
+                        continue;
+                    }
+                    std::println("removed {}  ({}; the workspace builds in {})", shown,
+                                 mcpp::bmi_cache::human_bytes(size), target.string());
+                }
+                bytes += size;
+                ++removed;
+            }
+        }
     }
 
     if (removed == 0 && failed == 0) {

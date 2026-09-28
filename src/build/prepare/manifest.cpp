@@ -71,6 +71,7 @@ select_workspace_members(PrepareState& state, const std::filesystem::path& wsRoo
     // `--features` names features of the selected members: each member takes
     // the tokens it declares, and a token no selected member declares is
     // refused.
+    state.requestedFeatures = state.overrides.features;
     std::vector<std::string> tokens;
     for (auto const& t : mcpp::build::feature_request_tokens(state.overrides.features))
         tokens.push_back(t);
@@ -125,7 +126,7 @@ select_workspace_members(PrepareState& state, const std::filesystem::path& wsRoo
 
     std::string shown;
     for (auto const& [key, spec] : state.m->dependencies)
-        shown += (shown.empty() ? "" : ", ") + spec.shortName;
+        shown += (shown.empty() ? "" : ", ") + key;
     mcpp::ui::status("Workspace", selection.size() == 1
         ? std::format("building member '{}'", shown)
         : std::format("building {} members: {}", selection.size(), shown));
@@ -576,6 +577,15 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
         // Read where the project keeps it. A planning pass that writes
         // elsewhere (plan_only) still resolves against the project's lock.
         auto lockPath = (state.overrides.plan_only ? *state.root : state.workRoot) / "mcpp.lock";
+        // A workspace keeps one lock at its root (§15). Until its first build
+        // has written it, a selected member's own lock from before is read in
+        // its place, so the upgrade does not move a git dependency.
+        if (state.workspacePlan() && !std::filesystem::exists(lockPath))
+            for (auto const& mp : state.selectedMemberPaths)
+                if (std::filesystem::exists(state.runtimeWorkspaceRoot / mp / "mcpp.lock")) {
+                    lockPath = state.runtimeWorkspaceRoot / mp / "mcpp.lock";
+                    break;
+                }
         if (std::filesystem::exists(lockPath)) {
             if (auto lock = mcpp::pm::load(lockPath); lock) {
                 for (auto const& p : lock->packages) {

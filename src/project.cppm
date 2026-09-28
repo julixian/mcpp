@@ -559,6 +559,15 @@ resolve_member_dir(const mcpp::manifest::Manifest& rootManifest,
                    const std::filesystem::path& rootDir,
                    std::string_view package_filter) {
     if (!rootManifest.workspace.present) return std::filesystem::path{};
+    // "." and the rooted workspace's own package name select that package
+    // (workspace design 2026-09-29 §7.1): it is a member of every command
+    // that acts on the whole workspace, and `-p` names it like any other.
+    if (!rootManifest.package.name.empty()
+        && (package_filter == "." || package_filter == rootManifest.package.name
+            || (!rootManifest.package.namespace_.empty()
+                && package_filter == rootManifest.package.namespace_ + "."
+                                     + rootManifest.package.name)))
+        return rootDir;
     if (package_filter.empty()) {
         if (rootManifest.package.name.empty()) {
             return std::unexpected(std::string(
@@ -768,7 +777,6 @@ virtual_workspace_root(const mcpp::manifest::Manifest& workspace,
     v.package.virtualRoot = true;
     v.package.standard = first.package.standard;
     v.package.standardDeclared = first.package.standardDeclared;
-    v.package.mcppFloor = workspace.workspace.inherited.mcppFloor;
     v.language.standard = first.language.standard;
     v.cppStandard = first.cppStandard;
     v.toolchain = first.toolchain;

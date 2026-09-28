@@ -23,17 +23,14 @@
 #    to a full prepare for the wrong reason — the assertion below would hold
 #    while proving nothing.
 #
-#  * Part 2 — the key must reach the fingerprint.
+#  * Part 2 — the key must reach the graph.
 #
 #    `module_extensions` decides which units emit a BMI and which objects link
-#    unconditionally, i.e. it is a build VARIANT. mcpp.toml's mtime alone only
-#    protects the fast path inside one output dir; it does not stop a BMI
-#    cache entry built under one classification from being served under
-#    another. Changing the key must land in a different `target/<triple>/<fp>/`.
-#
-#    (Contrast `[build] build_program_timeout`, which is deliberately NOT
-#    fingerprinted — it changes no edge, and folding it in would make raising a
-#    timeout rebuild the whole project.)
+#    unconditionally. It is an attribute of the package that declares it, not
+#    of the configuration (workspace design 2026-09-29 §3): the build
+#    directory stays, and the graph written into it must classify the files
+#    the key now names. A `.ccm` file the key starts naming becomes a module
+#    interface with its own BMI edge, in the same directory.
 set -e
 
 TMP=$(mktemp -d)
@@ -90,7 +87,8 @@ out="$("$MCPP" run 2>&1)"
 [[ "$out" == *"42"* ]] || { echo "FAIL: expected 42 (41+1), got: $out"; exit 1; }
 echo "  ok: the new dependency edge is real (41+1 = 42)"
 
-# ── 2. Changing module_extensions must change the fingerprint ──────────────
+# ── 2. Changing module_extensions must change the graph ────────────────────
+printf 'export module gshape.extra;\nexport auto extra() -> int { return 2; }\n' > src/extra.ccm
 cat > mcpp.toml <<'EOF'
 [package]
 name    = "gshape"
@@ -103,12 +101,15 @@ EOF
 "$MCPP" build > b3.log 2>&1 || { cat b3.log; echo "FAIL: build after key change"; exit 1; }
 FP_AFTER="$(fingerprint)"
 
-[[ "$FP_BEFORE" != "$FP_AFTER" ]] || {
-    echo "FAIL: module_extensions changed but the output dir did not"
-    echo "      before=$FP_BEFORE after=$FP_AFTER"
-    echo "      (the key is missing from the canonical compile-flags string)"
+[[ "$FP_BEFORE" == "$FP_AFTER" ]] || {
+    echo "FAIL: module_extensions moved the build directory ($FP_BEFORE -> $FP_AFTER)"
+    echo "      (a package attribute entered the configuration's name)"
     exit 1; }
-echo "  ok: the key is fingerprinted ($FP_BEFORE -> $FP_AFTER)"
+ninja_file="$(find target -path "*/$FP_AFTER/build.ninja" | head -1)"
+grep -q 'gshape\.extra' "$ninja_file" || {
+    echo "FAIL: the .ccm named by module_extensions is not a module interface of the graph"
+    exit 1; }
+echo "  ok: the key reaches the graph in the same directory ($FP_AFTER)"
 
 # ── 3. A dead entry is reported, not silently ignored ──────────────────────
 #

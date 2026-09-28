@@ -1184,7 +1184,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // replay. Must stay within the first few lines — see read_shape.
     append(mcpp::build::header_line(plan.graphShape, plan.scheduleTag,
                                     plan.accelOverridden,
-                                    plan.packFormat) + "\n");
+                                    plan.packFormat, plan.requestTag) + "\n");
     append("ninja_required_version = 1.11\n\n");
 
     // All compile/link flags are computed once via flags.cppm.
@@ -1199,6 +1199,30 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // in two of them is a graph where the DLL is copied only when something
     // else happens to ask.
     const auto& deployFiles = flags.runtimeDeploy;
+
+    // A workspace plan's link groups (workspace design 2026-09-29 §15): a
+    // member's units link with the flags of the member's closure and take the
+    // runtime files of that closure, computed by the same `compute_flags` from
+    // a copy of the plan with the group's fields in place of the plan's.
+    std::vector<CompileFlags> groupFlags;
+    if (!plan.linkGroups.empty()) {
+        BuildPlan view = plan;
+        for (auto& g : view.linkGroups) {
+            swap_link_group(view, g);
+            groupFlags.push_back(compute_flags(view));
+            swap_link_group(view, g);
+        }
+    }
+    // Every file placed beside an artifact: the plan's own deploy set (a
+    // workspace plan's virtual root has no program, so none), each group's,
+    // and the graph-built shared libraries each group's units load.
+    std::vector<BuildPlan::DeployFile> placedFiles;
+    if (!plan.manifest.package.virtualRoot) placedFiles = deployFiles;
+    for (std::size_t g = 0; g < groupFlags.size(); ++g) {
+        for (auto const& d : groupFlags[g].runtimeDeploy) placedFiles.push_back(d);
+        for (auto const& pl : plan.linkGroups[g].placements)
+            placedFiles.push_back({{pl.source}, pl.dest});
+    }
 
     // ── The raw image a flasher takes ──────────────────────────────────────
     //
@@ -2741,6 +2765,10 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
 
     // Link units
     for (auto& lu : plan.linkUnits) {
+        // A member's unit reads its link group's flags (§15); every other
+        // unit reads the plan's.
+        const auto& uflags = lu.linkGroup >= 0
+            ? groupFlags[static_cast<std::size_t>(lu.linkGroup)] : flags;
         std::string ins;
         // FIRST, before every other object. Mach-O runs __init_offsets in
         // LINK order and has no priority-ordered init section, so "runs
@@ -2806,8 +2834,11 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
         // deps), so other targets are unaffected.
         std::string orderOnly;
         if (lu.kind == LinkUnit::Binary || lu.kind == LinkUnit::TestBinary) {
-            for (auto const& d : deployFiles)
+            for (auto const& d : uflags.runtimeDeploy)
                 orderOnly += " " + escape_ninja_path(d.dest);
+            if (lu.linkGroup >= 0)
+                for (auto const& pl : plan.linkGroups[static_cast<std::size_t>(lu.linkGroup)].placements)
+                    orderOnly += " " + escape_ninja_path(pl.dest);
         }
 
         // The import library is a SECOND output of this edge, declared as an
@@ -2945,13 +2976,13 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
             // Swapping the driver is not sufficient by itself — this slot names
             // `libc++.a` by path on macOS and `-static-libstdc++` on MinGW.
             tail.cxxRuntime   = cxxUnit
-                ? flags.ldStdlibFor(role_of(lu.kind))
-                : flags.ldStdlibCFor(role_of(lu.kind));
+                ? uflags.ldStdlibFor(role_of(lu.kind))
+                : uflags.ldStdlibCFor(role_of(lu.kind));
             // An archive has no run-time search path of its own: `ar` never
             // reads `$unit_ldflags`, so rpath flags there would be dead bytes
             // in every graph that builds a static library.
             if (lu.kind != LinkUnit::StaticLibrary)
-                tail.runtimeFallback = flags.ldRuntimeFallback;
+                tail.runtimeFallback = uflags.ldRuntimeFallback;
             // NOT ON A DIRECT LINK. The tag selects between `DT_RPATH`
             // and `DT_RUNPATH`, entries of a dynamic section; an image with no
             // loader has neither, and `ld.lld` rejects the flag's `-Wl,` form
@@ -2974,6 +3005,11 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
             }
             if (auto unit = tail.render(); !unit.empty())
                 out_line += "  unit_ldflags =" + unit + "\n";
+        }
+        // The group's link line, in place of the plan's (§15).
+        if (lu.linkGroup >= 0 && lu.kind != LinkUnit::StaticLibrary) {
+            out_line += "  ldflags =" + uflags.ld + "\n";
+            out_line += "  c_ldflags =" + uflags.ldC + "\n";
         }
         append(std::move(out_line));
 
@@ -3035,11 +3071,11 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // exactly one source (every project before this feature, and most
     // packages after it) emits the exact same line as always: the loop below
     // reduces to the one-word case with no change in spelling.
-    if (deployFiles.size() >= 2) {
+    if (placedFiles.size() >= 2) {
         // #734 E4: one edge for the whole list. One entry keeps the per-file
         // edge below, byte for byte.
         std::string outs, ins, list;
-        for (auto const& d : deployFiles) {
+        for (auto const& d : placedFiles) {
             outs += " " + escape_ninja_path(d.dest);
             for (auto const& s : d.sources) {
                 ins += " " + escape_ninja_path(s);
@@ -3047,17 +3083,17 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
             }
         }
         append(std::format("build{} : stage_list{} | placements.list\n  count = {}\n",
-                           outs, ins, deployFiles.size()));
+                           outs, ins, placedFiles.size()));
         if (placements) *placements = std::move(list);
     } else {
-        for (auto const& d : deployFiles) {
+        for (auto const& d : placedFiles) {
             std::string ins;
             for (auto const& s : d.sources) ins += " " + escape_ninja_path(s);
             append(std::format("build {} : stage_file{}\n",
                 escape_ninja_path(d.dest), ins));
         }
     }
-    if (!deployFiles.empty())
+    if (!placedFiles.empty())
         append("\n");
 
     // ── Declared build-graph nodes (`mcpp:action=`) ─────────────────────────
@@ -3267,7 +3303,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
                 defaults += " " + escape_ninja_path(alias);
             }
         }
-        for (auto const& d : deployFiles) {
+        for (auto const& d : placedFiles) {
             defaults += " " + escape_ninja_path(d.dest);
         }
         defaults += actionDefaults;

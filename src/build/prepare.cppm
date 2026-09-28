@@ -475,6 +475,24 @@ export struct BuildContext {
     // already existed inside prepare_build; the banner and mcpp.lock were simply
     // reading the input instead of the output. Both now read this.
     std::map<std::string, std::string> resolvedVersions;
+    // The selected members of a workspace plan (workspace design 2026-09-29
+    // §15), in selection order: each member's manifest (its hooks, its
+    // `[pack]`, its identity), its root, and the directory below `bin/` its
+    // products are in. Empty outside a workspace plan, whose subject is
+    // `manifest` itself.
+    struct WorkspaceMember {
+        std::string                 name;        // qualified package name
+        std::string                 memberPath;  // as `[workspace] members` writes it
+        std::filesystem::path       root;
+        std::string                 productDir;  // empty: `bin/` itself
+        mcpp::manifest::Manifest    manifest;
+    };
+    std::vector<WorkspaceMember>    workspaceMembers;
+    // The command's selection and this plan's group, each the member paths
+    // joined by a unit separator; empty outside a workspace. A fast-path
+    // record is written, and matched, per selection and group (§15).
+    std::string                     workspaceRequest;
+    std::string                     workspaceGroup;
 };
 
 // The ONE cache-mode resolver, for the same reason resolve_profile_name exists:
@@ -488,6 +506,15 @@ export struct BuildContext {
 // Precedence: --cache > MCPP_BUILD_CACHE > [build] cache > global. An
 // unparseable value falls through to the next source rather than silently
 // meaning "global" — see prepare_build, which also reports it.
+// A plan of one workspace member, read as that member (workspace design
+// 2026-09-29 §15): the member's manifest and root become the context's, and
+// its link group's runtime fields become the plan's, so a reader that asks
+// "the package being built" -- `mcpp pack`, the runtime closure it stages --
+// is answered about the member rather than about the virtual root. Called
+// after the plan's graph is written; the plan's own fields are exchanged, not
+// lost. A context of any other shape is left as it is.
+export void focus_on_member(BuildContext& ctx);
+
 export CacheMode resolve_cache_mode(const mcpp::manifest::Manifest& m,
                                     std::string_view override_mode);
 
@@ -611,6 +638,9 @@ export struct BuildOverrides {
     // configuration group (workspace design 2026-09-29 §15). Empty: the member
     // is selected from `package_filter` or the command's directory.
     std::vector<std::string> workspace_members;
+    // Every member the COMMAND selected, across its configuration groups: the
+    // request a fast-path record names. Empty: `workspace_members`.
+    std::vector<std::string> workspace_request;
     // --profile <name>. Empty = fall through to `[build] default-profile`, then
     // to `profile_fallback` below, whose own default is "dev". The comment here
     // said "release" for as long as `mcpp build --help` did, and neither had

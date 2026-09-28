@@ -275,8 +275,11 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
 
     // Manifest may override mode only when neither --mode nor an
     // equivalent flag (--target *-musl → static) was given.
-    if (!modeFromUser && !ctx->manifest.packConfig.defaultMode.empty()) {
-        if (auto m = mcpp::pack::parse_mode(ctx->manifest.packConfig.defaultMode))
+    // A workspace plan's subject is its one selected member (§15).
+    const auto& subjectManifest = ctx->workspaceMembers.size() == 1
+        ? ctx->workspaceMembers.front().manifest : ctx->manifest;
+    if (!modeFromUser && !subjectManifest.packConfig.defaultMode.empty()) {
+        if (auto m = mcpp::pack::parse_mode(subjectManifest.packConfig.defaultMode))
             opts.mode = *m;
     }
 
@@ -370,6 +373,9 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
         mcpp::ui::error(br.error().message);
         return PackOutcome{1};
     }
+    // Everything below reads the package being packed: in a workspace plan,
+    // its selected member (workspace design 2026-09-29 §15).
+    mcpp::build::focus_on_member(*ctx);
 
     // ─── Pick the main binary target ─────────────────────────────────
     //

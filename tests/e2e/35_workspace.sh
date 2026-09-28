@@ -94,15 +94,18 @@ echo "=== Building from workspace root ==="
 echo "workspace build: ok"
 
 # ── Verify the binary runs correctly ────────────────────
-# target/ is created in the member dir (apps/hello/target/), not workspace root.
+# One build directory per configuration, at the workspace root; each
+# member's products in its own product directory, bin/<package name>/
+# (workspace design 2026-09-29 §5).
 # On Windows (MINGW/MSYS) the binary has a .exe suffix
 OS="$(uname -s)"
 if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
-    BIN=$(find apps/hello/target -type f -name hello.exe | head -1)
+    BIN=$(find target -type f -path '*/bin/hello/hello.exe' | head -1)
 else
-    BIN=$(find apps/hello/target -type f -name hello | head -1)
+    BIN=$(find target -type f -path '*/bin/hello/hello' | head -1)
 fi
-test -n "$BIN" || { echo "FAIL: hello binary not found"; exit 1; }
+test -n "$BIN" || { echo "FAIL: hello binary not found in target/<triple>/<key>/bin/hello/"; exit 1; }
+test ! -e apps/hello/target || { echo "FAIL: a member directory received a build directory"; exit 1; }
 OUT=$("$BIN" 2>&1)
 echo "output: $OUT"
 test "$OUT" = "Hello, World!" || { echo "FAIL: unexpected output '$OUT'"; exit 1; }

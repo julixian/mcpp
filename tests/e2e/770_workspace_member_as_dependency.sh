@@ -128,12 +128,16 @@ EOF
 printf 'int lib_v();\nint main() { return lib_v() == 7 ? 0 : 1; }\n' > app/src/main.cpp
 
 # Each position is asserted right after its own build, so the root position's
-# counts are read even when the sibling position does not build.
+# counts are read even when the sibling position does not build. The database
+# is removed before each build, so it holds that build's plan alone.
 for position in lib app; do
+    rm -f compile_commands.json target/*/*/compile_commands.json
     "$MCPP" build -p "$position" > "build-$position.log" 2>&1 \
         || fail "A/B: -p $position" "build-$position.log"
-    cdb="$position/compile_commands.json"
-    [ -f "$cdb" ] || fail "A: no $cdb"
+    # One database per configuration, at the workspace root (workspace
+    # design 2026-09-29 §7.1); each position's plan writes it anew.
+    cdb="compile_commands.json"
+    [ -f "$cdb" ] || fail "A: no $cdb (-p $position)"
     for word in -DWS_DEF=1 -DWS_CXXFLAG=1 -DMEMBER_CXXFLAG=1 -DMEMBER_DEF=1 -DLEVEL=2; do
         n=$(count "$cdb" lib/lib.cpp "$word")
         [ "$n" = 1 ] || fail "A: $word occurs $n times in lib.cpp (-p $position)"

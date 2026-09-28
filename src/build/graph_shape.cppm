@@ -71,13 +71,66 @@ std::string_view to_string(GraphShape shape) {
 // (putting it there would cost a full recompile to package an already-built
 // tree). So `pack --format X` then `build` would replay a graph carrying a dist
 // edge, which is the `A then B then A` shape both other fields exist to stop.
+// `requestTag` records what the graph was planned for beyond its directory's
+// name: a workspace plan's members and the requested features (`request_tag`).
+// A build directory is one configuration (workspace design 2026-09-29 §3), so
+// `-p a`, `-p b`, `--workspace` and a `--features` build all write their
+// graphs into one directory, and the fast paths replay a graph only when its
+// tag is the one the request computes.
 std::string header_line(GraphShape shape, std::string_view scheduleTag,
                         bool accelOverridden = false,
-                        std::string_view packFormat = {}) {
-    return std::format("# mcpp:graph={};schedule={};accel={};dist={}",
+                        std::string_view packFormat = {},
+                        std::string_view requestTag = {}) {
+    return std::format("# mcpp:graph={};schedule={};accel={};dist={};request={}",
                        to_string(shape), scheduleTag,
                        accelOverridden ? "override" : "default",
-                       packFormat.empty() ? std::string_view("none") : packFormat);
+                       packFormat.empty() ? std::string_view("none") : packFormat,
+                       requestTag);
+}
+
+// The tag of a request: the workspace members of the plan (their paths joined
+// by a unit separator; empty outside a workspace) and the requested features,
+// normalised so that spelling and order do not change it.
+std::string request_tag(std::string_view group, std::string_view features) {
+    std::vector<std::string> toks;
+    for (std::size_t i = 0; i < features.size();) {
+        auto c = features.find_first_of(", ", i);
+        auto t = features.substr(i, c == std::string_view::npos ? c : c - i);
+        if (!t.empty()) toks.emplace_back(t);
+        if (c == std::string_view::npos) break;
+        i = c + 1;
+    }
+    std::ranges::sort(toks);
+    toks.erase(std::unique(toks.begin(), toks.end()), toks.end());
+    std::string key(group);
+    key += '\x1f';
+    for (auto const& t : toks) { key += t; key += ','; }
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned char c : key) { h ^= c; h *= 0x100000001b3ull; }
+    return std::format("{:016x}", h);
+}
+
+// The request tag this graph was written for; empty when the file predates
+// the field, which the fast paths treat as a miss.
+std::string read_request(const std::filesystem::path& ninjaPath) {
+    std::ifstream input(ninjaPath);
+    if (!input) return {};
+    std::string line;
+    for (int i = 0; i < 8 && std::getline(input, line); ++i) {
+        constexpr std::string_view prefix = "# mcpp:graph=";
+        if (!line.starts_with(prefix)) continue;
+        auto value = std::string_view(line).substr(prefix.size());
+        while (!value.empty() && (value.back() == '\r' || value.back() == ' '))
+            value.remove_suffix(1);
+        constexpr std::string_view key = ";request=";
+        const auto at = value.find(key);
+        if (at == std::string_view::npos) return {};
+        auto rest = value.substr(at + key.size());
+        if (const auto semi = rest.find(';'); semi != std::string_view::npos)
+            rest = rest.substr(0, semi);
+        return std::string(rest);
+    }
+    return {};
 }
 
 // Read the shape back. `nullopt` means "this file does not say" — a build.ninja
