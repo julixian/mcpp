@@ -687,4 +687,49 @@ implementing it, and the readings.
   failed on the Windows row and found it. The detector accepts both spellings,
   the comment in `cli.cppm` states the exception, and the CHANGELOG lists the
   one re-run.
+- **F7. §7.4 named the wrong sibling of #729.** It listed the LLVM step of
+  `ci-windows.yml` among the builds piped into `tee` without `pipefail`; that
+  step runs under `shell: bash`, which GitHub starts with `-eo pipefail`, and
+  is not affected. The lint's reading of the workflows before the change is
+  seven W1 problems: in `ci-linux.yml` the LLVM, musl-gcc and GCC cold-rebuild
+  steps and two example steps, and in `ci-fresh-install.yml` two template
+  steps. A list written from reading the files is the claim; the lint's output
+  is the reading.
+- **F8. The release gate's first reading was of its own harness.** The first
+  release run of 2026.9.28.2 (36363585412) failed the GalTranslPP canary before
+  it built anything: `release_canaries.py` started `bash` by name, and a Windows
+  program that does so gets `System32\bash.exe`, the WSL launcher, because the
+  loader searches the system directory before `PATH`. The gate held and no tag
+  was created. The workflow now names the step's bash (`CANARY_BASH`), the
+  runner has tests, and the canaries were dispatched on the fix's branch before
+  the release was dispatched again (#731).
+
+### 8.3 Readings
+
+**Before and after, per task.** Each criterion of §7 was read against the
+released 2026.9.28.1 (xlings 2026.9.28.1) and against this round's versions.
+
+| Task | Criterion | 2026.9.28.1 | 2026.9.28.2 |
+|---|---|---|---|
+| X1 | the index build script runs once per `update` (E2E-91 S6; sandbox) | 2 runs | 1 run |
+| X2 | a store hit reads "is in the store", then "active: a -> b" | "is already installed", "upgraded" | as specified |
+| X3 | every `download_progress` event names its stream (E2E-123 P3; sandbox) | no `stream` | named, bounded by the elapsed time |
+| X4 | off a terminal, the xim index download prints two lines (E2E-123 P1; sandbox, CN mirror) | 162 lines (769 in a CI log) | 2 lines |
+| X5 | the marker; #617's handoff; #624's nested home (E2E-120 S6, E2E-124; sandbox) | no marker; "package file not found" | as specified |
+| M1 | e2e 819 L1 to L6; e2e 820 W1 to W5 on the Windows row (VS 2026, MSVC 14.51.36231) | `--crt` unknown | pass |
+| M2 | e2e 820 W6; e2e 799 D; the measurement (run 36361809507) | the tools do not start as actions; `--path-prepend` unknown | the tools start as actions on the Visual Studio row and on the masked row (managed msvc@14.44.35207), and do not start directly |
+| M3 | e2e 118 on the Windows row | asserted only the missing depfile | the rebuild is asserted and passes |
+| M4 | e2e 818 criteria 5 and 6; e2e 820 W7; e2e 821 | 0 statements (818); A1 fails (821) | once; once at `[workspace.build]`; once per run of the edge |
+| M5 | the lint on the workflows before and after the change | 7 W1 problems | 0 |
+| M6 | the docs check on the Linux, macOS, Windows and bare Windows rows | no `defaultToolchain` | gcc@16.1.0, llvm@20.1.7, llvm@20.1.7 and gcc@16.1.0: 0 problems on each row |
+| M7 | unit `ConditionalOrder.*`; the sandbox section #728 | lexical order | specificity |
+| M8 | the canaries; `verify-published.sh` | not present | see F8 and the sandbox table below |
+| I1, I2 | the static test; the Windows install tests of `qt-base` and `qt` (openxlings/xim-pkgindex#898) | the test fails at `qt` and `qt-base` | both recipes install and pass their checks with revision 1 |
+| N2 | `red_members.py selftest` (seven cases) | not present | pass |
+
+**CI.** mcpp#730's last head (`feb5743f`): every workflow concluded success;
+the two jobs of the xcode-27 image fail as known red (#669). The two earlier runs
+on the branch found F4, F6, the fast path that e2e 821 assumed on every host
+(it serves only ELF products, #400), and the measurement's three harness
+defects; each was fixed on the branch.
 
