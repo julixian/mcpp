@@ -114,16 +114,20 @@ struct diagnostic {
     const char* impact   = "";
     const char* hint     = "";
 };
-inline void diagnostic_field_(const char* s) {
+// Output goes through printf only: an inline function of this interface that
+// names `stdout` or `fputc` carries `FILE` into the module, and GCC then
+// rejects a build program that includes <cstdio> after `import mcpp;`.
+inline void diagnostic_field_(const char* s, char end) {
     for (const char* p = s ? s : ""; *p; ++p)
-        std::fputc((*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p, stdout);
+        std::printf("%c", (*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p);
+    std::printf("%c", end);
 }
 inline void report(const diagnostic& d) {
-    std::fputs("mcpp:diagnostic=", stdout);
-    diagnostic_field_(d.severity); std::fputc('\t', stdout);
-    diagnostic_field_(d.message);  std::fputc('\t', stdout);
-    diagnostic_field_(d.impact);   std::fputc('\t', stdout);
-    diagnostic_field_(d.hint);     std::fputc('\n', stdout);
+    std::printf("mcpp:diagnostic=");
+    diagnostic_field_(d.severity, '\t');
+    diagnostic_field_(d.message,  '\t');
+    diagnostic_field_(d.impact,   '\t');
+    diagnostic_field_(d.hint,     '\n');
 }
 
 // ── The probe channel (mcpp 2026.9.5.2+) ────────────────────────────────────
