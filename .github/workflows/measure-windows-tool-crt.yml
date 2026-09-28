@@ -209,17 +209,27 @@ jobs:
             echo "ok: M-a $tool.exe does not start without a runtime"
           done
 
+      # The recorded edges are run again with ninja directly: their outputs
+      # (the edge targets, absolute paths under target/.build-mcpp/out) are
+      # removed, so ninja runs exactly those two edges and nothing else.
       - name: "M-b: the candidate's action edge starts each tool"
         shell: bash
         run: |
           nf=$(cat "$RUNNER_TEMP/probe-candidate/ninja-file")
           bd=$(dirname "$nf")
-          find "$bd" \( -name moc-probe.txt -o -name lrelease-probe.stamp \) -delete
-          "$NINJA" -C "$bd" -t targets all | grep -E 'moc-probe.txt|lrelease-probe.stamp' | cut -d: -f1 > "$RUNNER_TEMP/edges"
-          test -s "$RUNNER_TEMP/edges" || { echo "::error::no tool edge in the graph"; exit 1; }
+          abs() { case "$1" in [A-Za-z]:*|/*) cygpath -u "$1" ;; *) echo "$bd/$1" ;; esac; }
+          # `-t targets all` prints `<target>: <rule>`, and a Windows target
+          # begins with a drive letter and its colon: the rule is cut at the
+          # LAST `: `, never at the first colon.
+          "$NINJA" -C "$bd" -t targets all | grep -E 'moc-probe.txt|lrelease-probe.stamp' | sed 's/: [^:]*$//' > "$RUNNER_TEMP/edges"
+          [ "$(wc -l < "$RUNNER_TEMP/edges")" -eq 2 ] || { cat "$RUNNER_TEMP/edges"; echo "::error::the graph does not hold the two tool edges"; exit 1; }
+          while IFS= read -r t; do rm -f "$(abs "$t")"; done < "$RUNNER_TEMP/edges"
+          echo "edges: $(tr '\n' ' ' < "$RUNNER_TEMP/edges")"
           PATH="/usr/bin:/c/Windows/System32:/c/Windows" "$NINJA" -C "$bd" $(cat "$RUNNER_TEMP/edges")
-          grep -q "Probe" "$(find "$bd" -name moc-probe.txt | head -1)" \
-            || { echo "::error::moc.exe ran but wrote no code for Probe"; exit 1; }
+          moc_out=$(abs "$(grep 'moc-probe.txt' "$RUNNER_TEMP/edges")")
+          grep -q "Probe" "$moc_out" || { echo "::error::moc.exe ran but wrote no code for Probe ($moc_out)"; exit 1; }
+          lr_out=$(abs "$(grep 'lrelease-probe.stamp' "$RUNNER_TEMP/edges")")
+          test -f "$lr_out" || { echo "::error::the lrelease edge left no stamp ($lr_out)"; exit 1; }
           echo "ok: M-b moc.exe and lrelease.exe start from the action's PATH (${{ matrix.row }})"
 
       - name: "M-c (reading): the released mcpp's action edge"
@@ -228,9 +238,10 @@ jobs:
           nf=$(cat "$RUNNER_TEMP/probe-released/ninja-file")
           [ -n "$nf" ] || { echo "READING M-c: not recorded (see the step above)"; exit 0; }
           bd=$(dirname "$nf")
-          find "$bd" \( -name moc-probe.txt -o -name lrelease-probe.stamp \) -delete
-          edges=$("$NINJA" -C "$bd" -t targets all | grep -E 'moc-probe.txt|lrelease-probe.stamp' | cut -d: -f1)
-          if PATH="/usr/bin:/c/Windows/System32:/c/Windows" "$NINJA" -C "$bd" $edges > "$RUNNER_TEMP/released.log" 2>&1; then
+          abs() { case "$1" in [A-Za-z]:*|/*) cygpath -u "$1" ;; *) echo "$bd/$1" ;; esac; }
+          "$NINJA" -C "$bd" -t targets all | grep -E 'moc-probe.txt|lrelease-probe.stamp' | sed 's/: [^:]*$//' > "$RUNNER_TEMP/edges-released"
+          while IFS= read -r t; do rm -f "$(abs "$t")"; done < "$RUNNER_TEMP/edges-released"
+          if PATH="/usr/bin:/c/Windows/System32:/c/Windows" "$NINJA" -C "$bd" $(cat "$RUNNER_TEMP/edges-released") > "$RUNNER_TEMP/released.log" 2>&1; then
             echo "READING M-c: the released mcpp's edge started the tools (${{ matrix.row }})"
           else
             echo "READING M-c: the released mcpp's edge did not start the tools (${{ matrix.row }}):"
