@@ -738,7 +738,8 @@ released 2026.9.28.1 (xlings 2026.9.28.1) and against this round's versions.
 | M7 | unit `ConditionalOrder.*`; the sandbox section #728 | lexical order | specificity |
 | M8 | the canaries; `verify-published.sh` | not present | see F8 and the sandbox table below |
 | I1, I2 | the static test; the Windows install tests of `qt-base` and `qt` (openxlings/xim-pkgindex#898) | the test fails at `qt` and `qt-base` | both recipes install and pass their checks with revision 1 |
-| N2 | `red_members.py selftest` (seven cases) | not present | pass |
+| N1 | the full sweep with mcpp 2026.9.28.2 (run 36376460690) | pinned to 2026.9.28.1 | 22 shards green (linux default 6, linux llvm 9, macos 2, windows 5) |
+| N2 | `red_members.py selftest` (seven cases) | not present | pass; on the full sweep, "No member failed." |
 
 **CI.** mcpp#730's last head (`feb5743f`): every workflow concluded success;
 the two jobs of the xcode-27 image fail as known red (#669). The two earlier runs
