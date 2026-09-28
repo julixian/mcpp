@@ -649,4 +649,187 @@ resolve_member_dir(const mcpp::manifest::Manifest& rootManifest,
         package_filter, list));
 }
 
+
+// ─── Workspace plans (workspace design 2026-09-29 §15) ──────────────────────
+//
+// A command on a workspace selects members and plans them under one root: the
+// root package of a rooted workspace when it is selected, and otherwise a
+// virtual root that holds the values one plan shares. The functions below are
+// shared by the command layer, which groups the selected members into plans,
+// and by the planner, which builds each plan's root; both read the same list
+// of root-position values, so a group and its root cannot disagree about it.
+
+// A selected member's effective manifest: loaded as a member, with the
+// workspace's configuration inherited, exactly as the planner loads the member
+// it builds.
+export std::expected<mcpp::manifest::Manifest, std::string>
+load_member_manifest(const mcpp::manifest::Manifest& workspace,
+                     const std::filesystem::path& wsRoot,
+                     std::string_view memberPath) {
+    const auto dir = wsRoot / std::string(memberPath);
+    if (memberPath == ".") {
+        auto m = workspace;
+        merge_workspace_deps(m, workspace, wsRoot);
+        return m;
+    }
+    if (!std::filesystem::exists(dir / "mcpp.toml"))
+        return std::unexpected(std::format(
+            "workspace member '{}' has no mcpp.toml", memberPath));
+    auto mm = mcpp::manifest::load(dir / "mcpp.toml", {.insideWorkspace = true});
+    if (!mm) return std::unexpected(std::format(
+        "workspace member '{}': {}", memberPath, mm.error().format()));
+    inherit_workspace_config(*mm, workspace, wsRoot);
+    if (auto bad = workspace_inheritance_error(*mm, dir)) return std::unexpected(*bad);
+    return std::move(*mm);
+}
+
+// The values of a member's manifest that are one value per plan: the
+// toolchain request and the target rows, the C++ standard, the graph-wide
+// `[build]` keys, the profiles and the indices. Members whose keys are equal
+// are planned together; the key is a canonical string of those values and
+// nothing else, so a member's own flags, sources and dependencies never
+// separate it from another member.
+export std::string root_position_key(const mcpp::manifest::Manifest& m) {
+    std::string s;
+    auto field = [&](std::string_view name, std::string_view value) {
+        s += name; s += '='; s += value; s += '\x1f';
+    };
+    auto list = [&](std::string_view name, const std::vector<std::string>& values) {
+        s += name; s += '=';
+        for (auto const& v : values) { s += v; s += '\x1e'; }
+        s += '\x1f';
+    };
+    for (auto const& [platform, spec] : m.toolchain.byPlatform)
+        field("toolchain." + platform, spec);
+    for (auto const& [triple, e] : m.targetOverrides) {
+        field("target." + triple + ".toolchain", e.toolchain);
+        field("target." + triple + ".linkage", e.linkage);
+        field("target." + triple + ".cxx_runtime", e.cxxRuntime);
+        field("target." + triple + ".sysroot", e.sysroot);
+        field("target." + triple + ".min_api", std::to_string(e.minApiLevel));
+        list("target." + triple + ".runner", e.runner);
+        for (auto const& [name, argv] : e.namedRunners)
+            list("target." + triple + ".runners." + name, argv);
+    }
+    field("standard", m.package.standard);
+    auto const& b = m.buildConfig;
+    list("dialect_cxxflags", b.dialectCxxflags);
+    field("cxx_runtime", b.cxxRuntime);
+    field("cxx_runtime_tests", b.cxxRuntimeTests);
+    field("cxx_runtime_shared", b.cxxRuntimeShared);
+    field("static_stdlib", b.staticStdlib ? "1" : "0");
+    field("dependency_linkage", b.dependencyLinkage);
+    field("target", b.target);
+    field("macos_deployment_target", b.macosDeploymentTarget);
+    field("ios_deployment_target", b.iosDeploymentTarget);
+    field("abi_threads", b.abiThreadsDeclared ? (b.abiThreads ? "1" : "0") : "-");
+    field("abi_exceptions", b.abiExceptionsDeclared ? (b.abiExceptions ? "1" : "0") : "-");
+    field("accel", b.accel);
+    field("bmi_schedule", b.bmiSchedule);
+    field("jobs", b.jobs);
+    field("cache", b.cacheMode);
+    field("allow_host_libs", b.allowHostLibs ? "1" : "0");
+    field("platform_dependencies", b.platformDependencies);
+    field("default_profile", b.defaultProfile);
+    list("runner", b.runner);
+    for (auto const& [name, r] : b.namedRunners)
+        list("runners." + name + (r.longLived ? ".long" : ""), r.argv);
+    field("run_exclusive", b.runExclusive ? "1" : "0");
+    for (auto const& [name, pr] : m.profiles) {
+        field("profile." + name, std::format("{}/{}/{}/{}/{}", pr.optLevel,
+              pr.debug ? 1 : 0, pr.lto ? 1 : 0, pr.strip ? 1 : 0,
+              pr.dependencyLinkageDeclared ? pr.dependencyLinkage : std::string("-")));
+        list("profile." + name + ".cflags", pr.cflags);
+        list("profile." + name + ".cxxflags", pr.cxxflags);
+        list("profile." + name + ".ldflags", pr.ldflags);
+    }
+    for (auto const& [name, idx] : m.indices)
+        field("index." + name, std::format("{}#{}#{}#{}#{}", idx.url, idx.rev, idx.tag,
+                                            idx.branch, idx.path.generic_string()));
+    for (auto const& [cap, pin] : m.capabilityPins) field("cap." + cap, pin);
+    for (auto const& [tool, pin] : m.toolOverrides) field("tool." + tool, pin);
+    return s;
+}
+
+// The root of a plan whose selected members do not include a rooted
+// workspace's own package. It carries the root-position values of the first
+// selected member, which every member of the plan shares (`root_position_key`),
+// the workspace's own tables, and nothing a package owns: no sources, targets,
+// dependencies, flags, hooks or build program. Its dependencies are the member
+// edges the planner adds.
+export mcpp::manifest::Manifest
+virtual_workspace_root(const mcpp::manifest::Manifest& workspace,
+                       const mcpp::manifest::Manifest& first,
+                       const std::filesystem::path& wsRoot) {
+    mcpp::manifest::Manifest v;
+    v.sourcePath = wsRoot / "mcpp.toml";
+    v.package.name = "workspace";
+    v.package.version = "0.0.0";
+    v.package.virtualRoot = true;
+    v.package.standard = first.package.standard;
+    v.package.standardDeclared = first.package.standardDeclared;
+    v.package.mcppFloor = workspace.workspace.inherited.mcppFloor;
+    v.language.standard = first.language.standard;
+    v.cppStandard = first.cppStandard;
+    v.toolchain = first.toolchain;
+    v.targetOverrides = first.targetOverrides;
+    v.indices = first.indices;
+    v.profiles = first.profiles;
+    v.capabilityPins = first.capabilityPins;
+    v.toolOverrides = first.toolOverrides;
+    v.workspace = workspace.workspace;
+    v.xlings.subos = workspace.xlings.subos;
+    v.xlings.subosDeclared = workspace.xlings.subosDeclared;
+    auto& b = v.buildConfig;
+    auto const& f = first.buildConfig;
+    b.sourcesDeclared = true;
+    b.runner = f.runner;
+    b.namedRunners = f.namedRunners;
+    b.runExclusive = f.runExclusive;
+    b.jobs = f.jobs;
+    b.bmiSchedule = f.bmiSchedule;
+    b.accel = f.accel;
+    b.staticStdlib = f.staticStdlib;
+    b.cxxRuntime = f.cxxRuntime;
+    b.cxxRuntimeTests = f.cxxRuntimeTests;
+    b.cxxRuntimeShared = f.cxxRuntimeShared;
+    b.target = f.target;
+    b.dialectCxxflags = f.dialectCxxflags;
+    b.abiThreads = f.abiThreads;
+    b.abiThreadsDeclared = f.abiThreadsDeclared;
+    b.abiExceptions = f.abiExceptions;
+    b.abiExceptionsDeclared = f.abiExceptionsDeclared;
+    b.allowHostLibs = f.allowHostLibs;
+    b.macosDeploymentTarget = f.macosDeploymentTarget;
+    b.iosDeploymentTarget = f.iosDeploymentTarget;
+    b.defaultProfile = f.defaultProfile;
+    b.dependencyLinkage = f.dependencyLinkage;
+    b.cacheMode = f.cacheMode;
+    b.platformDependencies = f.platformDependencies;
+    return v;
+}
+
+// The directory a member's products are placed in, below the configuration's
+// `bin/` (workspace design 2026-09-29 §5.2): the member's package name, or
+// `<namespace>.<name>` when another member of the workspace has the same
+// name. The workspace's own package, `"."`, keeps `bin/` itself (empty).
+// Decided over every member of the workspace, not over one selection, so a
+// member's directory is the same whichever command built it.
+export std::string product_directory_name(const std::vector<WorkspaceMember>& all,
+                                          std::string_view memberPath) {
+    if (memberPath == ".") return {};
+    auto it = std::ranges::find_if(all, [&](const WorkspaceMember& m) {
+        return m.memberPath == memberPath;
+    });
+    if (it == all.end() || it->name.empty()) {
+        std::string s(memberPath);
+        for (auto& c : s) if (c == '/' || c == '\\') c = '.';
+        return s;
+    }
+    const auto shared = std::ranges::count_if(all, [&](const WorkspaceMember& m) {
+        return m.name == it->name;
+    });
+    return shared > 1 ? qualified_member_name(*it) : it->name;
+}
+
 } // namespace mcpp::project

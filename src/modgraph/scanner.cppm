@@ -148,6 +148,10 @@ struct PackageRoot {
     UsageRequirements               publicUsage;
     UsageRequirements               linkUsage;
     bool                            usageResolved = false;
+    // Set on a selected workspace member that the plan builds (workspace
+    // design 2026-09-29 §15): the directory below `bin/` its products are
+    // placed in. Absent on the plan's root and on every dependency.
+    std::optional<std::string>      memberProducts;
 };
 ScanResult scan_packages(const std::vector<PackageRoot>& packages);
 

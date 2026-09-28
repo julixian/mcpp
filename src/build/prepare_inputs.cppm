@@ -508,315 +508,47 @@ std::filesystem::path target_dir(const mcpp::toolchain::Toolchain& tc,
 }
 
 
-// Compose a stable canonical compile-flags string for fingerprinting.
-// Exported so the "every build-variant knob is in here" invariant is machine-
-// checkable: the profile knobs were absent for a long time precisely because
-// nothing could assert on this string.
-// `includeDialectFlags`: false when this call serves the PER-PACKAGE
-// fingerprint loop (`canonical_package_build_metadata` below) for a package
-// that is not necessarily this build's root. `dialectCxxflags` is graph-wide
-// (types.cppm's BuildConfig::dialectCxxflags): only the root's value reaches
-// any command, so only the root's value may enter the fingerprint, and only
-// once (#717 design 2026-09-27 §6.2). The default keeps this the SAME call
-// the direct root-only call site below already makes.
-std::string canonical_compile_flags(const mcpp::manifest::Manifest& m,
-                                    bool targetIsMacos = false,
-                                    bool includeDialectFlags = true) {
+// The configuration's part of the build directory's name (workspace design
+// 2026-09-29 §3). A build directory is one configuration: the inputs every
+// node of one graph shares because objects compiled under two values of them
+// cannot be linked or imported together. They are the C++ standard, the
+// macOS deployment target, the dialect flags, the profile knobs and the
+// dependency linkage, read from the root, which is the virtual root of a
+// workspace plan; the toolchain, the target, the standard library, the runtime
+// contract and the mcpp version enter the fingerprint beside this string.
+//
+// A package's own flags, sources, include directories, per-glob flags,
+// C standard, module extensions and runtime needs are ATTRIBUTES of its node,
+// not inputs of the configuration. They reach that package's command lines,
+// and ninja, which records every edge's command, rebuilds exactly the edges
+// whose commands changed. Hashing them into the directory's name instead moved
+// every package of the graph to a new directory, and rebuilt all of them,
+// when one package's `cxxflags` changed.
+std::string canonical_configuration_flags(const mcpp::manifest::Manifest& root,
+                                          bool targetIsMacos = false) {
     std::string s;
-    s += "-std="; s += m.package.standard;
+    s += "-std="; s += root.package.standard;
     s += " -fmodules";
-    // macOS deployment target changes the effective compile triple
-    // (arm64-apple-macosxNN) — a std.pcm built for one target cannot be
-    // loaded by a TU compiled for another. Fold the resolved value
-    // (env override > [build] macos_deployment_target manifest default)
-    // into the fingerprint so switching targets rebuilds the BMI cache
-    // instead of dying with a module config mismatch.
-    //
-    // TARGET-KEYED, NOT HOST-KEYED (#685). This used to read
-    // `if constexpr (mcpp::platform::is_macos)`, i.e. the platform mcpp
-    // itself was BUILT for, which left the fingerprint blind to
-    // `macos_deployment_target` whenever the BUILD ran on a non-Apple host —
-    // so `mcpp build --target aarch64-macos` on Linux kept the same output
-    // directory no matter what the manifest key was edited to. The caller
-    // answers whether THIS build's target is macOS (the same discriminator
-    // `min_platform_version` uses); it defaults to false so a caller that
-    // has no target in hand (a manifest-only unit test) gets today's
-    // non-macOS behaviour rather than silently guessing.
-    //
-    // The built-in default floor (rustc-style) lives in the single
-    // resolver (platform::macos::deployment_target), so this rule, the
-    // flags and the std-module prebuild always agree — the 0.0.50-era
-    // attempt to inject a default here alone left the test build's
-    // std.pcm unstaged (import std failed wholesale on macos CI).
     if (auto dtv = mcpp::platform::macos::deployment_target(
-            targetIsMacos, m.buildConfig.macosDeploymentTarget);
+            targetIsMacos, root.buildConfig.macosDeploymentTarget);
         !dtv.empty()) {
         s += " macos_deployment_target=";
         s += dtv;
     }
-    if (!m.buildConfig.cStandard.empty()) {
-        s += " c_standard=";
-        s += m.buildConfig.cStandard;
-    }
-    for (auto const& flag : m.buildConfig.cflags) {
-        s += " cflag:";
+    for (auto const& flag : root.buildConfig.dialectCxxflags) {
+        s += " dialect:";
         s += flag;
     }
-    for (auto const& flag : m.buildConfig.cxxflags) {
-        s += " cxxflag:";
-        s += flag;
-    }
-    // Explicit [build] dialect_cxxflags (auto-promoted ones are already in
-    // cxxflags above) — they change every BMI in the graph.
-    //
-    // GATED: this is graph-wide (only the root's value reaches a command,
-    // BuildConfig::dialectCxxflags's own comment), so it belongs in the
-    // fingerprint only where `m` is known to be the root -- the direct call
-    // below, not the per-package loop of `canonical_package_build_metadata`,
-    // which calls this for every dependency too (#717 design §6.2, finding 7:
-    // a dependency's own value used to enter ITS fingerprint although it
-    // reaches no command).
-    if (includeDialectFlags) {
-        for (auto const& flag : m.buildConfig.dialectCxxflags) {
-            s += " dialect:";
-            s += flag;
-        }
-    }
-    for (auto const& flag : m.buildConfig.ldflags) {
-        s += " ldflag:";
-        s += flag;
-    }
-    // Per-glob flags (G4): full ordered serialization — glob + every list —
-    // so editing any entry (or reordering) re-fingerprints the output dir.
-    for (auto const& gf : m.buildConfig.globFlags) {
-        s += " globflags:"; s += gf.glob;
-        for (auto const& f : gf.cflags)   { s += " gc:";  s += f; }
-        for (auto const& f : gf.cxxflags) { s += " gxx:"; s += f; }
-        for (auto const& f : gf.asmflags) { s += " gas:"; s += f; }
-        for (auto const& f : gf.defines)  { s += " gd:";  s += f; }
-    }
-    // [build] module_extensions changes WHICH FILES ARE MODULE INTERFACES,
-    // i.e. the shape of the graph: which units emit a BMI, which objects link
-    // unconditionally, which ninja rule each unit gets. That is a build
-    // variant, so it belongs in the fingerprint — mcpp.toml's mtime alone only
-    // protects the fast path within one output dir, not the BMI cache.
-    //
-    // Contrast [build] build_program_timeout, which is deliberately absent:
-    // it changes no edge. See BuildConfig::buildProgramTimeoutSecs.
-    for (auto const& e : m.buildConfig.moduleExtensions) {
-        s += " modext:";
-        s += e;
-    }
-    // The resolved [profile] knobs. These are NOT in cflags/cxxflags: the
-    // profile block (see the profile resolution below) lands them in
-    // buildConfig.optLevel/debug/lto/strip and flags.cppm turns them into
-    // -O<n>/-g/-flto at command-construction time. Leaving them out made
-    // `--dev`, `--release` and `--profile dist` share ONE fingerprint, hence
-    // one target/<triple>/<fp>/ directory AND one global cache entry — so a
-    // release build could be served -O0 -g dependency objects. They are
-    // build-variant by definition; they belong here.
-    s += " opt=";   s += m.buildConfig.optLevel;
-    s += " debug="; s += m.buildConfig.debug ? "1" : "0";
-    s += " lto=";   s += m.buildConfig.lto   ? "1" : "0";
-    s += " strip="; s += m.buildConfig.strip ? "1" : "0";
-    // #519 — the same reasoning as the profile knobs above, one axis later.
-    // The REQUEST is folded in rather than the derived `-fPIC`, because this
-    // string is built before the plan exists; the request is what a user
-    // edits and the flag is a function of it. Without this, flipping
-    // `dependency_linkage` reuses the previous configuration's output
-    // directory — measured on a two-package fixture, where both builds landed
-    // in `target/x86_64-linux-gnu/5d4a4a8a584ba471/` and the shared build's
-    // `libcore.so` was left sitting in the static build's `bin/`.
-    //
-    // Only appended when non-empty, so every existing build directory keeps
-    // its identity and this release rebuilds nothing.
-    if (!m.buildConfig.dependencyLinkage.empty()) {
+    s += " opt=";   s += root.buildConfig.optLevel;
+    s += " debug="; s += root.buildConfig.debug ? "1" : "0";
+    s += " lto=";   s += root.buildConfig.lto   ? "1" : "0";
+    s += " strip="; s += root.buildConfig.strip ? "1" : "0";
+    if (!root.buildConfig.dependencyLinkage.empty()) {
         s += " deplinkage=";
-        s += m.buildConfig.dependencyLinkage;
+        s += root.buildConfig.dependencyLinkage;
     }
     return s;
 }
 
-std::string canonical_package_build_metadata(
-    const std::vector<mcpp::modgraph::PackageRoot>& packages,
-    bool targetIsMacos = false)
-{
-    std::string s;
-    for (auto const& pkg : packages) {
-        s += "\npackage:";
-        s += pkg.manifest.package.namespace_;
-        s += "/";
-        s += pkg.manifest.package.name;
-        s += "@";
-        s += pkg.manifest.package.version;
-        s += " source=";
-        s += pkg.manifest.package.sourceProvenance;
-        // WHAT THIS PACKAGE IS BUILT WITH, AND NOT ONLY WHAT IT ASKS THE
-        // RUNTIME FOR.
-        //
-        // Only the root's compile inputs used to reach the fingerprint, through
-        // `canonical_compile_flags` on the root manifest. A DEPENDENCY's
-        // `[build] cflags` / `defines` / `sources` / per-glob flags reached
-        // nothing — so editing one left the fingerprint unchanged, the consumer
-        // kept the same output directory, and the fast path replayed a
-        // build.ninja generated before the edit.
-        //
-        // AND THE WAY THAT SHOWS IS THAT THE EDIT APPEARS TO HAVE HAD NO
-        // EFFECT. Measured 2026-08-23 on a path dependency: a flag added to
-        // `[build] cflags` was absent from the generated `unit_cflags` after a
-        // rebuild, absent after touching the sources, and present the moment
-        // `target/` was removed. The first two observations are what a reader
-        // uses to conclude the flag is being filtered, and one was concluded
-        // and written down before the third measurement was taken.
-        //
-        // The comment beside the root-flag tail merge in prepare.cppm has said
-        // "canonical_package_build_metadata folds packages[].manifest.
-        // buildConfig" since before this fix. It now does.
-        //
-        // packages[0] is the root, whose flags `canonical_compile_flags`
-        // already folds; serialising it twice is harmless and keeps this loop
-        // one rule rather than one rule and an exception.
-        //
-        // EXCEPT for `dialect_cxxflags` (#717 design §6.2, finding 7): that
-        // key is graph-wide, so a dependency's own value must not enter ITS
-        // fingerprint contribution, and the root's must enter the fingerprint
-        // exactly once -- through the DIRECT root-only call this function's
-        // caller already makes on the root manifest (`canonical_compile_flags
-        // (*state.m, ...)`, scan.cpp), not through this per-package loop,
-        // where `includeDialectFlags = false` for every entry including the
-        // root.
-        s += ' ';
-        s += canonical_compile_flags(pkg.manifest, targetIsMacos,
-                                     /*includeDialectFlags=*/false);
-        // The level a C++-layer provider compiles its implementation units at
-        // (`make_plan`). Appended only when there is one, so every other
-        // output directory keeps its identity.
-        if (auto own = mcpp::manifest::cxx_layer_implementation_standard(pkg.manifest)) {
-            s += " implementation-standard=";
-            s += own->canonical;
-        }
-        for (auto const& src : pkg.manifest.buildConfig.sources) {
-            s += " src:";
-            s += src;
-        }
-        for (auto const& dir : pkg.manifest.buildConfig.includeDirs) {
-            s += " inc:";
-            s += dir.generic_string();
-        }
-        for (auto const& dir : pkg.manifest.buildConfig.includeDirsAfter) {
-            s += " inca:";
-            s += dir.generic_string();
-        }
-        auto const& runtime = pkg.manifest.runtimeConfig;
-        for (auto const& requirement : runtime.requirements) {
-            s += " runtime-need:";
-            s += requirement.kind;
-            s += ':';
-            s += requirement.value;
-            s += ':';
-            s += requirement.phase;
-            s += requirement.required ? ":required" : ":optional";
-        }
-        for (auto const& artifact : runtime.artifacts) {
-            s += " runtime-artifact:";
-            s += artifact.role;
-            s += ':';
-            s += artifact.path.generic_string();
-            s += ':';
-            s += artifact.provenance;
-            s += ':';
-            s += artifact.abi;
-            s += ':';
-            s += artifact.digest;
-            s += ':';
-            s += artifact.hostFingerprint;
-        }
-        for (auto const& value : runtime.linkIntent.libraries)
-            s += " link-library:" + value;
-        for (auto const& value : runtime.linkIntent.linkLibraryDirs)
-            s += " link-dir:" + value.generic_string();
-        for (auto const& value : runtime.linkIntent.transitiveNeededDirs)
-            s += " needed-dir:" + value.generic_string();
-        for (auto const& value : runtime.linkIntent.runtimeSearchDirs)
-            s += " runtime-dir:" + value.generic_string();
-        for (auto const& value : runtime.linkIntent.frameworks)
-            s += " framework:" + value;
-        for (auto const& value : runtime.linkIntent.deployFiles)
-            s += " deploy:" + value.generic_string();
-        // Legacy fields remain fingerprinted while they are readable.
-        for (auto const& value : runtime.libraryDirs)
-            s += " legacy-runtime-dir:" + value.generic_string();
-        for (auto const& value : runtime.dlopenLibs)
-            s += " legacy-soname:" + value;
-        for (auto const& value : runtime.capabilities)
-            s += " legacy-capability:" + value;
-        for (auto const& value : runtime.provides)
-            s += " legacy-provides:" + value;
-        for (auto const& [capability, provider] : runtime.providerOverrides)
-            s += " provider-override:" + capability + '=' + provider;
-        if (!pkg.manifest.buildConfig.cStandard.empty()) {
-            s += " c_standard=";
-            s += pkg.manifest.buildConfig.cStandard;
-        }
-        for (auto const& flag : pkg.manifest.buildConfig.cflags) {
-            s += " cflag:";
-            s += flag;
-        }
-        for (auto const& flag : pkg.manifest.buildConfig.cxxflags) {
-            s += " cxxflag:";
-            s += flag;
-        }
-        for (auto const& flag : pkg.manifest.buildConfig.ldflags) {
-            s += " ldflag:";
-            s += flag;
-        }
-        // Per-glob flags — same full ordered serialization as the root-side
-        // block above. Until #253 dependency globFlags were unfingerprinted
-        // (held only by "descriptor frozen per version" + "feature toggles
-        // always change cflags via -DMCPP_FEATURE_*"); feature-folded entries
-        // make the vector build-variant, so fingerprint it directly.
-        // featureOrigin is diagnostic-only and deliberately NOT serialized
-        // (the active feature set is already in cflags above).
-        for (auto const& gf : pkg.manifest.buildConfig.globFlags) {
-            s += " globflags:"; s += gf.glob;
-            for (auto const& f : gf.cflags)   { s += " gc:";  s += f; }
-            for (auto const& f : gf.cxxflags) { s += " gxx:"; s += f; }
-            for (auto const& f : gf.asmflags) { s += " gas:"; s += f; }
-            for (auto const& f : gf.defines)  { s += " gd:";  s += f; }
-        }
-        // Same reason as the root block, and it cannot be skipped on the
-        // grounds that "a descriptor is frozen per version": path and git
-        // dependencies are not frozen, and this key changes their products.
-        for (auto const& e : pkg.manifest.buildConfig.moduleExtensions) {
-            s += " modext:";
-            s += e;
-        }
-        if (pkg.usageResolved) {
-            for (auto const& dir : pkg.privateBuild.includeDirs) {
-                s += " private_include:";
-                s += dir.generic_string();
-            }
-            for (auto const& dir : pkg.publicUsage.includeDirs) {
-                s += " public_include:";
-                s += dir.generic_string();
-            }
-            for (auto const& dir : pkg.privateBuild.includeDirsAfter) {
-                s += " private_include_after:";
-                s += dir.generic_string();
-            }
-            for (auto const& dir : pkg.publicUsage.includeDirsAfter) {
-                s += " public_include_after:";
-                s += dir.generic_string();
-            }
-        }
-        for (auto const& [path, content] : pkg.manifest.buildConfig.generatedFiles) {
-            s += " genfile:";
-            s += path.generic_string();
-            s += "=";
-            s += content;
-        }
-    }
-    return s;
-}
 
 }  // namespace mcpp::build

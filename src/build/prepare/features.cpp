@@ -1862,6 +1862,9 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             // A package of programs runs its build program in its own tool
             // sub-build, where its sources are compiled (#649 E6).
             if (!state.compilesHere(i)) continue;
+            // A workspace member's program runs where a root's does
+            // (target_side.cpp, step9_member_build_programs).
+            if (state.isWorkspaceMemberPackage(i)) continue;
             std::error_code bpEc;
             if (!std::filesystem::exists(pkg.root / "build.mcpp", bpEc)
                 && pkg.manifest.buildConfig.ruleModules.empty()) continue;
@@ -2033,8 +2036,11 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             // A CLAIM THAT ONLY EVER TIGHTENS.
             if (bcDep.runExclusive && !exclusiveBefore)
                 state.m->buildConfig.runExclusive = true;
-            state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
-                bcDep.ldflags.begin() + ldN, bcDep.ldflags.end());
+            // A workspace plan reads each package's own flags when it links
+            // a member's closure; nothing is pooled in its root (§15).
+            if (!state.workspacePlan())
+                state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
+                    bcDep.ldflags.begin() + ldN, bcDep.ldflags.end());
         }
 
         // apply() may have added interface defines to packages' publicUsage

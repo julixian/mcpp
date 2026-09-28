@@ -2283,15 +2283,13 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
             auto obj = escape_ninja_path(cu.object);
             append(std::format("build {} : stage_file {}\n", obj,
                                escape_ninja_path(cu.cachedObject)));
-            // A member's own build rewrites its outputs in place, and an
-            // object of equal size is no evidence of equal content: content.
-            if (!cu.servedFromMember) append("  verify = --verify size\n");
+            append("  verify = --verify size\n");
             staged.push_back(obj);
             if (!cu.providesModule.empty() && !cu.cachedBmi.empty()) {
                 auto bmi = bmi_path(cu.providesModule);
                 append(std::format("build {} : stage_file {}\n", bmi,
                                    escape_ninja_path(cu.cachedBmi)));
-                if (!cu.servedFromMember) append("  verify = --verify size\n");
+                append("  verify = --verify size\n");
                 staged.push_back(bmi);
             }
         }

@@ -367,10 +367,14 @@ static std::vector<std::string> propagateLinkFlags(
         // exactly that word, so the consumer's renderer reads the dependency's
         // flags with the same reading its own flags receive, and an element
         // that packs several tokens is several words on both sides.
+        //
+        // A workspace plan links each member's closure with that closure's own
+        // flags (workspace design 2026-09-29 §15), read from each package when
+        // the plan is made, so nothing is pooled in the virtual root.
         std::vector<std::string> added;
         for (auto const& word : mcpp::manifest::flag_words(depManifest.buildConfig.ldflags)) {
             auto normalized = mcpp::manifest::flag_element(normalizeDepLdflag(depRoot, word));
-            state.m->buildConfig.ldflags.push_back(normalized);
+            if (!state.workspacePlan()) state.m->buildConfig.ldflags.push_back(normalized);
             added.push_back(std::move(normalized));
         }
         return added;
@@ -1762,8 +1766,23 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         // application `z.o`), compiled its sources in the consumer's build, and
         // made a tool that depends on the package declaring it a cycle of the
         // consumer's graph although the two builds never meet.
+        // A selected workspace member is built in this plan whatever its
+        // targets are (workspace design 2026-09-29 §15).
+        const auto selectedMember = state.selectedMemberAt(ctx.dep_root);
         const bool depProgramOnly = state.isProgramOnlyPackage(*ctx.dep_manifest)
-                                 && spec.artifacts.empty();
+                                 && spec.artifacts.empty() && !selectedMember;
+        // A root receives the profile's own compile flags; in a workspace plan
+        // each selected member does, as it did when it was the root. The
+        // tests `mcpp test` discovered are the selected member's targets.
+        if (selectedMember && state.selectedMembers.size() == 1)
+            for (auto const& t : state.extraTargets) ctx.dep_manifest->targets.push_back(t);
+        if (selectedMember) {
+            auto& mbc = ctx.dep_manifest->buildConfig;
+            mbc.cflags.insert(mbc.cflags.end(), state.profileCflags.begin(),
+                              state.profileCflags.end());
+            mbc.cxxflags.insert(mbc.cxxflags.end(), state.profileCxxflags.begin(),
+                                state.profileCxxflags.end());
+        }
         auto linkFlagsAdded = depProgramOnly
             ? std::vector<std::string>{}
             : propagateLinkFlags(state, ctx.dep_root, *ctx.dep_manifest);
@@ -1786,6 +1805,7 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         const auto depPackageIndex = state.packages.size();
         auto depPackage = makePackageRoot(state, ctx.dep_root, *state.dep_manifests.back());
         if (!depPackage) return std::unexpected(depPackage.error());
+        if (selectedMember) depPackage->memberProducts = state.selectedMembers.at(*selectedMember);
         state.packages.push_back(std::move(*depPackage));
         recordDependencyEdge(state, item.consumerDepIndex, depPackageIndex, spec,
                              item.buildOnly, name);
@@ -1835,12 +1855,37 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
         if (auto fe = validateForwards(state, *state.dep_manifests.back(), depActive,
                                        state.dep_manifests.back()->package.name); !fe)
             return std::unexpected(fe.error());
+        // `--features <dependency>/<feature>` for a selected member: a forward
+        // of that member, applied to its edges as the root's are.
+        auto injectMemberCliForwards = [&](const std::string& childKey,
+                                           mcpp::manifest::DependencySpec& childSpec) {
+            if (!selectedMember) return;
+            auto fw = state.memberCliForwards.find(*selectedMember);
+            if (fw == state.memberCliForwards.end()) return;
+            for (auto const& [depKey, depFeat] : fw->second)
+                if (depKey == childKey
+                    && std::ranges::find(childSpec.features, depFeat) == childSpec.features.end())
+                    childSpec.features.push_back(depFeat);
+        };
         for (auto& [child_name, child_spec] : state.dep_manifests.back()->dependencies) {
             auto childReq = child_spec;
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
+            injectMemberCliForwards(child_name, childReq);
             state.worklist.push_back({child_name, childReq, thisDepLabel,
                                 childReq.version, selfIdx, ctx.dep_root,
                                 item.devOnly, item.buildOnly});
+        }
+        // A selected member's `[dev-dependencies]` under `mcpp test`, as a
+        // root's: its own, and never walked into its dependencies' tests.
+        if (selectedMember && state.includeDevDeps) {
+            for (auto& [child_name, child_spec] : state.dep_manifests.back()->devDependencies) {
+                auto childReq = child_spec;
+                injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
+                injectMemberCliForwards(child_name, childReq);
+                state.worklist.push_back({child_name, childReq, thisDepLabel + " (dev-dep)",
+                                    childReq.version, selfIdx, ctx.dep_root,
+                                    /*devOnly=*/true, item.buildOnly});
+            }
         }
         // A dependency's own `[build-dependencies]` — the only channel through
         // which a package can speak about what IT needs at build time. Both
@@ -1856,6 +1901,7 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
                  state.dep_manifests.back()->buildDependencies) {
             auto childReq = child_spec;
             injectForwards(*state.dep_manifests.back(), depActive, child_name, childReq);
+            injectMemberCliForwards(child_name, childReq);
             state.worklist.push_back({child_name, childReq,
                                 thisDepLabel + " (build-dep)",
                                 childReq.version, selfIdx, ctx.dep_root,
@@ -1973,8 +2019,18 @@ static void step4b_define_lookup_closures(PrepareState& state) {
     };
     // Compiled in this plan: not a package of programs, or one whose programs
     // this plan ships.
+    state.isWorkspaceMemberPackage = [&](std::size_t i) {
+        if (i == 0 || i >= state.packages.size() || !state.workspacePlan()) return false;
+        if (state.packages[i].memberProducts) return true;
+        const auto& r = state.packages[i].root;
+        if (r.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal()) return true;
+        return !workspace_member_of(state, r).empty();
+    };
+    // A selected workspace member is compiled here whatever its targets are
+    // (workspace design 2026-09-29 §15).
     state.compilesHere = [&](std::size_t i) {
-        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest) || state.isArtifactPackage(i);
+        return i == 0 || !state.isProgramOnlyPackage(state.packages[i].manifest)
+            || state.isArtifactPackage(i) || state.packages[i].memberProducts.has_value();
     };
 
 

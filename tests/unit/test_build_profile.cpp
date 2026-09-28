@@ -82,18 +82,18 @@ TEST(BuildProfile, CustomProfileNamePassesThrough) {
 TEST(BuildProfile, OptLevelIsInTheCanonicalFlags) {
     auto a = base();
     auto b = base(); b.buildConfig.optLevel = "0";
-    EXPECT_NE(mcpp::build::canonical_compile_flags(a),
-              mcpp::build::canonical_compile_flags(b));
+    EXPECT_NE(mcpp::build::canonical_configuration_flags(a),
+              mcpp::build::canonical_configuration_flags(b));
 }
 
 TEST(BuildProfile, DebugLtoStripAreInTheCanonicalFlags) {
-    auto ref = mcpp::build::canonical_compile_flags(base());
+    auto ref = mcpp::build::canonical_configuration_flags(base());
     { auto m = base(); m.buildConfig.debug = true;
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
+      EXPECT_NE(mcpp::build::canonical_configuration_flags(m), ref); }
     { auto m = base(); m.buildConfig.lto = true;
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
+      EXPECT_NE(mcpp::build::canonical_configuration_flags(m), ref); }
     { auto m = base(); m.buildConfig.strip = true;
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
+      EXPECT_NE(mcpp::build::canonical_configuration_flags(m), ref); }
 }
 
 // The exact shape the three built-in profiles resolve to (prepare_build's
@@ -111,9 +111,9 @@ TEST(BuildProfile, BuiltInProfilesProduceDistinctCanonicalFlags) {
     dist.buildConfig.optLevel = "3";
     dist.buildConfig.strip    = true;
 
-    auto fdev     = mcpp::build::canonical_compile_flags(dev);
-    auto frelease = mcpp::build::canonical_compile_flags(release);
-    auto fdist    = mcpp::build::canonical_compile_flags(dist);
+    auto fdev     = mcpp::build::canonical_configuration_flags(dev);
+    auto frelease = mcpp::build::canonical_configuration_flags(release);
+    auto fdist    = mcpp::build::canonical_configuration_flags(dist);
 
     EXPECT_NE(fdev, frelease);
     EXPECT_NE(frelease, fdist);
@@ -121,24 +121,33 @@ TEST(BuildProfile, BuiltInProfilesProduceDistinctCanonicalFlags) {
 }
 
 TEST(BuildProfile, CanonicalFlagsStillCoverTheNonProfileKnobs) {
-    auto ref = mcpp::build::canonical_compile_flags(base());
+    auto ref = mcpp::build::canonical_configuration_flags(base());
     { auto m = base(); m.package.standard = "c++26";
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
-    { auto m = base(); m.buildConfig.cxxflags = {"-DFOO"};
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
-    { auto m = base(); m.buildConfig.cflags = {"-DBAR"};
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
-    { auto m = base(); m.buildConfig.ldflags = {"-lm"};
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
+      EXPECT_NE(mcpp::build::canonical_configuration_flags(m), ref); }
     { auto m = base(); m.buildConfig.dialectCxxflags = {"-freflection"};
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
+      EXPECT_NE(mcpp::build::canonical_configuration_flags(m), ref); }
+    { auto m = base(); m.buildConfig.dependencyLinkage = "shared";
+      EXPECT_NE(mcpp::build::canonical_configuration_flags(m), ref); }
+}
+
+// Workspace design 2026-09-29 §3: a package's own flags are attributes of its
+// node, not inputs of the configuration, so editing them keeps the build
+// directory and ninja rebuilds the edges whose commands changed.
+TEST(BuildProfile, PackageFlagsAreNotInTheConfiguration) {
+    auto ref = mcpp::build::canonical_configuration_flags(base());
+    { auto m = base(); m.buildConfig.cxxflags = {"-DFOO"};
+      EXPECT_EQ(mcpp::build::canonical_configuration_flags(m), ref); }
+    { auto m = base(); m.buildConfig.cflags = {"-DBAR"};
+      EXPECT_EQ(mcpp::build::canonical_configuration_flags(m), ref); }
+    { auto m = base(); m.buildConfig.ldflags = {"-lm"};
+      EXPECT_EQ(mcpp::build::canonical_configuration_flags(m), ref); }
     { auto m = base(); m.buildConfig.cStandard = "c17";
-      EXPECT_NE(mcpp::build::canonical_compile_flags(m), ref); }
+      EXPECT_EQ(mcpp::build::canonical_configuration_flags(m), ref); }
 }
 
 // ── macos_deployment_target: TARGET-keyed, not HOST-keyed (mcpp#685) ────────
 //
-// `canonical_compile_flags` used to fold this value in only
+// The fingerprint's flag string used to fold this value in only
 // `if constexpr (mcpp::platform::is_macos)` -- the platform mcpp ITSELF was
 // built for -- so `mcpp build --target aarch64-macos` on a Linux host kept
 // the exact same fingerprint (hence the exact same `target/<triple>/<fp>/`
@@ -158,18 +167,18 @@ TEST(BuildProfile, NonMacosTargetIgnoresDeploymentTargetInTheFingerprint) {
     // one building for something other than macOS) must not see the
     // fingerprint move just because the manifest names a macOS floor it will
     // never apply.
-    EXPECT_EQ(mcpp::build::canonical_compile_flags(ref),
-              mcpp::build::canonical_compile_flags(changed));
-    EXPECT_EQ(mcpp::build::canonical_compile_flags(ref, /*targetIsMacos=*/false),
-              mcpp::build::canonical_compile_flags(changed, /*targetIsMacos=*/false));
+    EXPECT_EQ(mcpp::build::canonical_configuration_flags(ref),
+              mcpp::build::canonical_configuration_flags(changed));
+    EXPECT_EQ(mcpp::build::canonical_configuration_flags(ref, /*targetIsMacos=*/false),
+              mcpp::build::canonical_configuration_flags(changed, /*targetIsMacos=*/false));
 }
 
 TEST(BuildProfile, TargetIsMacosFoldsDeploymentTargetIntoTheFingerprint) {
     ScopedDeploymentTargetEnv noEnv(nullptr);
     auto ref = base();
     auto changed = base(); changed.buildConfig.macosDeploymentTarget = "11.0";
-    EXPECT_NE(mcpp::build::canonical_compile_flags(ref, /*targetIsMacos=*/true),
-              mcpp::build::canonical_compile_flags(changed, /*targetIsMacos=*/true));
+    EXPECT_NE(mcpp::build::canonical_configuration_flags(ref, /*targetIsMacos=*/true),
+              mcpp::build::canonical_configuration_flags(changed, /*targetIsMacos=*/true));
 
     // AND THE ENV OVERRIDE, folded the same way `deployment_target` resolves
     // it: with MACOSX_DEPLOYMENT_TARGET set, the manifest value stops
@@ -178,8 +187,8 @@ TEST(BuildProfile, TargetIsMacosFoldsDeploymentTargetIntoTheFingerprint) {
     ScopedDeploymentTargetEnv env("12.3");
     auto manifestA = base(); manifestA.buildConfig.macosDeploymentTarget = "11.0";
     auto manifestB = base(); manifestB.buildConfig.macosDeploymentTarget = "13.0";
-    EXPECT_EQ(mcpp::build::canonical_compile_flags(manifestA, /*targetIsMacos=*/true),
-              mcpp::build::canonical_compile_flags(manifestB, /*targetIsMacos=*/true));
+    EXPECT_EQ(mcpp::build::canonical_configuration_flags(manifestA, /*targetIsMacos=*/true),
+              mcpp::build::canonical_configuration_flags(manifestB, /*targetIsMacos=*/true));
 }
 
 // ── cache-mode parsing ──────────────────────────────────────────────────────

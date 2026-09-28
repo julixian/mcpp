@@ -606,6 +606,11 @@ export struct BuildOverrides {
     std::string accel;
     bool        force_static = false; // --static (or implied by musl target)
     std::string package_filter;      // -p <name>: only build this workspace member
+    // The workspace members this plan builds, as written in `[workspace]
+    // members` ("." is a rooted workspace's own package), all of one
+    // configuration group (workspace design 2026-09-29 §15). Empty: the member
+    // is selected from `package_filter` or the command's directory.
+    std::vector<std::string> workspace_members;
     // --profile <name>. Empty = fall through to `[build] default-profile`, then
     // to `profile_fallback` below, whose own default is "dev". The comment here
     // said "release" for as long as `mcpp build --help` did, and neither had

@@ -120,6 +120,48 @@ TEST(BuildStage, DifferentSizeIsAlwaysCopied) {
     EXPECT_EQ(read_file(dst), "longer-payload");
 }
 
+// Workspace design 2026-09-29 §5.3: a shared library placed in two product
+// directories holds one copy of its bytes where the file system allows a link;
+// any other file is copied, so a program that writes a file beside itself
+// never writes through to its source.
+TEST(BuildStage, ASharedLibraryIsPlacedByALinkAndADataFileByACopy) {
+    Tmp tmp;
+    auto lib  = tmp.path / "store" / "libfoo.so.1";
+    auto data = tmp.path / "store" / "table.dat";
+    write_file(lib, "library");
+    write_file(data, "data");
+    for (auto const& dir : {"cli", "gui"}) {
+        ASSERT_TRUE(stage_file(lib, tmp.path / "bin" / dir / "libfoo.so.1", no_retry()));
+        ASSERT_TRUE(stage_file(data, tmp.path / "bin" / dir / "table.dat", no_retry()));
+    }
+    std::error_code ec;
+    const auto libLinks = std::filesystem::hard_link_count(lib, ec);
+    ASSERT_FALSE(ec);
+    // Three names on a file system with links (the source and two
+    // placements), one where the link fell back to a copy.
+    EXPECT_TRUE(libLinks == 3 || libLinks == 1) << libLinks;
+    if (libLinks == 3)
+        EXPECT_TRUE(std::filesystem::equivalent(tmp.path / "bin" / "cli" / "libfoo.so.1",
+                                                tmp.path / "bin" / "gui" / "libfoo.so.1"));
+    EXPECT_EQ(std::filesystem::hard_link_count(data), 1u);
+    EXPECT_EQ(read_file(tmp.path / "bin" / "gui" / "table.dat"), "data");
+}
+
+// A linked placement is replaced out of place: a new source never rewrites the
+// bytes the earlier source shares with the placement.
+TEST(BuildStage, ReplacingALinkedPlacementLeavesTheEarlierSourceIntact) {
+    Tmp tmp;
+    auto first  = tmp.path / "v1" / "foo.dll";
+    auto second = tmp.path / "v2" / "foo.dll";
+    auto dst    = tmp.path / "bin" / "app" / "foo.dll";
+    write_file(first, "version one");
+    write_file(second, "version two!");
+    ASSERT_TRUE(stage_file(first, dst, no_retry()));
+    ASSERT_TRUE(stage_file(second, dst, no_retry()));
+    EXPECT_EQ(read_file(dst), "version two!");
+    EXPECT_EQ(read_file(first), "version one");
+}
+
 TEST(BuildStage, MissingSourceIsAnError) {
     Tmp tmp;
     auto r = stage_file(tmp.path / "nope.bin", tmp.path / "dst.bin", no_retry());

@@ -706,13 +706,14 @@ static void step11_compute_fingerprint(PrepareState& state) {
     // `macos_deployment_target` whenever THIS BUILD's resolved toolchain
     // targets macOS, whether mcpp itself is running on Linux, Windows or
     // macOS — see the discriminator comment on `min_platform_version` and
-    // on `canonical_compile_flags`.
+    // on `canonical_configuration_flags`.
     const bool fpTargetIsMacos = [&] {
         auto fpTt = mcpp::toolchain::triple::parse(state.tc->targetTriple);
         return fpTt && fpTt->os == "macos";
     }();
-    fpi.compileFlags        = canonical_compile_flags(*state.m, fpTargetIsMacos)
-                              + canonical_package_build_metadata(state.packages, fpTargetIsMacos);
+    // The configuration alone (workspace design 2026-09-29 §3): a package's own
+    // flags are attributes of its node and reach its commands, not this name.
+    fpi.compileFlags        = canonical_configuration_flags(*state.m, fpTargetIsMacos);
     // [c-abi] REALISATION AND `__OPENKAL__` PARTICIPATE IN THE FINGERPRINT
     // (design 2026-09-18 §3.4, gap #4 of the design's own self-review). Two
     // builds whose C library declares `data-model = "lp64"` and `"llp64"`
@@ -725,32 +726,10 @@ static void step11_compute_fingerprint(PrepareState& state) {
     if (state.tc->kernelAbiIsOpenkal) fpi.compileFlags += " openkal-kernel-abi";
     for (auto& t : state.tc->cEnvTokens)        fpi.compileFlags += " cenv:" + t;
     for (auto& t : state.tc->cEnvBuiltinsTokens) fpi.compileFlags += " cenv:" + t;
-    // A package opting OUT via `c-environment = "platform"` (§3.4) still
-    // changes what ITS OWN objects contain, relative to a graph where it
-    // did not opt out — so the opt-out is folded in too, named by the
-    // package rather than by its flags, since the flags it now keeps are
-    // simply the ones already covered above.
-    //
-    // GATED ON THE REALISATION ACTUALLY BEING ACTIVE (`cEnvTokens` or
-    // `cEnvBuiltinsTokens` non-empty) — NOT unconditional. `cEnvironment ==
-    // "platform"` is true for every `mcpp:kernel-abi=<impl>` provider now
-    // (it is INFERRED, this same revision), in every graph that uses one,
-    // whether or not that graph's C library declares `[c-abi]` at all. An
-    // unconditional loop here folded `cenv-platform:<name>` into the
-    // fingerprint of EVERY project using openkal-windows (say) even when
-    // nothing about the realised environment was active — moving every
-    // such project's output directory on upgrade for a string that
-    // describes an opt-out from a realisation that never ran. There is
-    // nothing to opt OUT of when there is nothing being realised, so the
-    // opt-out changes nothing about that package's own objects and must
-    // not move the fingerprint either — the same "declares nothing, byte
-    // identical" guarantee the rest of this block already gives, which this
-    // loop had broken on its own.
-    if (!state.tc->cEnvTokens.empty() || !state.tc->cEnvBuiltinsTokens.empty()) {
-        for (auto& pkg : state.packages)
-            if (pkg.manifest.cEnvironment == "platform")
-                fpi.compileFlags += " cenv-platform:" + pkg.manifest.package.name;
-    }
+    // A package opting OUT via `c-environment = "platform"` (§3.4) is an
+    // attribute of that package's node: it changes that package's commands,
+    // which ninja rebuilds, and not the configuration (workspace design
+    // 2026-09-29 §3).
     // The module-edge schedule changes the SHAPE of build.ninja, and the fast
     // path replays that file without a plan to compare against. Folding the
     // switch into the fingerprint puts a differently-scheduled build in a

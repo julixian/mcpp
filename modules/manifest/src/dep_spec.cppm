@@ -109,6 +109,11 @@ struct DependencySpec {
     // are private-only.)
     bool                        reexport = false;
     bool                        defaultFeatures = true; // consumer opt-out: `default-features = false`
+    // A member edge (workspace design 2026-09-29 §15): the edge from a
+    // workspace plan's root to a selected member. It puts the member in the
+    // graph and links nothing into the root, as an `artifacts` edge does.
+    // Written by the engine only; no manifest spells it.
+    bool                        workspaceMember = false;
                                                         // suppresses the dep's own [features].default seed
                                                         // (Cargo parity). Explicit `features = [...]` still apply.
     // Canonical dependency parsing writes exactly one coordinate. Kept as a
