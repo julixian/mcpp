@@ -55,6 +55,9 @@ if [ "$(resolutions a2.log)" != 0 ]; then
     if [ -n "$first_request" ] && [ "$first_request" = "$second_request" ]; then
         echo "NOT MEASURED: an unchanged second build did not take the fast path on this host, and both builds recorded the same request ($first_request)"
         echo "--- the recorded entry ---"; cat target/.build_cache
+        # #734 E5: the fast path states why it declined under -v.
+        "$MCPP" build -v > a3.log 2>&1 || true
+        echo "--- why the fast path declined ---"; grep "fast-path" a3.log || echo "(no reason printed)"
         exit 0
     fi
     fail "control: an unchanged second build resolved the toolchain, and the recorded requests differ ('$first_request', then '$second_request')" a2.log
