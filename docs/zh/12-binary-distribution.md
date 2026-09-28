@@ -125,6 +125,19 @@ error: the published interface imports mathkit:secret , which no unit in this
 要么重构，让接口够不到它；要么把它改成 `export module` 分区，并接受它的源码
 被发布。
 
+### 公开模块，以及 `mcpp pack` 与 `mcpp build` 的报告（mcpp 2026.9.28.3+）
+
+包的公开模块是 lib root 的模块，以及它用 `export import` 传递地转出的模块（SPEC-008）。消费方
+可以 import 的就是这些；发布的闭包还包含它们 import 但未转出的单元，因为消费方构建这些接口
+需要它们。"Withheld" 一行列出每个未发布的单元，包括包没有 lib root 的情形。下面三种情况都是
+警告：库可以用模块实现自己而只发布头文件，是否有意如此只有作者能说明。
+
+| 情况 | 报告者 | 写明的后果 |
+|---|---|---|
+| `lib` 目标导出了模块但没有 lib root | `mcpp build`，只对当前构建的包 | `mcpp pack` 发布的库不带模块接口 |
+| 打包形态不包含的导出模块 | `mcpp pack`，逐个写出模块名 | 使用打包形态的消费方无法 import 它们 |
+| 当前构建的包 import 了某个有 lib root 的依赖的非公开模块;该依赖不是本包所在工作区的成员(工作区成员总与本包一起从源码构建) | `mcpp build`，写出该模块与公开模块 | 从源码构建成功，但对打包形态会失败 |
+
 ## 兼容性 tag
 
 每一个产物都记录它是为哪一套工具链构建的：

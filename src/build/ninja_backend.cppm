@@ -62,8 +62,17 @@ public:
 // Factory for this backend implementation.
 std::unique_ptr<Backend> make_ninja_backend();
 
+// The ninja mcpp runs for a toolchain: the sandbox-local ninja beside the
+// toolchain when there is one, else `ninja` from PATH. One answer for the
+// engine's own builds and for the build information (#734 E2).
+std::string ninja_program_for(const mcpp::toolchain::Toolchain& tc);
+
 // Helper exposed for testing / debugging
 std::string emit_ninja_string(const BuildPlan& plan);
+// The same, and when the plan places two or more files beside its programs,
+// the placement list the one `stage_list` edge reads (#734 E4), for the caller
+// to write as `<outputDir>/placements.list`. Empty when there is no such edge.
+std::string emit_ninja_string(const BuildPlan& plan, std::string* placements);
 std::string filter_ninja_output(std::string_view output,
                                 std::span<const std::string> commandPrefixes);
 
@@ -1133,6 +1142,10 @@ std::string filter_ninja_output(std::string_view output,
 }
 
 std::string emit_ninja_string(const BuildPlan& plan) {
+    return emit_ninja_string(plan, nullptr);
+}
+
+std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // dyndep requires P1689 scanning capability:
     //   GCC: built-in -fdeps-format=p1689r5
     //   Clang: external clang-scan-deps tool (same P1689 output format)
@@ -1322,6 +1335,16 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     append("rule stage_file\n");
     append("  command = $mcpp stage $verify --output $out $in\n");
     append("  description = STAGE $out\n");
+    append("  restat = 1\n\n");
+    // #734 E4: every file a program's runtime needs beside it, placed by ONE
+    // process. A process per file cost 4.5 s for 1270 files on a first
+    // Windows build, against 0.5 s for one copying process. The list is a
+    // file of the build directory, rewritten only when it changes, and an
+    // input of the edge, so adding or removing an entry re-runs it; `restat`
+    // keeps an unchanged destination's time stamp.
+    append("rule stage_list\n");
+    append("  command = $mcpp stage --list placements.list\n");
+    append("  description = STAGE $count files\n");
     append("  restat = 1\n\n");
 
     // P1: per-file dyndep rule. Converts one .ddi → .dd independently.
@@ -2260,13 +2283,15 @@ std::string emit_ninja_string(const BuildPlan& plan) {
             auto obj = escape_ninja_path(cu.object);
             append(std::format("build {} : stage_file {}\n", obj,
                                escape_ninja_path(cu.cachedObject)));
-            append("  verify = --verify size\n");
+            // A member's own build rewrites its outputs in place, and an
+            // object of equal size is no evidence of equal content: content.
+            if (!cu.servedFromMember) append("  verify = --verify size\n");
             staged.push_back(obj);
             if (!cu.providesModule.empty() && !cu.cachedBmi.empty()) {
                 auto bmi = bmi_path(cu.providesModule);
                 append(std::format("build {} : stage_file {}\n", bmi,
                                    escape_ninja_path(cu.cachedBmi)));
-                append("  verify = --verify size\n");
+                if (!cu.servedFromMember) append("  verify = --verify size\n");
                 staged.push_back(bmi);
             }
         }
@@ -3012,11 +3037,27 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     // exactly one source (every project before this feature, and most
     // packages after it) emits the exact same line as always: the loop below
     // reduces to the one-word case with no change in spelling.
-    for (auto const& d : deployFiles) {
-        std::string ins;
-        for (auto const& s : d.sources) ins += " " + escape_ninja_path(s);
-        append(std::format("build {} : stage_file{}\n",
-            escape_ninja_path(d.dest), ins));
+    if (deployFiles.size() >= 2) {
+        // #734 E4: one edge for the whole list. One entry keeps the per-file
+        // edge below, byte for byte.
+        std::string outs, ins, list;
+        for (auto const& d : deployFiles) {
+            outs += " " + escape_ninja_path(d.dest);
+            for (auto const& s : d.sources) {
+                ins += " " + escape_ninja_path(s);
+                list += std::format("{}\t{}\n", s.generic_string(), d.dest.generic_string());
+            }
+        }
+        append(std::format("build{} : stage_list{} | placements.list\n  count = {}\n",
+                           outs, ins, deployFiles.size()));
+        if (placements) *placements = std::move(list);
+    } else {
+        for (auto const& d : deployFiles) {
+            std::string ins;
+            for (auto const& s : d.sources) ins += " " + escape_ninja_path(s);
+            append(std::format("build {} : stage_file{}\n",
+                escape_ninja_path(d.dest), ins));
+        }
     }
     if (!deployFiles.empty())
         append("\n");
@@ -3672,8 +3713,23 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         plan.targetSide.cAbiDecl ? plan.targetSide.cAbiDecl->absent
                                  : std::vector<mcpp::targetside::CAbiAbsentEntry>{});
     write_consumer_include_sidecar(plan.outputDir, root_include_dirs_of(plan));
-    auto manifest = emit_ninja_string(plan);
+    std::string placements;
+    auto manifest = emit_ninja_string(plan, &placements);
     stage("emit-ninja");
+    if (!placements.empty()) {
+        // Written only when it changes: it is an input of the placement edge.
+        const auto listPath = plan.outputDir / "placements.list";
+        std::error_code lec;
+        std::string old;
+        if (std::filesystem::exists(listPath, lec)) {
+            std::ifstream in(listPath, std::ios::binary);
+            old.assign(std::istreambuf_iterator<char>(in), {});
+        }
+        if (old != placements) {
+            std::filesystem::create_directories(plan.outputDir, lec);
+            std::ofstream(listPath, std::ios::binary | std::ios::trunc) << placements;
+        }
+    }
 
     // Command-length backstop (see
     // .agents/docs/2026-08-06-command-length-architecture.md). The structural
@@ -3696,7 +3752,22 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     if (auto bad = check_action_ordering(manifest, plan))
         return std::unexpected(BuildError{*bad, ninja_path});
     auto goalArg = append_goal_phony(manifest, opts.ninjaTargets);
-    write_file(ninja_path, manifest);
+    // An unchanged build.ninja is not rewritten, but its TIME is moved: the
+    // project fast path compares every source with it, and reads it as "the
+    // graph was confirmed current then". A source edited since the last
+    // rewrite would otherwise stay newer after this build confirmed the graph,
+    // and every later build declined the fast path until the graph's text
+    // changed (#734, measured on Linux: an edit to src/main.cpp, then two
+    // builds, the second planned in full). No edge reads build.ninja's time.
+    {
+        std::error_code tec;
+        const bool existed = std::filesystem::exists(ninja_path, tec);
+        const auto before  = existed ? std::filesystem::last_write_time(ninja_path, tec)
+                                     : std::filesystem::file_time_type{};
+        write_file(ninja_path, manifest);
+        if (existed && !tec && std::filesystem::last_write_time(ninja_path, tec) == before && !tec)
+            std::filesystem::last_write_time(ninja_path, std::filesystem::file_time_type::clock::now(), tec);
+    }
     stage("write-ninja");
 
     // compile_commands.json — via the dedicated module.
@@ -3827,18 +3898,10 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     // The compiler's internal `as`/`ld` lookup is handled via the
     // -B<binutils-bin> flag we emit into cxxflags/ldflags (see
     // emit_ninja_string). No PATH injection needed here.
-    std::filesystem::path ninjaBin;
-    auto ninja_name = std::string("ninja") + std::string(mcpp::platform::exe_suffix);
-    if (auto nb = mcpp::xlings::paths::find_sibling_binary(
-            plan.toolchain.binaryPath, "ninja", ninja_name)) {
-        ninjaBin = *nb;
-    }
-
     // Raw program path (no shell quoting): recorded in the fast-path cache and
     // exec'd directly via capture_exec/execvp, which take argv (not a shell
     // string). Shell-using call sites must quote it locally.
-    std::string ninjaProgram = ninjaBin.empty() ? std::string("ninja")
-                                                 : ninjaBin.string();
+    std::string ninjaProgram = ninja_program_for(plan.toolchain);
 
     // THE BUILD FILE IN THE ENCODING NINJA READS IT IN (#693, M4). Ninja reads
     // UTF-8 when it declares the UTF-8 code page and the host honours it, and
@@ -4117,6 +4180,13 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
                                           std::move(diagnostics)});
     }
     return r;
+}
+
+std::string ninja_program_for(const mcpp::toolchain::Toolchain& tc) {
+    auto ninja_name = std::string("ninja") + std::string(mcpp::platform::exe_suffix);
+    if (auto nb = mcpp::xlings::paths::find_sibling_binary(tc.binaryPath, "ninja", ninja_name))
+        return nb->string();
+    return "ninja";
 }
 
 std::unique_ptr<Backend> make_ninja_backend() {

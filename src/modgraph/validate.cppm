@@ -169,10 +169,17 @@ ValidateReport validate(const Graph&                    g,
                     // root by construction. One that has some, but not the
                     // conventional one, is the case the warning exists for and
                     // still gets it.
+                    // SPEC-008 W1 (#734 E6): the consequence is stated,
+                    // because the reader of this property is `mcpp pack`,
+                    // not this build. The first line keeps its words.
                     r.warnings.push_back({lib_root_rel, std::format(
-                        "lib target without conventional lib root '{}' "
-                        "(create the file or set [lib].path)",
-                        lib_root_rel.string())});
+                        "lib target without conventional lib root '{}'\n"
+                        "  impact: `mcpp pack` publishes this library without a module "
+                        "interface\n"
+                        "  hint: add '{}' re-exporting the public modules with "
+                        "`export import`, or set [lib].path; a library that "
+                        "publishes headers only can ignore this",
+                        lib_root_rel.string(), lib_root_rel.string())});
                 }
             }
         }

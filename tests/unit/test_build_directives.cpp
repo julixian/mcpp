@@ -1062,13 +1062,13 @@ TEST(BuildDirectives, DeployRowIsProtocolElevenWithLinkGlobalScopeAndATag) {
     EXPECT_EQ(def->scope, dirs::Scope::LinkGlobal);
     EXPECT_EQ(def->sinceProtocol, 11);
     EXPECT_FALSE(def->tag.empty());
-    EXPECT_EQ(dirs::kProtocolVersion, 13);
+    EXPECT_EQ(dirs::kProtocolVersion, 14);
 }
 
-TEST(BuildDirectives, ProtocolThirteenIsAcceptedAndFourteenIsNot) {
-    auto ok = parse("mcpp:protocol=13\n");
+TEST(BuildDirectives, ProtocolFourteenIsAcceptedAndFifteenIsNot) {
+    auto ok = parse("mcpp:protocol=14\n");
     EXPECT_FALSE(dirs::protocol_error(ok).has_value());
-    auto no = parse("mcpp:protocol=14\n");
+    auto no = parse("mcpp:protocol=15\n");
     EXPECT_TRUE(dirs::protocol_error(no).has_value());
 }
 

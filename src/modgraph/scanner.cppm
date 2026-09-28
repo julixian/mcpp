@@ -1054,6 +1054,10 @@ std::expected<SourceUnit, ScanError> scan_file(const std::filesystem::path& file
                 name = owningModule + name;
             }
             u.requires_.push_back(ModuleId{name});
+            // `export import X;` re-exports X to whoever imports this unit
+            // (SPEC-008: a package's public modules are its interface root and
+            // what the root re-exports, transitively). #734 E6 W3 reads it.
+            if (is_export) u.reexports.push_back(ModuleId{name});
             continue;
         }
     }

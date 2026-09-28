@@ -60,11 +60,13 @@ prepare_build(bool print_fingerprint,
     };
 
     if (auto r = phase0_manifest_and_workspace(state); !r) return fail(r.error());
+    if (auto r = check_engine_floors(state, /*rootOnly=*/true); !r) return fail(r.error());
     if (auto r = phase1_toolchain_spec_and_axes(state); !r) return fail(r.error());
     if (auto r = phase2_define_toolchain_resolver(state); !r) return fail(r.error());
     if (auto r = phase3_xlings_before_graph(state); !r) return fail(r.error());
     if (auto r = phase4a_graph_load(state); !r) return fail(r.error());
     if (auto r = phase4b_graph_worklist(state); !r) return fail(r.error());
+    if (auto r = check_engine_floors(state, /*rootOnly=*/false); !r) return fail(r.error());
     if (auto r = phase5_toolchain_after_graph(state); !r) return fail(r.error());
     if (auto r = phase6_features_and_host_tools(state); !r) return fail(r.error());
     if (auto r = phase9_target_side(state); !r) return fail(r.error());

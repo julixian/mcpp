@@ -11,6 +11,8 @@ import mcpp.targetside;
 import mcpp.diag;
 import mcpp.build.version_floor;
 import mcpp.manifest;
+import mcpp.version;          // this binary's release, for E9's floor
+import mcpp.xpkg_version;     // the release ordering
 import mcpp.source_kind;
 import mcpp.modgraph.glob;
 import mcpp.modgraph.graph;
@@ -152,6 +154,33 @@ static std::expected<void, std::string> step0_workspace_handling(PrepareState& s
                     *state.m, *state.wsManifest, state.runtimeWorkspaceRoot);
         }
     }
+    return {};
+}
+
+std::expected<void, std::string> check_engine_floors(const PrepareState& state,
+                                                     bool rootOnly) {
+    const auto have = mcpp::xpkg_version::parse(mcpp::MCPP_VERSION);
+    if (!have) return {};   // a development build with an unparsable version states no order
+    auto check = [&](const mcpp::manifest::Manifest& m,
+                     std::string_view where) -> std::expected<void, std::string> {
+        if (m.package.mcppFloor.empty()) return {};
+        const auto need = mcpp::xpkg_version::parse(m.package.mcppFloor);
+        if (!need || mcpp::xpkg_version::compare(*have, *need) >= 0) return {};
+        const std::string who = m.package.namespace_.empty()
+            ? m.package.name : m.package.namespace_ + "." + m.package.name;
+        return std::unexpected(std::format(
+            "package '{}' ({}) requires mcpp >= {}; this is mcpp {}.\n"
+            "       hint: pin \"mcpp\": \"{}\" (or newer) in .xlings.json and run "
+            "`xlings install`, or run `xlings install mcpp@{}`",
+            who, where, m.package.mcppFloor, mcpp::MCPP_VERSION,
+            m.package.mcppFloor, m.package.mcppFloor));
+    };
+    if (rootOnly) {
+        if (!state.m) return {};
+        return check(*state.m, state.root ? state.root->generic_string() : "the project");
+    }
+    for (auto const& p : state.packages)
+        if (auto r = check(p.manifest, p.root.generic_string()); !r) return r;
     return {};
 }
 

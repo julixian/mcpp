@@ -103,6 +103,22 @@ mcpp does not read is reported, as in `[build]`: a warning, and an error under
 resources = "res"
 ```
 
+`mcpp = ">=<release>"` (mcpp 2026.9.28.3+) states the oldest mcpp release the
+package supports. It is a floor, not a pin: the release a project installs is
+the one `.xlings.json` names. Only the `>=` form is accepted, because a bare
+release means "exactly" elsewhere in mcpp; a bare release and a value that is
+not a release are refused with the spelling that is meant. An engine below the
+floor stops before any other work, naming the package, the floor, its own
+release and the command that installs a newer one. `[workspace.package] mcpp`
+states it once for every member. An engine older than 2026.9.28.3 ignores the
+key with a warning.
+
+```toml
+[package]
+name = "myplugin"
+mcpp = ">=2026.9.28.3"
+```
+
 #### Dialect flags and the `import std` BMI
 
 Some flags change what the standard library's headers declare, so the precompiled `import std`
@@ -1022,6 +1038,10 @@ path = "src/capi/lua.cppm"    # Override the default lib-root location
 ```
 
 Default convention: `src/<last segment of package name>.cppm` (e.g. package name `mcpplibs.cmdline` → `src/cmdline.cppm`).
+`path` is the only key of the table; any other key is reported, as in `[build]`
+(mcpp 2026.9.28.3+). The lib root is the interface root of SPEC-008: the module a
+packed library publishes, with what it re-exports, and the module a build
+program imports from a host-module dependency.
 ### 2.5 `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`
 
 Moved to [05 — Dependencies and Resolution](05-dependencies.md).

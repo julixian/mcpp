@@ -367,6 +367,9 @@ struct PrepareState {
     // detect (nothing outside the escaping closure's own body names them).
     std::vector<mcpp::modgraph::PackageRoot> packages;
     std::vector<std::vector<std::string>> activeFeaturesByPackage;
+    // #734 E7: per consumer, the dormant features of its host-module providers.
+    std::map<std::size_t, std::vector<mcpp::build::BuildProgramEnv::DormantFeature>>
+        dormantFeaturesByConsumer;
     std::map<std::string, std::string> xlingsWinner;
     std::vector<std::unique_ptr<mcpp::manifest::Manifest>> dep_manifests;
     std::vector<DepCacheIdentity> dep_cache_identities;
@@ -499,6 +502,10 @@ struct PrepareState {
 // static would give each definition internal linkage, invisible outside
 // its own file.
 std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& state);
+
+// plan.cpp: the member path of a package root within the workspace this build
+// runs in, or empty (#734 E1, W3).
+std::string workspace_member_of(const PrepareState& state, const std::filesystem::path& root);
 std::expected<void, std::string> phase1_toolchain_spec_and_axes(PrepareState& state);
 std::expected<void, std::string> phase2_define_toolchain_resolver(PrepareState& state);
 std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state);
@@ -508,6 +515,11 @@ std::expected<void, std::string> phase5_toolchain_after_graph(PrepareState& stat
 std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& state);
 std::expected<void, std::string> phase9_target_side(PrepareState& state);
 std::expected<void, std::string> phase11_scan(PrepareState& state);
+// E9 (#734): every package's `mcpp = ">=V"` against this binary. Checked for the
+// root right after its manifest is final and for the whole graph after loading,
+// so a too-new root fails before any later phase can fail on a key it uses.
+std::expected<void, std::string> check_engine_floors(const PrepareState& state,
+                                                     bool rootOnly);
 std::expected<BuildContext, std::string> phase13_finish(PrepareState& state);
 // P13's records half (records.cpp), called by phase13_finish.
 std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildContext& ctx);

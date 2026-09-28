@@ -962,6 +962,56 @@ export int cmd_dyndep(const mcpplibs::cmdline::ParsedArgs& parsed) {
 // and the destination. One source — every invocation before this feature —
 // takes the exact path it always has.
 export int cmd_stage(const mcpplibs::cmdline::ParsedArgs& parsed) {
+    // `--list FILE` (#734 E4): many placements, one process. Each destination
+    // keeps the single-file semantics below -- content comparison, an
+    // out-of-place write, the check that several sources agree -- because each
+    // group is handed to the same `stage_files`.
+    if (auto listFile = parsed.option_or_empty("list").value(); !listFile.empty()) {
+        mcpp::build::stage::StageOptions opts;
+        std::string verify = parsed.option_or_empty("verify").value();
+        if (verify.empty())
+            if (const char* e = std::getenv("MCPP_STAGE_VERIFY"); e && *e) verify = e;
+        if (!verify.empty()) opts.verify = mcpp::build::stage::parse_verify(verify);
+        std::ifstream in(std::filesystem::path{listFile}, std::ios::binary);
+        if (!in) {
+            std::println(stderr, "error: cannot read the placement list {}", listFile);
+            return 1;
+        }
+        std::vector<std::pair<std::string, std::vector<std::filesystem::path>>> groups;
+        std::vector<std::vector<std::string>> spelled;   // each group's sources as the list writes them
+        std::map<std::string, std::size_t> index;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            const auto tab = line.find('\t');
+            if (tab == std::string::npos) {
+                std::println(stderr, "error: placement list line without a tab: {}", line);
+                return 2;
+            }
+            std::string src = line.substr(0, tab), dst = line.substr(tab + 1);
+            auto [it, fresh] = index.emplace(dst, groups.size());
+            if (fresh) { groups.push_back({dst, {}}); spelled.emplace_back(); }
+            groups[it->second].second.push_back(
+                mcpp::platform::fs::extended_length(std::filesystem::path{src}));
+            spelled[it->second].push_back(src);
+        }
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            auto const& [dst, srcs] = groups[g];
+            auto r = mcpp::build::stage::stage_files(
+                srcs, mcpp::platform::fs::extended_length(std::filesystem::path{dst}), opts);
+            if (!r) {
+                // One edge places the whole list, so ninja's echo of the
+                // command no longer shows which files were involved; the
+                // entries are named here as the list writes them.
+                std::println(stderr, "error: {}", r.error().message);
+                std::println(stderr, "  placement list entries ({}):", listFile);
+                for (auto const& src : spelled[g]) std::println(stderr, "    {} -> {}", src, dst);
+                return 1;
+            }
+        }
+        return 0;
+    }
     std::filesystem::path outPath = parsed.option_or_empty("output").value();
     if (outPath.empty()) {
         std::println(stderr, "error: --output <path> required");

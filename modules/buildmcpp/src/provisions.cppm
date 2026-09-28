@@ -483,11 +483,22 @@ host_module_collision(const std::vector<HostModule>& mods)
 // out that impression is a supply-chain statement. It is a WARNING rather than
 // an error because the engine cannot decide who is official: a path
 // dependency, a private mirror and an internal fork are all legitimate and all
-// indistinguishable from here. The message names both halves — the module name
-// and the package identity — because exactly one of them is the surprising one
+// indistinguishable from here. The message names both halves -- the module name
+// and the package identity -- because exactly one of them is the surprising one
 // and the reader is better placed to say which.
+//
+// THE RULE (#734 E10, SPEC-007). A build-program module may use the prefix to
+// say that it is an mcpp plugin, under its package's own namespace:
+// `mcpp.<namespace>.*` (`mcpp.acme.protobuf`, `mcpp.mcpplibs.capi.lua`). The
+// second segments below belong to the official families and to the engine's
+// own interface; only packages in namespace `mcpp` provide them. mcpp-index
+// applies the same list as an admission rule, so the two enforcers state one
+// rule.
 inline constexpr std::string_view kReservedModulePrefix = "mcpp.";
 inline constexpr std::string_view kOfficialNamespace    = "mcpp";
+inline constexpr std::string_view kReservedSecondSegments[] = {
+    "core", "plugins", "deps", "rules", "dist", "tools",
+};
 
 inline std::optional<std::string>
 reserved_prefix_warning(std::string_view moduleName,
@@ -496,11 +507,30 @@ reserved_prefix_warning(std::string_view moduleName,
 {
     if (!moduleName.starts_with(kReservedModulePrefix)) return std::nullopt;
     if (packageNamespace == kOfficialNamespace)         return std::nullopt;
+    const auto rest   = moduleName.substr(kReservedModulePrefix.size());
+    const auto second = rest.substr(0, rest.find('.'));
+    for (auto r : kReservedSecondSegments) {
+        if (second != r) continue;
+        return std::format(
+            "build-program module '{}' of '{}' uses 'mcpp.{}', which belongs to the "
+            "modules maintained by the mcpp project. Nothing breaks -- the name "
+            "claims an origin the package does not have. A plugin names its modules "
+            "'mcpp.{}.*' under its own namespace.",
+            moduleName, packageFqn, r,
+            packageNamespace.empty() ? std::string_view("<namespace>") : packageNamespace);
+    }
+    if (!packageNamespace.empty()
+        && (rest == packageNamespace
+            || (rest.starts_with(packageNamespace)
+                && rest.size() > packageNamespace.size()
+                && rest[packageNamespace.size()] == '.')))
+        return std::nullopt;
     return std::format(
-        "build rule '{}' declares the module '{}'; the '{}' prefix is reserved "
-        "for rules maintained by the mcpp project. Nothing breaks — the name "
-        "simply claims an origin the package does not have.",
-        packageFqn, moduleName, kReservedModulePrefix);
+        "build-program module '{}' of '{}' is under 'mcpp.' but not under its own "
+        "namespace. Nothing breaks; a plugin names its modules 'mcpp.{}.*', so that "
+        "two plugins cannot choose one name.",
+        moduleName, packageFqn,
+        packageNamespace.empty() ? std::string_view("<namespace>") : packageNamespace);
 }
 
 } // namespace mcpp::build::provisions

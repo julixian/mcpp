@@ -181,6 +181,12 @@ enum class Slot : std::size_t {
     // second path to keep in sync. The directory need not exist when the
     // program runs: a `prepare` action may populate it later, at build time.
     RuntimeSearchDir,
+    // A STRUCTURED DIAGNOSTIC (#734 E11), as `<severity>\t<message>\t<impact>\t<hint>`.
+    // The engine renders it through its own diagnostics model, so a plugin's
+    // message has the engine's form (impact and hint lines, the JSON record,
+    // `--strict` for a degradation) and is replayed on a cache hit as a
+    // warning is.
+    Diagnostics,
     Count
 };
 inline constexpr std::size_t kSlotCount = static_cast<std::size_t>(Slot::Count);
@@ -279,7 +285,7 @@ struct Def {
     int              sinceProtocol;
 };
 
-inline constexpr std::array<Def, 27> kTable{{
+inline constexpr std::array<Def, 28> kTable{{
     //  wire                    tag                  slot                    scope                  transform                must   missingPrefix                 missingSuffix                                    since
     {"cxxflag",             "cxxflag",           Slot::CxxFlags,         Scope::PackagePrivate, Transform::Verbatim,      false, "",                           "",                                              1},
     {"cflag",               "cflag",             Slot::CFlags,           Scope::PackagePrivate, Transform::Verbatim,      false, "",                           "",                                              1},
@@ -393,6 +399,7 @@ inline constexpr std::array<Def, 27> kTable{{
     // direction is already safe: an older engine reading a newer entry hits
     // the unknown-tag path and discards the whole record.
     {"warning",             "warning",           Slot::Warnings,         Scope::Advisory,       Transform::Verbatim,      false, "", "", 5},
+    {"diagnostic",          "diagnostic",        Slot::Diagnostics,      Scope::Advisory,       Transform::Verbatim,      false, "", "", 14},
     {"action",              "action",            Slot::Actions,          Scope::GraphNode,      Transform::Verbatim,      false, "",                           "",                                              1},
     // The probe channel: a rule package measures, the engine compares. See
     // Slot::Facts for the shape of each value.
@@ -535,6 +542,17 @@ std::optional<std::string> encoding_error(const Directives& d);
 // The package name comes from the caller because a build program cannot spell
 // it reliably — in a workspace it would have to know which member it is.
 std::vector<std::string> advisories(std::string_view packageName, const Directives& d);
+
+// #734 E11: the structured diagnostics a build program stated, parsed from
+// their `<severity>\t<message>\t<impact>\t<hint>` wire form. The severity is
+// one of "note", "warning", "degraded"; anything else reads as "warning".
+struct StatedDiagnostic {
+    std::string severity;
+    std::string message;
+    std::string impact;
+    std::string hint;
+};
+std::vector<StatedDiagnostic> stated_diagnostics(const Directives& d);
 
 // ── Cache serialization ────────────────────────────────────────────────────
 
@@ -930,6 +948,24 @@ std::string glob_fingerprint(const std::filesystem::path& root,
     std::string joined;
     for (auto const& h : hits) { joined += h; joined.push_back('\n'); }
     return mcpp::toolchain::hash_string(joined);
+}
+
+std::vector<StatedDiagnostic> stated_diagnostics(const Directives& d) {
+    std::vector<StatedDiagnostic> out;
+    for (auto const& raw : d.at(Slot::Diagnostics)) {
+        std::array<std::string, 4> f;
+        std::size_t i = 0, start = 0;
+        for (std::size_t k = 0; k <= raw.size() && i < f.size(); ++k) {
+            if (k == raw.size() || (raw[k] == '\t' && i + 1 < f.size())) {
+                f[i++] = raw.substr(start, k - start);
+                start = k + 1;
+            }
+        }
+        StatedDiagnostic sd{f[0], f[1], f[2], f[3]};
+        if (sd.severity != "note" && sd.severity != "degraded") sd.severity = "warning";
+        out.push_back(std::move(sd));
+    }
+    return out;
 }
 
 std::vector<std::string> advisories(std::string_view packageName, const Directives& d) {

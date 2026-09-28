@@ -137,6 +137,23 @@ error: the published interface imports mathkit:secret , which no unit in this
 Restructure so the interface does not reach it, or make it an `export module`
 partition and accept that its source is published.
 
+### Public modules, and what `mcpp pack` and `mcpp build` report (mcpp 2026.9.28.3+)
+
+A package's public modules are the lib root's module and what it re-exports
+with `export import`, transitively (SPEC-008). They are what a consumer may
+import; the published closure also carries what they import without
+re-exporting, because a consumer needs it to build their interfaces. The
+"Withheld" row lists every unit that is not published, including when the
+package has no lib root. The three conditions below are warnings: a library may
+implement itself in modules and publish only headers, and only its author can
+state which it means.
+
+| Condition | Reported by | Consequence stated |
+|---|---|---|
+| a `lib` target exports modules and has no lib root | `mcpp build`, for the package being built | `mcpp pack` publishes the library without a module interface |
+| exported modules that the packed form does not ship | `mcpp pack`, naming each module | a consumer of the packed form cannot import them |
+| the package being built imports a module of a dependency that has a lib root, outside its public modules; the dependency is not a member of the package's own workspace, whose members are built from source with it | `mcpp build`, naming the module and the public ones | the build succeeds from source and fails against the packed form |
+
 ## The compatibility tag
 
 Every artifact records the toolchain it was built for:

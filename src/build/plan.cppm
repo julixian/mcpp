@@ -71,6 +71,10 @@ struct CompileUnit {
     bool                            servedFromCache = false;
     std::filesystem::path           cachedObject;   // absolute, inside the cache
     std::filesystem::path           cachedBmi;      // absolute; empty if no module
+    // #734 E1: served from a workspace member's own build directory rather
+    // than from an immutable cache entry. Its bytes change under an unchanged
+    // name, so its stage edges compare content, not size.
+    bool                            servedFromMember = false;
     // mcpp#344: this object's address INSIDE a global-cache entry — relative to
     // `<entry>/obj/`, and a pure function of the owning package (its source's
     // path relative to its own package root). Distinct from `object`, which is
@@ -384,6 +388,12 @@ struct BuildPlan {
     std::vector<std::string>        rcFlags;         // -I / -D, target-shaped
 
     std::vector<CompileUnit>        compileUnits;     // topologically sorted
+    // Each package's build key (`cache_key::key_hex`), indexed as the graph's
+    // packages, [0] the root. Set in the global cache mode. #734 E1 compares a
+    // workspace member's key in a consumer's graph with the member's key as the
+    // root of its own build: equal keys are equal compile commands.
+    std::vector<std::string>        packageKeys;
+    std::vector<std::string>        packageKeyInputs;   // each key's inputs, as JSON text
     std::vector<LinkUnit>           linkUnits;
     // Build-graph nodes declared by build programs (`mcpp:action=`). Paths are
     // absolute and engine variables already substituted by the time they get

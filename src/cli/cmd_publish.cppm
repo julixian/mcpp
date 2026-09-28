@@ -17,6 +17,8 @@ import mcpp.pack.library_pipeline;
 import mcpp.pack.pipeline;
 import mcpp.pack.route;
 import mcpp.platform.terminal;
+import mcpp.project;          // resolve_member_dir, for `pack -p` (#734 E3)
+import mcpp.manifest;
 import mcpp.publish.pipeline;
 import mcpp.ui;
 import mcpp.wire;
@@ -258,6 +260,35 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
                   mcpp::pack::PackOutcome* report,
                   mcpp::pack::LibraryPackReport* libraryReport,
                   bool* libraryRoute) {
+    // `-p <member>` (#734 E3): the member is resolved by the resolver every
+    // other `-p` uses, and the pack then runs in its directory, so the result
+    // is by construction the one `mcpp pack` in that directory produces. A
+    // relative `--output` keeps meaning the directory the user typed it in.
+    std::optional<std::filesystem::path> outputFromUser;
+    if (auto pkg = parsed.option_or_empty("package").value(); !pkg.empty()) {
+        auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
+        if (!root) {
+            mcpp::ui::error("-p needs a workspace; no mcpp.toml was found here or above");
+            return 2;
+        }
+        auto rm = mcpp::manifest::load(*root / "mcpp.toml");
+        if (!rm) { mcpp::ui::error(rm.error().format()); return 2; }
+        auto member = mcpp::project::resolve_member_dir(*rm, *root, pkg);
+        if (!member) { mcpp::ui::error(member.error()); return 2; }
+        if (member->empty()) {
+            mcpp::ui::error(std::format("-p {}: {} is not a workspace", pkg, root->string()));
+            return 2;
+        }
+        if (auto v = parsed.value("output"))
+            outputFromUser = std::filesystem::absolute(*v);
+        std::error_code ec;
+        std::filesystem::current_path(*member, ec);
+        if (ec) {
+            mcpp::ui::error(std::format("-p {}: cannot enter {}: {}", pkg,
+                                        member->string(), ec.message()));
+            return 2;
+        }
+    }
     // ─── Resolve mode ────────────────────────────────────────────────
     mcpp::pack::Options opts;
     bool modeFromUser = false;
@@ -293,7 +324,7 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
             opts.formatName = *v;
         }
     }
-    if (auto v = parsed.value("output")) opts.output = *v;
+    if (auto v = parsed.value("output")) opts.output = outputFromUser ? outputFromUser->string() : *v;
 
     // `value()`, not `option_or_empty()`, for `profile` — and NOT for
     // anything whose name a positional shares. `ParsedArgs::value()` falls back

@@ -71,6 +71,12 @@ struct Package {
     std::string                 license;
     std::vector<std::string>    authors;
     std::string                 repo;
+    // `mcpp = ">=V"`: the oldest mcpp release this package supports, stored as
+    // the version after `>=`. Empty when the package states none. A floor, not
+    // a pin: the pin a project installs is `.xlings.json`'s. The parser accepts
+    // only the `>=` form, because a bare version means "exactly" everywhere
+    // else in mcpp.
+    std::string                 mcppFloor;
     std::vector<std::string>    platforms;     // declared supported platforms (CI matrix hint)
     // Accelerator backends this package supports, declared in the same spirit
     // as `platforms`: a statement of intent and a CI-matrix hint, not a gate.
@@ -1674,6 +1680,7 @@ struct WorkspaceInherited {
     std::string              description;
     std::string              repo;
     std::vector<std::string> authors;
+    std::string              mcppFloor;     // `[workspace.package] mcpp`, as `Package::mcppFloor`
     // `[workspace.build]` — the INHERITABLE SUBSET of `[build]`, and the subset
     // is a stated list rather than "whatever [build] happens to carry". A key
     // that is not in it is refused at parse time with the reason, because

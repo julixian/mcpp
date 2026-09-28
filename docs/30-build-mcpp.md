@@ -1056,6 +1056,91 @@ one. `mcpp::graph_file()` names a JSON document that states the resolved graph:
 - The entries are the `graph` section of `resolution.json` with four additions
   (`manifest_dir`, `features`, `targets`, `metadata`), from one derivation.
 
+### The interface's name: `mcpp.core` (protocol 14)
+
+The engine's build-program interface is named `mcpp.core`, which is the name the
+specification (SPEC-007) gives to the layer. `mcpp` is its permanent equivalent:
+the engine embeds both units, and the second consists of `export import mcpp;`.
+A program may use either spelling, or both.
+
+```cpp
+import mcpp.core;   // the same symbols as `import mcpp;`
+```
+
+### Build information: the resolved toolchain (protocol 14)
+
+A build program reads the resolved toolchain as a set of facts. mcpp does not
+translate them for any foreign build system; a plugin that drives CMake, vcpkg,
+Meson or make does. Every value is empty when it does not apply, and a role is
+one of `cc`, `cxx`, `ld`, `ar`, `rc`, `as`, `mt`.
+
+| Accessor | Value |
+|---|---|
+| `mcpp::tool(role)` | the row's tool for the role: the driver on a GNU-style row, the toolset's tools on the cl.exe row |
+| `mcpp::abi_tool(role)` | the target ABI's native tool: on the MSVC ABI `cl`, `link`, `lib`, `ml64` and the SDK's `rc` and `mt`, whichever driver the row uses; elsewhere the same as `tool(role)` |
+| `mcpp::tool_env()` | the environment the engine runs the ABI's tools with, one `KEY=value` per line (`INCLUDE`, `LIB`, `PATH` on the MSVC ABI) |
+| `mcpp::toolset_identity()` | a path-free identity such as `msvc 14.44.35207; sdk 10.0.26100.0` or `clang 22.1.8` |
+| `mcpp::msvc_instance_dir()` | the Visual Studio instance the MSVC toolset belongs to; empty for a managed toolset |
+| `mcpp::ninja_program()` | the ninja mcpp itself runs |
+| `mcpp::cxx_runtime()` | the program's C++ runtime contract: `self-contained`, `toolchain-coupled` or `host-coupled` |
+| `mcpp::msvc_crt_linkage()` | on the MSVC ABI `static` (`/MT`) or `dynamic` (`/MD`), the value `place-dlls` reads |
+
+The values enter the build program's context, so every build program runs once
+more after an upgrade to the release that introduced them.
+
+### Structured diagnostics: `mcpp::report` (protocol 14)
+
+A diagnostic stated with `mcpp::report` is rendered in the engine's form: the
+message, then an `impact:` line and a `hint:` line. It reaches
+`--message-format json` with the same fields, a `degraded` one fails the build
+under `--strict`, and a cached run reports it again. `mcpp::warning(text)` stays,
+and equals a diagnostic with a message only.
+
+```cpp
+mcpp::report({.severity = "warning",
+              .message  = "the generator found no schema",
+              .impact   = "no bindings are generated",
+              .hint     = "add schema/*.proto"});
+```
+
+### Placing many files at once: `mcpp stage --list`
+
+`mcpp stage --list <file>` places every `<source>\t<destination>` pair of the
+file in one process. Each destination keeps the single-file semantics: an equal
+destination is not written, a write goes out of place, and several sources for
+one destination must agree. The engine places the deploy entries of a program
+with one such edge when there are two or more; an action may call
+`${mcpp.self} stage --list` as well.
+
+```text
+data/a.txt	bin/data/a.txt
+data/b.txt	bin/data/b.txt
+```
+
+### The names of a plugin's modules
+
+A module a build program imports may use the `mcpp.` prefix to state that it is
+an mcpp plugin, under its package's own namespace. The engine warns when a
+module outside namespace `mcpp` uses a reserved second segment or another
+namespace; mcpp-index applies the same rule when it admits a package.
+
+| Module name | Provided by |
+|---|---|
+| `mcpp`, `mcpp.core` | the engine |
+| `mcpp.plugins.*`, `mcpp.deps.*`, `mcpp.rules.*`, `mcpp.dist.*`, `mcpp.tools.*` | packages in namespace `mcpp` |
+| `mcpp.<namespace>.*` | packages in that namespace |
+
+### A module behind a feature that is not enabled
+
+When a build program imports a module that a dependency offers only behind a
+feature, the error names the package and the feature:
+
+```text
+error: build.mcpp imports 'mcpp.rules.qt'
+  provided by: mcpp.plugins, feature "rules-qt" (not enabled)
+  hint: enable it on the dependency edge: mcpp.plugins = { ..., features = ["rules-qt"] }
+```
+
 ### `import mcpp;` is the surface that evolves (mcpp 2026.8.5.1+)
 
 Two ways to talk to mcpp, and they carry **different compatibility promises**:
@@ -1107,10 +1192,12 @@ if constexpr (requires { mcpp::runner("qemu"); })   // hard error when absent
 ```
 
 A `requires`-expression over a **qualified name that does not exist** is
-ill-formed, not `false`. So there is no in-language feature probe, and a
-package that adopts a new directive states its floor in prose (its README) and
-relies on the diagnostic above. Such a package should name the mcpp version it
-requires.
+ill-formed, not `false`. So there is no in-language feature probe. A package
+that adopts a new directive states its floor in its manifest,
+`[package] mcpp = ">=<release>"` (mcpp 2026.9.28.3+, docs/04): an engine below
+the floor stops before compiling anything and names the release to install. An
+older engine ignores the key with a warning, and the diagnostic above remains
+what it reports.
 
 ### `import std;` (mcpp 2026.8.2.1+)
 

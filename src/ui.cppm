@@ -149,9 +149,12 @@ private:
     void render_line(std::size_t percent, const std::string& info_text);
     void render_line_swept(std::size_t frame, const std::string& info_text);
 
-    // Not a terminal: one start line, then one finish line.
+    // One line per item in both modes (#734): a terminal redraws it in place
+    // and ends it with the completion line; elsewhere only the completion
+    // line is printed. `announce` records the size without printing.
     void announce(std::size_t total_bytes);
     void finish_plain(std::string_view final_message);
+    std::string completion(std::string_view final_message) const;
 
     std::string verb_;
     std::string label_;
@@ -608,20 +611,19 @@ ProgressBar::ProgressBar(std::string_view verb, std::string_view label)
 void ProgressBar::announce(std::size_t total_bytes) {
     if (announced_) return;
     announced_ = true;
-    if (total_bytes > 0)
-        info(verb_, std::format("{} ({})", label_, fmt_bytes(total_bytes)));
-    else
-        info(verb_, label_);
+    if (total_bytes > lastBytes_) lastBytes_ = total_bytes;
 }
 
-void ProgressBar::finish_plain(std::string_view final_message) {
+std::string ProgressBar::completion(std::string_view final_message) const {
     const auto secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start_).count();
     if (lastBytes_ > 0)
-        info(verb_, std::format("{} done, {} in {:.1f}s", final_message,
-                                fmt_bytes(lastBytes_), secs));
-    else
-        info(verb_, std::format("{} done in {:.1f}s", final_message, secs));
+        return std::format("{} done, {} in {:.1f}s", final_message, fmt_bytes(lastBytes_), secs);
+    return std::format("{} done in {:.1f}s", final_message, secs);
+}
+
+void ProgressBar::finish_plain(std::string_view final_message) {
+    info(verb_, completion(final_message));
 }
 
 ProgressBar::~ProgressBar() {
@@ -672,7 +674,8 @@ void ProgressBar::update(std::size_t percent) {
 void ProgressBar::update_bytes(std::size_t current, std::size_t total,
                                double elapsed_sec) {
     if (g_quiet || finished_) return;
-    if (!live_progress()) { announce(total); lastBytes_ = current; return; }
+    if (!live_progress()) { announce(total); if (current > lastBytes_) lastBytes_ = current; return; }
+    if (current > lastBytes_) lastBytes_ = current;
     auto now = std::chrono::steady_clock::now();
     auto pct = total ? (current * 100 / total) : 0;
     if (pct > 100) pct = 100;
@@ -696,6 +699,7 @@ void ProgressBar::update_indeterminate(std::size_t current_bytes,
                                        double elapsed_sec) {
     if (g_quiet || finished_) return;
     if (!live_progress()) { announce(0); lastBytes_ = current_bytes; return; }
+    lastBytes_ = current_bytes;
     auto now = std::chrono::steady_clock::now();
     // Same ~80ms throttle as update_bytes(); there is no "100%" early-out here
     // because there is no known total.
@@ -723,9 +727,9 @@ void ProgressBar::finish() {
         finish_plain(label_);
         return;
     }
-    // Clear the line and re-emit as a static info line.
+    // Clear the line and re-emit it as the completion line.
     std::print("\r\033[2K");
-    info(verb_, label_);
+    info(verb_, completion(label_));
 }
 
 void ProgressBar::finish_with(std::string_view final_message) {
@@ -738,7 +742,7 @@ void ProgressBar::finish_with(std::string_view final_message) {
         return;
     }
     std::print("\r\033[2K");
-    info(verb_, final_message);
+    info(verb_, completion(final_message));
 }
 
 void ProgressBar::finish_failed(std::string_view final_message) {

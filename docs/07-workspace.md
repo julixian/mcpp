@@ -413,6 +413,28 @@ fan-out continues; a timed-out build fails that member; `--workspace-timeout` st
 the fan-out and lists what did not run instead of leaving the CI job to kill the
 process (which discards everything it had to say).
 
+### 5.4 A member used by other members is built once (mcpp 2026.9.28.3+)
+
+A member that other members use as a path dependency is built once, in its own
+directory, and every member that uses it takes its objects and module
+interfaces from there. A `--workspace` build and separate `-p` builds of two
+programs therefore compile a shared library member once, where each program
+used to compile it again in its own directory.
+
+- **Staleness is the member's own.** Before a consumer builds, the member's
+  own build runs, and its ninja decides what is stale, including an input
+  outside the member's root (a header under `../3rdParty`).
+- **Equal build keys are the condition.** The member's build key in the
+  consumer's graph must equal its key as the root of its own build; the key
+  covers the toolchain, the flags, the profile and the features. A member that
+  a consumer builds differently (another feature set, for example) is compiled
+  in that consumer's graph, as before; `-v` states the input that differs.
+- **One build at a time.** Two consumers built at once take turns on the
+  member's directory.
+- **Scope.** The rule applies in the default cache mode (`--cache off` compiles
+  everything in the graph that asks for it) and to members only; a path
+  dependency outside the workspace has one consumer and keeps its behaviour.
+
 ## 6. Directory Layout
 
 The recommended directory layout for a workspace:

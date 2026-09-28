@@ -104,7 +104,14 @@ export namespace mcpp::build::program_protocol {
 // it did under v12 and no cached entry changes meaning. Same cost as v5's: a
 // package calling `env()` fails on an older engine at the build.mcpp COMPILE,
 // because that engine's bundled module has no such method.
-inline constexpr int kProtocolVersion = 13;
+// v14 (mcpp#734): the interface is also named `mcpp.core` (the module `mcpp`
+// stays its permanent equivalent), and it states the resolved toolchain's
+// build information -- `tool`, `abi_tool`, `tool_env`, `toolset_identity`,
+// `msvc_instance_dir`, `ninja_program`, `cxx_runtime`, `msvc_crt_linkage` --
+// together with the batched placement and structured diagnostics of the same
+// release. No directive of v13 changes spelling, so a program that uses none of
+// these serialises to the bytes it did under v13.
+inline constexpr int kProtocolVersion = 14;
 
 // ── Cache-format epoch ─────────────────────────────────────────────────────
 //
