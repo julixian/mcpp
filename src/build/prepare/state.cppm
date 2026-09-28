@@ -508,6 +508,11 @@ std::expected<void, std::string> phase5_toolchain_after_graph(PrepareState& stat
 std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& state);
 std::expected<void, std::string> phase9_target_side(PrepareState& state);
 std::expected<void, std::string> phase11_scan(PrepareState& state);
+// E9 (#734): every package's `mcpp = ">=V"` against this binary. Checked for the
+// root right after its manifest is final and for the whole graph after loading,
+// so a too-new root fails before any later phase can fail on a key it uses.
+std::expected<void, std::string> check_engine_floors(const PrepareState& state,
+                                                     bool rootOnly);
 std::expected<BuildContext, std::string> phase13_finish(PrepareState& state);
 // P13's records half (records.cpp), called by phase13_finish.
 std::expected<void, std::string> step13_lockfile(PrepareState& state, BuildContext& ctx);

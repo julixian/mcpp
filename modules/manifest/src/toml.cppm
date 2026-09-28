@@ -14,6 +14,7 @@ import mcpp.pm.dependency_selector;
 import mcpp.pm.index_spec;
 import mcpp.platform;
 import mcpp.platform.axis;   // the one macos/macosx spelling rule
+import mcpp.xpkg_version;    // the release grammar of `mcpp = ">=V"`
 
 // ANONYMOUS NAMESPACE, AND THIS COST TWO WINDOWS JOBS TO LEARN.
 //
@@ -34,6 +35,32 @@ import mcpp.platform.axis;   // the one macos/macosx spelling rule
 // Nothing outside this file calls it, so nothing outside this file should be
 // able to see it.
 namespace {
+
+// `mcpp = ">=V"` (#734, E9): the oldest mcpp release a package supports.
+// Returns the version after `>=`. Only the floor form is accepted: a bare
+// version means "exactly this one" everywhere else in mcpp, and a range with an
+// upper bound would state that a newer engine cannot build the package, which
+// the engine's compatibility promise makes false.
+std::expected<std::string, std::string> parse_mcpp_floor(std::string_view text) {
+    auto trim = [](std::string_view s) {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
+        return s;
+    };
+    auto t = trim(text);
+    if (!t.starts_with(">=")) {
+        if (mcpp::xpkg_version::parse(t))
+            return std::unexpected(std::format(
+                "'{}' names one release exactly; a floor is written \">={}\"", t, t));
+        return std::unexpected(std::format(
+            "'{}' is not a floor; write \">=<release>\", for example \">=2026.9.29.1\"", t));
+    }
+    auto ver = trim(t.substr(2));
+    if (ver.empty() || !mcpp::xpkg_version::parse(ver))
+        return std::unexpected(std::format(
+            "'{}' is not an mcpp release; write \">=<release>\", for example \">=2026.9.29.1\"", ver));
+    return std::string(ver);
+}
 
 // A dependency's version requirement, checked with the parser that will later
 // be asked to match it.
@@ -1489,7 +1516,7 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
     // MUST stay in sync with the `doc->get_*("package.<key>")` reads above.
     static constexpr std::string_view kKnownPackageKeys[] = {
         "accelerators", "authors", "c-environment", "description", "exclusive",
-        "license", "metadata", "name", "namespace", "platforms", "provides",
+        "license", "mcpp", "metadata", "name", "namespace", "platforms", "provides",
         "repo", "requires", "requires_abi", "standard", "std-compat-module",
         "std-module", "std-module-flags", "version",
     };
@@ -1508,6 +1535,19 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                     key, supported));
             }
         }
+    }
+
+    // `[package] mcpp = ">=V"` — the engine floor (#734, E9). Refused rather
+    // than ignored when malformed: a floor that silently reads as no floor is
+    // the failure it exists to prevent.
+    if (auto* pt = doc->get_table("package"); pt && pt->contains("mcpp")) {
+        auto v = doc->get_string("package.mcpp");
+        if (!v) return std::unexpected(error(origin,
+            "[package].mcpp must be a string such as \">=2026.9.29.1\""));
+        auto floor = parse_mcpp_floor(*v);
+        if (!floor) return std::unexpected(error(origin,
+            std::format("[package].mcpp: {}", floor.error())));
+        m.package.mcppFloor = *floor;
     }
 
     // [capabilities] cap = "provider" — root-only provider pins.
@@ -3215,6 +3255,17 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
     if (auto v = doc->get_string("lib.path")) {
         m.lib.path = *v;
     }
+    // Reported like `[build]` and `[package]` do (#734, E12). Before this a
+    // misspelt `path` was accepted without a word, and the lib root silently
+    // fell back to the convention.
+    if (auto* lt = doc->get_table("lib")) {
+        for (auto& [key, ignored] : *lt) {
+            (void)ignored;
+            if (key == "path") continue;
+            m.schemaWarnings.push_back(std::format(
+                "[lib] has unsupported key '{}' (ignored). Supported keys: path.", key));
+        }
+    }
 
     // [pack] — `mcpp pack` configuration. See docs/10-pack-and-release.md.
     if (auto v = doc->get_string("pack.default_mode")) {
@@ -4023,8 +4074,18 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                 inh.repo = *v;
             if (auto v = doc->get_string_array("workspace.package.authors"))
                 inh.authors = *v;
+            if (wpkg->contains("mcpp")) {
+                auto v = doc->get_string("workspace.package.mcpp");
+                if (!v) return std::unexpected(error(origin,
+                    "[workspace.package].mcpp must be a string such as \">=2026.9.29.1\""));
+                auto floor = parse_mcpp_floor(*v);
+                if (!floor) return std::unexpected(error(origin,
+                    std::format("[workspace.package].mcpp: {}", floor.error())));
+                inh.mcppFloor = *floor;
+            }
             static constexpr std::string_view kKnown[] = {
                 "standard", "version", "license", "description", "repo", "authors",
+                "mcpp",
             };
             for (auto& [key, ignored] : *wpkg) {
                 (void)ignored;
@@ -4035,7 +4096,7 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                 // is not, which is the defect this table was added to fix.
                 return std::unexpected(error(origin, std::format(
                     "[workspace.package] has no key '{}'. Supported: "
-                    "standard, version, license, description, repo, authors. "
+                    "standard, version, license, description, repo, authors, mcpp. "
                     "`name` is per-member by definition.", key)));
             }
         }

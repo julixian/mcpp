@@ -180,6 +180,7 @@ export void inherit_workspace_package(mcpp::manifest::Manifest& member,
     if (member.package.description.empty()) member.package.description = inh.description;
     if (member.package.repo.empty())        member.package.repo        = inh.repo;
     if (member.package.authors.empty())     member.package.authors     = inh.authors;
+    if (member.package.mcppFloor.empty())   member.package.mcppFloor   = inh.mcppFloor;
 }
 
 // EVERYTHING A MEMBER INHERITS FROM ITS WORKSPACE ROOT, IN ONE FUNCTION.
