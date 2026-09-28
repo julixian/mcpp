@@ -113,8 +113,10 @@ jobs:
           "$XLINGS_BIN" install qt-base@6.11.1 -y
           QT="$(cygpath -u "$USERPROFILE")/.xlings/data/xpkgs/xim-x-qt-base/6.11.1"
           test -x "$QT/bin/moc.exe" || { echo "::error::no moc.exe in $QT/bin"; exit 1; }
-          # What revision 1 of the recipe removes (task I2).
-          ( cd "$QT/bin" && ls vcruntime140*.dll msvcp140*.dll concrt140.dll vccorlib140.dll 2>/dev/null; \
+          # What revision 1 of the recipe removes (task I2). The published
+          # revision 1 no longer carries them, and `ls` of absent files exits 2,
+          # which `bash -e` would read as a failed install.
+          ( cd "$QT/bin" && { ls vcruntime140*.dll msvcp140*.dll concrt140.dll vccorlib140.dll 2>/dev/null || true; }; \
             rm -f vcruntime140*.dll msvcp140*.dll concrt140.dll vccorlib140.dll )
           echo "QT=$QT" >> "$GITHUB_ENV"
 
