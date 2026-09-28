@@ -497,3 +497,35 @@ version. The other repositories change only where the release requires it.
 | T13 | the release canaries (xlings, mcppls), both rooted workspaces, and the plugins' CI | xlings, mcppls, mcpp-plugins | T11 |
 | T14 | sandbox verification with the CN mirror; issues commented and closed | all | T12, T13 |
 | T15 | acceptance on the validation project's pull request: its Windows CI against 1828 s, the core library compiled once, the Release layout | the validation project | T14 |
+
+## 17. Implementation record (2026-09-29)
+
+Implemented in one change on `feat/workspace-build-graph`, released as
+2026.9.29.1. Where the implementation settled a question the sections above
+left open, the answer is recorded here.
+
+| Question | Answer | Where |
+|---|---|---|
+| The root of a rooted workspace | Every workspace plan has a virtual root; the workspace's own package is the member `"."`, whose products keep `bin/`. A command at the root selects it alone. The package is then the same node in every selection. | `select_workspace_members` (prepare/manifest.cpp) |
+| Which values separate plans | Every root-position value (`root_position_key`): the toolchain and target rows, the standard, the graph-wide `[build]` keys, the profiles, the indices, the capability and tool pins. The virtual root copies them from the group's first member, so a group and its root cannot disagree. | `mcpp.project` |
+| A member's build program | Runs after every dependency's program, where a root's runs, with its own artifacts directory and a graph document of its closure in which it is `root`. A workspace member reached as another member's dependency runs there too, so its program sees one environment in every selection. | `step9_member_build_programs` (prepare/target_side.cpp) |
+| A member's identity | A path member that declares no namespace keeps its bare name (a root's identity) instead of the default namespace a path dependency receives. | prepare/graph.cpp |
+| Per-member link data | Each package's normalised link flags are read when the plan is made; a member's link group holds the plan's flags followed by its closure's, and its closure's runtime contract, and `compute_flags` renders it from a copy of the plan with the group swapped in. The link edge carries the group's `ldflags` and `c_ldflags`. | `make_plan` step 6, `swap_link_group`, ninja_backend.cppm |
+| Graph-built shared libraries | Linked once at `bin/`, placed in each product directory whose units load them. | `LinkGroup::placements` |
+| Linked placement | Shared libraries only; other deployed files are copied, since a program may write a file beside itself and a link would carry the write to its source. A linked destination is never written in place. | mcpp.build.stage |
+| `-p X` and `--workspace` in one directory | `build.ninja` records a request tag (the plan's members and the requested features), and every fast path compares it; one `.build_cache` entry per selection and configuration group. Alternating selections re-plan (one plan of the selection) and recompile nothing. | graph_shape.cppm, execute.cppm |
+| The lock | `<workspace>/mcpp.lock`. A plan of all members writes the whole record; a plan of some keeps the other entries, and `--locked` then reports no entry of another member as drift. A selected member's git dependencies are locked as a root's. | prepare/records.cpp |
+| Tests | `mcpp test` keeps one plan per member (`-p X` each), in the shared directory; the members' dev-dependencies are their own. | cmd_build.cppm |
+| Concurrency | Groups are planned in turn and built on threads with a static share of the jobs; the `.build_cache` write is one locked step. | cmd_build.cppm |
+
+Readings with the implementation (Linux, llvm 22.1.8):
+
+| Reading | 2026.9.28.3 | 2026.9.29.1 |
+|---|---|---|
+| chain of five libraries and a program, `--workspace`, nothing built | 36.8 s | 0.51 s |
+| the same, nothing changed | not replayed | 3 ms |
+| `-p app`, nothing changed | not replayed | 3 ms |
+
+mcpp's own repository, a rooted workspace, builds itself with the new engine
+(full build, gcc 16.1.0, 115 s), and its module tests run through member plans
+(`mcpp test -p graph`, `-p versioning`).

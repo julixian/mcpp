@@ -3923,6 +3923,22 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
                                       flags.graphLinkIsolated, plan.packageRoots); !h) {
         return std::unexpected(BuildError{h.error(), {}});
     }
+    // A workspace member's units link with their group's line (§15), which
+    // is checked the same way.
+    if (!plan.linkGroups.empty()) {
+        BuildPlan view = plan;
+        std::set<std::string> checked{flags.ld};
+        for (auto& g : view.linkGroups) {
+            swap_link_group(view, g);
+            const auto gf = compute_flags(view);
+            swap_link_group(view, g);
+            if (!checked.insert(gf.ld).second) continue;
+            if (auto h = verify_hermetic_link(plan.toolchain, gf.ld, plan.outputDir,
+                                              plan.manifest.buildConfig.allowHostLibs,
+                                              gf.graphLinkIsolated, plan.packageRoots); !h)
+                return std::unexpected(BuildError{h.error(), {}});
+        }
+    }
     stage("hermetic-check");
 
     // When the toolchain comes from mcpp's private sandbox, use the

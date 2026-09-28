@@ -377,13 +377,13 @@ static std::vector<std::string> propagateLinkFlags(
         // flags with the same reading its own flags receive, and an element
         // that packs several tokens is several words on both sides.
         //
-        // A workspace plan links each member's closure with that closure's own
-        // flags (workspace design 2026-09-29 §15), read from each package when
-        // the plan is made, so nothing is pooled in the virtual root.
+        // In a workspace plan the pooled list serves the units no member owns
+        // (a dependency's shared library); a member's units link with its own
+        // closure's flags, which the plan reads from each package (§15).
         std::vector<std::string> added;
         for (auto const& word : mcpp::manifest::flag_words(depManifest.buildConfig.ldflags)) {
             auto normalized = mcpp::manifest::flag_element(normalizeDepLdflag(depRoot, word));
-            if (!state.workspacePlan()) state.m->buildConfig.ldflags.push_back(normalized);
+            state.m->buildConfig.ldflags.push_back(normalized);
             added.push_back(std::move(normalized));
         }
         return added;
@@ -1637,7 +1637,15 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
                                        const std::filesystem::path& wsRoot) {
                 return inherit_as_workspace_member(*dep_manifest, ws, wsRoot, dep_root);
             };
-            if (depIsMember) {
+            // A rooted workspace's own package, the member "." of a workspace
+            // plan (§15), is the workspace's manifest: it reads its own
+            // `[workspace.dependencies]`, as it did as the root.
+            const bool depIsWorkspacePackage = state.workspacePlan() && state.wsManifest
+                && dep_root.lexically_normal() == state.runtimeWorkspaceRoot.lexically_normal();
+            if (depIsWorkspacePackage) {
+                mcpp::project::merge_workspace_deps(*dep_manifest, *state.wsManifest,
+                                                    state.runtimeWorkspaceRoot);
+            } else if (depIsMember) {
                 if (auto bad = inheritAsMember(*state.wsManifest, state.runtimeWorkspaceRoot))
                     return std::unexpected(*bad);
             } else if (!gitMember.empty()) {

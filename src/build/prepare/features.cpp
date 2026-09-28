@@ -323,9 +323,12 @@ static std::expected<void, std::string> step6_activate_features(PrepareState& st
             // place costs nothing. What the gate exists for is the shape where
             // a target's mere presence changes how the package is linked into
             // every consumer — and that is exactly a `shared` or `lib` target.
+            // A selected workspace member builds every target, so every one
+            // of its targets is gated, as a root's are (§15).
             std::erase_if(pkg.manifest.targets,
                           [&](const mcpp::manifest::Target& t) {
-                if (t.kind != mcpp::manifest::Target::Library
+                if (!pkg.memberProducts
+                    && t.kind != mcpp::manifest::Target::Library
                     && t.kind != mcpp::manifest::Target::SharedLibrary)
                     return false;
                 for (auto const& rf : t.requiredFeatures)
@@ -2040,11 +2043,8 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             // A CLAIM THAT ONLY EVER TIGHTENS.
             if (bcDep.runExclusive && !exclusiveBefore)
                 state.m->buildConfig.runExclusive = true;
-            // A workspace plan reads each package's own flags when it links
-            // a member's closure; nothing is pooled in its root (§15).
-            if (!state.workspacePlan())
-                state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
-                    bcDep.ldflags.begin() + ldN, bcDep.ldflags.end());
+            state.m->buildConfig.ldflags.insert(state.m->buildConfig.ldflags.end(),
+                bcDep.ldflags.begin() + ldN, bcDep.ldflags.end());
         }
 
         // apply() may have added interface defines to packages' publicUsage

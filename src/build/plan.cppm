@@ -493,6 +493,10 @@ struct BuildPlan {
     // musl-gcc 15.1 modules failed to emit vector<pair<string,string>>'s
     // move-ctor instantiation across the module boundary (release link error).
     std::vector<RuntimeCapabilityProvider> runtimeProviders;
+    // Where the files the runtime needs are placed beside the programs,
+    // relative to outputDir: `bin`, or a workspace member's product directory
+    // while its link group is swapped in (§15).
+    std::filesystem::path              productDir = "bin";
 
     // A workspace plan's per-member link data (workspace design 2026-09-29
     // §15). A selected member's link units link the member's closure -- the
@@ -540,6 +544,7 @@ void swap_link_group(BuildPlan& plan, BuildPlan::LinkGroup& g) {
     std::swap(plan.runtimeDlopenLibs, g.runtimeDlopenLibs);
     std::swap(plan.runtimeCapabilities, g.runtimeCapabilities);
     std::swap(plan.runtimeProviders, g.runtimeProviders);
+    std::swap(plan.productDir, g.productDir);
 }
 
 // Merge the generic facts exported by the already-selected xlings
@@ -2834,12 +2839,14 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         for (auto i : closureIdx) closure.insert(qualified_package_name(packages[i].manifest));
 
         // The member's link group: the closure's link flags after the
-        // plan's own, in the order a root build gives them (the member, then
-        // its dependencies in discovery order), and the closure's runtime.
+        // root's own (`packages[0]` is snapshotted before any dependency is
+        // loaded, so it holds the profile's flags and nothing pooled), in the
+        // order a root build gives them (the member, then its dependencies in
+        // discovery order), and the closure's runtime.
         BuildPlan::LinkGroup group;
         group.member = owner;
         group.productDir = productDir;
-        group.ldflags = manifest.buildConfig.ldflags;
+        group.ldflags = packages[0].linkUsage.ldflags;
         for (auto i : closureIdx)
             for (auto const& f : packages[i].linkUsage.ldflags)
                 group.ldflags.push_back(f);
