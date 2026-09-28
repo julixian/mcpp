@@ -15,12 +15,10 @@ on:
         required: false
 
 jobs:
-  # A RELEASE IS GATED BY ITS CONSUMERS (the 2026-09-28 design, WS10). Real
-  # projects are built with the candidate first (.github/release-canaries.toml),
-  # and the job that creates the tag needs them: a canary that fails blocks the
-  # tag. 2026.9.27.1 shipped a regression (#726) that only GalTranslPP showed,
-  # and it was read after the release because the project's pin had to be moved
-  # by hand.
+  # A RELEASE IS GATED BY THE ECOSYSTEM'S OWN PROJECTS (the 2026-09-28 design,
+  # WS10): they are built with the candidate first
+  # (.github/release-canaries.toml), and the job that creates the tag needs
+  # them. A downstream project validates the release in its own pull request.
   canaries:
     uses: ./.github/workflows/release-canaries.yml
 
