@@ -62,6 +62,11 @@ SPEC-007 §9 与新的 SPEC-008。配套的 mcpp-plugins 0.17.0 以本版本为�
   832 读出 `no validated artifact snapshot is recorded`)。现在这些目标记录产物的戳记,判定为通过(没有适用的
   规则);产物被重新链接时快路径仍交回完整路径。`-v` 下每个拒绝点以一句话写出其条件。
 
+### 发布流程
+
+- **发布门只含本生态的工程。** GalTranslPP 从 `.github/release-canaries.toml` 移除:下游工程(用户的应用或其
+  fork)在发布之后于自己的 PR 中固定新版本加以验证,不作为 mcpp 发布的门。门中保留 xlings 与 mcppls。
+
 ### 兼容性
 
 - 协议升至 14:使用 §9 新接口的构建程序在旧引擎上编译失败并指出缺少的名字;以
