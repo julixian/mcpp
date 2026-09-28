@@ -1235,6 +1235,13 @@ Each item has an e2e:
       graph's text changed. The backend now moves the file's time when it
       confirms the graph (e2e 832).
     Under `-v` each refusal is a sentence rather than the code of its condition.
+11. **E5's reading, and its fix.** On the macOS row every build declined with
+    "no validated artifact snapshot is recorded for this build". The runtime
+    validation holds ELF/glibc rules only and returned before writing its
+    record on every other target, so the fast path never found a snapshot to
+    compare. Where no rule applies the record is now written with a Pass verdict
+    (the module's own definition: every rule that applies held); a relinked
+    artifact still sends the fast path to the full build.
 
 **mcpp-plugins 0.17.0.** U1 to U4 on one branch (`feat/734-plugins-0.17.0`).
 

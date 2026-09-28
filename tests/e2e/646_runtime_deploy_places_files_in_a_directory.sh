@@ -125,11 +125,22 @@ write_manifest '{ from = "assets/icd2/lvp_icd.json", to = "vulkan/icd.d" }'
 grep -q 'library_path' "$bin/vulkan/icd.d/lvp_icd.json" 2>/dev/null \
     || fail "the merged destination does not carry the shared bytes" merge.log
 G=$(find target -name build.ninja | head -1)
-STAGE_LINES=$(grep -c "^build .*vulkan/icd\.d/lvp_icd\.json : stage_file" "$G" 2>/dev/null || true)
-[ "$STAGE_LINES" -eq 1 ] \
-    || fail "expected exactly one stage_file edge, found $STAGE_LINES" "$G"
-grep "^build .*vulkan/icd\.d/lvp_icd\.json : stage_file" "$G" | grep -qF "icd2/lvp_icd.json" \
-    || fail "the merged edge does not list the root's second source" "$G"
+# One placement is its own `stage_file` edge; two or more (a Windows program
+# also places its C++ runtime DLLs) are one `stage_list` edge reading
+# placements.list (#734 E4). Either way the destination has both sources.
+if grep -q "^build .*vulkan/icd\.d/lvp_icd\.json.* : stage_list" "$G"; then
+    LIST="$(dirname "$G")/placements.list"
+    n=$(grep -c "bin/vulkan/icd\.d/lvp_icd\.json$" "$LIST" || true)
+    [ "$n" -eq 2 ] || fail "expected the destination twice in the placement list, found $n" "$LIST"
+    grep "bin/vulkan/icd\.d/lvp_icd\.json$" "$LIST" | grep -qF "icd2/lvp_icd.json" \
+        || fail "the placement list does not name the root's second source" "$LIST"
+else
+    STAGE_LINES=$(grep -c "^build .*vulkan/icd\.d/lvp_icd\.json : stage_file" "$G" 2>/dev/null || true)
+    [ "$STAGE_LINES" -eq 1 ] \
+        || fail "expected exactly one stage_file edge, found $STAGE_LINES" "$G"
+    grep "^build .*vulkan/icd\.d/lvp_icd\.json : stage_file" "$G" | grep -qF "icd2/lvp_icd.json" \
+        || fail "the merged edge does not list the root's second source" "$G"
+fi
 echo "identical-bytes merge OK"
 
 # ── 4. A destination outside the executable's directory ───────────────────

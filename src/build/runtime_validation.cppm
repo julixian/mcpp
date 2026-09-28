@@ -600,18 +600,57 @@ ArtifactSnapshot snapshot_link_artifacts(const mcpp::build::BuildPlan& plan) {
     return out;
 }
 
+// THE RECORD WITHOUT THE RULES (#734 E5). The rules below are ELF/glibc
+// rules, and on every other target none of them applies: that is a Pass by
+// this module's own definition ("every rule that applies was checked and
+// held"). The record is still written, because the project fast path replays
+// a build only against a validated snapshot of its artifacts; before this,
+// no record was written on macOS, Windows or an SDK-sysroot target, and every
+// build there was planned in full (e2e 645, 831 and 832 on the macOS row: "no
+// validated artifact snapshot is recorded for this build").
+void record_without_rules(const mcpp::build::BuildPlan& plan,
+                          const ArtifactSnapshot& before) {
+    auto doc = read_cache(plan.outputDir);
+    bool changed = false;
+    if (doc.value("schema", 0) != 1
+        || doc.value("contract_hash", "") != plan.runtimeBinding.contractHash) {
+        doc = nlohmann::json::object();
+        changed = true;
+    }
+    doc["schema"] = 1;
+    doc["contract_hash"] = plan.runtimeBinding.contractHash;
+    for (auto const& [artifact, oldStamp] : before) {
+        auto now = stamp(artifact);
+        if (!now.exists) continue;
+        const auto key = cache_key(plan, artifact);
+        const auto fp  = fingerprint(artifact, now, plan.runtimeBinding.contractHash);
+        if (auto a = doc.find("artifacts"); a != doc.end() && a->is_object())
+            if (auto e = a->find(key); e != a->end() && e->is_object()
+                && e->value("fingerprint", "") == fp && e->value("status", "") == "pass")
+                continue;
+        ValidatedArtifact v;
+        v.artifact = artifact;
+        v.verdict.status = mcpp::platform::elf::RuntimeVerdict::Status::Pass;
+        store_artifact(doc, key, fp, v);
+        changed = true;
+    }
+    if (changed) write_cache(plan.outputDir, doc);
+}
+
 ValidationReport validate_changed_artifacts(
     const mcpp::build::BuildPlan& plan,
     const ArtifactSnapshot& before) {
     ValidationReport report;
-    if constexpr (!mcpp::platform::is_linux) return report;
+    if constexpr (!mcpp::platform::is_linux) { record_without_rules(plan, before); return report; }
     // Provider dispatch (see mcpp.runtime.binding): what follows is
     // ELF/glibc physics, and an identity from another provider — `ucrt@…` on
     // Windows — has no rules here rather than a missing glibc.
     if (plan.runtimeBinding.platform != "linux"
         || mcpp::platform::runtime::runtime_provider(
-               plan.runtimeBinding.runtimeId) != "glibc")
+               plan.runtimeBinding.runtimeId) != "glibc") {
+        record_without_rules(plan, before);
         return report;
+    }
 
     // AND THE ARTIFACT HAS TO BE ONE THAT COULD LOAD ON THIS MACHINE.
     //
@@ -638,8 +677,10 @@ ValidationReport validate_changed_artifacts(
     // decision in the tree is right about it except the ones that mean "this
     // machine".
     if (auto tt = mcpp::toolchain::triple::parse(plan.toolchain.targetTriple);
-        tt && tt->has_own_sysroot())
+        tt && tt->has_own_sysroot()) {
+        record_without_rules(plan, before);
         return report;
+    }
 
     auto doc = read_cache(plan.outputDir);
     bool changedCache = false;

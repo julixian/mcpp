@@ -58,7 +58,7 @@ cat >> mcpp.toml <<'EOF'
 [lib]
 path = "src/flatlib.cppm"
 EOF
-sed -i 's|sources = \["src/alpha.cppm", "src/beta.cppm"\]|sources = ["src/flatlib.cppm", "src/alpha.cppm", "src/beta.cppm"]|' mcpp.toml
+sed 's|sources = \["src/alpha.cppm", "src/beta.cppm"\]|sources = ["src/flatlib.cppm", "src/alpha.cppm", "src/beta.cppm"]|' mcpp.toml > mcpp.toml.new && mv mcpp.toml.new mcpp.toml   # BSD sed has no bare -i
 printf 'export module probe.flatlib;\nexport import Alpha;\nexport import Beta;\n' > src/flatlib.cppm
 "$MCPP" pack flatlib > i2.log 2>&1 || fail "I2: the pack failed" i2.log
 grep -q "does not ship" i2.log && fail "I2: W2 appeared with a facade" i2.log

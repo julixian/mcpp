@@ -62,13 +62,13 @@ after=$(grep -c "placements\|data/f" "$OUT/.ninja_log" || true)
 [ "$before" = "$after" ] || fail "S2: a build with no placement change ran the placement edge" "$OUT/.ninja_log"
 
 # S3
-t2=$(stat -c %Y "$DEST2")
+touch -r "$DEST2" s3.ref   # a reference file, since the stat options differ between GNU and BSD
 sleep 1.1
 echo changed > data/f1.txt
 touch src/main.cpp
 "$MCPP" build > s3.log 2>&1 || fail "S3: the build failed" s3.log
 grep -qx changed "$DEST1" || fail "S3: the changed source did not arrive" "$DEST1"
-[ "$(stat -c %Y "$DEST2")" = "$t2" ] || fail "S3: an unchanged destination was rewritten" s3.log
+[ -z "$(find "$DEST2" -newer s3.ref)" ] || fail "S3: an unchanged destination was rewritten" s3.log
 
 # S4
 program 1
