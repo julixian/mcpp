@@ -265,7 +265,8 @@ mcpp self env --format json
   "xlingsBinary":"/home/u/.mcpp/registry/bin/xlings",
   "config":      "/home/u/.mcpp/config.toml",
   "buildCache":  "/home/u/.mcpp/build-cache/v1",
-  "mcppVersion": "2026.8.8.3"
+  "mcppVersion": "2026.8.8.3",
+  "defaultToolchain": "gcc@16.1.0"   // 2026.9.28.2+
 }
 ```
 
@@ -278,6 +279,11 @@ a machine that has never run mcpp, the output is the paths it **would** use and
 That is why this exists at all: without it a client has to reimplement mcpp's
 home resolution, including the part where the `mcpp` on `PATH` may be an
 xlings shim rather than the real binary.
+
+`defaultToolchain` is the toolchain a build with nothing configured resolves on
+this host: the one answer the first run installs, and the value the tables of
+docs/01 and docs/20 are checked against on each CI host. On Windows it depends
+on whether a usable MSVC is present, from Visual Studio or a managed toolset.
 
 ### `mcpp.xpkg` — a parsed descriptor
 
@@ -421,6 +427,7 @@ a program classifying the outcome reads `reason`:
 | `host-tool-toolchain` | `build.mcpp` under a cross `--target` needs a resolvable HOST toolchain and none is set |
 | `std-module-precompile` | the standard library's module could not be precompiled for this configuration |
 | `msvc-redist-unavailable` | an explicit `cxx_runtime = "toolchain-coupled"` on an MSVC-ABI row whose toolset has no redistributable directory to stage *(2026.9.28.1+)* |
+| `crt-declared-under-host-coupled` | a file of the MSVC C++ runtime is declared beside the program while its contract is host-coupled, under which the system's runtime serves it and no copy is placed *(2026.9.28.2+)* |
 | `other` | a refusal whose branch has not been given a token yet |
 
 **One token is also printed by `mcpp build` itself.**

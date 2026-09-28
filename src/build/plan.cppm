@@ -447,6 +447,14 @@ struct BuildPlan {
         // actually checked, at build time, against each other's bytes.
         std::vector<std::filesystem::path> sources;
         std::filesystem::path dest;     // relative to outputDir, e.g. bin/libopenblas.dll
+        // Where the entry comes from: a declaration, the toolset's C++
+        // runtime, or a DLL found in a runtime search directory. The plan
+        // lists declared and derived candidates; which file sits beside the
+        // program is decided once, by mcpp.build.runtime_placement (read
+        // through `CompileFlags::runtimeDeploy`), never by a reader of this
+        // list.
+        enum class Origin : std::uint8_t { Declared, Toolchain, Derived };
+        Origin origin = Origin::Declared;
 
         // Whether `other` names this destination. On a PE target the
         // comparison folds case: the file systems a Windows program runs from
@@ -463,15 +471,6 @@ struct BuildPlan {
         }
     };
     std::vector<DeployFile>            runtimeDeployFiles;
-    // A DLL a runtime search directory offers under a name the deploy list
-    // declares (SPEC-007 R4.3). The declared file is placed; the planning
-    // caller compares the two and warns on a difference, because the output
-    // of the post-link placement edge is not shown on a successful build.
-    struct ShadowedDll {
-        std::filesystem::path declared;   // the deploy list's source
-        std::filesystem::path offered;    // the search directory's file
-    };
-    std::vector<ShadowedDll>           shadowedSearchDirDlls;
     // Aggregated host-runtime requirements from dependency packages'
     // [runtime] metadata. Capability/provider-driven — no platform special-casing
     // in mcpp: providers (e.g. compat.glx-runtime) declare these per platform.
@@ -1501,33 +1500,32 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     for (auto const& entry : plan.linkIntent.deploy) {
         add_deploy(entry.from, entry.to);
     }
-    // A DLL found in a runtime search directory is a derived source: it
-    // yields to a destination the lists above declare (SPEC-007 R4.3, one
-    // destination, one writer), as the toolset's staged runtime does
-    // (flags.cppm). The post-link placement compares the two files and warns
-    // on a difference. Two search directories offering one name are two
-    // derived sources of one destination and are checked by `mcpp stage`.
-    const auto declaredCount = plan.runtimeDeployFiles.size();
-    auto declared = [&](const std::filesystem::path& dest) -> const BuildPlan::DeployFile* {
-        for (auto const& d : std::span{plan.runtimeDeployFiles}.first(declaredCount))
-            if (d.is_destination(dest, peTarget)) return &d;
-        return nullptr;
-    };
+    // A DLL found in a runtime search directory is a DERIVED candidate
+    // (SPEC-007 R4.3). The plan lists it and does not decide: which file sits
+    // beside the program -- a declaration, the toolset's C++ runtime, or this
+    // one -- is mcpp.build.runtime_placement's answer, read through
+    // `CompileFlags::runtimeDeploy`. A difference between a declared file and
+    // a search directory's copy is stated by the post-link placement edge,
+    // once, through the edge-advice channel (mcpp.build.advice).
+    //
+    // Sorted within each directory: directory order is not a stable input, and
+    // this list reaches build.ninja.
     for (auto const& dir : plan.linkIntent.runtimeSearchDirs) {
         std::error_code dirEc;
         if (!std::filesystem::is_directory(dir, dirEc)) continue;
+        std::vector<std::filesystem::path> dlls;
         for (auto const& entry : std::filesystem::directory_iterator(dir, dirEc)) {
             if (!entry.is_regular_file()) continue;
             auto ext = entry.path().extension().string();
             std::ranges::transform(ext, ext.begin(),
                 [](unsigned char c){ return std::tolower(c); });
-            if (ext != ".dll") continue;
-            if (auto const* d = declared(std::filesystem::path("bin") / entry.path().filename())) {
-                plan.shadowedSearchDirDlls.push_back({d->sources.front(), entry.path()});
-                continue;
-            }
-            add_deploy(entry.path());
+            if (ext == ".dll") dlls.push_back(entry.path().lexically_normal());
         }
+        std::ranges::sort(dlls);
+        for (auto const& dll : dlls)
+            plan.runtimeDeployFiles.push_back(
+                {{dll}, std::filesystem::path("bin") / dll.filename(),
+                 BuildPlan::DeployFile::Origin::Derived});
     }
     // The same private runtime directories embedded as executable RUNPATH are
     // also needed in the process environment for libraries reached only via

@@ -10,6 +10,7 @@ module;
 export module mcpp.build.execute;
 
 import std;
+import mcpp.build.advice;
 import mcpp.build.build_program;   // #359 glob inputs the mtime sweep cannot see
 import mcpp.build.compile_commands; // C1: the fast path restores a deleted root CDB
 import mcpp.build.prepare;
@@ -651,7 +652,10 @@ runtime_files_for(const mcpp::build::BuildContext& ctx,
         if (dest.empty() || !seen.insert(dest).second) return;
         out.emplace_back(std::move(dest), staged);
     };
-    for (auto const& d : ctx.plan.runtimeDeployFiles) add(d.dest);
+    // The resolver's answer, not the plan's candidates: a runtime search
+    // directory's copy of a name that another kind outranks is not placed,
+    // and a list naming it would name a file that is not there.
+    for (auto const& d : mcpp::build::compute_flags(ctx.plan).runtimeDeploy) add(d.dest);
     for (auto const& lu : ctx.plan.linkUnits) {
         if (lu.kind != mcpp::build::LinkUnit::SharedLibrary) continue;
         add(lu.output);
@@ -1320,6 +1324,11 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
     }
     if (verbose && !out.empty())
         std::fputs(out.c_str(), stdout);
+    // What the edges that ran had to say on success: the same reader the full
+    // path calls (mcpp.build.advice), because this path skips `prepare` and a
+    // report attached to one path only appears or not depending on whether
+    // build.ninja was up to date.
+    mcpp::build::advice::report_and_clear(outputDir);
 
     if (elapsedOut) {
         *elapsedOut = std::chrono::duration_cast<std::chrono::milliseconds>(

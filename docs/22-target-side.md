@@ -1005,8 +1005,11 @@ for arch/env conditions and combinators.
   ```
 
   The same rule applies to `dev-dependencies`, `build-dependencies` and
-  `feature-deps.<feature>`, and several matching sections apply in manifest
-  order, the last one winning. `mcpp why deps` names the table each request
+  `feature-deps.<feature>`, and several matching sections apply in order of
+  selector specificity, the most specific last and therefore winning: a
+  triple after an OS, an OS after a family, with the selector text breaking a
+  tie (SPEC-004 §3.1.1, 2026.9.28.2+; earlier releases applied them in the
+  text order of their selectors). `mcpp why deps` names the table each request
   came from ([09 — Commands by Scenario](09-commands-by-scenario.md)). A table
   that writes options without a source, `huxerui.huxerui = { linkage =
   "shared" }`, declares a dependency on a package named
@@ -1073,9 +1076,10 @@ for arch/env conditions and combinators.
   `accelerator` is not one of these (mcpp 2026.9.6.5): it is an input to the
   build rather than an answer from the graph, so
   `[target.'cfg(accelerator = "cuda")'.dependencies]` applies.
-- **Precedence**: an exact-triple table wins over a `cfg`/alias table; multiple
-  matching predicate tables have their flags concatenated, and their dependency
-  declarations applied in manifest order. Conditional entries
+- **Precedence**: a more specific table applies later, so it wins: an
+  exact-triple table over an OS table, an OS table over a family table
+  (SPEC-004 §3.1.1). Multiple matching tables have their flags concatenated in
+  that order, and their dependency declarations applied in it. Conditional entries
   are appended **after** the unconditional `[build]` ones, so under GNU
   "last flag wins" a conditional rule overrides a broader unconditional one.
   That is what makes a per-OS **removal** expressible:

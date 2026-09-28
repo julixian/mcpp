@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   e2e:
-    name: e2e suite (macOS ARM64, self-host, ${{ matrix.image }})
+    name: e2e suite (macOS ARM64, self-host, ${{ matrix.image }}${{ matrix.known_red != '' && format(', known red {0}', matrix.known_red) || '' }})
     # The same two images as ci-macos.yml; `xcode-27` is macOS 27 (see there).
     # KNOWN RED on xcode-27, along with ci-macos.yml's own job: the image's
     # Command Line Tools SDK ships an `arm64e.x1` .tbd stub ld64.lld 22.1.8
@@ -31,8 +31,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [macos-15, xcode-27]
+        include:
+          - image: macos-15
+            known_red: ''
+          - image: xcode-27
+            known_red: '#669'
     runs-on: ${{ matrix.image }}
+    # KNOWN RED, MACHINE-READABLY (the 2026-09-28 design, WS7). A leg whose
+    # failure has a tracked external cause carries that issue in `known_red`:
+    # the leg may fail without failing the workflow, its own result and log
+    # stay visible, and .github/tools/check_workflow_assertions.py requires
+    # the issue to be open. The leg leaves the list when #669 closes.
+    continue-on-error: ${{ matrix.known_red != '' }}
     timeout-minutes: 60
     # NOTE: no MCPP_VERBOSE — the e2e suite asserts mcpp's default quiet
     # output (tests 48/53).

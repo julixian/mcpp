@@ -100,3 +100,35 @@ TEST_F(DiagTest, FlushIsTheSolePolicyPointAndReportsFailureToTheCaller) {
              "stale BMI possible after editing an included file");
     EXPECT_TRUE(flush(/*strict=*/false));
 }
+
+// WS3 of the 2026-09-28 design: one statement per fact per PROCESS. A
+// `--workspace` build flushes after each member, and a fact every member
+// shares -- a redundant word the workspace states -- was printed once per
+// member. The terminal prints it once; each run's record still holds it, so
+// `take()` gives every member's occurrence to a machine-readable envelope.
+TEST_F(DiagTest, AFactIsPrintedOncePerProcessAndRecordedPerRun) {
+    const std::string fact = "the CRT word is redundant ([workspace.build] dialect_cxxflags)";
+    testing::internal::CaptureStderr();
+    for (int member = 0; member < 5; ++member) {
+        warning("build/msvc-crt-word", fact);
+        auto run = take();
+        ASSERT_EQ(run.size(), 1u) << "member " << member << " lost its own record";
+        EXPECT_EQ(run[0].what, fact);
+        (void)flush(/*strict=*/false);
+    }
+    const auto printed = testing::internal::GetCapturedStderr();
+    std::size_t count = 0;
+    for (auto at = printed.find(fact); at != std::string::npos; at = printed.find(fact, at + 1))
+        ++count;
+    EXPECT_EQ(count, 1u) << printed;
+}
+
+TEST_F(DiagTest, NotesArePrintedAsNotesAndNeverPromoted) {
+    testing::internal::CaptureStderr();
+    note("build/runtime-placement", "a dependency ships the MSVC C++ runtime");
+    const auto printed = testing::internal::GetCapturedStderr();
+    EXPECT_NE(printed.find("note:"), std::string::npos) << printed;
+    EXPECT_EQ(printed.find("warning:"), std::string::npos) << printed;
+    EXPECT_EQ(count(Severity::Degraded), 0u);
+    EXPECT_TRUE(flush(/*strict=*/true));
+}

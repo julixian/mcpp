@@ -8,6 +8,7 @@ module;
 export module mcpp.cli.cmd_publish;
 
 import std;
+import mcpp.build.advice;
 import mcpplibs.cmdline;
 import mcpp.build.prepare;   // profile_override_from_flags
 import mcpp.libs.json;
@@ -105,13 +106,31 @@ export int cmd_place_dlls(const mcpplibs::cmdline::ParsedArgs& parsed) {
             if (offered) placedByOthers.push_back(name);
         }
     }
-    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore, placedByOthers);
+    // The rule the plan's resolver applied to the MSVC C++ runtime's names
+    // (mcpp.build.runtime_placement), and the toolset's runtime directory. A
+    // graph written before these options existed passes neither, and gets
+    // the search-order placement it was written for.
+    mcpp::pack::RuntimeCrtRule crtRule;
+    if (auto v = parsed.option_or_empty("crt").value(); !v.empty()) crtRule.policy = v;
+    if (auto v = parsed.option_or_empty("toolset-crt").value(); !v.empty())
+        crtRule.toolsetCrtDir = std::filesystem::path{v};
+    auto placed = mcpp::pack::place_runtime_dlls(program, dirs, placedBefore, placedByOthers,
+                                                 crtRule);
     if (!placed) {
         std::println(stderr, "error: {}", placed.error().message);
         return 1;
     }
-    for (auto const& n : placed->notes) std::println("note: {}", n);
-    for (auto const& w : placed->warnings) std::println(stderr, "warning: {}", w);
+    // What the placement has to say on success goes to the edge-advice
+    // channel (mcpp.build.advice), which mcpp reports after a successful
+    // build without `-v`; printed here, it reached nobody (WS3).
+    {
+        std::vector<mcpp::build::advice::Line> lines;
+        for (auto const& n : placed->notes)
+            lines.push_back({mcpp::build::advice::Kind::Note, n});
+        for (auto const& w : placed->warnings)
+            lines.push_back({mcpp::build::advice::Kind::Warning, w});
+        mcpp::build::advice::write(stamp, lines);
+    }
 
     // The depfile syntax ninja reads (`deps = gcc`): a space and `#` are
     // escaped with a backslash, and `$` is doubled.

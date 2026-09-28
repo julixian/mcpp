@@ -24,17 +24,14 @@ subst() {  # subst <sed-expr> <file>
     sed "$1" "$2" > "$2.tmp" && mv "$2.tmp" "$2"
 }
 
-# Windows + a GNU-dialect toolchain (the CI leg's clang) is the one
-# combination that genuinely CANNOT track textual includes: the depfile GCC
-# emits for a module TU needs an awk filter to be loadable by ninja, and
-# native Windows has no awk. #257 does not fix that — it makes the engine SAY
-# so, through diag::degraded. On that platform this test therefore asserts
-# the degradation is reported rather than asserting a capability the build
-# does not have; silence would be the actual defect.
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) EXPECT_TRACKING=0 ;;
-    *)                    EXPECT_TRACKING=1 ;;
-esac
+# EVERY HOST TRACKS INCLUDES (the 2026-09-28 design, WS2). Until 2026.9.28.2
+# a Windows host with a GNU-dialect toolchain -- the default LLVM row's clang++
+# since #718 -- emitted no depfile, because the gate read the HOST instead of
+# the compiler, and this test asserted only that the engine said so. Clang
+# writes a plain depfile on Windows as it does elsewhere, and GCC's filtered
+# form arrives through `mcpp depfile-filter` there, so the rebuild is asserted
+# on every host, and the old degradation must be gone. On 2026.9.28.1 this
+# fails on the Windows row: the edit below leaves the output at 41.
 DEGRADED_MSG="emits no GNU depfile"
 
 TMP=$(mktemp -d)
@@ -71,17 +68,10 @@ EOF
 run_log=$("$MCPP" run 2>&1)
 out="$(echo "$run_log" | tail -1)"
 [[ "$out" == "41" ]] || { echo "unexpected initial output: $out"; exit 1; }
-
-if [[ $EXPECT_TRACKING -eq 0 ]]; then
-    echo "$run_log" | grep -q "$DEGRADED_MSG" || {
-        echo "$run_log"
-        echo "FAIL: this toolchain/platform cannot emit a depfile, and said nothing."
-        echo "      A capability gap must be reported, not silent (#257)."
-        exit 1
-    }
-    echo "  windows: depfile degradation reported as expected; rebuild tracking not asserted"
-    echo "OK"
-    exit 0
+if echo "$run_log" | grep -q "$DEGRADED_MSG"; then
+    echo "$run_log"
+    echo "FAIL: the build still reports that it emits no GNU depfile"
+    exit 1
 fi
 
 subst 's/41/42/' src/vals.inc

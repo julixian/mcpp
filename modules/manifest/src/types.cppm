@@ -1031,6 +1031,13 @@ struct BuildConfig : BuildInputs {
     // rather than being silently linked in. Root-only, like `target`;
     // validated in `prepare_build`, not here.
     std::string                         platformDependencies;
+    // THE VALUES `[workspace.build]` CONTRIBUTED, per list key (the TOML key,
+    // "dialect_cxxflags"), as the workspace wrote them. A diagnostic about one
+    // of them names the table that states it -- `[workspace.build]`, not the
+    // member's `[build]` (the 2026-09-28 design, WS3). Filled by
+    // `mcpp::project::inherit_workspace_build`; empty for a manifest read on
+    // its own. A record, not an input: nothing is compiled from it.
+    std::map<std::string, std::vector<std::string>> inheritedFromWorkspace;
 };
 
 // Canonical package identity used by runtime requirements/artifacts.  A short

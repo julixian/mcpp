@@ -4,6 +4,7 @@
 export module mcpp.manifest.xpkg;
 
 import mcpp.manifest.types;
+import mcpp.manifest.cfg_selector;
 import std;
 import mcpp.pm.dep_spec;
 import mcpp.pm.dependency_selector;
@@ -1576,6 +1577,9 @@ synthesize_from_xpkg_lua(std::string_view luaContent,
                 cur.skip_ws_and_comments();
             }
             cur.consume('}');
+            // The order the mcpp.toml reader gives them: a more specific
+            // selector applies later (SPEC-004 §3.1.1, #728).
+            mcpp::manifest::cfg::order_by_specificity(m.conditionalConfigs);
         }
         else if (key == "targets") {
             // `{ ["name"] = { kind = "lib" }, ... }`

@@ -3,6 +3,81 @@
 > 本文件追踪 `mcpp-community/mcpp` 公开仓的版本演进。
 > 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026.9.28.2] - 2026-09-28
+
+本版本实施 2026-09-28 生态设计中 mcpp 的部分(WS1、WS2、WS3、WS7、WS8、WS10 与决定 D7),关闭
+#728 与 #729,并完成 #718 中运行时放置的一半。设计、任务划分与实施记录见
+`.agents/docs/2026-09-28-ecosystem-design-and-optimisation-plan.md`,其依据见
+`.agents/docs/2026-09-28-ecosystem-review-of-two-days-of-mcpp-and-xlings.md`。配套的 xlings
+2026.9.28.2 见 openxlings/xlings#628。
+
+### 行为变化
+
+- **Windows 程序旁的文件由一个解析器决定(WS1,SPEC-006 §3.7.1)。** 声明的来源(`[runtime]
+  deploy`)优先于工具链的来源,工具链的来源优先于推导的来源(运行时搜索目录中找到的 DLL)。MSVC C++
+  运行时作为一个有版本的集合决定:放置工具集的集合,除非某个搜索目录提供版本严格更新的完整集合,
+  此时放置该集合并说明一次;依赖包自带而未被放置的副本作为打包缺陷说明一次;声明的运行时文件比
+  工具集的旧时给出警告;读不出的版本不参与决定。版本取自 PE 文件的 `VERSIONINFO`。契约决定是否
+  携带:`toolchain-coupled` 携带;`host-coupled` 不放置任何副本,并拒绝声明的副本(拒绝理由
+  `crt-declared-under-host-coupled`);`self-contained` 只在依赖包带来运行时名字时放置。规划、
+  链接后的 `place-dlls`(`--crt`、`--toolset-crt`)与 `mcpp pack` 读同一个答案,`resolution.json`
+  的 `runtime.placement`、`runtime.crt_set` 与 `runtime.placement_notes` 记录它。此前链接后的放置
+  按搜索次序取第一个提供 `vcruntime140.dll` 的目录,Qt 载荷中比工具集更旧的副本因此被放到程序旁。
+- **每个 action 运行时,工具集的运行时目录位于 `PATH` 最前(WS1,决定 D3)。** 面向 MSVC ABI 的
+  构建经 action 包装器的 `--path-prepend` 设置它,与 `mcpp run`、`mcpp test` 相同;依赖包不带运行时
+  发布的宿主工具(Qt 的 `moc.exe`)因此能够启动。系统目录在加载器的搜索次序中先于 `PATH`,装有
+  VC++ redistributable 的机器仍使用系统的副本。
+- **每个宿主上都跟踪头文件依赖(WS2)。** GNU 方言的编译器在每个宿主上写 depfile。Windows 上的
+  clang++(自 #718 起为 LLVM 行的默认)此前不写,编辑模块 purview 中 `#include` 的文件不会重新编译
+  导入者;Windows 上 GCC 的模块 depfile 由 `mcpp depfile-filter` 过滤,它运行编译命令本身,不需要
+  shell。`emits no GNU depfile` 的降级提示随之删除。
+- **每个事实每次运行陈述一次(WS3)。** `mcpp.diag` 在一个进程中按(域、文本)只打印一次,工作空间
+  各成员共有的事实因此只打印一次;说明(`note:`)是独立的严重级别,`--strict` 不提升它。继承自
+  `[workspace.build]` 的冗余 CRT 参数指向 `[workspace.build]`,不再指向不含它的成员 `[build]`。
+  构建边在成功时要陈述的事(放置比较出的差异,两个目录提供同名 DLL 时的选择)写入
+  `.mcpp-advice/<该边的输出>.advice`,构建成功后由完整路径与快速路径共用的一个函数报告一次
+  (SPEC-007 R4.5);此前这些内容只在构建失败或 `-v` 时可见,规划期对同一事实的第二次陈述随之删除。
+  `emit build-database` 的信封按成员列出各自的诊断,代码由域得出(`build/msvc-crt-word` 为
+  `MCPP_BUILD_MSVC_CRT_WORD`)。
+- **命中同一目标的条件表按选择器的具体程度应用(决定 D7,#728)。** 更具体的后应用,因而胜出:
+  三元组高于任何 cfg 表达式,OS 高于族,`cfg(all(...))` 按其固定的三元组分量计数;具体程度相同时
+  按选择器文本排序。此前按选择器文本的字典序应用,`aarch64-unknown-linux-gnu` 先于 `linux`,其标量
+  被后者覆盖(SPEC-004 §3.1.1)。
+
+### 特性
+
+- **`mcpp self env --format json` 报告 `defaultToolchain`(WS8)。** 该值由
+  `pins::host_default_toolchain` 一个函数回答,即首次运行安装的工具链;docs/01 与 docs/20 的表格在
+  每个 CI 宿主上与之核对(`.github/tools/check_default_toolchain_docs.py`)。
+
+### 内部
+
+- **CI 的步骤断言其名称所说的事(WS7,#729)。** `.github/tools/check_workflow_assertions.py` 检查
+  工作流:经管道的构建须在 `pipefail` 下运行(W1),被丢弃的退出状态须被读取(W2),已知为红的任务须
+  标注其 issue(W3);它在 `origin/main` 的工作流上报告 7 处。LLVM 自构建改用 llvm@22.1.8,并以
+  `set -o pipefail` 断言构建本身,函数规模门(`check_function_sizes.sh`)在其后运行。xcode-27 任务
+  标注 #669 并允许失败。
+- **发布门(WS10)。** `.github/release-canaries.toml` 列出真实工程,`release-canaries.yml` 以候选
+  mcpp 构建它们,`release.yml` 的打 tag 任务依赖其结果;`tests/release/verify-published.sh` 在沙箱
+  中验证已发布的 mcpp 与 xlings,每个发布项一节,并保留此前各版本的小节;PR 模板要求列出每条新规则
+  所跨越的既有不变量与位于交点的测试。
+- **测量任务。** `measure-windows-tool-crt.yml` 在带 Visual Studio 与屏蔽 Visual Studio 的两个
+  Windows 行上隐藏系统的 C++ 运行时,测量 Qt 的宿主工具能否只经 action 的 `PATH` 启动(设计 §2.9),
+  它是从 `xim:qt-base` 中移除运行时副本的前提。
+- **xlings 固定版本为 2026.9.28.2。** interface 协议 1.3:`download_progress` 带 `stream` 且发送
+  频率有上限;home 以 `.xlings-home` 声明;`update` 只构建一次索引(openxlings/xlings#628)。
+
+### 兼容性
+
+- 运行时搜索目录中带有较旧 MSVC C++ 运行时副本的 Windows 程序,现在得到工具集的副本;差异以一条
+  说明陈述,不再在每次链接时警告。
+- 在 `host-coupled` 下声明 MSVC C++ 运行时文件的 manifest 被拒绝。
+- 若干条件表命中同一目标、且字典序与具体程度给出不同次序的 manifest,其标量取值与列表参数的次序
+  随之改变。
+- Windows 上以 GNU 方言编译的工程,编译命令多出 depfile 参数,升级后第一次构建完整重建一次。
+- 面向 MSVC ABI 的构建中,每个 action 的命令行多出工具集运行时目录(`__action --path-prepend`),
+  升级后第一次构建中每个 action(包括 `check` 与 `prepare`)重新运行一次。
+
 ## [2026.9.28.1] - 2026-09-28
 
 本版本合入 #717、#718、#720、#722、#723、#724、#725 与 #726 的修复与特性。设计与实施记录见

@@ -18,3 +18,4 @@ export import mcpp.manifest.types;
 export import mcpp.manifest.toml;
 export import mcpp.manifest.xpkg;
 export import mcpp.manifest.flag_words;
+export import mcpp.manifest.cfg_selector;

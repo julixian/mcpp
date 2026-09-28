@@ -103,7 +103,7 @@ int main() {
 EOF
 
 MCPP="${MCPP:-mcpp}"
-ran_prepare() { grep -q 'PREPARE prep:install\|__action-stamp.*install\.sh' "$1"; }
+ran_prepare() { grep -qE 'PREPARE prep:install|__action(-stamp)? .*install\.sh' "$1"; }
 
 # ── 1. first build: header compiles, program runs through runtime_search_dir
 "$MCPP" build -v > b1.log 2>&1 || { cat b1.log; echo "FAIL: first build failed"; exit 1; }

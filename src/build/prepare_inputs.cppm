@@ -171,9 +171,11 @@ inline Ctx context_for(std::string_view targetTriple) {
 // target-side layer (docs/14) and are answerable only after the graph is
 // resolved — see `merge_layer_conditional_config` in prepare.cppm for the
 // second pass that evaluates them.
-inline constexpr std::string_view kCfgTripleKeys[] = {
-    "arch", "env", "family", "os",
-};
+// The four lists are stated once, in mcpp.manifest.cfg_selector, which also
+// ranks a selector's specificity by them (the order conditional tables apply
+// in, SPEC-004 §3.1.1): a key known to one reader and unknown to the other is
+// the drift this file's header warns about.
+using mcpp::manifest::cfg::kCfgTripleKeys;
 // THE LAYER KEYS SPLIT BY SCHEDULE, not by subject matter.
 //
 // The five in `kCfgLayerKeys` are answered BY dependency resolution: which C
@@ -193,16 +195,9 @@ inline constexpr std::string_view kCfgTripleKeys[] = {
 //
 // Both sets are the cfg VOCABULARY, so `is_cfg_layer_key` still answers for
 // either; only the schedule question (`uses_layer`) distinguishes them.
-inline constexpr std::string_view kCfgEarlyLayerKeys[] = {
-    "accelerator",
-};
-inline constexpr std::string_view kCfgLayerKeys[] = {
-    "c++-abi", "c-abi", "compiler", "compiler-runtime",
-    "kernel-abi",
-};
-inline constexpr std::string_view kCfgBarewords[] = {
-    "linux", "macos", "unix", "windows",
-};
+using mcpp::manifest::cfg::kCfgEarlyLayerKeys;
+using mcpp::manifest::cfg::kCfgLayerKeys;
+using mcpp::manifest::cfg::kCfgBarewords;
 
 // Answerable before resolution. Its value comes from the build's own accel.
 inline bool is_cfg_early_layer_key(std::string_view k) {

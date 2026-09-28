@@ -379,21 +379,16 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
     // compiler when nothing was ever recorded as one — see its own comment
     // for why #622 happened). One derivation, called from both, so they
     // cannot drift the way a hand-copied second copy would.
+    // The host's answer is `pins::host_default_toolchain` (WS8): one function,
+    // which `mcpp self env --format json` reports too. A machine with no
+    // usable MSVC gets the GNU pin, not an MSVC-ABI clang it cannot use --
+    // mirrors the windows-gnu seed below, which this function's other caller
+    // runs after.
     state.native_first_run_spec = [&]() -> std::string {
-        namespace pins = mcpp::toolchain::triple::pins;
-        if constexpr (mcpp::platform::is_macos) {
-            return std::string(pins::kFirstRunMac);
-        } else if constexpr (mcpp::platform::is_windows) {
-            // A machine with no usable MSVC gets the GNU pin, not an
-            // MSVC-ABI clang it cannot use — mirrors the windows-gnu seed
-            // below, which this function's other caller runs after.
-            return std::string(state.msvc_usable_either_origin()
-                ? pins::kFirstRunWinMsvc : pins::kFirstRunWinGnu);
-        } else if (mcpp::platform::host_arch == std::string_view("x86_64")) {
-            return std::string(pins::kFirstRunLinuxX86_64);
-        } else {
-            return std::string(pins::kFirstRunLinuxOther);
-        }
+        const bool msvcUsable = mcpp::platform::is_windows
+                             && state.msvc_usable_either_origin();
+        return std::string(
+            mcpp::toolchain::triple::pins::host_default_toolchain(msvcUsable));
     };
 
     state.windowsGnuFirstRun = false;

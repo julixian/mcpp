@@ -392,8 +392,30 @@ void step13_resolution_json(PrepareState& state, BuildContext& ctx) {
             j["graph"] = { {"packages", std::move(graphPackages)} };
         }
 
+        // What sits beside the program, as the runtime placement resolver
+        // decided it (mcpp.build.runtime_placement), with the kind of each
+        // source and the C++ runtime set chosen. `mcpp pack` and `mcpp why
+        // runtime` read the same decision; this is its record.
+        nlohmann::json placement = nlohmann::json::array();
+        for (auto const& d : roleFlags.runtimeDeploy) {
+            using Origin = mcpp::build::BuildPlan::DeployFile::Origin;
+            placement.push_back({
+                {"dest", d.dest.generic_string()},
+                {"sources", path_array(d.sources)},
+                {"kind", d.origin == Origin::Derived   ? "derived"
+                       : d.origin == Origin::Toolchain ? "toolchain" : "declared"},
+            });
+        }
+        nlohmann::json crtSet = {
+            {"rule", roleFlags.runtimeCrtPolicy},
+            {"kind", roleFlags.runtimeCrtKind},
+            {"version", roleFlags.runtimeCrtVersion},
+        };
         j["runtime"] = {
             {"cxx_runtime_by_role", contracts},
+            {"placement", std::move(placement)},
+            {"crt_set", std::move(crtSet)},
+            {"placement_notes", roleFlags.runtimeNotes},
             {"library_dirs", dirs},
             {"dlopen_libs", ctx.plan.runtimeDlopenLibs},
             {"capabilities", legacyCaps},

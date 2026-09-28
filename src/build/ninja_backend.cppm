@@ -35,6 +35,7 @@ import mcpp.runtime.elf;
 import mcpp.build.compile_commands;
 import mcpp.build.cmdlimits;
 import mcpp.diag;
+import mcpp.build.advice;
 import mcpp.dyndep;
 import mcpp.toolchain.detect;
 import mcpp.toolchain.dialect;
@@ -1176,17 +1177,15 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     // All compile/link flags are computed once via flags.cppm.
     auto flags = compute_flags(plan);
 
-    // Everything that has to sit beside the artifact, from both producers:
-    // the manifest's `[runtime] deploy_files` (already in the plan) and the
-    // C++ runtime contract's own answer (`toolchain-coupled` on PE — see
-    // mcpp.build.distribution). Merged ONCE, here, because three places below
-    // consume the list — the implicit dependency of each executable, the copy
-    // edges, and `default` — and a list that is complete in two of them is a
-    // graph where the DLL is copied only when something else happens to ask.
-    auto deployFiles = plan.runtimeDeployFiles;
-    deployFiles.insert(deployFiles.end(),
-                       flags.toolchainRuntimeDeploy.begin(),
-                       flags.toolchainRuntimeDeploy.end());
+    // Everything that has to sit beside the artifact: the runtime placement
+    // resolver's one answer over the declared deploys, the runtime search
+    // directories' DLLs and the toolset's C++ runtime (CompileFlags::
+    // runtimeDeploy, mcpp.build.runtime_placement). Read ONCE, here, because
+    // three places below consume the list -- the implicit dependency of each
+    // executable, the copy edges, and `default` -- and a list that is complete
+    // in two of them is a graph where the DLL is copied only when something
+    // else happens to ask.
+    const auto& deployFiles = flags.runtimeDeploy;
 
     // ── The raw image a flasher takes ──────────────────────────────────────
     //
@@ -1442,19 +1441,38 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     //           `x.c++-module: gcm.cache/x.gcm` + .PHONY + `gcm.cache/x.gcm:| x.o`
     // So Clang emits nothing the filter would need to remove, and the
     // conflated gate was protecting against a shape that does not exist.
-    const bool posixDepfile = !msvcDeps && !mcpp::platform::is_windows;
+    //
+    // WHETHER A UNIT EMITS A GNU DEPFILE IS A PROPERTY OF THE COMPILER, NOT
+    // OF THE HOST (the 2026-09-28 design, WS2). Until 2026.9.28.2 this read
+    // `!msvcDeps && !is_windows`, so every clang++ build on Windows -- the
+    // default Windows row since #718 -- got no `-MMD`, and a header edit did
+    // not rebuild the objects and BMIs that include it. Every GNU-dialect
+    // compiler writes one now, on every host; only HOW GCC's filtered form
+    // arrives depends on the host:
+    //   * POSIX: the awk filter, in the same shell command, as before (so a
+    //     POSIX build's commands are unchanged by the upgrade);
+    //   * Windows: no shell to chain a filter in, so `mcpp depfile-filter`
+    //     runs the compile itself and keeps the first record of the raw
+    //     depfile (the same rule as the awk program).
+    // cl.exe keeps deps=msvc via /showIncludes, the equivalent mechanism.
+    const bool gnuDepfile = !msvcDeps;
     const bool needsGnuModuleFilter =
-        posixDepfile && plan.toolchain.compiler == mcpp::toolchain::CompilerId::GCC;
+        gnuDepfile && plan.toolchain.compiler == mcpp::toolchain::CompilerId::GCC;
     const std::string mmd_flag =
-        posixDepfile ? (needsGnuModuleFilter ? "-MMD -MF $out.d.raw "
-                                             : "-MMD -MF $out.d ")
-                     : "";
-    const std::string mmd_filter = needsGnuModuleFilter
+        gnuDepfile ? (needsGnuModuleFilter ? "-MMD -MF $out.d.raw "
+                                           : "-MMD -MF $out.d ")
+                   : "";
+    const std::string mmd_filter =
+        (needsGnuModuleFilter && !mcpp::platform::is_windows)
         ? " && awk 'NR==1{print;next} /^[^ ]/{exit} {print}' "
           "\"$out.d.raw\" > \"$out.d\" && rm -f \"$out.d.raw\""
         : "";
+    const std::string win_depfile_filter =
+        (needsGnuModuleFilter && mcpp::platform::is_windows)
+        ? "$mcpp depfile-filter --raw $out.d.raw --out $out.d -- "
+        : "";
     auto append_cxx_deps = [&] {
-        if (posixDepfile) {
+        if (gnuDepfile) {
             append("  deps = gcc\n");
             append("  depfile = $out.d\n");
         } else {
@@ -1465,19 +1483,7 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     // toolchain — the second half of the same asymmetry #257 reports. They
     // never carry module reversed-rules, so they need the flag but not the
     // filter.
-    const std::string c_mmd_flag = posixDepfile ? "-MMD -MF $out.d " : "";
-    // Windows non-MSVC (mingw gcc / clang) is the one combination left with
-    // no include tracking: the GCC filter needs awk, which is not available
-    // there. cl.exe is fine — deps=msvc via /showIncludes is the equivalent
-    // mechanism, not a degradation.
-    if (!posixDepfile && !msvcDeps) {
-        mcpp::diag::degraded("build/depfile",
-            "this toolchain and platform combination emits no GNU depfile",
-            "editing a file #include'd inside a module interface purview (or a "
-            "header pulled into a .cpp) will not trigger a rebuild, so the build "
-            "may reuse a stale BMI or object",
-            "touch the including .cppm/.cpp after editing such a file");
-    }
+    const std::string c_mmd_flag = gnuDepfile ? "-MMD -MF $out.d " : "";
     // #261: the flag payload of every compile/scan rule is unbounded — one
     // -I per dependency include dir — and on Windows ninja spawns through
     // CreateProcess, whose command line caps at 32767 chars. Route the
@@ -1554,9 +1560,10 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     if constexpr (mcpp::platform::is_windows) {
         // Windows: skip BMI restat optimization (requires POSIX shell).
         const std::string payload = " $local_includes";
-        append(std::format("  command = $cxx{} $cxxflags $unit_cxxflags"
-                           " $module_output $module_lang {}\n",
-                           rsp_ref(payload), compile_tail));
+        append(std::format("  command = {}$cxx{} $cxxflags $unit_cxxflags"
+                           " $module_output $module_lang {}{}\n",
+                           win_depfile_filter, rsp_ref(payload), mmd_flag,
+                           compile_tail));
         append_rspfile(payload);
         append_cxx_deps();
     } else {
@@ -1649,11 +1656,11 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         if constexpr (mcpp::platform::is_windows) {
             const std::string payload = " $local_includes";
             append(std::format(
-                "  command = $cxx{} $cxxflags $unit_cxxflags{}{} $in {}$out\n",
-                rsp_ref(payload), traits.bmiOnlyFlags, module_src_flags,
-                dial.outputObjPrefix));
+                "  command = {}$cxx{} $cxxflags $unit_cxxflags{}{} {}$in {}$out\n",
+                win_depfile_filter, rsp_ref(payload), traits.bmiOnlyFlags,
+                module_src_flags, mmd_flag, dial.outputObjPrefix));
             append_rspfile(payload);
-            append_deps();
+            append_cxx_deps();
         } else {
             // Same bak / bmi-equal / restore dance as cxx_module, and for the
             // same reason: ninja's `restat` compares the output's MTIME, and a
@@ -1680,10 +1687,11 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         append("rule cxx_module_object\n");
         if constexpr (mcpp::platform::is_windows) {
             const std::string payload = " $local_includes";
-            append(std::format("  command = $cxx{} $cxxflags $unit_cxxflags{} {}\n",
-                               rsp_ref(payload), module_src_flags, compile_tail));
+            append(std::format("  command = {}$cxx{} $cxxflags $unit_cxxflags{} {}{}\n",
+                               win_depfile_filter, rsp_ref(payload), module_src_flags,
+                               mmd_flag, compile_tail));
             append_rspfile(payload);
-            append_deps();
+            append_cxx_deps();
         } else {
             append(std::format(
                 "  command = $cxx $local_includes $cxxflags $unit_cxxflags{} {}{}{}\n",
@@ -1697,8 +1705,9 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     append("rule cxx_object\n");
     if constexpr (mcpp::platform::is_windows) {
         const std::string payload = " $local_includes";
-        append(std::format("  command = $cxx{} $cxxflags $unit_cxxflags {}\n",
-                           rsp_ref(payload), compile_tail));
+        append(std::format("  command = {}$cxx{} $cxxflags $unit_cxxflags {}{}\n",
+                           win_depfile_filter, rsp_ref(payload), mmd_flag,
+                           compile_tail));
         append_rspfile(payload);
     } else {
         append(std::format(
@@ -1942,7 +1951,19 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         // set reads runtime search directories a `prepare` action fills, so it
         // differs between the first plan and the second, and every build after
         // the first re-ran the placement (e2e 797).
-        append("  command = $mcpp place-dlls --output $out --depfile $out.d $in" + dirs + "\n");
+        //
+        // The C++ runtime's rule is passed as the contract gave it, with the
+        // toolset's runtime directory: a name a `prepare` action brings into a
+        // search directory after planning is decided by the same resolver
+        // (mcpp.build.runtime_placement), not by search order. Both are
+        // properties of the toolset and the contract, so the command stays the
+        // same across the plans of one build.
+        std::string crt = " --crt " + flags.runtimeCrtPolicy;
+        if (flags.runtimeCrtPolicy != "system" && flags.runtimeCrtPolicy != "not-applicable"
+            && !plan.toolchain.msvcRedistDir.empty())
+            crt += " --toolset-crt " + ninja_command_word(plan.toolchain.msvcRedistDir.string());
+        append("  command = $mcpp place-dlls --output $out --depfile $out.d" + crt
+               + " $in" + dirs + "\n");
         append("  depfile = $out.d\n");
         append("  deps = gcc\n");
         append("  description = DLLS $in\n\n");
@@ -3080,7 +3101,22 @@ std::string emit_ninja_string(const BuildPlan& plan) {
         // that can set both before running it. An action that declares
         // neither keeps the positional `__action-stamp` form, byte for byte,
         // so upgrading changes no existing edge's command and re-runs nothing.
-        const bool named = !a.env.empty() || !a.cwd.empty();
+        //
+        // A BUILD FOR A WINDOWS TARGET HAS ONE C++ RUNTIME, THE TOOLSET'S, FOR
+        // THE PROGRAM AND FOR THE TOOLS THAT BUILD IT (the 2026-09-28 design,
+        // §2.9). A tool an action runs -- Qt's moc.exe, a vcpkg port's
+        // generator -- needs a C++ runtime to start, and a library package no
+        // longer carries one (D3); the toolset's runtime directory goes first
+        // on every such action's PATH, as it already does for `mcpp run` and
+        // `mcpp test`. The system directory still precedes PATH in the
+        // loader's search, so a machine with the VC++ redistributable
+        // installed uses that; PATH supplies it where the system has none.
+        // Decided by the TARGET, as every other runtime question is: on a
+        // host that is not Windows the directory is inert on PATH, and the
+        // same graph is then assertable on every host.
+        const bool crtOnPath = mcpp::toolchain::is_msvc_target(plan.toolchain)
+                            && !plan.toolchain.msvcRedistDir.empty();
+        const bool named = !a.env.empty() || !a.cwd.empty() || crtOnPath;
         if (stamped || named) {
             // `mcpp_exe_path()`, not `self_exe_path()` directly: this file
             // already has one spelling of "where am I" and a second would be
@@ -3098,6 +3134,8 @@ std::string emit_ninja_string(const BuildPlan& plan) {
                 + (named ? " __action" : " __action-stamp");
             for (auto const& e : a.env) wrapped += " --env " + q(e);
             if (!a.cwd.empty()) wrapped += " --cwd " + q(a.cwd);
+            if (crtOnPath)
+                wrapped += " --path-prepend " + q(plan.toolchain.msvcRedistDir.string());
             // Before the stamp list, so the wrapper can tell the flag from a
             // stamp path without an allowlist of extensions. `directives.cppm`
             // refuses a `prepare` action with no `output_dir`, so this is
@@ -3714,9 +3752,17 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     // A distribution contract that could not be honored is reported, never
     // silently downgraded — the whole point of the model (INV-1/INV-4 in
     // .agents/docs/2026-08-02-issue336-pr142-analysis.md). Emitted here rather
-    // than inside compute_flags, which runs twice per build.
+    // than inside compute_flags, which runs twice per build. Through
+    // mcpp.diag, so a workspace whose members share the fact prints it once
+    // (WS3), with the runtime placement resolver's own statements beside it:
+    // a dependency that ships the C++ runtime, a newer set chosen, a declared
+    // runtime file older than the toolset's.
     for (auto const& d : flags.diagnostics)
-        mcpp::ui::warning(std::format("cxx_runtime: {}", d));
+        mcpp::diag::warning("build/cxx-runtime", std::format("cxx_runtime: {}", d));
+    for (auto const& n : flags.runtimeNotes)
+        mcpp::diag::note("build/runtime-placement", n);
+    for (auto const& w : flags.runtimeWarnings)
+        mcpp::diag::warning("build/runtime-placement", w);
 
     // A declared C standard the compiler does not apply is said once, never
     // dropped without a word (#695, W3b): cl.exe compiles C in its default
@@ -3916,6 +3962,10 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     r.exitCode = ok ? 0 : 1;
     r.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0);
+
+    // What the edges that ran had to say on success (mcpp.build.advice): the
+    // one reader both build paths call.
+    if (ok) mcpp::build::advice::report_and_clear(plan.outputDir);
 
     if (ok) {
         auto runtimeReport =

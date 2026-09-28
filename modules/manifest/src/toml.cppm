@@ -3,6 +3,7 @@
 export module mcpp.manifest.toml;
 
 import mcpp.manifest.types;
+import mcpp.manifest.cfg_selector;
 import mcpp.targetside;
 import std;
 import mcpp.source_kind;
@@ -3975,6 +3976,10 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
             if (!mcpp::manifest::is_empty(cc))
                 m.conditionalConfigs.push_back(std::move(cc));
         }
+        // The order they apply in: a more specific selector later, so it wins
+        // (SPEC-004 §3.1.1, #728). The loop above iterates a `std::map`, which
+        // is lexical order; that order is kept only as the tie-break.
+        mcpp::manifest::cfg::order_by_specificity(m.conditionalConfigs);
     }
 
     // [workspace] — multi-package workspace support (0.0.11+).

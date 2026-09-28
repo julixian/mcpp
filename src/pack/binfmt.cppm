@@ -156,6 +156,35 @@ resolve_macho_names(std::span<const std::string> names,
 // predicate must not quietly make for it.
 bool is_system_lib(Format f, std::string_view name);
 
+// ─── PE versions ────────────────────────────────────────────────────────
+//
+// Two version readings a PE image carries, for the runtime placement resolver
+// (mcpp.build.runtime_placement), which compares the MSVC CRT's copies.
+//
+// `pe_file_version` is VS_FIXEDFILEINFO's file version, from the RT_VERSION
+// resource: what Explorer shows as "File version", and the only version a
+// redistributable DLL states about itself (vcruntime140.dll 14.44.35112.0).
+//
+// `pe_linker_version` is the optional header's MajorLinkerVersion and
+// MinorLinkerVersion (link.exe of MSVC 14.44 writes 14.44). It is a reading,
+// not a guarantee: lld-link writes 14.0 whatever toolset's libraries it links,
+// so it cannot answer "which toolset built this image" for a clang-linked one.
+//
+// Both return nullopt for a file that is not a PE image, or whose field cannot
+// be read (no resource section, a truncated header). A caller must treat that
+// as "unknown", never as a version: an unreadable version decides nothing.
+struct PeVersion {
+    std::uint16_t major = 0, minor = 0, build = 0, revision = 0;
+    auto operator<=>(const PeVersion&) const = default;
+    std::string str() const {
+        return std::format("{}.{}.{}.{}", major, minor, build, revision);
+    }
+};
+std::optional<PeVersion> pe_file_version(const std::filesystem::path& image);
+std::optional<PeVersion> pe_file_version(std::string_view bytes);
+std::optional<PeVersion> pe_linker_version(const std::filesystem::path& image);
+std::optional<PeVersion> pe_linker_version(std::string_view bytes);
+
 } // namespace mcpp::pack::binfmt
 
 namespace mcpp::pack::binfmt {
@@ -555,31 +584,64 @@ elf_needed(std::string_view b) {
 // through it. A delay-loaded DLL that is missing does not fail at startup —
 // it fails later, somewhere in the program, which is strictly worse to debug.
 // Leaving it out of the closure would produce exactly that.
-std::expected<std::vector<std::string>, std::string>
-pe_needed(std::string_view b) {
+// The parts of a PE image each reader below needs: where the optional header
+// and the data directories are, how many directories there are, and how an RVA
+// maps to a file offset. One parse, so the import reader and the version
+// readers cannot disagree about the same header.
+struct PeLayout {
+    std::size_t   nt = 0;         // offset of "PE\0\0"
+    std::size_t   dirsAt = 0;     // offset of data directory 0
+    std::uint32_t numDirs = 0;
+    struct Section { std::uint32_t va, vsize, raw, rawSize; };
+    std::vector<Section> sections;
+
+    std::optional<std::size_t> rva_to_off(std::uint32_t rva, std::size_t fileSize) const {
+        for (auto const& s : sections) {
+            // A section's mapped size is VirtualSize, but a section whose
+            // VirtualSize is 0 (some linkers) still maps SizeOfRawData.
+            auto span = s.vsize ? s.vsize : s.rawSize;
+            if (rva >= s.va && rva - s.va < span) {
+                std::size_t off = s.raw + (rva - s.va);
+                if (off < fileSize) return off;
+                return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    }
+    // Data directory `i` as (RVA, size), when the image has that many.
+    std::optional<std::pair<std::uint32_t, std::uint32_t>>
+    directory(std::string_view b, std::uint32_t i) const {
+        if (i >= numDirs) return std::nullopt;
+        auto rva  = le32(b, dirsAt + static_cast<std::size_t>(i) * 8);
+        auto size = le32(b, dirsAt + static_cast<std::size_t>(i) * 8 + 4);
+        if (!rva || !size) return std::nullopt;
+        return std::pair{*rva, *size};
+    }
+};
+
+std::expected<PeLayout, std::string> pe_layout(std::string_view b) {
     auto lfanew = le32(b, 0x3C);
     if (!lfanew) return std::unexpected("PE: no e_lfanew");
-    const std::size_t nt = *lfanew;
-    if (!has_at(b, nt, std::string_view("PE\0\0", 4)))
+    PeLayout l;
+    l.nt = *lfanew;
+    if (!has_at(b, l.nt, std::string_view("PE\0\0", 4)))
         return std::unexpected("PE: no PE\\0\\0 signature at e_lfanew");
 
-    auto numSections = le16(b, nt + 6);
-    auto optSize     = le16(b, nt + 20);
-    auto magic       = le16(b, nt + 24);
+    auto numSections = le16(b, l.nt + 6);
+    auto optSize     = le16(b, l.nt + 20);
+    auto magic       = le16(b, l.nt + 24);
     if (!numSections || !optSize || !magic)
         return std::unexpected("PE: headers are truncated");
     // 0x10b PE32, 0x20b PE32+. They differ only in where the data directories
     // start — the extra 16 bytes are the 64-bit ImageBase and friends.
-    std::size_t dirsAt = 0;
-    if      (*magic == 0x10b) dirsAt = nt + 24 + 96;
-    else if (*magic == 0x20b) dirsAt = nt + 24 + 112;
+    if      (*magic == 0x10b) l.dirsAt = l.nt + 24 + 96;
+    else if (*magic == 0x20b) l.dirsAt = l.nt + 24 + 112;
     else return std::unexpected("PE: optional header magic is neither PE32 nor PE32+");
-    auto numDirs = le32(b, dirsAt - 4);
+    auto numDirs = le32(b, l.dirsAt - 4);
     if (!numDirs) return std::unexpected("PE: data directory count is truncated");
+    l.numDirs = *numDirs;
 
-    struct Section { std::uint32_t va, vsize, raw, rawSize; };
-    std::vector<Section> sections;
-    const std::size_t secAt = nt + 24 + *optSize;
+    const std::size_t secAt = l.nt + 24 + *optSize;
     for (std::uint16_t i = 0; i < *numSections; ++i) {
         const std::size_t s = secAt + static_cast<std::size_t>(i) * 40;
         auto vsize  = le32(b, s + 8);
@@ -587,21 +649,88 @@ pe_needed(std::string_view b) {
         auto rawSz  = le32(b, s + 16);
         auto raw    = le32(b, s + 20);
         if (!vsize || !va || !rawSz || !raw) break;
-        sections.push_back({*va, *vsize, *raw, *rawSz});
+        l.sections.push_back({*va, *vsize, *raw, *rawSz});
     }
+    return l;
+}
 
-    auto rva_to_off = [&](std::uint32_t rva) -> std::optional<std::size_t> {
-        for (auto const& s : sections) {
-            // A section's mapped size is VirtualSize, but a section whose
-            // VirtualSize is 0 (some linkers) still maps SizeOfRawData.
-            auto span = s.vsize ? s.vsize : s.rawSize;
-            if (rva >= s.va && rva - s.va < span) {
-                std::size_t off = s.raw + (rva - s.va);
-                if (off < b.size()) return off;
-                return std::nullopt;
-            }
+// VS_FIXEDFILEINFO, reached through the resource directory: type RT_VERSION
+// (16), then the first name, then the first language, then the data entry.
+// The fixed block is located by its signature 0xFEEF04BD rather than by
+// computing the VS_VERSIONINFO header's padded length: the key is UTF-16 and
+// the padding rule is alignment to 32 bits, and a search over the first bytes
+// of the block is both simpler and what every reader that works does.
+std::optional<PeVersion> pe_file_version(std::string_view b) {
+    auto l = pe_layout(b);
+    if (!l) return std::nullopt;
+    auto dir = l->directory(b, 2);
+    if (!dir || dir->first == 0) return std::nullopt;
+    auto base = l->rva_to_off(dir->first, b.size());
+    if (!base) return std::nullopt;
+
+    // One level of IMAGE_RESOURCE_DIRECTORY: 16 header bytes, then the named
+    // entries, then the id entries, 8 bytes each. Returns the OffsetToData of
+    // the entry chosen (with its high bit, which marks a subdirectory).
+    auto pick = [&](std::size_t at, std::optional<std::uint32_t> wantId)
+        -> std::optional<std::uint32_t> {
+        auto named = le16(b, at + 12);
+        auto ids   = le16(b, at + 14);
+        if (!named || !ids) return std::nullopt;
+        const std::size_t first = at + 16;
+        const std::size_t count = static_cast<std::size_t>(*named) + *ids;
+        for (std::size_t i = 0; i < count; ++i) {
+            auto name = le32(b, first + i * 8);
+            auto data = le32(b, first + i * 8 + 4);
+            if (!name || !data) return std::nullopt;
+            if (!wantId) return *data;
+            if ((*name & 0x80000000u) == 0 && *name == *wantId) return *data;
         }
         return std::nullopt;
+    };
+    constexpr std::uint32_t kSubdir = 0x80000000u;
+    auto type = pick(*base, 16u);
+    if (!type || (*type & kSubdir) == 0) return std::nullopt;
+    auto name = pick(*base + (*type & ~kSubdir), std::nullopt);
+    if (!name || (*name & kSubdir) == 0) return std::nullopt;
+    auto lang = pick(*base + (*name & ~kSubdir), std::nullopt);
+    if (!lang || (*lang & kSubdir) != 0) return std::nullopt;
+    const std::size_t entry = *base + *lang;
+    auto dataRva  = le32(b, entry);
+    auto dataSize = le32(b, entry + 4);
+    if (!dataRva || !dataSize) return std::nullopt;
+    auto data = l->rva_to_off(*dataRva, b.size());
+    if (!data) return std::nullopt;
+
+    const std::size_t end = std::min<std::size_t>(b.size(), *data + *dataSize);
+    for (std::size_t at = *data; at + 16 <= end; at += 4) {
+        auto sig = le32(b, at);
+        if (!sig || *sig != 0xFEEF04BDu) continue;
+        auto ms = le32(b, at + 8);
+        auto ls = le32(b, at + 12);
+        if (!ms || !ls) return std::nullopt;
+        return PeVersion{
+            static_cast<std::uint16_t>(*ms >> 16), static_cast<std::uint16_t>(*ms & 0xFFFF),
+            static_cast<std::uint16_t>(*ls >> 16), static_cast<std::uint16_t>(*ls & 0xFFFF)};
+    }
+    return std::nullopt;
+}
+
+std::optional<PeVersion> pe_linker_version(std::string_view b) {
+    auto l = pe_layout(b);
+    if (!l) return std::nullopt;
+    if (l->nt + 27 >= b.size()) return std::nullopt;
+    return PeVersion{static_cast<std::uint8_t>(b[l->nt + 26]),
+                     static_cast<std::uint8_t>(b[l->nt + 27]), 0, 0};
+}
+
+std::expected<std::vector<std::string>, std::string>
+pe_needed(std::string_view b) {
+    auto layout = pe_layout(b);
+    if (!layout) return std::unexpected(layout.error());
+    const std::size_t dirsAt = layout->dirsAt;
+    const std::optional<std::uint32_t> numDirs = layout->numDirs;
+    auto rva_to_off = [&](std::uint32_t rva) {
+        return layout->rva_to_off(rva, b.size());
     };
 
     std::vector<std::string> out;
@@ -800,6 +929,23 @@ resolve_macho_names(std::span<const std::string> names,
         out.push_back(std::move(r));
     }
     return out;
+}
+
+std::optional<PeVersion> pe_file_version(std::string_view bytes) {
+    return detail::pe_file_version(bytes);
+}
+std::optional<PeVersion> pe_file_version(const std::filesystem::path& image) {
+    auto buf = detail::slurp(image);
+    if (!buf) return std::nullopt;
+    return detail::pe_file_version(std::string_view{*buf});
+}
+std::optional<PeVersion> pe_linker_version(std::string_view bytes) {
+    return detail::pe_linker_version(bytes);
+}
+std::optional<PeVersion> pe_linker_version(const std::filesystem::path& image) {
+    auto buf = detail::slurp(image);
+    if (!buf) return std::nullopt;
+    return detail::pe_linker_version(std::string_view{*buf});
 }
 
 bool is_system_lib(Format f, std::string_view name) {

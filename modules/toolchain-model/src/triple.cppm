@@ -1059,6 +1059,25 @@ namespace pins {
     inline constexpr std::string_view kSuggestLlvm          = "llvm 20.1.7";
     inline constexpr std::string_view kSuggestGccMusl       = "gcc 15.1.0-musl";
     inline constexpr std::string_view kSuggestGccMingw      = "gcc 16.1.0";
+
+    // THE DEFAULT TOOLCHAIN OF THIS HOST, ANSWERED ONCE (the 2026-09-28
+    // design, WS8): what a build with nothing configured resolves. The first
+    // run installs and records it; `mcpp self env --format json` reports it
+    // as `defaultToolchain`, and docs/01 and docs/20 are checked against that
+    // report on each host's CI row. `msvcUsable` is the one input a constant
+    // cannot know -- whether a usable MSVC (STL and SDK, from Visual Studio or
+    // a managed toolset) is on this machine, which decides the Windows row.
+    inline std::string_view host_default_toolchain(bool msvcUsable) {
+        if constexpr (mcpp::platform::is_macos) {
+            return kFirstRunMac;
+        } else if constexpr (mcpp::platform::is_windows) {
+            return msvcUsable ? kFirstRunWinMsvc : kFirstRunWinGnu;
+        } else if (mcpp::platform::host_arch == std::string_view("x86_64")) {
+            return kFirstRunLinuxX86_64;
+        } else {
+            return kFirstRunLinuxOther;
+        }
+    }
 } // namespace pins
 
 // ── Artifact naming conventions ──────────────────────────────────────────────

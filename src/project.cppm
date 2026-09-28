@@ -326,6 +326,16 @@ export void inherit_workspace_build(mcpp::manifest::Manifest& member,
         prepend(b.ldflags,  w.ldflags);
         prepend(b.defines,  w.defines);
         prepend(b.dialectCxxflags, w.dialectCxxflags);
+        // Where each inherited value was written, for the diagnostics that
+        // name a key (WS3): a word the workspace states is the workspace's.
+        for (auto const& [key, src] : {
+                 std::pair{"cflags", &w.cflags}, std::pair{"cxxflags", &w.cxxflags},
+                 std::pair{"ldflags", &w.ldflags}, std::pair{"defines", &w.defines},
+                 std::pair{"dialect_cxxflags", &w.dialectCxxflags}}) {
+            if (src->empty()) continue;
+            auto& rec = b.inheritedFromWorkspace[key];
+            rec.insert(rec.end(), src->begin(), src->end());
+        }
         // A RELATIVE INCLUDE DIRECTORY IN THE WORKSPACE MANIFEST WAS WRITTEN
         // AGAINST THE WORKSPACE ROOT, and every member would otherwise resolve
         // it against its own directory.

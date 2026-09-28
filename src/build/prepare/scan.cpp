@@ -292,12 +292,26 @@ step11_msvc_crt_word_check(PrepareState& state) {
         for (std::size_t i = 0; i < state.packages.size(); ++i) {
             auto const& pkg = state.packages[i];
             const bool isRoot = i == 0;
+            // A word `[workspace.build]` contributed is named at the table
+            // that states it (WS3): the member's `[build]` does not contain
+            // it, and a reader sent there finds nothing to remove.
+            auto inherited_words = [&](std::string_view tomlKey) {
+                auto it = pkg.manifest.buildConfig.inheritedFromWorkspace.find(
+                    std::string(tomlKey));
+                return it == pkg.manifest.buildConfig.inheritedFromWorkspace.end()
+                    ? std::vector<std::string>{}
+                    : mcpp::manifest::flag_words(it->second);
+            };
             auto check_words = [&](std::span<const std::string> list,
-                                   std::string_view key)
+                                   std::string_view key, std::string_view tomlKey)
                     -> std::expected<void, std::string> {
+                const auto fromWorkspace = inherited_words(tomlKey);
+                const auto workspaceKey = std::format("[workspace.build] {}", tomlKey);
                 for (auto const& w : list) {
+                    const bool inherited =
+                        std::ranges::find(fromWorkspace, w) != fromWorkspace.end();
                     auto verdict = mcpp::toolchain::check_crt_word(
-                        w, wantsStatic, key);
+                        w, wantsStatic, inherited ? std::string_view(workspaceKey) : key);
                     if (!verdict) continue;
                     if (verdict->contradicts)
                         return std::unexpected(verdict->message);
@@ -315,11 +329,11 @@ step11_msvc_crt_word_check(PrepareState& state) {
                 ? std::string("[build] cxxflags")
                 : std::format("the [build] cxxflags of dependency '{}'",
                               pkg.manifest.package.name);
-            if (auto r = check_words(cxxflagsWords, cxxflagsKey); !r)
+            if (auto r = check_words(cxxflagsWords, cxxflagsKey, "cxxflags"); !r)
                 return std::unexpected(r.error());
             if (isRoot)
                 if (auto r = check_words(pkg.manifest.buildConfig.dialectCxxflags,
-                                         "[build] dialect_cxxflags"); !r)
+                                         "[build] dialect_cxxflags", "dialect_cxxflags"); !r)
                     return std::unexpected(r.error());
         }
     }
