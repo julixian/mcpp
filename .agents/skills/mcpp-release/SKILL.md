@@ -318,7 +318,7 @@ gh workflow run release.yml --ref "v$NEW_VERSION"
 # 1. 在 main 上修复
 git checkout main && git pull
 # ... 修改代码 ...
-git commit -m "fix: 描述"
+git commit -m "fix: <what the fix does, in English>"
 git push origin main
 
 # 2. 更新 tag 指向新 commit（包含修复）
@@ -350,7 +350,7 @@ gh workflow run release.yml --ref "v$NEW_VERSION"
 | `.github/tools/gtc` | GitCode CLI（release create/upload、PR） |
 | `.github/workflows/release.yml` | Release workflow 定义（四平台 + publish-ecosystem） |
 | `install.sh` | 安装脚本（随 release 发布） |
-| `CHANGELOG.md` | Release notes 来源（按 `## [X.Y.Z]` 提取） |
+| `CHANGELOG.md` | Release notes 来源（按 `## [X.Y.Z]` 提取）；条目、commit 与 release notes 一律用英文（2026.9.28.3 起） |
 
 > **注意版本 bump 的两个阶段**：`mcpp.toml` + `fingerprint.cppm` 在发版**前**改
 > （它们定义要发什么）；`.xlings.json` 只在发版成功、镜像并进索引后才可更新

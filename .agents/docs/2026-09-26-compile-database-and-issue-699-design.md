@@ -12,7 +12,7 @@ status: landed
     only; every verdict below is taken against a specification.
   - mcpp-community/mcpp#699 (2026-09-25), *emit build-database for IDEs: one failing member
     loses the whole database, and build programs cannot tell a plan pass*, from
-    Sunrisepeak/mcpp-language-server#23 and #24 on the GalTranslPP workspace.
+    Sunrisepeak/mcpp-language-server#23 and #24 on the validation project workspace.
   - mcpp-community/mcpp#701 and pull request #702 (2026-09-25, head `c57c12f2`): a build
     program declares a runtime library directory, and a passing check moves its stamp. Their
     consumer is mcpp-plugins 0.13.0 (`deps-vcpkg`, `deps-cmake`, `rules-qt`), whose design
@@ -72,7 +72,7 @@ status: landed
 | **O1** | deps-cmake and deps-vcpkg run installation as `check` actions | the plugin record | design gap: no action role describes construction whose file names are unknown | §5.4 P: the `prepare` role (D9) |
 | **O2** | on Windows, a program started by hand does not find DLLs from a runtime search directory | this review | framework gap | §5.4 W: placement after the link (D11) |
 | **S7** | a contract for build plugins | this review | new specification | SPEC-007, draft 0.1 (§5.6, D12) |
-| | xmake's database; GalTranslPP's incomplete Qt and its environment checks inside build programs | report §3.4; #699 | not mcpp | §3.7, §4.8 |
+| | xmake's database; the validation project's incomplete Qt and its environment checks inside build programs | report §3.4; #699 | not mcpp | §3.7, §4.8 |
 
 Three statements:
 
@@ -342,7 +342,7 @@ redirect, and §3.2's rule.
 ### 4.1 The report
 
 mcppls builds its model from `mcpp emit build-database --format json`. On the five-member
-GalTranslPP workspace, the member GPPGUI requests the host tool `Updater` of `gpp.updater`, whose
+The validation project workspace, the member gui requests the host tool `Updater` of `updater`, whose
 build runs a `lupdate` check that failed because the machine's Qt lacked qtdeclarative. `emit`
 answered `MCPP_BUILD_DATABASE_PLAN_FAILED` without `data`, the four members that planned lost
 their sets, and mcppls fell back to a guessed model on which clangd crashed. The issue asks for

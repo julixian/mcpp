@@ -256,7 +256,7 @@ curl -fsSL https://github.com/xlings-res/xim-index/releases/download/latest/xim-
 
 ```
 [ ] version bumped in mcpp.toml + fingerprint.cppm (one commit)
-[ ] CHANGELOG entry
+[ ] CHANGELOG 条目,用英文书写(它就是 release notes;commit 与 PR 同样用英文)
 [ ] `bash .github/tools/check_version_pins.sh` passes (verifies `mcpp.toml` = `MCPP_VERSION`, and `.xlings.json` is not newer)
 [ ] merge to main, CI green
 [ ] gh workflow run release.yml --ref main

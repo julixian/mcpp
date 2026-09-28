@@ -102,7 +102,8 @@ class Matrix(unittest.TestCase):
                 self.assertTrue(c.get(key), f"canary {c['name']} has no {key}")
         # The gate holds the ecosystem's own projects (mcpp#736); a downstream
         # project validates a release in its own pull request after it.
-        self.assertNotIn("GalTranslPP", names)
+        self.assertEqual(set(names), {"xlings", "mcppls"},
+                         "a new canary is an ecosystem repository, added deliberately here")
 
 
 if __name__ == "__main__":

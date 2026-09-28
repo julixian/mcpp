@@ -26,6 +26,7 @@
 # Environment:
 #   VER     the mcpp version (required)
 #   XVER    the xlings version; the xlings sections are NOT RUN without it
+#   PVER    the mcpp.plugins version; its section is NOT RUN without it
 #   MIRROR  the mirror both tools use (default CN)
 #   W       the probe directory, recreated on every run (default
 #           /tmp/verify-published)
@@ -562,10 +563,94 @@ if "$M" index update > "$W/iu2.log" 2>&1; then
     else fail "progress: the refresh printed no step ($(tail -1 "$W/iu2.log"))"; fi
 else fail "progress: mcpp index update failed"; fi
 
+echo "== #734 E8/E2/E11: mcpp.core states the build information and renders a diagnostic"
+d="$W/s734core"; mkdir -p "$d/src"
+printf '[package]\nname    = "core734"\nversion = "0.1.0"\n' > "$d/mcpp.toml"
+cat > "$d/build.mcpp" <<'EOF'
+import std;
+import mcpp.core;
+int main() {
+    const std::string id = mcpp::toolset_identity();
+    const std::string cxx = mcpp::tool("cxx");
+    const std::string msg = "toolset identity: " + id;
+    mcpp::report({.severity = "note", .message = msg.c_str()});
+    return id.empty() || cxx.empty() ? 1 : 0;
+}
+EOF
+printf 'int main() { return 0; }\n' > "$d/src/main.cpp"
+if (cd "$d" && "$M" build > build.log 2>&1); then
+    if grep -q 'toolset identity: [a-z]' "$d/build.log"; then pass "#734 import mcpp.core reads the toolset identity and reports it ($(grep -o 'toolset identity: [^ ]* [^ ]*' "$d/build.log" | head -1))"
+    else fail "#734 the build program's note is not rendered"; fi
+else fail "#734 a build program importing mcpp.core does not build ($(grep -m1 -i error "$d/build.log"))"; fi
+
+echo "== #734 E9: [package] mcpp is a floor"
+d="$W/s734floor"; mkdir -p "$d/src"
+printf 'int main() { return 0; }\n' > "$d/src/main.cpp"
+printf '[package]\nname    = "floor734"\nversion = "0.1.0"\nmcpp    = ">=%s"\n' "$VER" > "$d/mcpp.toml"
+if (cd "$d" && "$M" build > at.log 2>&1); then pass "#734 a package whose floor is this release builds"
+else fail "#734 a floor equal to this release is refused ($(grep -m1 -i error "$d/at.log"))"; fi
+printf '[package]\nname    = "floor734"\nversion = "0.1.0"\nmcpp    = ">=2099.1.1.1"\n' > "$d/mcpp.toml"
+if (cd "$d" && "$M" build > above.log 2>&1); then fail "#734 a floor above this release was accepted"
+elif grep -q 'requires mcpp >= 2099.1.1.1' "$d/above.log"; then pass "#734 a floor above this release stops the build, naming the floor"
+else fail "#734 the refusal does not name the floor ($(grep -m1 -i error "$d/above.log"))"; fi
+
+echo "== #734 E5: the fast path resumes after an edit"
+d="$W/s734fast"; mkdir -p "$d/src"
+printf '[package]\nname    = "fast734"\nversion = "0.1.0"\n' > "$d/mcpp.toml"
+printf 'int main() { return 1; }\n' > "$d/src/main.cpp"
+(cd "$d" && "$M" build > b0.log 2>&1); sleep 1.1
+printf 'int main() { return 0; }\n' > "$d/src/main.cpp"
+(cd "$d" && "$M" build > b1.log 2>&1)
+if (cd "$d" && "$M" build -v > b2.log 2>&1) && ! grep -q 'declined' "$d/b2.log" && ! grep -q 'Resolving toolchain' "$d/b2.log"; then
+    pass "#734 the build after a confirmed edit is replayed by the fast path"
+else fail "#734 the fast path did not resume ($(grep -m1 'declined' "$d/b2.log"))"; fi
+
+echo "== #734 E3/E6: pack -p at a workspace root; W3 leaves the package's own members alone"
+d="$W/s734pack"; mkdir -p "$d/lib/src" "$d/app/src"
+printf '[workspace]\nmembers = ["lib", "app"]\n' > "$d/mcpp.toml"
+printf '[package]\nnamespace = "probe"\nname      = "lib734"\nversion   = "0.1.0"\n\n[targets.lib734]\nkind = "lib"\n\n[build]\nsources = ["src/lib734.cppm", "src/inner.cppm"]\n' > "$d/lib/mcpp.toml"
+printf 'export module probe.lib734;\nexport int one() { return 1; }\n' > "$d/lib/src/lib734.cppm"
+printf 'export module probe.lib734.inner;\nexport int two() { return 2; }\n' > "$d/lib/src/inner.cppm"
+printf '[package]\nname    = "app734"\nversion = "0.1.0"\n\n[dependencies.probe]\nlib734 = { path = "../lib" }\n' > "$d/app/mcpp.toml"
+printf 'import probe.lib734.inner;\nint main() { return two() == 2 ? 0 : 1; }\n' > "$d/app/src/main.cpp"
+if (cd "$d" && "$M" build --workspace > ws.log 2>&1); then
+    if grep -q "not one of that package's public modules" "$d/ws.log"; then fail "#734 W3 warned on a member of the package's own workspace"
+    else pass "#734 a member's non-public module, imported inside its workspace, draws no W3"; fi
+else fail "#734 the workspace does not build ($(grep -m1 -i error "$d/ws.log"))"; fi
+if (cd "$d" && "$M" pack -p lib > pack.log 2>&1) && ls "$d"/lib/target/dist/*.tar.gz > /dev/null 2>&1; then
+    pass "#734 mcpp pack -p lib at the workspace root writes the member's archive"
+else fail "#734 pack -p failed ($(grep -m1 -i error "$d/pack.log"))"; fi
+
+echo "== #734 plugins: a consumer of the published mcpp.plugins reaches L3 and L2"
+if [ -z "${PVER:-}" ]; then skip "#734 plugins: PVER (the mcpp.plugins version) is not given"
+else
+    d="$W/s734plugins"; mkdir -p "$d/src" "$d/data"
+    printf '[package]\nname    = "plug734"\nversion = "0.1.0"\n\n[build-dependencies.mcpp]\nplugins = { version = "%s", features = ["tools-embed"], host-module = true }\n' "$PVER" > "$d/mcpp.toml"
+    printf 'hello734' > "$d/data/msg.txt"
+    cat > "$d/build.mcpp" <<'EOF'
+import std;
+import mcpp;
+import mcpp.tools.embed;
+import mcpp.plugins.fs;
+int main() {
+    mcpp::tools::embed::options o;
+    o.name_space = "fx";
+    o.null_terminate = true;
+    mcpp::plugins::fs::write_if_changed(std::filesystem::path(mcpp::out_dir()) / "l2.txt", "l2\n");
+    return mcpp::tools::embed::file("data/msg.txt", o) ? 0 : 1;
+}
+EOF
+    printf '#include <cstdio>\n#include "msg_txt.h"\nint main() { std::puts(reinterpret_cast<const char*>(fx::msg_txt)); return 0; }\n' > "$d/src/main.cpp"
+    if (cd "$d" && "$M" run > run.log 2>&1) && grep -qx hello734 "$d/run.log"; then
+        pass "#734 mcpp.plugins $PVER from the index: tools-embed (L3) and mcpp.plugins.fs (L2) in one build program"
+    else fail "#734 the plugins consumer failed ($(grep -m1 -i error "$d/run.log"))"; fi
+fi
+
 # ════════════════════════════════════════════════════════════════════════════
 echo "== not run on this kind of host"
 skip "Windows behaviour: e2e 820 (the runtime placement over real toolsets, the action PATH, pack, the workspace statement), e2e 811 and 814, and the moc.exe measurement run on the Windows CI rows"
 skip "the GNU depfile on Windows (e2e 118's Windows legs) runs on the Windows CI rows"
+skip "#734 on Windows and macOS: e2e 825 (the MSVC build information), the fast path on PE and Mach-O (e2e 645, 831, 832), and the deps members' mechanisms (mcpp-plugins' CI rows)"
 
 echo
 [ -n "$REHEARSAL" ] && echo "REHEARSAL: $REHEARSAL; this run did not verify a published package"

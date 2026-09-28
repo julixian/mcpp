@@ -95,7 +95,7 @@ of the same round (§9.3), and the whole round lands in #727.
 | #724 §2.3 | Run side-effect-free generators under `emit` | feature | not the engine | decline | none |
 | review | An index that requires a newer mcpp prints `error: ... [E0006]` at the start of a run that then succeeds | defect (measured) | engine | a closing tip at most, and only when the run refreshed an index | W12 |
 | review | Library, git and index acquisitions show no progress, while toolchains do | gap | engine; xlings if its `update_packages` emits no events | one renderer, more producers; non-terminal output without `\r` | W11 |
-| #726 | On Windows an xlings invocation left the registry's shim directory in front of the process `PATH`, kept `XLINGS_HOME` set for the rest of the run, and started xlings in the project's directory | defect (measured on GalTranslPP's Windows CI) | engine | fix, as pull request #727 proposes (§9.3) | W13 |
+| #726 | On Windows an xlings invocation left the registry's shim directory in front of the process `PATH`, kept `XLINGS_HOME` set for the rest of the run, and started xlings in the project's directory | defect (measured on the validation project's Windows CI) | engine | fix, as pull request #727 proposes (§9.3) | W13 |
 | #721 | GCC 16.1 ICE | upstream | not in scope for this round | excluded | none |
 
 Everything is one round and one release, in one pull request (#727), in three
@@ -711,7 +711,7 @@ The reasons are structural, not a matter of taste:
 - **Every object in an image must agree.** Every object and prebuilt library linked
   into one image must use the same CRT: the `RuntimeLibrary` mismatch check fails
   the link with LNK2038. The prebuilt ecosystem ships `/MD`, which is the case of
-  GalTranslPP with Qt and vcpkg.
+  the validation project with Qt and vcpkg.
 - **Each `/MT` image has its own CRT state.** Under `/MT`, each DLL carries its own
   heap, `FILE*` table, `errno` and locale. Memory or CRT objects that cross a DLL
   boundary are therefore unsound. A program made of several images needs one
@@ -822,7 +822,7 @@ second key would be a second spelling of one fact.
   `/MDd`, `/MTd`) is always a second statement. The engine never lets the last
   word win.
   - A word that agrees with the resolved model is warned as redundant.
-    GalTranslPP's `-fms-runtime-lib=dll` therefore keeps building.
+    the validation project's `-fms-runtime-lib=dll` therefore keeps building.
   - A word that disagrees is refused. The message names the word, the key, and
     the value that corresponds to the word.
 - **Upgrade.**
@@ -1045,7 +1045,7 @@ The first and last criteria fail on 2026.9.27.1: the read site is unchanged at
 
 ### 9.3 #726: an xlings invocation on Windows leaves the process as it found it (W13)
 
-**Observation (measured on GalTranslPP's Windows CI).** A `vcpkg install` action
+**Observation (measured on the validation project's Windows CI).** A `vcpkg install` action
 failed with `'C:\Program' is not recognized ...` in a build that installed a
 toolchain or a payload itself; a second build passed.
 
@@ -1097,7 +1097,7 @@ the build. On Windows two differences existed:
   - `NeitherPathNorTheHomeOutlivesTheInvocation`;
   - `TheWindowsPrefixStartsInTheHome`.
 - The Windows legs of the pull request's CI.
-- GalTranslPP's Windows CI against the branch, which is a real project with a
+- The validation project's Windows CI against the branch, which is a real project with a
   `.xlings.json` at its root and 22 vcpkg ports.
 
 ## 10. What is not done, and why
@@ -1200,7 +1200,7 @@ gate (§8).
   - The S1 addition for W10 (D6).
   - After the release, its nightly run is green again (W1), and it may read the
     generated-output record.
-- **GalTranslPP.** After the release it needs:
+- **The validation project.** After the release it needs:
   - no CRT flag at all, because W9's default is its choice;
   - the updater back on an `artifacts` edge (W6);
   - `lib.path` may point at `gpp-build.ixx` (W2).

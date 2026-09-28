@@ -222,6 +222,16 @@ Agent（Claude Code 等）在执行任务时，**同样必须遵守 PR 流程**�
 
 ### Agent 的典型工作流
 
+## Language of commits, pull requests, CHANGELOG entries and release notes
+
+Commit messages (subject and body), squash-merge messages, pull-request titles
+and descriptions, CHANGELOG entries and release notes are written in English,
+in declarative sentences, with no emoji and no attribution trailers. A release's
+notes are its `## [<version>]` section of CHANGELOG.md (release.yml extracts it),
+so an English CHANGELOG entry is an English release. Entries before 2026.9.28.3
+remain as written. The user-facing documentation keeps both languages
+(docs/ and docs/zh/).
+
 ```bash
 # 1. 从最新 main 切分支
 git checkout main && git pull origin main
