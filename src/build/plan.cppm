@@ -2701,6 +2701,12 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         lu.dependencyOwned = true;
         lu.artifactOf      = owner;
         lu.output          = target_output(r.target, naming);
+        // In a workspace plan `bin/` holds products only: the workspace's own
+        // package's, and each member's directory. The program is linked with
+        // its package's intermediate files and placed beside each member
+        // program that ships it (step 6, §15 of the 2026-09-29 design).
+        if (manifest.package.virtualRoot)
+            lu.output = std::filesystem::path("obj") / sanitize(owner) / lu.output.filename();
         lu.windowsSubsystem = r.target.windowsSubsystem;
         lu.windowsEntry     = r.target.windowsEntry;
         lu.loaderTagFlag    = loader_tag_flag(lu.kind);
@@ -3005,8 +3011,44 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
             units.push_back(std::move(lu));
         }
+        // A program the closure ships through `artifacts` (mcpp#711) is linked
+        // once, at `bin/`, and placed beside the member's programs, where a
+        // program that launches it looks for it.
+        for (auto const& r : artifactRequests) {
+            const bool requested = std::ranges::any_of(artifactEdges, [&](auto const& e) {
+                return closureIdx.contains(e.first) && e.second == r.packageIndex;
+            });
+            if (!requested) continue;
+            std::filesystem::path out;
+            for (auto const& u : plan.linkUnits)
+                if (u.artifactOf == qualified_package_name(packages[r.packageIndex].manifest)
+                    && u.targetName == r.target.name) { out = u.output; break; }
+            if (out.empty()) continue;
+            const bool seen = std::ranges::any_of(group.placements,
+                [&](auto const& pl) { return pl.source == out; });
+            if (!seen && out.parent_path() != productDir)
+                group.placements.push_back({out, place(out)});
+        }
         plan.linkGroups.push_back(std::move(group));
         for (auto& u : units) plan.linkUnits.push_back(std::move(u));
+    }
+
+    // A product directory is a directory: nothing this plan writes may take
+    // its path as a file (a program of the workspace's own package named as a
+    // member, say).
+    for (auto const& g : plan.linkGroups) {
+        if (g.productDir == std::filesystem::path("bin")) continue;
+        for (auto const& u : plan.linkUnits) {
+            bool clash = u.output == g.productDir;
+            for (auto const& a : u.runtimeAliases) clash = clash || a == g.productDir;
+            if (clash)
+                return std::unexpected(std::format(
+                    "target '{}' would be written to '{}', which is the product "
+                    "directory of workspace member '{}'.\n"
+                    "       Rename the target, or give the member a namespace so "
+                    "that its directory is qualified.",
+                    u.targetName, u.output.generic_string(), g.member));
+        }
     }
 
     // The single derivation. Deliberately at the END of make_plan, after every

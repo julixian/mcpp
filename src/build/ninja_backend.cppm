@@ -1141,6 +1141,11 @@ std::string filter_ninja_output(std::string_view output,
     return filtered;
 }
 
+// The aggregate target for everything staged out of the global cache. Named
+// with a leading underscore so it cannot collide with a module or target name
+// (both of which are identifiers or paths).
+constexpr std::string_view kStagedCacheGoal = "_mcpp_staged_cache";
+
 std::string emit_ninja_string(const BuildPlan& plan) {
     return emit_ninja_string(plan, nullptr);
 }
@@ -2205,7 +2210,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // Aggregate target for everything staged out of the global cache. Named
     // with a leading underscore so it cannot collide with a module or target
     // name (both of which are identifiers or paths).
-    constexpr std::string_view kStagedCachePhony = "_mcpp_staged_cache";
+    constexpr std::string_view kStagedCachePhony = kStagedCacheGoal;
 
     auto bmi_path = [&traits](std::string_view name) {
         std::string s(traits.bmiDir);
@@ -4050,6 +4055,26 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         nenv.emplace_back(runtimeEnv->first, runtimeEnv->second);
     for (auto& ev : plan.toolchain.envOverrides)
         nenv.emplace_back(ev.key, ev.value);
+
+    // THE STAGED CACHE IS PLACED BY A PASS OF ITS OWN, before the graph that
+    // reads it. ninja 1.12.1 loads a dyndep file whose producer is up to date
+    // as soon as that producer's order-only inputs are ready, from inside the
+    // completion of the node that readied them; when the dyndep file names that
+    // same node as an input, loading it grows the list the completion is
+    // iterating, a use-after-free (ninja-build/ninja#2662, unfixed upstream).
+    // The scans wait on `_mcpp_staged_cache` and the importers' dyndep files
+    // name the staged BMIs, so re-staging a dependency in a directory whose
+    // scans are current -- a dependency upgraded with its build served from the
+    // cache -- crashed ninja (e2e 196). After this pass the staged nodes are
+    // current, and the second pass loads those dyndep files when it starts.
+    if (manifest.find("\nbuild " + std::string(kStagedCacheGoal) + " : phony") != std::string::npos) {
+        std::vector<std::string> pre{ninjaProgram, "--quiet", "-C", plan.outputDir.string(),
+                                     std::string(kStagedCacheGoal)};
+        (void)mcpp::platform::process::capture_exec_deadline(pre, nenv,
+            std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000),
+            nullptr);
+        stage("ninja-staged-cache");
+    }
 
     bool buildTimedOut = false;
     auto cap = mcpp::platform::process::capture_exec_deadline(

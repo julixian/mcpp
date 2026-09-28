@@ -16,7 +16,9 @@
 #   G6  two members with one package name in two namespaces get qualified
 #       product directories;
 #   G7  no member directory receives a build directory, and `clean --stale`
-#       removes the ones members held before, keeping `target/.build-mcpp/`.
+#       removes the ones members held before, keeping `target/.build-mcpp/`;
+#   G8  a program a member ships through `artifacts` is beside that member's
+#       program, in its product directory.
 set -e
 
 TMP=$(mktemp -d)
@@ -29,10 +31,10 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;; esac
 
 cat > mcpp.toml <<'EOF'
 [workspace]
-members = ["core", "cli", "gui", "ns1/tool", "ns2/tool", "modern"]
+members = ["core", "cli", "gui", "ns1/tool", "ns2/tool", "modern", "helper"]
 EOF
 
-mkdir -p core/src cli/src gui/src ns1/tool/src ns2/tool/src modern/src
+mkdir -p core/src cli/src gui/src ns1/tool/src ns2/tool/src modern/src helper/src
 cat > core/mcpp.toml <<'EOF'
 [package]
 name = "core"
@@ -59,6 +61,22 @@ EOF
 done
 printf '#include <cstdio>\nimport shared_core;\nint main() { std::printf("%%d\\n", core_v() + 1); return 0; }\n' > cli/src/main.cpp
 printf '#include <cstdio>\nimport shared_core;\nint main() { std::printf("%%d\\n", core_v() + 2); return 0; }\n' > gui/src/main.cpp
+cat >> gui/mcpp.toml <<'EOF'
+
+[dependencies.helper]
+path = "../helper"
+artifacts = ["helper"]
+EOF
+cat > helper/mcpp.toml <<'EOF'
+[package]
+name = "helper"
+version = "0.1.0"
+
+[targets.helper]
+kind = "bin"
+main = "src/main.cpp"
+EOF
+printf 'int main() { return 0; }\n' > helper/src/main.cpp
 
 for ns in ns1 ns2; do
     cat > $ns/tool/mcpp.toml <<EOF
@@ -108,6 +126,10 @@ other=$(echo "$dirs" | grep -v "^$main_dir$")
 [ -f "$main_dir/bin/ns1.tool/tool$EXE" ] || fail "G6: bin/ns1.tool/tool missing" ws.log
 [ -f "$main_dir/bin/ns2.tool/tool$EXE" ] || fail "G6: bin/ns2.tool/tool missing" ws.log
 
+# G8: the program gui ships is beside gui's program.
+[ -f "$main_dir/bin/gui/helper$EXE" ] || fail "G8: bin/gui/helper is missing" ws.log
+[ -f "$main_dir/bin/helper/helper$EXE" ] || fail "G8: bin/helper/helper is missing" ws.log
+
 # G1: the core module is compiled once, in the one graph.
 log="$main_dir/.ninja_log"
 n=$(grep -c 'core\.m\.o' "$log" || true)
@@ -136,7 +158,7 @@ fi
 [ -d "$main_dir" ] || fail "G3: the flag edit moved the build directory"
 
 # G7: no member directory holds a build directory; the old ones are stale.
-for m in core cli gui ns1/tool ns2/tool modern; do
+for m in core cli gui ns1/tool ns2/tool modern helper; do
     [ ! -d "$m/target/$(basename "$(dirname "$main_dir")")" ] \
         || fail "G7: $m received a build directory"
 done
