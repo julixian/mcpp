@@ -61,6 +61,8 @@
   mcpp 构建它们,`release.yml` 的打 tag 任务依赖其结果;`tests/release/verify-published.sh` 在沙箱
   中验证已发布的 mcpp 与 xlings,每个发布项一节,并保留此前各版本的小节;PR 模板要求列出每条新规则
   所跨越的既有不变量与位于交点的测试。
+  canary 以路径调用运行该步骤的 bash(`CANARY_BASH`):Windows 上按名字启动的 `bash` 是 System32 中的
+  WSL 启动器,本版本第一次发布运行因此在 GalTranslPP canary 处停止,未创建 tag(#731)。
 - **测量任务。** `measure-windows-tool-crt.yml` 在带 Visual Studio 与屏蔽 Visual Studio 的两个
   Windows 行上隐藏系统的 C++ 运行时,测量 Qt 的宿主工具能否只经 action 的 `PATH` 启动(设计 §2.9),
   它是从 `xim:qt-base` 中移除运行时副本的前提。

@@ -1,12 +1,13 @@
 ---
 subject: design
-status: active
+status: landed
 ---
 
 # An ecosystem design for mcpp and xlings: one authority per fact, and the work that follows from it
 
-**Status:** active, revision 3 (2026-09-28). The design is settled; §7 divides it
-into tasks and is the implementation record.
+**Status:** landed, revision 4 (2026-09-28). The design is settled; §7 divides it
+into tasks, and §8 records their implementation: mcpp 2026.9.28.2 and xlings
+2026.9.28.2 are released and indexed.
 
 - **Revision 1** proposed the design and seven decisions.
 - **Revision 2** records the reviewer's answers: D1 to D7 are settled as
@@ -16,6 +17,8 @@ into tasks and is the implementation record.
 - **Revision 3** divides the workstreams into tasks per repository, with the
   dependencies between them and the criterion of each (§7). Facts found while
   dividing them, which change no decision, are recorded in §7.4.
+- **Revision 4** records the implementation (§8): where it departed from §7,
+  nine findings, the before and after reading of each task, and a self-review.
 
 **Input.** The review `2026-09-28-ecosystem-review-of-two-days-of-mcpp-and-xlings.md`
 (cited below as "the review §n"), the #717-#726 round's records, and the
@@ -687,4 +690,125 @@ implementing it, and the readings.
   failed on the Windows row and found it. The detector accepts both spellings,
   the comment in `cli.cppm` states the exception, and the CHANGELOG lists the
   one re-run.
+- **F7. §7.4 named the wrong sibling of #729.** It listed the LLVM step of
+  `ci-windows.yml` among the builds piped into `tee` without `pipefail`; that
+  step runs under `shell: bash`, which GitHub starts with `-eo pipefail`, and
+  is not affected. The lint's reading of the workflows before the change is
+  seven W1 problems: in `ci-linux.yml` the LLVM, musl-gcc and GCC cold-rebuild
+  steps and two example steps, and in `ci-fresh-install.yml` two template
+  steps. A list written from reading the files is the claim; the lint's output
+  is the reading.
+- **F8. The release gate's first reading was of its own harness.** The first
+  release run of 2026.9.28.2 (36363585412) failed the GalTranslPP canary before
+  it built anything: `release_canaries.py` started `bash` by name, and a Windows
+  program that does so gets `System32\bash.exe`, the WSL launcher, because the
+  loader searches the system directory before `PATH`. The gate held and no tag
+  was created. The workflow now names the step's bash (`CANARY_BASH`), the
+  runner has tests, and the canaries were dispatched on the fix's branch before
+  the release was dispatched again (#731).
+- **F9. A packaging revision reaches a consumer when its index does.** The
+  GalTranslPP canary, dispatched on #731's branch after `qt-base` revision 1
+  was published, built, ran and packed the project with the candidate, and
+  stated once that `xim-x-qt-base\6.11.1\bin` ships the MSVC C++ runtime:
+  the resolver placed the toolset's set instead, as WS1 specifies. The payload
+  was revision 0 because the job restores the whole mcpp home from CI's cache,
+  its index copy included, and that copy predates the revision; by that index
+  the installed payload is current. A consumer receives revision 1 on the
+  first use after its index refreshes (GalTranslPP's own CI caches the
+  payloads and not the index; its reading follows the release).
+
+### 8.3 Readings
+
+**Before and after, per task.** Each criterion of §7 was read against the
+released 2026.9.28.1 (xlings 2026.9.28.1) and against this round's versions.
+
+| Task | Criterion | 2026.9.28.1 | 2026.9.28.2 |
+|---|---|---|---|
+| X1 | the index build script runs once per `update` (E2E-91 S6; sandbox) | 2 runs | 1 run |
+| X2 | a store hit reads "is in the store", then "active: a -> b" | "is already installed", "upgraded" | as specified |
+| X3 | every `download_progress` event names its stream (E2E-123 P3; sandbox) | no `stream` | named, bounded by the elapsed time |
+| X4 | off a terminal, the xim index download prints two lines (E2E-123 P1; sandbox, CN mirror) | 162 lines (769 in a CI log) | 2 lines |
+| X5 | the marker; #617's handoff; #624's nested home (E2E-120 S6, E2E-124; sandbox) | no marker; "package file not found" | as specified |
+| M1 | e2e 819 L1 to L6; e2e 820 W1 to W5 on the Windows row (VS 2026, MSVC 14.51.36231) | `--crt` unknown | pass |
+| M2 | e2e 820 W6; e2e 799 D; the measurement (run 36361809507) | the tools do not start as actions; `--path-prepend` unknown | the tools start as actions on the Visual Studio row and on the masked row (managed msvc@14.44.35207), and do not start directly |
+| M3 | e2e 118 on the Windows row | asserted only the missing depfile | the rebuild is asserted and passes |
+| M4 | e2e 818 criteria 5 and 6; e2e 820 W7; e2e 821 | 0 statements (818); A1 fails (821) | once; once at `[workspace.build]`; once per run of the edge |
+| M5 | the lint on the workflows before and after the change | 7 W1 problems | 0 |
+| M6 | the docs check on the Linux, macOS, Windows and bare Windows rows | no `defaultToolchain` | gcc@16.1.0, llvm@20.1.7, llvm@20.1.7 and gcc@16.1.0: 0 problems on each row |
+| M7 | unit `ConditionalOrder.*`; the sandbox section #728 | lexical order | specificity |
+| M8 | the canaries; `verify-published.sh` | not present | see F8 and the sandbox table below |
+| I1, I2 | the static test; the Windows install tests of `qt-base` and `qt` (openxlings/xim-pkgindex#898) | the test fails at `qt` and `qt-base` | both recipes install and pass their checks with revision 1 |
+| N1 | the full sweep with mcpp 2026.9.28.2 (run 36376460690) | pinned to 2026.9.28.1 | 22 shards green (linux default 6, linux llvm 9, macos 2, windows 5) |
+| N2 | `red_members.py selftest` (seven cases) | not present | pass; on the full sweep, "No member failed." |
+
+**CI.** mcpp#730's last head (`feb5743f`): every workflow concluded success;
+the two jobs of the xcode-27 image fail as known red (#669). The two earlier runs
+on the branch found F4, F6, the fast path that e2e 821 assumed on every host
+(it serves only ELF products, #400), and the measurement's three harness
+defects; each was fixed on the branch.
+
+**Sandbox readings.** `tests/release/verify-published.sh` in fresh SubOS
+sandboxes (`xlings subos use <n> --sandbox`), with the CN mirror set for xlings
+and for mcpp, against what the index publishes:
+
+| mcpp | xlings | ok | failed | not run | The failures |
+|---|---|---|---|---|---|
+| 2026.9.28.1 | 2026.9.28.1 | 15 | 12 | 2 | every section this round adds, each with the reading of §8.3's second column |
+| 2026.9.28.1 | 2026.9.28.2 | 20 | 7 | 2 | the seven mcpp sections: mcpp's registry runs its pinned xlings 2026.9.28.1 and carries no marker (two); no `defaultToolchain`; the lexical order; the three `place-dlls` legs (`--crt` unknown) |
+| 2026.9.28.2 | 2026.9.28.2 | 27 | 0 | 2 | none |
+
+The two sections not run are Windows behaviour, read on the Windows CI rows
+(e2e 820, e2e 118, the measurement). Every section kept from 2026.9.28.1
+(#717, #720, #723, #724, #725, the progress of an index refresh) passes in
+all three runs.
+
+**GalTranslPP on Windows.** The real project the review started from, read
+three ways with mcpp 2026.9.28.2, each with the LLVM row (llvm@22.1.8) over the
+Visual Studio 2026 toolset (MSVC 14.51.36231) on `windows-2025`:
+
+| Reading | Build, run, pack | The runtime beside the program |
+|---|---|---|
+| the release's canary (the candidate, CI's cached mcpp home) | 4 of 4 commands held; `GalTransl++ CLI v3.1.1` | `qt-base` revision 0 from the cached home: its copy is stated once as a packaging fault, and the toolset's set is placed (F9) |
+| the project's CI, pin 2026.9.28.2 (Sunrisepeak/GalTranslPP#3, `0681f59`) | success in 41 minutes | no runtime copy in `qt-base`'s `bin`: nothing is stated; the package carries the set the build placed |
+| the same, without the #718 workaround (`229f0d1`, run 36378870254) | success in 35 minutes; no statement that a CRT word is redundant | the model alone chooses the dynamic CRT: the packages carry `MSVCP140*` and `VCRUNTIME140*` beside GPPCLI and GPPGUI |
+
+### 8.4 Self-review
+
+**Architecture.** Each fact that §1 set out to give one authority now has one:
+the files beside a PE program (`mcpp.build.runtime_placement`, read by the
+plan, `place-dlls` and `mcpp pack`), the order of conditional tables
+(`mcpp.manifest.cfg_selector`, read by both manifest readers), the host's
+default toolchain (`pins::host_default_toolchain`, read by the first run,
+`self env` and the docs check), and a home (`home_identity::is_home`, read by
+every xlings reader). Two statements remain second copies by construction:
+`verify-published.sh` embeds the PE synthesiser of `tests/e2e/_synth_pe.py`,
+because a sandbox sees no checkout, and the index keeps its own list of red
+members, because the owner of a failure is a fact of the index.
+
+**Crossings.** The pull-request template's table was filled before CI and
+still missed one crossing (F6: the action `PATH` against the stability of an
+action's command line). The table asks which invariants a change crosses; a
+change to a generated command line crosses every test and comment that reads
+that command, and those are found by searching for the old spelling, not by
+thinking of invariants.
+
+**Stability.** The release gate works and costs time: the GalTranslPP canary
+builds its vcpkg dependencies without a cache on `main`, about fifty minutes,
+before any archive is built. Its cache is saved per run, so later releases
+from `main` restore it. The measurement workflow renames system files on a
+disposable runner and restores them from bash in an `always()` step.
+
+**User experience.** A project that wrote the #718 workaround
+(`dialect_cxxflags = ["-fms-runtime-lib=dll"]`) is told once that the word is
+redundant; GalTranslPP carries it. Off a terminal, xlings still passes the
+sub-index build scripts' frames through (openxlings/xlings#629).
+
+**Compatibility.** On Windows the first build after the upgrade re-runs each
+action once and, for GNU-dialect compiles, rebuilds once; a program whose
+search directories carry an older runtime copy receives the toolset's. No
+index descriptor changes meaning under D7 (§8.3).
+
+**Open after this round.** openxlings/xlings#629 (the frames), mcpp #669 (the
+xcode-27 image's SDK), and the reach of a packaging revision, which is the
+reach of the consumer's index (F9) and is not a defect.
 
