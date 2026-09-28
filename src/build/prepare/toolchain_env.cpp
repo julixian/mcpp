@@ -39,6 +39,7 @@ import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.config;
 import mcpp.xlings;
+import mcpp.build.resources;   // the resource compiler the row uses (#734 E2)
 import mcpp.toolchain.post_install;
 import mcpp.platform;
 import mcpp.platform.macos;
@@ -290,6 +291,134 @@ void fill_package_build_env(mcpp::build::BuildProgramEnv& e,
     }
 }
 
+namespace {
+
+// #734 E2: the MSVC architecture directory name of a target triple.
+std::string msvc_arch_of(std::string_view triple) {
+    if (triple.starts_with("aarch64") || triple.starts_with("arm64")) return "arm64";
+    if (triple.starts_with("i686") || triple.starts_with("i386") || triple.starts_with("x86-")) return "x86";
+    return "x64";
+}
+
+// The `bin/Host<h>/<arch>` directory of an MSVC toolset that holds cl.exe,
+// preferring the host's own architecture as the engine's toolset search does.
+std::filesystem::path msvc_bin_dir(const std::filesystem::path& tools, std::string_view arch) {
+    std::error_code ec;
+    const bool armHost = mcpp::platform::host_arch == std::string_view("aarch64")
+                      || mcpp::platform::host_arch == std::string_view("arm64");
+    const std::array<std::string_view, 3> hosts = armHost
+        ? std::array<std::string_view, 3>{"Hostarm64", "Hostx64", "Hostx86"}
+        : std::array<std::string_view, 3>{"Hostx64", "Hostarm64", "Hostx86"};
+    for (auto h : hosts) {
+        auto dir = tools / "bin" / std::string(h) / std::string(arch);
+        if (std::filesystem::exists(dir / "cl.exe", ec)) return dir;
+    }
+    return {};
+}
+
+// #734 E2: the build information of the resolved toolchain. Each value comes
+// from the producer the engine's own command lines read: the C compiler from
+// `derive_c_compiler`, the archiver from `archive_tool`, the resource compiler
+// from `find_rc_tool`, the MSVC environment from `build_env_for_cl`, the ninja
+// from `ninja_program_for`, the runtime contract from `program_cxx_runtime`.
+std::map<std::string, std::string>
+build_information(const mcpp::manifest::Manifest& m, const mcpp::toolchain::Toolchain& tc) {
+    std::map<std::string, std::string> info;
+    auto put = [&](std::string_view k, const std::filesystem::path& v) {
+        if (!v.empty()) info[std::string(k)] = v.string();
+    };
+    const bool msvcCompiler = tc.compiler == mcpp::toolchain::CompilerId::MSVC;
+    const bool msvcAbi      = mcpp::toolchain::is_msvc_target(tc);
+    const auto& dial        = mcpp::toolchain::dialect_for(tc);
+
+    // The row's tools.
+    const auto cxx = tc.binaryPath;
+    const auto cc  = mcpp::toolchain::derive_c_compiler(tc);
+    put("MCPP_TOOL_CXX", cxx);
+    put("MCPP_TOOL_CC",  cc.empty() ? cxx : cc);
+    put("MCPP_TOOL_AR",  mcpp::toolchain::archive_tool(tc));
+    if (auto rc = mcpp::build::resources::find_rc_tool(tc, dial.id)) put("MCPP_TOOL_RC", rc->path);
+
+    // The MSVC ABI's native tools, from the resolved toolset and its SDK.
+    std::filesystem::path clBin;
+    if (msvcAbi) {
+        const auto arch  = msvc_arch_of(tc.targetTriple);
+        clBin = msvcCompiler ? tc.binaryPath.parent_path()
+                             : (tc.msvcToolsDir.empty() ? std::filesystem::path{}
+                                                        : msvc_bin_dir(tc.msvcToolsDir, arch));
+        if (!clBin.empty()) {
+            const auto cl = clBin / "cl.exe";
+            put("MCPP_ABI_TOOL_CXX", cl);
+            put("MCPP_ABI_TOOL_CC",  cl);
+            put("MCPP_ABI_TOOL_LD",  clBin / "link.exe");
+            put("MCPP_ABI_TOOL_AR",  clBin / "lib.exe");
+            put("MCPP_ABI_TOOL_AS",  clBin / (arch == "arm64" ? "armasm64.exe"
+                                            : arch == "x86"   ? "ml.exe" : "ml64.exe"));
+            auto sdk = mcpp::toolchain::msvc::resolve_sdk_for(cl);
+            if (sdk.sdk) {
+                const auto sdkBin = sdk.sdk->root / "bin" / sdk.sdk->version / arch;
+                put("MCPP_ABI_TOOL_RC", sdkBin / "rc.exe");
+                put("MCPP_ABI_TOOL_MT", sdkBin / "mt.exe");
+                // The environment the engine itself runs this toolset with.
+                std::string env;
+                for (auto const& ev : msvcCompiler && !tc.envOverrides.empty()
+                                          ? tc.envOverrides
+                                          : mcpp::toolchain::msvc::build_env_for_cl(cl, arch, *sdk.sdk)) {
+                    if (!env.empty()) env += '\n';
+                    env += ev.key + "=" + ev.value;
+                }
+                info["MCPP_TOOL_ENV"] = env;
+                info["MCPP_TOOLSET_IDENTITY"] = std::format(
+                    "msvc {}; sdk {}",
+                    tc.msvcToolsVersion.empty() ? clBin.parent_path().parent_path()
+                                                       .parent_path().filename().string()
+                                                : tc.msvcToolsVersion,
+                    sdk.sdk->version);
+            }
+            // A Visual Studio instance, when the toolset came from one: the
+            // tools directory is <instance>/VC/Tools/MSVC/<v>.
+            const auto tools = clBin.parent_path().parent_path().parent_path();
+            const auto vc    = tools.parent_path().parent_path().parent_path();
+            std::error_code ec;
+            if (tc.msvcOrigin != "managed" && vc.filename() == "VC"
+                && std::filesystem::exists(vc / "Auxiliary" / "Build", ec))
+                put("MCPP_MSVC_INSTANCE_DIR", vc.parent_path());
+        }
+        // On the cl.exe row the row's tools are the toolset's.
+        if (msvcCompiler) {
+            for (auto role : {"LD", "AS", "MT"}) {
+                auto it = info.find(std::string("MCPP_ABI_TOOL_") + role);
+                if (it != info.end()) info[std::string("MCPP_TOOL_") + role] = it->second;
+            }
+            if (auto it = info.find("MCPP_ABI_TOOL_AR"); it != info.end()) info["MCPP_TOOL_AR"] = it->second;
+        } else {
+            put("MCPP_TOOL_LD", cxx);
+            put("MCPP_TOOL_AS", cc.empty() ? cxx : cc);
+            if (auto it = info.find("MCPP_ABI_TOOL_MT"); it != info.end()) info["MCPP_TOOL_MT"] = it->second;
+        }
+    } else {
+        // Off the MSVC ABI the driver links and assembles, and the ABI's tools
+        // are the row's.
+        put("MCPP_TOOL_LD", cxx);
+        put("MCPP_TOOL_AS", cc.empty() ? cxx : cc);
+        for (auto role : {"CC", "CXX", "LD", "AR", "RC", "AS", "MT"}) {
+            auto it = info.find(std::string("MCPP_TOOL_") + role);
+            if (it != info.end()) info[std::string("MCPP_ABI_TOOL_") + role] = it->second;
+        }
+        const std::string_view family =
+              tc.compiler == mcpp::toolchain::CompilerId::GCC   ? "gcc"
+            : tc.compiler == mcpp::toolchain::CompilerId::Clang ? "clang" : "unknown";
+        info["MCPP_TOOLSET_IDENTITY"] = std::format("{} {}", family, tc.version);
+    }
+
+    info["MCPP_NINJA"]            = mcpp::build::ninja_program_for(tc);
+    info["MCPP_CXX_RUNTIME"]      = mcpp::build::program_cxx_runtime(m, tc);
+    info["MCPP_MSVC_CRT_LINKAGE"] = mcpp::build::program_msvc_crt_linkage(m, tc);
+    return info;
+}
+
+} // namespace
+
 void fill_target_build_env(mcpp::build::BuildProgramEnv& e,
                            const mcpp::manifest::Manifest& m,
                            const mcpp::toolchain::Toolchain* tc,
@@ -319,6 +448,7 @@ void fill_target_build_env(mcpp::build::BuildProgramEnv& e,
     // the resolver already measured.
     e.cxxStdlib     = tc ? tc->stdlibId : std::string{};
     if (!tc) return;
+    e.buildInfo     = build_information(m, *tc);
 
     // The two flags mcpp passes to ITS OWN compiler, so a rule package driving
     // a second compiler passes the same two. Both read from the single

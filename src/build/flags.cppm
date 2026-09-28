@@ -167,6 +167,24 @@ std::string render_link_intent_flags(
 
 CompileFlags compute_flags(const BuildPlan& plan);
 
+// The object format the TARGET produces (#647 E3). One derivation, read by
+// `compute_flags` for the runtime contract table and the link-line shape, and
+// by the build information a build program receives (#734 E2).
+dist::Format target_object_format(const mcpp::toolchain::Toolchain& tc);
+
+// #734 E2: the C++ runtime contract of the package's programs as the manifest
+// states it or its default gives it, spelled as `cxx_runtime` is written; and
+// on the MSVC ABI the CRT linkage that contract compiles with ("static" or
+// "dynamic"; empty off that ABI). Read by the build information before any
+// plan exists, from the same producers `compute_flags` reads, so a plugin that
+// builds foreign code for the program agrees with it. The one input a plan
+// adds -- whether an ELF program loads a C++ shared library of this build --
+// does not change the MSVC answer and is not known here.
+std::string program_cxx_runtime(const mcpp::manifest::Manifest& m,
+                                const mcpp::toolchain::Toolchain& tc);
+std::string program_msvc_crt_linkage(const mcpp::manifest::Manifest& m,
+                                     const mcpp::toolchain::Toolchain& tc);
+
 // THE OPTIMIZATION LEVEL A BUILD REALISES, STATED ONCE (#694).
 //
 // `compute_flags` spells it and the `Finished` line names it. There used to be
@@ -592,6 +610,44 @@ std::filesystem::path graph_link_sysroot(const std::filesystem::path& outputDir)
     return outputDir / kGraphLinkSysrootDir;
 }
 
+dist::Format target_object_format(const mcpp::toolchain::Toolchain& tc) {
+    return mcpp::toolchain::is_mingw_target(tc)
+        ? dist::Format::Pe
+        : dist::format_for(tc.targetTriple,
+              mcpp::platform::needs_explicit_libcxx ? dist::Format::MachO
+            : mcpp::platform::is_windows            ? dist::Format::Pe
+                                                    : dist::Format::Elf);
+}
+
+std::string program_cxx_runtime(const mcpp::manifest::Manifest& m,
+                                const mcpp::toolchain::Toolchain& tc) {
+    const auto& bc = m.buildConfig;
+    const std::optional<dist::Contract> msvcAbiDefault =
+        mcpp::toolchain::is_msvc_target(tc)
+            ? std::optional(dist::msvc_abi_default_contract(
+                  mcpp::toolchain::msvc_wants_static_crt(bc.linkage, bc.cxxRuntime),
+                  !tc.msvcRedistDir.empty()))
+            : std::nullopt;
+    const auto contracts = dist::role_contracts(
+        dist::ContractStatement{
+            .cxxRuntime       = bc.cxxRuntime,
+            .cxxRuntimeTests  = bc.cxxRuntimeTests,
+            .cxxRuntimeShared = bc.cxxRuntimeShared,
+            .staticStdlib     = bc.staticStdlib,
+            .msvcAbiDefault   = msvcAbiDefault,
+        },
+        target_object_format(tc), dist::CxxSharedLoad{});
+    return std::string(dist::to_string(contracts.program));
+}
+
+std::string program_msvc_crt_linkage(const mcpp::manifest::Manifest& m,
+                                     const mcpp::toolchain::Toolchain& tc) {
+    if (!mcpp::toolchain::is_msvc_target(tc)) return {};
+    return mcpp::toolchain::msvc_wants_static_crt(m.buildConfig.linkage,
+                                                  m.buildConfig.cxxRuntime)
+        ? "static" : "dynamic";
+}
+
 CompileFlags compute_flags(const BuildPlan& plan) {
     CompileFlags f;
 
@@ -943,14 +999,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
     // table and the link-line shape both read it (#647 E3). Target-keyed, with
     // the host's format only as the fallback for a triple that names none; a
     // MinGW toolchain is a PE whatever its triple spelling says.
-    const mcpp::build::dist::Format targetObjectFormat =
-        isMingwTc ? mcpp::build::dist::Format::Pe
-                  : mcpp::build::dist::format_for(plan.toolchain.targetTriple,
-                        mcpp::platform::needs_explicit_libcxx
-                            ? mcpp::build::dist::Format::MachO
-                        : mcpp::platform::is_windows
-                            ? mcpp::build::dist::Format::Pe
-                            : mcpp::build::dist::Format::Elf);
+    const mcpp::build::dist::Format targetObjectFormat = target_object_format(plan.toolchain);
     const auto linkIntentFlavor = [&] {
         if (isMingwTc) return LinkIntentFlavor::PeGnu;
         if (isMsvcDialect) return LinkIntentFlavor::PeMsvc;

@@ -39,6 +39,19 @@ export namespace mcpp::build {
 // see, mirroring Cargo's env family. Injected as MCPP_* variables into the
 // child ONLY (never the calling process), and folded into the cache key so a
 // target/profile/feature change re-runs the program.
+// #734 E2: the build information a build program reads through
+// `mcpp::tool`, `mcpp::abi_tool`, `mcpp::tool_env`, `mcpp::toolset_identity`,
+// `mcpp::msvc_instance_dir`, `mcpp::ninja_program`, `mcpp::cxx_runtime` and
+// `mcpp::msvc_crt_linkage`. The roles are cc, cxx, ld, ar, rc, as, mt.
+inline constexpr std::string_view kBuildInformationKeys[] = {
+    "MCPP_TOOL_CC", "MCPP_TOOL_CXX", "MCPP_TOOL_LD", "MCPP_TOOL_AR",
+    "MCPP_TOOL_RC", "MCPP_TOOL_AS", "MCPP_TOOL_MT",
+    "MCPP_ABI_TOOL_CC", "MCPP_ABI_TOOL_CXX", "MCPP_ABI_TOOL_LD", "MCPP_ABI_TOOL_AR",
+    "MCPP_ABI_TOOL_RC", "MCPP_ABI_TOOL_AS", "MCPP_ABI_TOOL_MT",
+    "MCPP_TOOL_ENV", "MCPP_TOOLSET_IDENTITY", "MCPP_MSVC_INSTANCE_DIR",
+    "MCPP_NINJA", "MCPP_CXX_RUNTIME", "MCPP_MSVC_CRT_LINKAGE",
+};
+
 struct BuildProgramEnv {
     std::string targetTriple;               // resolved canonical triple; "" = host
     // The resolved toolchain's payload root and the target's own C library
@@ -69,6 +82,11 @@ struct BuildProgramEnv {
     // emits — so the answer belongs to the engine and is stated once here.
     std::string toolchainSysroot;
     std::string toolchainBinutilsDir;
+    // #734 E2: the build information of the resolved toolchain, keyed by the
+    // variable names of `kBuildInformationKeys`. Filled by prepare from the
+    // same producers the engine's own command lines read; a key absent here is
+    // emitted empty.
+    std::map<std::string, std::string> buildInfo;
     // WHICH COMPILER RESOLVED — "gcc" | "clang" | "msvc" | "".
     //
     // A package should never have to guess this, and until this field existed
@@ -613,6 +631,12 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
     e.emplace_back("MCPP_COMPILER", shared_value("MCPP_COMPILER"));
     e.emplace_back("MCPP_CXX_STDLIB", shared_value("MCPP_CXX_STDLIB"));
     e.emplace_back("MCPP_TARGET_SYSROOT", env.targetSysroot);
+    // #734 E2. Every key always, empty when it does not apply, for the reason
+    // the lines above give.
+    for (auto key : kBuildInformationKeys) {
+        auto it = env.buildInfo.find(std::string(key));
+        e.emplace_back(std::string(key), it == env.buildInfo.end() ? std::string{} : it->second);
+    }
     e.emplace_back("MCPP_TARGET_BUILTINS_LIB", env.targetBuiltinsLib);
     e.emplace_back("MCPP_TARGET_LIBC_PROFILE", env.targetLibcProfile);
     e.emplace_back("MCPP_TARGET_LIBC", env.targetLibc);

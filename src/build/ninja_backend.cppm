@@ -62,6 +62,11 @@ public:
 // Factory for this backend implementation.
 std::unique_ptr<Backend> make_ninja_backend();
 
+// The ninja mcpp runs for a toolchain: the sandbox-local ninja beside the
+// toolchain when there is one, else `ninja` from PATH. One answer for the
+// engine's own builds and for the build information (#734 E2).
+std::string ninja_program_for(const mcpp::toolchain::Toolchain& tc);
+
 // Helper exposed for testing / debugging
 std::string emit_ninja_string(const BuildPlan& plan);
 std::string filter_ninja_output(std::string_view output,
@@ -3827,18 +3832,10 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     // The compiler's internal `as`/`ld` lookup is handled via the
     // -B<binutils-bin> flag we emit into cxxflags/ldflags (see
     // emit_ninja_string). No PATH injection needed here.
-    std::filesystem::path ninjaBin;
-    auto ninja_name = std::string("ninja") + std::string(mcpp::platform::exe_suffix);
-    if (auto nb = mcpp::xlings::paths::find_sibling_binary(
-            plan.toolchain.binaryPath, "ninja", ninja_name)) {
-        ninjaBin = *nb;
-    }
-
     // Raw program path (no shell quoting): recorded in the fast-path cache and
     // exec'd directly via capture_exec/execvp, which take argv (not a shell
     // string). Shell-using call sites must quote it locally.
-    std::string ninjaProgram = ninjaBin.empty() ? std::string("ninja")
-                                                 : ninjaBin.string();
+    std::string ninjaProgram = ninja_program_for(plan.toolchain);
 
     // THE BUILD FILE IN THE ENCODING NINJA READS IT IN (#693, M4). Ninja reads
     // UTF-8 when it declares the UTF-8 code page and the host honours it, and
@@ -4117,6 +4114,13 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
                                           std::move(diagnostics)});
     }
     return r;
+}
+
+std::string ninja_program_for(const mcpp::toolchain::Toolchain& tc) {
+    auto ninja_name = std::string("ninja") + std::string(mcpp::platform::exe_suffix);
+    if (auto nb = mcpp::xlings::paths::find_sibling_binary(tc.binaryPath, "ninja", ninja_name))
+        return nb->string();
+    return "ninja";
 }
 
 std::unique_ptr<Backend> make_ninja_backend() {

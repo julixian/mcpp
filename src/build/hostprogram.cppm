@@ -521,6 +521,48 @@ inline const char* cxx_stdlib()                   { return env_or("MCPP_CXX_STDL
 // through the runtime binding, and nothing has to look for it.
 inline const char* sysroot_dir()                  { return env_or("MCPP_TARGET_SYSROOT"); }
 
+// ── The build information of the resolved toolchain (#734 E2, protocol 14) ──
+//
+// Facts, never interpretations: which tools this row runs, which tools are the
+// target ABI's own, the environment the engine runs them with, and the C++
+// runtime contract the program compiles with. A plugin that drives CMake,
+// vcpkg, Meson or make translates them for that system; mcpp knows none of
+// them. Every value is empty when it does not apply, and a role is one of
+// "cc", "cxx", "ld", "ar", "rc", "as", "mt".
+inline const char* build_info_key_(const char* prefix, const char* role) {
+    static char name[64];
+    int n = 0;
+    for (const char* p = prefix; *p && n < 48; ++p) name[n++] = *p;
+    for (const char* p = role;   *p && n < 63; ++p)
+        name[n++] = (*p >= 'a' && *p <= 'z') ? static_cast<char>(*p - 'a' + 'A') : *p;
+    name[n] = '\0';
+    return name;
+}
+// The row's tool for a role: the driver on GNU-style rows (it links and
+// assembles), the toolset's own tools on the cl.exe row.
+inline const char* tool(const char* role)          { return env_or(build_info_key_("MCPP_TOOL_", role)); }
+// The target ABI's native tool: on the MSVC ABI `cl`, `link`, `lib`, `rc`,
+// `ml64` and `mt` of the resolved toolset and SDK, whichever driver the row
+// uses; elsewhere the same as `tool(role)`.
+inline const char* abi_tool(const char* role)      { return env_or(build_info_key_("MCPP_ABI_TOOL_", role)); }
+// The environment the engine runs the ABI's tools with, one KEY=value per
+// line (INCLUDE, LIB, PATH, ... on the MSVC ABI); empty elsewhere.
+inline const char* tool_env()                      { return env_or("MCPP_TOOL_ENV"); }
+// A path-free identity of the toolset, for keying a cache by version:
+// "msvc 14.44.35207; sdk 10.0.26100.0", "clang 22.1.8", "gcc 16.1.0".
+inline const char* toolset_identity()              { return env_or("MCPP_TOOLSET_IDENTITY"); }
+// The Visual Studio instance the MSVC toolset belongs to, when it came from
+// one; empty for a managed toolset and off the MSVC ABI.
+inline const char* msvc_instance_dir()             { return env_or("MCPP_MSVC_INSTANCE_DIR"); }
+// The ninja mcpp itself runs, so a foreign build system needs none on PATH.
+inline const char* ninja_program()                 { return env_or("MCPP_NINJA"); }
+// The program's C++ runtime contract: "self-contained", "toolchain-coupled"
+// or "host-coupled".
+inline const char* cxx_runtime()                   { return env_or("MCPP_CXX_RUNTIME"); }
+// On the MSVC ABI the CRT the program compiles with, "static" (/MT) or
+// "dynamic" (/MD); empty elsewhere. The value `place-dlls --crt` reads.
+inline const char* msvc_crt_linkage()              { return env_or("MCPP_MSVC_CRT_LINKAGE"); }
+
 // ── Three answers a board-support package would otherwise hardcode ───────────
 //
 // The coupling these remove does not appear in any manifest. A board package
