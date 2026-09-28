@@ -703,6 +703,16 @@ implementing it, and the readings.
   was created. The workflow now names the step's bash (`CANARY_BASH`), the
   runner has tests, and the canaries were dispatched on the fix's branch before
   the release was dispatched again (#731).
+- **F9. A packaging revision reaches a consumer when its index does.** The
+  GalTranslPP canary, dispatched on #731's branch after `qt-base` revision 1
+  was published, built, ran and packed the project with the candidate, and
+  stated once that `xim-x-qt-base\6.11.1\bin` ships the MSVC C++ runtime:
+  the resolver placed the toolset's set instead, as WS1 specifies. The payload
+  was revision 0 because the job restores the whole mcpp home from CI's cache,
+  its index copy included, and that copy predates the revision; by that index
+  the installed payload is current. A consumer receives revision 1 on the
+  first use after its index refreshes (GalTranslPP's own CI caches the
+  payloads and not the index; its reading follows the release).
 
 ### 8.3 Readings
 
