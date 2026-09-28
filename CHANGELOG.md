@@ -80,11 +80,12 @@ to 2026.9.29.1.
 - **The fast path records the request.** `build.ninja` states the workspace
   members and the features it was planned for, and a fast path replays it only
   for the same request; one record is kept per selection and configuration.
-- **`mcpp.graph`.** One module holds the engine's graph algorithms: a stable
-  topological order with the cycle reported as its path, dependency levels and
-  the transitive closure. Module order, host-module order, unit order by
-  imports, the dependency closure, the package-cycle check and the build-key
-  fold use it; a cycle of modules is now reported as `a -> b -> a`.
+- **`mcpp.graph`.** One module holds the engine's graph algorithms: the
+  topological orders the engine uses, dependency levels and the transitive
+  closure. Module order, host-module order, unit order by imports, the
+  dependency closure, the package-cycle check and the build-key fold use it,
+  each with the order it had, so no compile or link order changes; a cycle of
+  modules is now reported as `a -> b -> a`.
 
 ## [2026.9.28.3] - 2026-09-28
 
