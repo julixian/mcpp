@@ -11,7 +11,11 @@
 #
 #   A1  `mcpp build --workspace` links the program shipped through `artifacts`;
 #   A2  the program in the shipping member's product directory runs;
-#   A3  the program as its own member's product runs too.
+#   A3  the program as its own member's product runs too;
+#   A4  `${mcpp.bin_dir}` in an action the helper's build program declares is
+#       the helper's product directory, where its binaries land (2026.9.29.3
+#       expanded it to the plan's `bin/`, so a file named after the program
+#       was looked for where the program is not).
 set -e
 
 TMP=$(mktemp -d)
@@ -57,6 +61,15 @@ import mcpp;
 int main() {
     mcpp::link_search("vendor/lib");
     mcpp::link_lib("vend");
+    mcpp::action a;
+    a.id = "copy-helper";
+    a.role = mcpp::roles::artifact;
+    a.arg("${mcpp.self}").arg("stage").arg("--verify").arg("content")
+     .arg("--output").arg("${mcpp.bin_dir}/helper.copy")
+     .arg("${mcpp.target_file:helper}")
+     .input("${mcpp.target_file:helper}")
+     .output("${mcpp.bin_dir}/helper.copy")
+     .submit();
     return 0;
 }
 EOF
@@ -86,5 +99,9 @@ shipped=$(find target -path '*/bin/gui/helper' -type f | head -1)
 own=$(find target -path '*/bin/helper/helper' -type f | head -1)
 [ -n "$own" ] || fail "A3: bin/helper/helper is missing" b.log
 "$own" || fail "A3: bin/helper/helper did not run"
+
+# A4
+[ -f "$(dirname "$own")/helper.copy" ] \
+    || { find target -name 'helper.copy'; fail "A4: \${mcpp.bin_dir} is not the helper's product directory" b.log; }
 
 echo "PASS: 838_a_program_shipped_through_artifacts_links_its_own_closure"

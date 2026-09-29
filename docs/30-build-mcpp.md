@@ -1003,7 +1003,7 @@ none to rely on), and the only interpolations are a closed set:
 | Variable | Value |
 |---|---|
 | `${mcpp.out_dir}` | the build output directory |
-| `${mcpp.bin_dir}` | where produced binaries land |
+| `${mcpp.bin_dir}` | where produced binaries land: `bin/`, or, for an action a workspace member's build program declares, that member's product directory (2026.9.29.4+) |
 | `${mcpp.compile_db}` | path to `compile_commands.json` (what clang-tidy's `-p` wants) |
 | `${mcpp.target_file:<name>}` | the built file of target `<name>` |
 | `${mcpp.stage_dir}` *(2026.9.11.1+)* | the tree `mcpp pack` staged, absolute. `artifact` role only, and only under `mcpp pack --format <name>` |

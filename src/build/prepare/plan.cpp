@@ -932,6 +932,11 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // NAMES ids and a collision there costs a duplicate line, not a wrong
         // edge.
         bool thisActionUsesStageDir = false;
+        // Where the declaring package's binaries land: `bin/`, or in a
+        // workspace plan the product directory of the member that declared
+        // the action (§15 of the 2026-09-29 workspace design). Set per
+        // package by `collect`.
+        std::filesystem::path binDir = ctx.plan.outputDir / "bin";
         const bool stagePass = !state.overrides.pack_stage_dir.empty();
         auto substitute = [&](std::string s, const char* actionId,
                               mcpp::manifest::BuildAction::Role role) {
@@ -940,7 +945,7 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
                     s.replace(p, what.size(), with);
             };
             rep("${mcpp.out_dir}",    ctx.plan.outputDir.string());
-            rep("${mcpp.bin_dir}",    (ctx.plan.outputDir / "bin").string());
+            rep("${mcpp.bin_dir}",    binDir.string());
             rep("${mcpp.compile_db}", ctx.plan.compileDbPath.string());
             // The engine's own executable, absolute (2026.9.13.1+). An action
             // whose command is an argv with no shell has no portable way to
@@ -1024,6 +1029,9 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             // program has no idea which package the engine loaded it for.
             // mcpp#534's ordering edge is scoped to this name.
             auto owner = mcpp::build::qualified_package_name(mm);
+            binDir = ctx.plan.outputDir / "bin";
+            for (auto const& g : ctx.plan.linkGroups)
+                if (!g.linkOnly && g.member == owner) binDir = ctx.plan.outputDir / g.productDir;
             for (auto a : mm.buildConfig.actions) {
                 thisActionUsesStageDir = false;
                 const auto sub = [&](std::string v) {
