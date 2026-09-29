@@ -18,7 +18,11 @@
 #   G7  no member directory receives a build directory, and `clean --stale`
 #       removes the ones members held before, keeping `target/.build-mcpp/`;
 #   G8  a program a member ships through `artifacts` is beside that member's
-#       program, in its product directory.
+#       program, in its product directory;
+#   G9  that program's own runtime files are beside it there, and its link
+#       waits for no runtime file of another member (2026.9.29.2 made it wait
+#       for cli's, which a workspace plan places only in bin/cli/, so the
+#       build stopped with "missing and no known rule to make it").
 set -e
 
 TMP=$(mktemp -d)
@@ -61,6 +65,14 @@ EOF
 done
 printf '#include <cstdio>\nimport shared_core;\nint main() { std::printf("%%d\\n", core_v() + 1); return 0; }\n' > cli/src/main.cpp
 printf '#include <cstdio>\nimport shared_core;\nint main() { std::printf("%%d\\n", core_v() + 2); return 0; }\n' > gui/src/main.cpp
+mkdir -p cli/data helper/data
+printf 'cli\n' > cli/data/cli.dat
+printf 'helper\n' > helper/data/helper.dat
+cat >> cli/mcpp.toml <<'EOF'
+
+[runtime]
+deploy_files = ["data/cli.dat"]
+EOF
 cat >> gui/mcpp.toml <<'EOF'
 
 [dependencies.helper]
@@ -75,6 +87,9 @@ version = "0.1.0"
 [targets.helper]
 kind = "bin"
 main = "src/main.cpp"
+
+[runtime]
+deploy_files = ["data/helper.dat"]
 EOF
 printf 'int main() { return 0; }\n' > helper/src/main.cpp
 
@@ -130,15 +145,26 @@ other=$(echo "$dirs" | grep -v "^$main_dir$")
 [ -f "$main_dir/bin/gui/helper$EXE" ] || fail "G8: bin/gui/helper is missing" ws.log
 [ -f "$main_dir/bin/helper/helper$EXE" ] || fail "G8: bin/helper/helper is missing" ws.log
 
+# G9: the build above succeeded with a runtime file in cli's closure; the
+# program gui ships has its runtime file beside it, and cli's is cli's.
+[ -f "$main_dir/bin/gui/helper.dat" ] || fail "G9: bin/gui/helper.dat is missing" ws.log
+[ -f "$main_dir/bin/cli/cli.dat" ] || fail "G9: bin/cli/cli.dat is missing" ws.log
+[ ! -e "$main_dir/bin/gui/cli.dat" ] || fail "G9: cli's runtime file is in gui's product directory" ws.log
+
 # G1: the core module is compiled once, in the one graph.
 log="$main_dir/.ninja_log"
 n=$(grep -c 'core\.m\.o' "$log" || true)
 [ "$n" = 1 ] || fail "G1: core's object was built $n times" "$log"
 
-# G2: `-p cli` after `--workspace` compiles nothing.
-before=$(wc -l < "$log")
+# G2: `-p cli` after `--workspace` compiles and links nothing. Counted over
+# objects, module interfaces and cli's program: the placement of cli's runtime
+# file is one staging edge whose list names the selection, so a plan of
+# another selection copies the file again.
+built() { awk -F'\t' 'NR > 1 { print $4 }' "$log" \
+            | grep -cE '\.(o|obj|gcm|pcm|ifc)$|^bin/cli/app' || true; }
+before=$(built)
 "$MCPP" build -p cli > p.log 2>&1 || fail "G2: -p cli failed" p.log
-after=$(wc -l < "$log")
+after=$(built)
 [ "$before" = "$after" ] || fail "G2: -p cli recompiled after --workspace" "$log"
 
 # G3: an edit to gui's flags recompiles gui only.
@@ -150,7 +176,10 @@ cxxflags = ["-DGUI_EXTRA=1"]
 EOF
 before=$(wc -l < "$log")
 "$MCPP" build --workspace > g3.log 2>&1 || fail "G3: the build after the edit failed" g3.log
-tail -n +$((before + 1)) "$log" | cut -f4 > g3.edges
+# Objects, module interfaces and programs; the staging of runtime files after
+# a plan of another selection is not a rebuild (see G2).
+tail -n +$((before + 1)) "$log" | cut -f4 \
+    | grep -E '\.(o|obj|gcm|pcm|ifc)$|/app(\.exe)?$' > g3.edges || true
 grep -q 'gui' g3.edges || fail "G3: gui was not rebuilt after its flags changed" g3.edges
 if grep -Eq 'core|/cli/|_cli|ns1|ns2' g3.edges; then
     fail "G3: an edit to gui's flags rebuilt another member" g3.edges

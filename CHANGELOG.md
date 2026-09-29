@@ -4,6 +4,25 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.9.29.3] - 2026-09-29
+
+This release completes the runtime placement of a program that a workspace
+member ships through `artifacts`. The validation project's post-release build
+of 2026.9.29.2 found it.
+
+### Fixed
+
+- **A program shipped through `artifacts` no longer waits for a runtime file
+  that a workspace plan never places.** Its link edge depended on the plan's
+  own deploy set, which a workspace plan does not place (`bin/` holds products
+  only), so a workspace whose members declare runtime files stopped with
+  "missing and no known rule to make it" (e2e 833 G9).
+- **The runtime files of such a program are beside it.** A member's runtime
+  set includes the closure of every package whose program the member ships
+  through `artifacts`, so the program finds its own runtime files in the
+  member's product directory, as it did beside a root's program in `bin/`
+  (e2e 833 G9).
+
 ## [2026.9.29.2] - 2026-09-29
 
 This release corrects what a workspace plan reads from its members. The plan's

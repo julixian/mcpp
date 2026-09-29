@@ -2863,9 +2863,23 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         for (auto i : closureIdx)
             for (auto const& f : packages[i].linkUsage.ldflags)
                 group.ldflags.push_back(f);
+        // The runtime files are those of the closure and of every package a
+        // program the closure ships through `artifacts` reaches: the program
+        // is placed beside the member's programs and loads its own runtime
+        // there, as it did beside a root's program in `bin/`.
         {
+            std::set<std::size_t> runtimeIdx = closureIdx;
+            std::vector<std::size_t> work;
+            for (auto const& [i, j] : artifactEdges)
+                if (closureIdx.contains(i) && runtimeIdx.insert(j).second) work.push_back(j);
+            while (!work.empty()) {
+                const auto i = work.back(); work.pop_back();
+                if (auto it = directPackageDeps.find(i); it != directPackageDeps.end())
+                    for (auto j : it->second)
+                        if (runtimeIdx.insert(j).second) work.push_back(j);
+            }
             std::vector<mcpp::modgraph::PackageRoot> closurePackages;
-            for (auto i : closureIdx) closurePackages.push_back(packages[i]);
+            for (auto i : runtimeIdx) closurePackages.push_back(packages[i]);
             derive_runtime(closurePackages, productDir, group);
         }
         const int groupIndex = static_cast<int>(plan.linkGroups.size());
