@@ -3018,6 +3018,30 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
             units.push_back(std::move(lu));
         }
+        // Every graph-built shared library of the closure is placed beside
+        // the member's images, not only those its units link: a library that
+        // another shared library needs (libffi under libwayland-client) is
+        // found there, as it is in `bin/` beside a root's program.
+        const bool loadsLibraries = std::ranges::any_of(units, [](const LinkUnit& u) {
+            return u.kind != LinkUnit::StaticLibrary;
+        });
+        for (auto i : closureIdx) {
+            if (!loadsLibraries) break;
+            auto it = sharedTargetsByPackage.find(i);
+            if (it == sharedTargetsByPackage.end()) continue;
+            for (auto t : it->second) {
+                auto const& dep = sharedDepTargets[t];
+                std::vector<std::filesystem::path> files{dep.output};
+                for (auto const& alias : runtime_aliases_for_target(dep.target, naming))
+                    files.push_back(alias);
+                for (auto const& f : files) {
+                    if (f.parent_path() == productDir) continue;
+                    const bool seen = std::ranges::any_of(group.placements,
+                        [&](auto const& pl) { return pl.source == f; });
+                    if (!seen) group.placements.push_back({f, place(f)});
+                }
+            }
+        }
         // A program the closure ships through `artifacts` (mcpp#711) is linked
         // once, at `bin/`, and placed beside the member's programs, where a
         // program that launches it looks for it.

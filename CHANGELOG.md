@@ -9,8 +9,9 @@
 This release corrects what a workspace plan reads from its members. The plan's
 root is a virtual root that holds the values shared by the whole graph; five
 statements that a member makes about itself were read from that root in
-2026.9.29.1 and were therefore empty. The mcpp-index sweep of 2026.9.29.1 found
-the first two.
+2026.9.29.1 and were therefore empty, and a member's product directory lacked
+the shared libraries that its libraries need. The mcpp-index sweep of
+2026.9.29.1 found the first two.
 
 ### Fixed
 
@@ -28,6 +29,10 @@ the first two.
   member's programs and shared libraries only (e2e 837). A quoted `#include`
   or resource file in a script is now found through the include directories as
   the resource compiler finds it, in every build.
+- **A member's product directory holds every graph-built shared library of its
+  closure.** Only the libraries a member's own units link were placed, so a
+  library that another library needs (libffi under libwayland-client) was
+  missing and the program did not start (e2e 835 L3).
 - **`[build] linkage` is a value of the plan.** It chooses the C runtime that
   every object is compiled against, so members that differ in it are separate
   configurations, and the plan takes it from its members.

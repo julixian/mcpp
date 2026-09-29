@@ -557,6 +557,7 @@ read from the member, or made a value of the plan:
 | a member's `[resources]`, `windows_code_page` | the virtual root's (empty) | per member: its directory and include directories, `res/<member>/`, its images only | e2e 837 |
 | `[build] linkage` | not copied to the virtual root | a root-position value | unit `RootPositionValuesSeparateMembers` |
 | unknown `mcpp:` capability, cfg() and schema warnings | not reported for a member | refused and reported for each selected member | e2e 836 M2, M3 |
+| the shared libraries of a member's closure | only those the member's units link were placed | every graph-built shared library of the closure, with its aliases, as §15 states | e2e 835 L3 |
 
 Each criterion fails on 2026.9.29.1 and passes on 2026.9.29.2. The resource
 case also showed a defect of every build: a quoted `#include` in a script was
@@ -564,6 +565,11 @@ tracked beside the script although the resource compiler finds it through the
 include directories, so a script that relied on them could not be built. The
 scan now resolves as the compiler does (unit
 `InputsAreResolvedThroughTheIncludeDirectories`).
+
+The last row is not a read of the root's manifest: a root's program sits in
+`bin/` beside every graph-built library, so no build before the workspace plan
+needed the transitive set named. The index member `wayland` (libffi under
+libwayland-client) showed it.
 
 The rule the inventory missed is general: a virtual root answers for the plan,
 and a read of the root's manifest is correct only for a value of the plan.
