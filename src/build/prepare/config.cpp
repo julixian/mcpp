@@ -794,7 +794,8 @@ bool is_std_module(std::string_view name) {
 
 bool graph_or_targets_import_std(const mcpp::modgraph::Graph& graph,
                                  const mcpp::manifest::Manifest& manifest,
-                                 const std::filesystem::path& projectRoot) {
+                                 const std::filesystem::path& projectRoot,
+                                 const std::vector<mcpp::modgraph::PackageRoot>& packages) {
     for (auto& u : graph.units) {
         for (auto& req : u.requires_) {
             if (is_std_module(req.logicalName))
@@ -804,16 +805,26 @@ bool graph_or_targets_import_std(const mcpp::modgraph::Graph& graph,
 
     // Some target entry files can be added to the plan after the package scan.
     // Check them here so std BMI setup matches what make_plan will compile: they
-    // are read by the same scan_entry_file make_plan reads them with.
-    const auto extTable = mcpp::extension_table_for(manifest.buildConfig.moduleExtensions,
-                                                    manifest.buildConfig.deviceExtensions);
-    for (auto& t : manifest.targets) {
-        if (t.main.empty()) continue;
-        const auto entry = mcpp::modgraph::scan_entry_file(projectRoot / t.main,
-                                                           manifest.package.name, extTable);
-        for (auto const& req : entry.requires_)
-            if (is_std_module(req.logicalName)) return true;
-    }
+    // are read by the same scan_entry_file make_plan reads them with. The
+    // packages whose targets make_plan compiles are the root and, in a
+    // workspace plan, every selected member (a member whose only sources are
+    // its tests is the case the root alone misses).
+    auto targets_import_std = [](const mcpp::manifest::Manifest& m,
+                                 const std::filesystem::path& root) {
+        const auto extTable = mcpp::extension_table_for(m.buildConfig.moduleExtensions,
+                                                        m.buildConfig.deviceExtensions);
+        for (auto& t : m.targets) {
+            if (t.main.empty()) continue;
+            const auto entry = mcpp::modgraph::scan_entry_file(root / t.main,
+                                                               m.package.name, extTable);
+            for (auto const& req : entry.requires_)
+                if (is_std_module(req.logicalName)) return true;
+        }
+        return false;
+    };
+    if (targets_import_std(manifest, projectRoot)) return true;
+    for (auto const& pkg : packages)
+        if (pkg.selectedMember && targets_import_std(pkg.manifest, pkg.root)) return true;
     return false;
 }
 

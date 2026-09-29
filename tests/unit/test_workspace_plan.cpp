@@ -55,6 +55,10 @@ TEST(WorkspacePlan, RootPositionValuesSeparateMembers) {
       EXPECT_NE(mcpp::project::root_position_key(m), ref); }
     { auto m = member("a"); m.buildConfig.cxxRuntime = "static";
       EXPECT_NE(mcpp::project::root_position_key(m), ref); }
+    // `linkage` chooses the C runtime every object of the plan is compiled
+    // against, so it is the plan's and not the member's.
+    { auto m = member("a"); m.buildConfig.linkage = "static";
+      EXPECT_NE(mcpp::project::root_position_key(m), ref); }
 }
 
 // The virtual root carries the plan's values and nothing a package owns.
@@ -100,4 +104,35 @@ TEST(WorkspacePlan, ProductDirectoriesAreNamedByPackage) {
     EXPECT_EQ(mcpp::project::product_directory_name(all, "ns1/common"), "ns1.common");
     EXPECT_EQ(mcpp::project::product_directory_name(all, "ns2/common"), "ns2.common");
     EXPECT_EQ(mcpp::project::product_directory_name(all, "."), "");
+}
+
+// A relative `[indices].path` a member declares was written in the member's
+// directory, and one the workspace declares in the workspace's: both are
+// anchored where they were written, so two members naming one tree share a
+// configuration and a member's path never resolves against the plan's root.
+TEST(WorkspacePlan, IndexPathsAreAnchoredWhereTheyWereWritten) {
+    namespace fs = std::filesystem;
+    const auto ws = fs::temp_directory_path()
+        / std::format("mcpp-ws-index-{}", std::random_device{}());
+    fs::create_directories(ws / "a");
+    fs::create_directories(ws / "b");
+    auto write = [](const fs::path& p, std::string_view text) {
+        std::ofstream(p) << text;
+    };
+    write(ws / "mcpp.toml",
+          "[workspace]\nmembers = [\"a\", \"b\"]\n\n[indices]\nx = { path = \"idx\" }\n");
+    write(ws / "a" / "mcpp.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\n");
+    write(ws / "b" / "mcpp.toml",
+          "[indices]\nx = { path = \"../idx\" }\n\n[package]\nname = \"b\"\nversion = \"0.1.0\"\n");
+    auto root = mcpp::manifest::load(ws / "mcpp.toml");
+    ASSERT_TRUE(root.has_value());
+    auto a = mcpp::project::load_member_manifest(*root, ws, "a");
+    auto b = mcpp::project::load_member_manifest(*root, ws, "b");
+    ASSERT_TRUE(a.has_value()) << a.error();
+    ASSERT_TRUE(b.has_value()) << b.error();
+    EXPECT_EQ(a->indices.at("x").path, (ws / "idx").lexically_normal());
+    EXPECT_EQ(b->indices.at("x").path, (ws / "idx").lexically_normal());
+    EXPECT_EQ(mcpp::project::root_position_key(*a), mcpp::project::root_position_key(*b));
+    std::error_code ec;
+    fs::remove_all(ws, ec);
 }

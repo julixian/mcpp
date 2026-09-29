@@ -2751,6 +2751,11 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
             escape_ninja_path(ru.output),
             escape_ninja_path(ru.source),
             implicit.empty() ? std::string{} : " |" + implicit));
+        if (!ru.flags.empty() && ru.flags != plan.rcFlags) {
+            std::string rcf;
+            for (auto const& f : ru.flags) { rcf += ' '; rcf += shell_quote_arg(f); }
+            append(std::format("  rcflags ={}\n", rcf));
+        }
     }
     if (!plan.resourceUnits.empty()) append("\n");
 

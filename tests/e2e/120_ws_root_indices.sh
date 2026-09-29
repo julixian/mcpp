@@ -11,6 +11,11 @@
 #      — previously `merge_workspace_deps` only propagated `version`, so a
 #      path-form workspace dependency was silently dropped and failed to
 #      resolve.
+#   3. A member that declares its own `[indices]` with a relative path wrote
+#      the path in ITS directory. The plan's root is the workspace root, so
+#      the member's path is anchored at the member (2026.9.29.1 resolved it
+#      against the workspace root and found no index). The two members name
+#      one tree, so they are one configuration.
 set -e
 
 TMP=$(mktemp -d)
@@ -71,7 +76,7 @@ EOF
 # ── Workspace root: virtual, one member, no re-declaration required ─────
 cat > mcpp.toml <<EOF
 [workspace]
-members = ["member-a"]
+members = ["member-a", "member-b"]
 
 [indices]
 x = { path = "local-index" }
@@ -119,6 +124,26 @@ int main() {
 }
 EOF
 
+mkdir -p member-b/src
+cat > member-b/mcpp.toml <<'EOF'
+[indices]
+x = { path = "../local-index" }
+
+[package]
+name = "member-b"
+version = "0.1.0"
+
+[dependencies.x]
+widget2 = "1.0.0"
+EOF
+cat > member-b/src/main.cpp <<'EOF'
+import widget2;
+
+int main() {
+    return widget2_value() == 35 ? 0 : 1;
+}
+EOF
+
 "$MCPP" build -p member-a > build.log 2>&1 || {
     cat build.log
     echo "FAIL: member did not resolve root-anchored [indices]/[workspace.dependencies] path"
@@ -128,6 +153,28 @@ EOF
 "$MCPP" run -p member-a > run.log 2>&1 || {
     cat run.log
     echo "FAIL: run failed"
+    exit 1
+}
+
+"$MCPP" build -p member-b > build-b.log 2>&1 || {
+    cat build-b.log
+    echo "FAIL: a member's own relative [indices].path is not anchored at the member"
+    exit 1
+}
+"$MCPP" run -p member-b > run-b.log 2>&1 || {
+    cat run-b.log
+    echo "FAIL: member-b's program failed"
+    exit 1
+}
+"$MCPP" build --workspace > build-ws.log 2>&1 || {
+    cat build-ws.log
+    echo "FAIL: --workspace"
+    exit 1
+}
+n=$(find target -name build.ninja | wc -l)
+[[ "$n" == 1 ]] || {
+    find target -name build.ninja
+    echo "FAIL: members naming one index tree are $n configurations, expected 1"
     exit 1
 }
 

@@ -10,7 +10,10 @@
 #
 #   L1  each program runs from its product directory;
 #   L2  the library in the two product directories is one file (one inode),
-#       or, where links are not possible, two copies with equal content.
+#       or, where links are not possible, two copies with equal content;
+#   L3  a shared library that another shared library of the closure needs is
+#       placed too (2026.9.29.1 placed only the libraries a member's own units
+#       link, so a program whose library needs libffi did not start).
 set -e
 
 TMP=$(mktemp -d)
@@ -21,18 +24,30 @@ MCPP="${MCPP:-mcpp}"
 
 cat > mcpp.toml <<'EOF'
 [workspace]
-members = ["shlib", "p1", "p2"]
+members = ["base", "shlib", "p1", "p2"]
 EOF
-mkdir -p shlib/src p1/src p2/src
+mkdir -p base/src shlib/src p1/src p2/src
+cat > base/mcpp.toml <<'EOF'
+[package]
+name = "base"
+version = "0.1.0"
+
+[targets.base]
+kind = "shared"
+EOF
+printf 'export module basis;\nexport int base_v() { return 6; }\n' > base/src/base.cppm
 cat > shlib/mcpp.toml <<'EOF'
 [package]
 name = "shlib"
 version = "0.1.0"
 
+[dependencies]
+base = { path = "../base" }
+
 [targets.shlib]
 kind = "shared"
 EOF
-printf 'export module shlib;\nexport int shared_v() { return 7; }\n' > shlib/src/shlib.cppm
+printf 'export module shlib;\nimport basis;\nexport int shared_v() { return base_v() + 1; }\n' > shlib/src/shlib.cppm
 for p in p1 p2; do
     cat > $p/mcpp.toml <<EOF
 [package]
@@ -70,5 +85,11 @@ if [ "$ia" != "$ib" ]; then
     cmp -s "$a" "$b" || fail "L2: the two placements differ"
     echo "note: the placements are copies on this file system"
 fi
+
+# L3
+for p in p1 p2; do
+    [ -n "$(find "$dir/$p" -maxdepth 1 -name 'libbase.so*' | head -1)" ] \
+        || fail "L3: libbase, which libshlib needs, is not placed in bin/$p/" b.log
+done
 
 echo "PASS: 835_a_shared_library_is_placed_by_a_link"

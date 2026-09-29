@@ -594,7 +594,8 @@ std::vector<std::string> feature_closure(const mcpp::manifest::Manifest& pm,
 bool is_std_module(std::string_view name);
 bool graph_or_targets_import_std(const mcpp::modgraph::Graph& graph,
                                  const mcpp::manifest::Manifest& manifest,
-                                 const std::filesystem::path& projectRoot);
+                                 const std::filesystem::path& projectRoot,
+                                 const std::vector<mcpp::modgraph::PackageRoot>& packages);
 
 // toolchain_env.cpp: target rows, sysroots, the MSVC binding, build-program environments
 const mcpp::manifest::TargetEntry*

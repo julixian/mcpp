@@ -97,7 +97,10 @@ std::vector<std::string_view> split_env_list(std::string_view value);
 
 struct ScanResult {
     // Quoted `#include`s and the data files named by resource statements,
-    // resolved against the .rc's directory. Angled includes are deliberately
+    // resolved as the resource compiler resolves them: against the .rc's
+    // directory, then the include directories it is given. A name found in
+    // none of them is recorded against the .rc's directory, where a file a
+    // build action produces is ordered before the compile. Angled includes are deliberately
     // absent: `<windows.h>` belongs to the toolchain, which is immutable for
     // the life of a build directory and already folded into the fingerprint.
     std::vector<std::filesystem::path> inputs;
@@ -117,7 +120,8 @@ struct ScanResult {
     bool                               declaresManifest = false;
 };
 
-ScanResult scan_rc(const std::filesystem::path& rc);
+ScanResult scan_rc(const std::filesystem::path& rc,
+                   std::span<const std::filesystem::path> includeDirs = {});
 
 // ─── Synthesising the common case ─────────────────────────────────────────
 
@@ -335,7 +339,8 @@ compile_utf8_manifest(const mcpp::toolchain::Toolchain& tc,
     return out;
 }
 
-ScanResult scan_rc(const std::filesystem::path& rc) {
+ScanResult scan_rc(const std::filesystem::path& rc,
+                   std::span<const std::filesystem::path> includeDirs) {
     ScanResult out;
     std::ifstream is(rc, std::ios::binary);
     if (!is) return out;
@@ -361,6 +366,10 @@ ScanResult scan_rc(const std::filesystem::path& rc) {
     auto add_input = [&](std::string_view raw) {
         std::filesystem::path p{std::string(raw)};
         auto abs = p.is_absolute() ? p : dir / p;
+        std::error_code ec;
+        if (!p.is_absolute() && !std::filesystem::exists(abs, ec))
+            for (auto const& d : includeDirs)
+                if (std::filesystem::exists(d / p, ec)) { abs = d / p; break; }
         if (std::find(out.inputs.begin(), out.inputs.end(), abs) == out.inputs.end())
             out.inputs.push_back(std::move(abs));
     };
