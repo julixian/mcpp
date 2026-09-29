@@ -1528,6 +1528,12 @@ static std::expected<void, std::string> step13_windows_resources(PrepareState& s
                 const auto resRel = S.owner.empty() ? std::filesystem::path("res")
                                                     : std::filesystem::path("res") / S.owner;
                 const auto resDir = ctx.plan.outputDir / resRel;
+                // Where the resource compiler looks for a script's includes and
+                // files: the package's directory, then its include_dirs. The
+                // scan resolves them the same way.
+                std::vector<std::filesystem::path> rcIncludes{S.dir};
+                for (auto const& d : M.buildConfig.includeDirs)
+                    rcIncludes.push_back(d.is_absolute() ? d : (S.dir / d));
                 std::error_code mkEc;
                 std::filesystem::create_directories(resDir, mkEc);
 
@@ -1591,9 +1597,7 @@ static std::expected<void, std::string> step13_windows_resources(PrepareState& s
                     mcpp::build::ResourceUnit ru;
                     ru.source = src;
                     ru.output = resRel / (std::string(stem) + std::string(outExt));
-                    ru.includeDirs.push_back(S.dir);
-                    for (auto const& d : M.buildConfig.includeDirs)
-                        ru.includeDirs.push_back(d.is_absolute() ? d : (S.dir / d));
+                    ru.includeDirs = rcIncludes;
                     ru.implicitInputs = std::move(inputs);
                     ctx.plan.resourceUnits.push_back(std::move(ru));
                     const auto& out = ctx.plan.resourceUnits.back().output;
@@ -1607,9 +1611,6 @@ static std::expected<void, std::string> step13_windows_resources(PrepareState& s
 
                 // Author-written scripts: compiled once, linked into every image.
                 for (auto const& rcSrc : scriptFiles) {
-                    std::vector<std::filesystem::path> rcIncludes;
-                    for (auto const& d : M.buildConfig.includeDirs)
-                        rcIncludes.push_back(d.is_absolute() ? d : (S.dir / d));
                     auto scan = rsrc::scan_rc(rcSrc, rcIncludes);
                     if (scan.versionInfoNamedByString) {
                         // The mcpp#365 silent failure, caught on the way in. A

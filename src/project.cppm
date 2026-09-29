@@ -702,10 +702,10 @@ load_member_manifest(const mcpp::manifest::Manifest& workspace,
 // The values of a member's manifest that are one value per plan: the
 // toolchain request and the target rows, the C++ standard, the graph-wide
 // `[build]` keys (among them `linkage`, which chooses the C runtime every
-// object is compiled against), the profiles and the indices. Members whose keys are equal
-// are planned together; the key is a canonical string of those values and
-// nothing else, so a member's own flags, sources and dependencies never
-// separate it from another member.
+// object is compiled against), the profiles and the indices. Members whose
+// keys are equal are planned together; the key is a canonical string of those
+// values and nothing else, so a member's own flags, sources and dependencies
+// never separate it from another member.
 export std::string root_position_key(const mcpp::manifest::Manifest& m) {
     std::string s;
     auto field = [&](std::string_view name, std::string_view value) {
