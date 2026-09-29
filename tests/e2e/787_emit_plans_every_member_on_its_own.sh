@@ -16,7 +16,8 @@
 # narrower case (E3, #699 item 2 -- see e2e 789), where the member is still
 # described. Criteria:
 #   A. `emit --workspace --format json` over `good` and `bad`: exit 1, `data`
-#      present, its one set is `good/good`, `diagnostics` holds exactly one
+#      present, its one set is `good` (one configuration: no prefix, SPEC-005
+#      v1.6 R3.3), `diagnostics` holds exactly one
 #      `error` with `path` "bad/mcpp.toml" and a message naming `bad`, and
 #      `watch` lists `bad/mcpp.toml` alongside `good`'s own inputs.
 #   B. Without `--format`, the same run prints the document (not empty) and
@@ -66,7 +67,7 @@ import json, sys
 e = json.load(open(sys.argv[1]))
 d = e["data"]
 sets = [s["name"] for s in d["database"]["sets"]]
-assert sets == ["good/good"], sets
+assert sets == ["good"], sets
 diags = e["diagnostics"]
 assert len(diags) == 1, diags
 diag = diags[0]
@@ -86,7 +87,7 @@ rc=$?
 set -e
 [ "$rc" = 1 ] || fail "B: bare invocation exit status $rc, expected 1" b.out b.err
 [ -s b.out ] || fail "B: the bare document is empty" b.err
-"$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["sets"][0]["name"]=="good/good", d["sets"]' b.out \
+"$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["sets"][0]["name"]=="good", d["sets"]' b.out \
     || fail "B: the bare document's set" b.out
 grep -q "bad" b.err || fail "B: the failed member's reason is not on stderr" b.err
 echo "ok: B, the exit code is 1 without --format too, and the document still prints"

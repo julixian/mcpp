@@ -119,7 +119,7 @@ grep -F -- "-Wl,-rpath,$RTDIR" "$G" >/dev/null \
 touch src/main.cpp   # past the whole-project no-op fast path, without
                       # touching build.mcpp itself
 "$MCPP" build > b2.log 2>&1 || fail "second build failed" b2.log
-grep -q "up to date (cached)" b2.log \
+grep -qE "up to date .*\(cached\)" b2.log \
   || fail "the second build re-ran build.mcpp; the replay path was not exercised" b2.log
 G2=$(find_graph)
 [ -n "$G2" ] || fail "no build.ninja after the second build" b2.log
