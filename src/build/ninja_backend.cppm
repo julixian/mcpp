@@ -2842,10 +2842,16 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
         // action populated after the first plan), relinked a program whose
         // link inputs had not changed. Empty on RPATH platforms (no *.dll
         // deps), so other targets are unaffected.
+        //
+        // A workspace plan places no deploy set of its own (its root has no
+        // program; see `placedFiles`), so a unit outside the link groups, a
+        // program shipped through `artifacts`, waits for none: it is placed in
+        // the members' product directories with their deploy sets.
         std::string orderOnly;
         if (lu.kind == LinkUnit::Binary || lu.kind == LinkUnit::TestBinary) {
-            for (auto const& d : uflags.runtimeDeploy)
-                orderOnly += " " + escape_ninja_path(d.dest);
+            if (lu.linkGroup >= 0 || !plan.manifest.package.virtualRoot)
+                for (auto const& d : uflags.runtimeDeploy)
+                    orderOnly += " " + escape_ninja_path(d.dest);
             if (lu.linkGroup >= 0)
                 for (auto const& pl : plan.linkGroups[static_cast<std::size_t>(lu.linkGroup)].placements)
                     orderOnly += " " + escape_ninja_path(pl.dest);
