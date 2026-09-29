@@ -559,6 +559,7 @@ read from the member, or made a value of the plan:
 | unknown `mcpp:` capability, cfg() and schema warnings | not reported for a member | refused and reported for each selected member | e2e 836 M2, M3 |
 | the shared libraries of a member's closure | only those the member's units link were placed | every graph-built shared library of the closure, with its aliases, as §15 states | e2e 835 L3 |
 | the runtime files of a program shipped through `artifacts` (2026.9.29.3) | its link waited for the plan's deploy set, which a workspace plan does not place; its own runtime files were not in the member's directory | the link waits for no plan-level file; a member's runtime set includes the closures its `artifacts` edges reach | e2e 833 G9 |
+| the link line of a program shipped through `artifacts` (2026.9.29.4) | the plan's line, which pools the dependencies' flags and not a member's, so a library its package's build program states was missing | a link group of its own closure that places nothing (`LinkGroup::linkOnly`) | e2e 838 |
 
 Each criterion fails on 2026.9.29.1 and passes on 2026.9.29.2. The resource
 case also showed a defect of every build: a quoted `#include` in a script was

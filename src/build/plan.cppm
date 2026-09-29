@@ -533,6 +533,11 @@ struct BuildPlan {
         // The graph-built shared libraries the member's units load, placed
         // beside them (a hard link where the file system allows, §5.3).
         std::vector<Placement>           placements;
+        // The group of a program shipped through `artifacts`: it holds the
+        // link line and the runtime contract of the program's own closure,
+        // and places nothing, since the members that ship the program place
+        // it and its runtime files. `member` is empty.
+        bool                             linkOnly = false;
     };
     std::vector<LinkGroup>             linkGroups;
 };
@@ -2725,9 +2730,9 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                     r.target.name, owner, lu.output.generic_string(), other.targetName));
 
         std::set<std::string> closure{owner};
+        std::set<std::size_t> seen{r.packageIndex};
         {
             std::vector<std::size_t> work{r.packageIndex};
-            std::set<std::size_t> seen{r.packageIndex};
             while (!work.empty()) {
                 const auto i = work.back(); work.pop_back();
                 if (auto it = directPackageDeps.find(i); it != directPackageDeps.end())
@@ -2795,6 +2800,23 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             lu.objects.push_back(cu.object);
         }
         append_shared_deps_for_linked_objects(lu);
+        // In a workspace plan the plan's own line pools the dependencies'
+        // flags and not a member's, so the program links with its closure's
+        // line, as a member's program does, in a group that places nothing.
+        if (manifest.package.virtualRoot) {
+            BuildPlan::LinkGroup group;
+            group.linkOnly   = true;
+            group.productDir = lu.output.parent_path();
+            group.ldflags    = packages[0].linkUsage.ldflags;
+            for (auto i : seen)
+                for (auto const& f : packages[i].linkUsage.ldflags)
+                    group.ldflags.push_back(f);
+            std::vector<mcpp::modgraph::PackageRoot> closurePackages;
+            for (auto i : seen) closurePackages.push_back(packages[i]);
+            derive_runtime(closurePackages, group.productDir, group);
+            lu.linkGroup = static_cast<int>(plan.linkGroups.size());
+            plan.linkGroups.push_back(std::move(group));
+        }
         plan.linkUnits.push_back(std::move(lu));
     }
 
@@ -3082,7 +3104,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     // its path as a file (a program of the workspace's own package named as a
     // member, say).
     for (auto const& g : plan.linkGroups) {
-        if (g.productDir == std::filesystem::path("bin")) continue;
+        if (g.linkOnly || g.productDir == std::filesystem::path("bin")) continue;
         for (auto const& u : plan.linkUnits) {
             bool clash = u.output == g.productDir;
             for (auto const& a : u.runtimeAliases) clash = clash || a == g.productDir;

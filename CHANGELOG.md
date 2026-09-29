@@ -4,6 +4,23 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.9.29.4] - 2026-09-29
+
+This release links a program that a workspace member ships through
+`artifacts` with the link line of its own package's closure. The validation
+project's post-release build of 2026.9.29.3 found it.
+
+### Fixed
+
+- **A program shipped through `artifacts` links with its own closure's line in
+  a workspace plan.** It was linked with the plan's line, which pools the
+  dependencies' link flags and not a member's; a library that the program's
+  package states through its build program (`mcpp::link_lib`) was therefore
+  missing, and the link failed with undefined references (e2e 838). The
+  program now has a link group of its own that holds its closure's line and
+  runtime contract and places nothing, since the members that ship the program
+  place it.
+
 ## [2026.9.29.3] - 2026-09-29
 
 This release completes the runtime placement of a program that a workspace

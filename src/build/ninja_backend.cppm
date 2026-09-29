@@ -1224,6 +1224,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     std::vector<BuildPlan::DeployFile> placedFiles;
     if (!plan.manifest.package.virtualRoot) placedFiles = deployFiles;
     for (std::size_t g = 0; g < groupFlags.size(); ++g) {
+        if (plan.linkGroups[g].linkOnly) continue;
         for (auto const& d : groupFlags[g].runtimeDeploy) placedFiles.push_back(d);
         for (auto const& pl : plan.linkGroups[g].placements)
             placedFiles.push_back({{pl.source}, pl.dest});
@@ -2844,12 +2845,16 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
         // deps), so other targets are unaffected.
         //
         // A workspace plan places no deploy set of its own (its root has no
-        // program; see `placedFiles`), so a unit outside the link groups, a
-        // program shipped through `artifacts`, waits for none: it is placed in
-        // the members' product directories with their deploy sets.
+        // program; see `placedFiles`), and the group of a program shipped
+        // through `artifacts` places none either, so such a program waits for
+        // none: it is placed in the members' product directories with their
+        // deploy sets.
         std::string orderOnly;
         if (lu.kind == LinkUnit::Binary || lu.kind == LinkUnit::TestBinary) {
-            if (lu.linkGroup >= 0 || !plan.manifest.package.virtualRoot)
+            const bool placesDeploy = lu.linkGroup >= 0
+                ? !plan.linkGroups[static_cast<std::size_t>(lu.linkGroup)].linkOnly
+                : !plan.manifest.package.virtualRoot;
+            if (placesDeploy)
                 for (auto const& d : uflags.runtimeDeploy)
                     orderOnly += " " + escape_ninja_path(d.dest);
             if (lu.linkGroup >= 0)
