@@ -4,6 +4,7 @@ export module mcpp.build.backend;
 
 import std;
 import mcpp.build.plan;
+import mcpp.build.progress;
 
 export namespace mcpp::build {
 
@@ -31,6 +32,12 @@ struct BuildOptions {
     // failure. POSIX only: the deadline runner has no kill-by-handle path on
     // Windows (see mcpp.platform.process), where the value is ignored.
     unsigned                    buildTimeoutSecs = 0;
+    // The report of this build directory (build progress design 2026-09-29).
+    // Set, ninja runs without `--quiet` and is read as it runs: the step
+    // record is written, the status lines and ninja's log feed the report,
+    // and a failed step's diagnostics are written when it fails. Null (under
+    // --quiet or machine output), ninja's output is examined after it exits.
+    mcpp::build::progress::Build* progress = nullptr;
 };
 
 struct BuildResult {
@@ -54,6 +61,10 @@ struct BuildError {
     // compile differently from a broken one, and matching on prose is how that
     // distinction silently rots.
     bool                                    timedOut = false;
+    // `message` and the failed steps' diagnostics were written as the steps
+    // failed; `diagnosticOutput` holds only what follows them (the advice
+    // that reads the whole output).
+    bool                                    reported = false;
 };
 
 struct Backend {

@@ -88,6 +88,11 @@ struct CompileUnit {
 
 struct LinkUnit {
     std::string                     targetName;
+    // The package the unit belongs to (qualified name): the root's, a
+    // member's, or the dependency's whose library or program it is. The build
+    // report attributes the link step to it (build progress design
+    // 2026-09-29, §6.3).
+    std::string                     package;
     enum Kind { Binary, StaticLibrary, SharedLibrary, TestBinary } kind = Binary;
     // Does this image belong to a DEPENDENCY rather than to the package being
     // built? A `kind = "shared"` dependency contributes a link unit to the
@@ -169,6 +174,8 @@ struct LinkUnit {
 // string in the link command, so a `.res` named there is invisible to ninja and
 // changing it produced "no work to do".
 struct ResourceUnit {
+    // The package whose `[resources]` declared the script (qualified name).
+    std::string                        package;
     std::filesystem::path              source;    // absolute; synthesised ones live under outputDir
     std::filesystem::path              output;    // relative to plan.outputDir
     // The `.rc`'s own inputs: quoted #includes and the data files named by its
@@ -286,8 +293,22 @@ std::optional<RecoveredInvocation> recover_invocation(
     const std::filesystem::path& defaultDirectory,
     bool windows);
 
+// How the build's report names a package of the plan (build progress design
+// 2026-09-29, §4.2, §6.3): the qualified name the plan's units carry, whether
+// the command asked for it (the root, or a selected member), the subject of
+// its line, and the units the global cache supplied.
+struct PlanPackage {
+    std::string name;
+    bool        requested   = false;
+    std::string subject;
+    std::size_t cachedUnits = 0;
+};
+
 struct BuildPlan {
     mcpp::manifest::Manifest        manifest;
+    // Every package of the graph, as the report names it; the backend writes
+    // the step record from it and from the statements it emits.
+    std::vector<PlanPackage>        packages;
     // Packages whose declared `[build] c_standard` the compiler does not apply,
     // spelt `<package> (<standard>)`, in the order their first C unit appears.
     // Filled only for cl.exe (W3b of the #693-#696 record) and reported once by
@@ -2384,6 +2405,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     for (auto const& dep : sharedDepTargets) {
         LinkUnit lu;
         lu.targetName = dep.target.name;
+        lu.package    = dep.packageName;
         lu.kind       = LinkUnit::SharedLibrary;
         lu.dependencyOwned = true;
         lu.output     = dep.output;
@@ -2510,6 +2532,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         if (inTestMode && t.kind != mcpp::manifest::Target::TestBinary) continue;
         LinkUnit lu;
         lu.targetName = t.name;
+        lu.package    = qualified_package_name(manifest);
         if (t.kind == mcpp::manifest::Target::Library) {
             lu.kind   = LinkUnit::StaticLibrary;
             lu.output = target_output(t, naming);
@@ -2714,6 +2737,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         const auto owner = qualified_package_name(pkg.manifest);
         LinkUnit lu;
         lu.targetName      = r.target.name;
+        lu.package         = owner;
         lu.kind            = LinkUnit::Binary;
         lu.dependencyOwned = true;
         lu.artifactOf      = owner;
@@ -2931,6 +2955,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
             LinkUnit lu;
             lu.targetName = t.name;
+            lu.package    = owner;
             lu.memberOf   = owner;
             lu.linkGroup  = groupIndex;
             if (t.kind == mcpp::manifest::Target::Library) {

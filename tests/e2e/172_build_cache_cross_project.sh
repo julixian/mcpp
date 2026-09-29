@@ -123,7 +123,7 @@ grep -q 'shared-lib' list1.log || {
 # ── project two: DIFFERENT name and version, same dependency ─────────────────
 make_project projtwo projtwo 9.9.9
 cd "$TMP/projtwo"
-"$MCPP" build > build.log 2>&1 || { cat build.log; exit 1; }
+"$MCPP" build -v > build.log 2>&1 || { cat build.log; exit 1; }
 
 N2="$(find_ninja "$TMP/projtwo")"
 [[ -n "$N2" ]] || { echo "FAIL: projtwo has no build.ninja"; exit 1; }
@@ -146,8 +146,8 @@ staged="$(dep_stage_edges "$N2")"
 # The status line must agree, and must carry the unit count. The bare word
 # "Cached" was printed for months while every unit was recompiled behind it; a
 # number that has to match the skipped edges cannot go quietly wrong that way.
-grep -qE 'Cached local-dev\.shared-lib v1\.0\.0 \([0-9]+ unit' build.log || {
-    echo "FAIL: no 'Cached ... (N units)' line for the reused dependency"
+grep -qE 'Compiling local-dev\.shared-lib v1\.0\.0 +cached [0-9]+ unit' build.log || {
+    echo "FAIL: no 'cached N units' line for the reused dependency"
     cat build.log
     exit 1
 }

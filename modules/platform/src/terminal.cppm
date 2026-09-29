@@ -1,25 +1,31 @@
-// mcpp.platform.terminal — terminal capability detection.
+// mcpp.platform.terminal — terminal capability detection and output.
 //
 // Provides:
-//   is_tty()         — whether stdout is a terminal
-//   terminal_cols()  — terminal width in columns
+//   is_tty()          — whether stdout is a terminal
+//   is_terminal(s)    — whether a standard stream is a terminal
+//   can_move_cursor(s)— whether a live display may be drawn on it
+//   cols(), rows()    — the terminal's size
+//   write(s, text)    — UTF-8 text to a standard stream
 
 module;
 #include <cstdio>
 #include <cstdlib>
-#ifdef __unix__
+#if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
 #include <sys/ioctl.h>
 #endif
 #if defined(_WIN32)
-#include <io.h>        // _dup, _dup2, _close, _get_osfhandle
+#include <io.h>        // _dup, _dup2, _close, _get_osfhandle, _fileno
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>   // SetHandleInformation, HANDLE_FLAG_INHERIT
+#include <windows.h>   // SetHandleInformation, GetConsoleMode, WriteConsoleW
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING   // older SDK and MinGW headers
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 #else
 #include <unistd.h>    // dup2, close
 #include <fcntl.h>     // fcntl, F_DUPFD_CLOEXEC
@@ -31,12 +37,38 @@ import std;
 
 export namespace mcpp::platform::terminal {
 
+// The two standard streams a human reads.
+enum class Stream { Out, Err };
+
 // Returns true if stdout is connected to a terminal (TTY).
 bool is_tty();
 
-// Returns the terminal width in columns. Tries TIOCGWINSZ on Unix,
-// falls back to $COLUMNS, then defaults to 80.
+// Whether the stream is a terminal: `isatty` on POSIX, macOS included, and a
+// console on Windows. Until 2026.9.29.5 this was compiled only under
+// `__unix__`, which Apple's compilers do not define, so macOS and Windows were
+// never terminals and drew neither colour nor a live line. A Windows program
+// under mintty writes to a pipe, not a console, and is not a terminal here.
+bool is_terminal(Stream s);
+
+// Whether a display that moves the cursor may be drawn on the stream: a
+// terminal, not `TERM=dumb`, and on Windows a console that accepted virtual
+// terminal processing. The first call on Windows enables that processing, so
+// that the escape sequences mcpp writes are interpreted rather than printed.
+bool can_move_cursor(Stream s);
+
+// Returns the terminal width in columns. Tries the terminal first (TIOCGWINSZ,
+// or the console's window on Windows), falls back to $COLUMNS, then to 80.
 std::size_t cols();
+
+// The terminal's height in rows, by the same order, with $LINES and 24.
+std::size_t rows();
+
+// Writes UTF-8 text to the stream. A Windows console receives it as UTF-16
+// through WriteConsoleW, so that text outside ASCII (`·`, `→`, a path in
+// Chinese) appears as written whatever the console's code page is; the stdio
+// buffer is flushed first, so the two paths keep their order. Everything else
+// receives the bytes through stdio, unflushed.
+void write(Stream s, std::string_view text);
 
 // EVERYTHING WRITTEN TO STANDARD OUTPUT GOES TO STANDARD ERROR UNTIL THIS IS
 // DESTROYED.
@@ -70,24 +102,109 @@ private:
 
 namespace mcpp::platform::terminal {
 
-bool is_tty() {
-#ifdef __unix__
-    return ::isatty(::fileno(stdout)) != 0;
+namespace {
+
+std::FILE* file_of(Stream s) { return s == Stream::Out ? stdout : stderr; }
+
+#if defined(_WIN32)
+HANDLE handle_of(Stream s) {
+    const auto h = reinterpret_cast<HANDLE>(::_get_osfhandle(::_fileno(file_of(s))));
+    return h == nullptr ? INVALID_HANDLE_VALUE : h;
+}
+
+bool console_of(Stream s, HANDLE* out = nullptr) {
+    const auto h = handle_of(s);
+    DWORD mode = 0;
+    if (h == INVALID_HANDLE_VALUE || !::GetConsoleMode(h, &mode)) return false;
+    if (out) *out = h;
+    return true;
+}
+#endif
+
+} // namespace
+
+bool is_terminal(Stream s) {
+#if defined(_WIN32)
+    return console_of(s);
+#elif defined(__unix__) || defined(__APPLE__)
+    return ::isatty(::fileno(file_of(s))) != 0;
 #else
+    (void)s;
     return false;
 #endif
 }
 
+bool is_tty() { return is_terminal(Stream::Out); }
+
+bool can_move_cursor(Stream s) {
+    if (!is_terminal(s)) return false;
+    if (const char* term = std::getenv("TERM"); term && std::string_view(term) == "dumb")
+        return false;
+#if defined(_WIN32)
+    HANDLE h;
+    if (!console_of(s, &h)) return false;
+    DWORD mode = 0;
+    if (!::GetConsoleMode(h, &mode)) return false;
+    if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) return true;
+    return ::SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+#else
+    return true;
+#endif
+}
+
+namespace {
+std::size_t from_env(const char* name, std::size_t fallback) {
+    if (auto* e = std::getenv(name); e && *e) {
+        try { auto n = std::stoul(e); if (n > 0) return n; } catch (...) {}
+    }
+    return fallback;
+}
+} // namespace
+
 std::size_t cols() {
-#ifdef __unix__
+#if defined(_WIN32)
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (HANDLE h; console_of(Stream::Out, &h) && ::GetConsoleScreenBufferInfo(h, &info))
+        return static_cast<std::size_t>(info.srWindow.Right - info.srWindow.Left + 1);
+#elif defined(__unix__) || defined(__APPLE__)
     struct winsize w{};
     if (::ioctl(::fileno(stdout), TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
         return w.ws_col;
 #endif
-    if (auto* e = std::getenv("COLUMNS"); e && *e) {
-        try { auto n = std::stoul(e); if (n > 0) return n; } catch (...) {}
+    return from_env("COLUMNS", 80);
+}
+
+std::size_t rows() {
+#if defined(_WIN32)
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (HANDLE h; console_of(Stream::Out, &h) && ::GetConsoleScreenBufferInfo(h, &info))
+        return static_cast<std::size_t>(info.srWindow.Bottom - info.srWindow.Top + 1);
+#elif defined(__unix__) || defined(__APPLE__)
+    struct winsize w{};
+    if (::ioctl(::fileno(stdout), TIOCGWINSZ, &w) == 0 && w.ws_row > 0)
+        return w.ws_row;
+#endif
+    return from_env("LINES", 24);
+}
+
+void write(Stream s, std::string_view text) {
+    if (text.empty()) return;
+#if defined(_WIN32)
+    if (HANDLE h; console_of(s, &h)) {
+        std::fflush(file_of(s));
+        const int n = ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                            static_cast<int>(text.size()), nullptr, 0);
+        if (n > 0) {
+            std::wstring wide(static_cast<std::size_t>(n), L'\0');
+            ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                  wide.data(), n);
+            DWORD written = 0;
+            if (::WriteConsoleW(h, wide.data(), static_cast<DWORD>(wide.size()), &written, nullptr))
+                return;
+        }
     }
-    return 80;
+#endif
+    std::fwrite(text.data(), 1, text.size(), file_of(s));
 }
 
 StdoutToStderr::StdoutToStderr() {

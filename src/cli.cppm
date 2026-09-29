@@ -35,6 +35,7 @@ import mcpp.platform;                // is_windows — the PATH separator of `__
 import mcpp.platform.env;            // --offline → MCPP_OFFLINE
 import mcpp.platform.process;        // __action-stamp runs the checked command
 import mcpp.platform.fs;             // __action-stamp writes its stamps
+import mcpp.build.progress;          // __action reports its start
 import mcpp.platform.runtime_search; // linker-wrapper path-injection opt-out
 import mcpp.ui;
 import mcpp.log;
@@ -1167,6 +1168,23 @@ int run(int argc, char** argv) {
             if (declared != env.end()) declared->second = std::move(joined);
             else env.emplace_back("PATH", std::move(joined));
         }
+        // The build's report learns that this action started (build progress
+        // design 2026-09-29, §6.4), by its first stamp as build.ninja spells
+        // it: the step's first output. Nothing is written when the build that
+        // runs it reads no progress.
+        if (!stamps.empty()) mcpp::build::progress::record_action_start(stamps.front());
+        // The command's own ninja, if it runs one (a CMake or vcpkg build),
+        // prints ninja's usual status and reports into no file of this
+        // build. An action that declares either variable keeps its value.
+        auto declares = [&](std::string_view name) {
+            return std::ranges::any_of(env, [&](auto const& kv) { return kv.first == name; });
+        };
+        if (const char* ns = std::getenv("NINJA_STATUS");
+            ns && std::string_view(ns).find("@@mcpp") != std::string_view::npos
+            && !declares("NINJA_STATUS"))
+            env.emplace_back("NINJA_STATUS", "[%f/%t] ");
+        if (!declares(mcpp::build::progress::kStartsEnv))
+            env.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
         // Stamps and the required directory are named relative to the build
         // directory, where ninja started this process. Anchored before the
         // command's own directory is entered, so `cwd` moves the command and

@@ -65,7 +65,7 @@ grep -qi "build.mcpp.*cached" b2.log || { cat b2.log; echo "FAIL: build.mcpp did
 # ── Build 3: a declared env input changed — forces a re-run ────────────────
 touch src/main.cpp
 MCPP_TEST_TOGGLE=1 "$MCPP" build > b3.log 2>&1 || { cat b3.log; echo "FAIL: build 3 errored"; exit 1; }
-grep -qi "build.mcpp.*\(running\|compiling\)" b3.log || { cat b3.log; echo "FAIL: changed env did not force build.mcpp re-run"; exit 1; }
+grep -qE "^ *build\.mcpp .* ran [0-9]" b3.log || { cat b3.log; echo "FAIL: changed env did not force build.mcpp re-run"; exit 1; }
 
 # ── CWD independence: build.mcpp must run with cwd = project root, so its
 #    relative file writes (the generated source) land in the project even when

@@ -5,7 +5,7 @@
 # Every member of the workspace below has a build program; cli and gui depend
 # on core.
 #
-#   B1  the status lines name the package a program belongs to;
+#   B1  each program's line names its package and states that it ran;
 #   B2  a member's program runs after the programs of the members it depends
 #       on (2026.9.29.4 ran them in discovery order: cli before core);
 #   B3  after `--workspace`, a selection of one member, a second
@@ -15,8 +15,8 @@
 #       followed the selection);
 #   B4  `mcpp emit build-database` after the build reuses them too;
 #   B5  in a `--workspace` build a member another member depends on is
-#       announced by its directory, and as a path dependency only where it
-#       is not selected.
+#       named by its directory, and as a path dependency only where it is not
+#       selected (`-v` lists the dependencies the default output folds).
 set -e
 
 TMP=$(mktemp -d)
@@ -62,27 +62,27 @@ done
 
 # B1
 for p in core cli gui; do
-    grep -q "build.mcpp running $p" b1.log || fail "B1: no status line names $p" b1.log
+    grep -qE "^ *build\.mcpp $p .* ran [0-9]" b1.log || fail "B1: no line states that $p's program ran" b1.log
 done
 
 # B2
-first=$(grep -m1 -n "build.mcpp running" b1.log)
-case "$first" in *"running core"*) ;; *) fail "B2: core's program did not run first" b1.log ;; esac
+first=$(grep -m1 -E "^ *build\.mcpp .* ran [0-9]" b1.log)
+case "$first" in *"build.mcpp core "*) ;; *) fail "B2: core's program did not run first" b1.log ;; esac
 
 # B3
-"$MCPP" build -p cli > b2.log 2>&1 || fail "-p cli failed" b2.log
+"$MCPP" build -p cli -v > b2.log 2>&1 || fail "-p cli failed" b2.log
 touch core/src/core.cppm
 "$MCPP" build --workspace > b3.log 2>&1 || fail "the second --workspace failed" b3.log
 touch core/src/core.cppm
 "$MCPP" build -p gui > b4.log 2>&1 || fail "-p gui failed" b4.log
 for f in b2.log b3.log b4.log; do
-    ! grep -q "build.mcpp running" $f || fail "B3: a program reran in $f" $f
-    grep -q "up to date" $f || fail "B3: $f shows no program at all" $f
+    ! grep -qE "^ *build\.mcpp .* ran [0-9]" $f || fail "B3: a program reran in $f" $f
+    grep -qE "^ *build\.mcpp .* cached" $f || fail "B3: $f shows no program at all" $f
 done
 
 # B4
 "$MCPP" emit build-database --format json -o db.json > e.log 2>&1 || fail "emit failed" e.log
-! grep -q "build.mcpp running" e.log || fail "B4: emit reran a program" e.log
+! grep -qE "^ *build\.mcpp .* ran [0-9]" e.log || fail "B4: emit reran a program" e.log
 
 # B5
 grep -q "Compiling core (core)" b1.log || fail "B5: core is not announced by its directory" b1.log

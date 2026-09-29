@@ -21,6 +21,7 @@ import mcpp.build.schedule.detach_codegen;
 import mcpp.build.test_targets;
 import mcpp.build.build_database;
 import mcpp.build.build_program;
+import mcpp.build.progress;         // the report every building command opens
 import mcpp.build.refusal;          // offline-download-required (#648 A1)
 import mcpp.diag;                   // a member's own diagnostics, in the envelope (WS3)
 import mcpp.dyndep;
@@ -187,8 +188,20 @@ int run_build_with_hooks(mcpp::build::BuildContext& ctx, bool verbose,
         if (!spans.back()->ok()) return 1;
     }
 
+    // A hook command writes to the terminal itself, so the build's live
+    // region is erased while one runs (build progress design 2026-09-29,
+    // §5.3); a `during_build` command that writes while the build runs keeps
+    // it erased for the whole build.
+    std::optional<mcpp::ui::SuspendRegion> sharedTerminal;
+    if (std::ranges::any_of(spans, [](auto const& s) { return s->writes_to_terminal(); }))
+        sharedTerminal.emplace();
+    auto invoke = [](auto const& hooks, mcpp::hooks::Event event, auto const& root) {
+        mcpp::ui::SuspendRegion hookOwnsTheTerminal;
+        return mcpp::hooks::invoke(hooks, event, root);
+    };
+
     for (auto const& sub : subjects)
-        if (!mcpp::hooks::invoke(*sub.hooks, mcpp::hooks::Event::BuildStart, sub.root))
+        if (!invoke(*sub.hooks, mcpp::hooks::Event::BuildStart, sub.root))
             return 1;
 
     int rc = mcpp::build::run_build_plan(ctx, verbose, no_cache, targetOverride);
@@ -205,8 +218,9 @@ int run_build_with_hooks(mcpp::build::BuildContext& ctx, bool verbose,
     // "the notifier failed" for a compile error would answer a question nobody
     // asked. A hook failure only decides the exit code of a build that worked.
     bool hookOk = true;
+    sharedTerminal.reset();
     for (auto const& sub : subjects)
-        hookOk = mcpp::hooks::invoke(*sub.hooks, terminalEvent, sub.root) && hookOk;
+        hookOk = invoke(*sub.hooks, terminalEvent, sub.root) && hookOk;
     return rc != 0 ? rc : ((spanOk && hookOk) ? 0 : 1);
 }
 
@@ -248,6 +262,9 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
     bool print_fp = parsed.is_flag_set("print-fingerprint");
     bool no_cache = parsed.is_flag_set("no-cache");
     bool configure_only = parsed.is_flag_set("configure-only");
+    // The build's report: its steps, its status line, `Finished` (build
+    // progress design 2026-09-29).
+    mcpp::build::progress::open(verbose);
 
     mcpp::build::BuildOverrides ov = overrides_from_selectors(parsed);
     // --cache global|local|off. --no-cache is the deprecated alias for off; the
@@ -265,8 +282,8 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
                                 std::string_view label,
                                 std::vector<std::filesystem::path>* configured = nullptr) -> int {
         auto where = [&](std::string_view msg) {
-            if (label.empty()) std::println(stderr, "error: {}", msg);
-            else               std::println(stderr, "error: {}: {}", label, msg);
+            if (label.empty()) mcpp::ui::error(std::format("{}", msg));
+            else               mcpp::ui::error(std::format("{}: {}", label, msg));
         };
         auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
         if (!root) {
@@ -305,7 +322,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
     // each), and a failed group does not stop the others; the first non-zero
     // exit wins.
     auto selection = workspace_selection(parsed.is_flag_set("workspace"), ov.package_filter);
-    if (!selection) { std::println(stderr, "error: {}", selection.error()); return 2; }
+    if (!selection) { mcpp::ui::error(std::format("{}", selection.error())); return 2; }
     if (*selection) {
         auto const& members = (*selection)->members;
         if (configure_only && members.size() == 1) {
@@ -314,7 +331,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
             return configure_member(std::move(mo), "");
         }
         auto groups = workspace_groups((*selection)->root, members);
-        if (!groups) { std::println(stderr, "error: {}", groups.error()); return 2; }
+        if (!groups) { mcpp::ui::error(std::format("{}", groups.error())); return 2; }
         std::vector<std::string> request;
         for (auto const& g : *groups)
             for (auto const& mp : g) request.push_back(mp);
@@ -337,7 +354,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
                 };
                 auto tests = group_tests((*selection)->root, g);
                 if (!tests && g.size() > 1) { configure_one_by_one(); continue; }
-                if (!tests) { std::println(stderr, "error: {}", tests.error()); rc = 2; continue; }
+                if (!tests) { mcpp::ui::error(std::format("{}", tests.error())); rc = 2; continue; }
                 mcpp::build::BuildOverrides mo = ov;
                 mo.package_filter.clear();
                 mo.project_root = (*selection)->root;
@@ -348,7 +365,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
                 auto ctx = mcpp::build::prepare_build(print_fp, includeDevDeps,
                                                       /*extraTargets=*/{}, mo);
                 if (!ctx && g.size() > 1) { configure_one_by_one(); continue; }
-                if (!ctx) { std::println(stderr, "error: {}: {}", g.front(), ctx.error()); rc = 2; continue; }
+                if (!ctx) { mcpp::ui::error(std::format("{}: {}", g.front(), ctx.error())); rc = 2; continue; }
                 ctx->plan.publishRootCompileDb = false;
                 if (int r = mcpp::build::run_configure_plan(*ctx, verbose); r != 0) rc = r;
                 configured.push_back(ctx->outputDir);
@@ -380,7 +397,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
             mo.workspace_request = request;
             auto ctx = mcpp::build::prepare_build(print_fp, /*includeDevDeps=*/false,
                                                   /*extraTargets=*/{}, mo);
-            if (!ctx) { std::println(stderr, "error: {}", ctx.error()); rc = 2; continue; }
+            if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); rc = 2; continue; }
             contexts.push_back(std::move(*ctx));
         }
         if (contexts.size() == 1) {
@@ -388,6 +405,10 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
                                                ov.target_triple);
             return r != 0 ? r : rc;
         }
+        // One report for every configuration: each package line names its
+        // configuration, and one `Finished` follows them all (design §9).
+        mcpp::build::progress::configurations(contexts.size());
+        mcpp::build::progress::defer_finished();
         const std::size_t hw = std::max(1u, std::thread::hardware_concurrency());
         std::set<std::filesystem::path> directories;
         for (auto const& c : contexts) directories.insert(c.outputDir.lexically_normal());
@@ -421,6 +442,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
         std::vector<std::filesystem::path> dirs;
         for (auto const& c : contexts) dirs.push_back(c.outputDir);
         mcpp::build::publish_workspace_compile_commands((*selection)->root, dirs);
+        if (rc == 0) mcpp::build::progress::finish_deferred();
         return rc;
     }
 
@@ -454,7 +476,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
 
     auto ctx = mcpp::build::prepare_build(print_fp, /*includeDevDeps=*/false,
                                           /*extraTargets=*/{}, ov);
-    if (!ctx) { std::println(stderr, "error: {}", ctx.error()); return 2; }
+    if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); return 2; }
 
     return run_build_with_hooks(*ctx, verbose, no_cache, ov.target_triple);
 }
@@ -901,6 +923,8 @@ export int cmd_run(const mcpplibs::cmdline::ParsedArgs& parsed,
     if (parsed.is_flag_set("list-runners"))
         return mcpp::build::list_runners(package_filter, cache_mode, no_cache,
                                          target_triple, features, profile, accel);
+    // Closed before the program starts: the program owns the terminal.
+    mcpp::build::progress::open(mcpp::log::is_verbose());
     return mcpp::build::build_run_target(targetName, passthrough, package_filter,
                                          cache_mode, no_cache, target_triple,
                                          no_runner, runner_name, features,

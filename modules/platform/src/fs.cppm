@@ -81,6 +81,12 @@ bool replace_file(const std::filesystem::path& source,
                   const std::filesystem::path& destination,
                   std::error_code& ec);
 
+// Appends `bytes` to the file, creating it, in one write that another process
+// appending to the same file cannot split: `O_APPEND` on POSIX, an open for
+// FILE_APPEND_DATA alone on Windows, where the C runtime's append mode seeks
+// and then writes, and two writers can overwrite each other.
+bool append_atomically(const std::filesystem::path& file, std::string_view bytes);
+
 // ── FileLock ──────────────────────────────────────────────────────────────
 //
 // RAII exclusive non-blocking file lock.
@@ -256,6 +262,26 @@ bool replace_file(const std::filesystem::path& source,
     // 临时文件与目标文件位于同一文件系统时，rename 提供原子替换。
     std::filesystem::rename(source, destination, ec);
     return !ec;
+#endif
+}
+
+bool append_atomically(const std::filesystem::path& file, std::string_view bytes) {
+#if defined(_WIN32)
+    HANDLE h = CreateFileW(file.wstring().c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool ok = WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()),
+                              &written, nullptr) && written == bytes.size();
+    CloseHandle(h);
+    return ok;
+#else
+    const int fd = ::open(file.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    const auto n = ::write(fd, bytes.data(), bytes.size());
+    ::close(fd);
+    return n == static_cast<decltype(n)>(bytes.size());
 #endif
 }
 

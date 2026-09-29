@@ -1518,9 +1518,13 @@ variable, emit `mcpp:rerun-if-changed=config.h` / `mcpp:rerun-if-env-changed=USE
 This replaces the old "process exited 0, so assume it's fine" guesswork with an
 explicit input/output contract — incremental builds stay correct.
 
-When nothing changed the output is `build.mcpp up to date <package> (cached)`;
-otherwise `build.mcpp compiling <package>` / `running <package>` (the package
-is named from 2026.9.29.5 on).
+Each program has one line, written when it finishes (2026.9.29.5+):
+`build.mcpp <package>  cached` when nothing changed, `build.mcpp <package>  ran
+<time>` when it was compiled or run (with `--verbose`, `compiled <time> · ran
+<time>`), and `failed` when it failed. On a terminal the line shows `waiting`,
+`compiling` or `running` with a clock while the program is pending or running.
+The programs of the packages the command was asked to build are listed; those of
+their dependencies are folded into one line, `build.mcpp N dependencies`.
 
 ## Host tools from a dependency (mcpp 2026.8.5.1+)
 

@@ -1887,6 +1887,7 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             bpEnv.packStageDir = state.overrides.pack_stage_dir;
             bpEnv.packStrip           = state.overrides.pack_strip;
             bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
+            bpEnv.requested       = pkg.selectedMember;
             bpEnv.languageModules = pkg.manifest.language.modules;
             bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;
             if (auto dit = state.deviceSourcesByPackage.find(pkg.root.string()); dit != state.deviceSourcesByPackage.end())

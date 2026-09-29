@@ -148,7 +148,7 @@ grep -qx "changed resource" "$DEPLOYED" \
 rm -rf "$BINDIR"
 touch src/main.cpp
 "$MCPP" build > b3.log 2>&1 || fail "third build failed" b3.log
-grep -qE "up to date .*\(cached\)" b3.log \
+grep -qE "^ *build\.mcpp .* cached" b3.log \
   || fail "the third build re-ran build.mcpp; the replay path was not exercised" b3.log
 [ -f "$DEPLOYED" ] \
   || fail "the deployed file was not restored on a build.mcpp cache hit" b3.log

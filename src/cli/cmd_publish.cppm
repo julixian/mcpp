@@ -11,6 +11,8 @@ import std;
 import mcpp.build.advice;
 import mcpplibs.cmdline;
 import mcpp.build.prepare;   // profile_override_from_flags
+import mcpp.build.progress;  // the build's report (build progress design 2026-09-29)
+import mcpp.log;
 import mcpp.libs.json;
 import mcpp.pack;
 import mcpp.pack.library_pipeline;
@@ -197,8 +199,12 @@ export int cmd_pack(const mcpplibs::cmdline::ParsedArgs& parsed) {
                                     messageFormat));
         return 2;
     }
-    if (messageFormat == "human")
+    if (messageFormat == "human") {
+        // The build is reported as `mcpp build` reports it; `Finished` closes
+        // the report before the pack's own lines.
+        mcpp::build::progress::open(mcpp::log::is_verbose());
         return cmd_pack_body(parsed, nullptr, nullptr, nullptr);
+    }
 
     mcpp::pack::PackOutcome outcome;
     mcpp::pack::LibraryPackReport library;

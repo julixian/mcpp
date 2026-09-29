@@ -89,7 +89,7 @@ out="$("$MCPP" run 2>&1 | grep '^ANSWER=' | tail -1)"
 sed -i 's/define_answer(int n)/define_answer(int n_)/; s/RULE_ANSWER=%d\\n", n)/RULE_ANSWER=%d\\n", n_ + 1)/' ../rules/src/rules.cppm
 touch src/main.cpp
 "$MCPP" build > b2.log 2>&1 || { cat b2.log; echo "FAIL: rebuild after editing the rule failed"; exit 1; }
-grep -q "build.mcpp running" b2.log || {
+grep -qE "^ *build\.mcpp .* ran [0-9]" b2.log || {
     cat b2.log; echo "FAIL: editing the rule module did not re-run build.mcpp"; exit 1; }
 out="$("$MCPP" run 2>&1 | grep '^ANSWER=' | tail -1)"
 [[ "$out" == "ANSWER=43" ]] || {

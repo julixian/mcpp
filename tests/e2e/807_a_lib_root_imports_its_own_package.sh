@@ -76,7 +76,7 @@ for form in explicit convention; do
         echo "FAIL: $form lib root: a lib root that imports its own package's unit did not build"
         exit 1
     }
-    grep -q "build.mcpp running" "$form/app/build.log" || {
+    grep -qE "^ *build\.mcpp .* ran [0-9]" "$form/app/build.log" || {
         cat "$form/app/build.log"
         echo "FAIL: $form lib root: the build program did not run"
         exit 1

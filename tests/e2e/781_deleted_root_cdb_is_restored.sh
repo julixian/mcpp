@@ -23,7 +23,13 @@ config_cdb=$(find target -name compile_commands.json | head -1)
 [[ -n "$config_cdb" ]] || { echo "FAIL: no configuration database under target/"; exit 1; }
 before=$(cat "$config_cdb")
 
+# Whether the last build planned: the full path writes build.ninja (or moves
+# its time when the text is unchanged), and the fast path replays it untouched.
+# A `Compiling` line no longer tells the two apart: it states that a package's
+# steps ran, on either path (build progress design 2026-09-29).
+planned_since() { find target -name build.ninja -newer "$1" 2>/dev/null | grep -q .; }
 rm compile_commands.json
+touch .before-build2; sleep 1
 
 "$MCPP" build > build2.log 2>&1 || {
     cat build2.log
@@ -39,11 +45,10 @@ rm compile_commands.json
 
 # "Without a plan": nothing in the tree changed since the first build, so a
 # real prepare pass has nothing to compile -- the restore must not trigger
-# one. A plan prints a "Compiling <pkg>" line; the fast path prints only
-# "Finished ... in <time>".
+# one. A plan writes build.ninja; the fast path replays it untouched.
 # The fast path replays ELF builds only (#400); on macOS and Windows the
 # second build plans again, and the full path's writer restores the file.
-if [[ "$(uname -s)" == Linux ]] && grep -q "Compiling" build2.log; then
+if [[ "$(uname -s)" == Linux ]] && planned_since .before-build2; then
     echo "FAIL: restoring the root database ran a full plan"
     cat build2.log
     exit 1

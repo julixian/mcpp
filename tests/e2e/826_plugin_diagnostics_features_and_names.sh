@@ -70,7 +70,7 @@ grep -q "mcpp.acme.gen'.*mcpp\.\|claims an origin" d1.log && fail "R1: an own-na
 # fast path and reaches no build program, so it would measure neither path.
 touch src/main.cpp
 "$MCPP" build > d2.log 2>&1 || fail "D2: the second build failed" d2.log
-grep -qE "up to date .*\(cached\)" d2.log || fail "D2: the second build ran the program; the replay is not measured" d2.log
+grep -qE "^ *build\.mcpp .* cached" d2.log || fail "D2: the second build ran the program; the replay is not measured" d2.log
 grep -q "impact: no bindings are generated" d2.log || fail "D2: the cached run did not report the diagnostic" d2.log
 
 # N1

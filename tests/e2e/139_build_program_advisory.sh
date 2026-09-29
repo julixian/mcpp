@@ -91,7 +91,7 @@ touch src/main.cpp
 # First establish that this build really was a cache hit. Without this the next
 # assertion could pass for the wrong reason — a re-run would also print the
 # line, and the replay path would go untested.
-grep -qE "up to date .*\(cached\)" second.log \
+grep -qE "^ *build\.mcpp .* cached" second.log \
   || { cat second.log; echo "FAIL: the second build re-ran the program; the replay path was not exercised"; exit 1; }
 
 grep -q "advisory: no emulator found" second.log \

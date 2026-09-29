@@ -19,6 +19,7 @@ import mcpp.manifest;
 import mcpp.source_kind;
 import mcpp.modgraph.glob;
 import mcpp.graph;
+import mcpp.build.progress;   // the members' programs wait in order (design 2026-09-29 §4.2)
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
@@ -1673,6 +1674,8 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
         // measured: `run-A.sh run-B.sh <artifact>`).
         const auto runnerBeforeRoot = bcRoot.runner;
         const auto namedBeforeRoot  = bcRoot.namedRunners;
+        // The root's program is the requested package's.
+        bpEnv.requested = !state.m->package.virtualRoot;
         auto bp = mcpp::build::run_build_program(
             *state.m, *state.root, host->first, host->second,
             state.m->cppStandard, bpEnv);
@@ -1911,14 +1914,26 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
     std::vector<std::size_t> roots(state.packages.size());
     std::iota(roots.begin(), roots.end(), std::size_t{0});
     const auto order = *mcpp::graph::depth_first_order(deps, roots, mcpp::graph::Cycles::Skip);
-    for (auto const i : order) {
-        if (i == 0) continue;
-        if (!state.isWorkspaceMemberPackage(i)) continue;
-        if (!state.compilesHere(i)) continue;
-        auto& pkg = state.packages[i];
+    auto hasProgram = [&](std::size_t i) {
+        if (i == 0 || !state.isWorkspaceMemberPackage(i) || !state.compilesHere(i)) return false;
         std::error_code bpEc;
-        if (!std::filesystem::exists(pkg.root / "build.mcpp", bpEc)
-            && pkg.manifest.buildConfig.ruleModules.empty()) continue;
+        return std::filesystem::exists(state.packages[i].root / "build.mcpp", bpEc)
+            || !state.packages[i].manifest.buildConfig.ruleModules.empty();
+    };
+    // mcpp runs them one after another, in this order, so every program not
+    // yet started is truly waiting; its line says so (build progress design
+    // 2026-09-29, §3.2), named as the program names itself.
+    for (auto const i : order) {
+        if (!hasProgram(i)) continue;
+        const auto& m = state.packages[i].manifest;
+        mcpp::build::progress::program_scheduled(
+            m.package.namespace_.empty() ? m.package.name
+                                         : m.package.namespace_ + "." + m.package.name,
+            state.packages[i].selectedMember);
+    }
+    for (auto const i : order) {
+        if (!hasProgram(i)) continue;
+        auto& pkg = state.packages[i];
         auto host = state.host_tc_for_build_program();
         if (!host) return std::unexpected(host.error());
         mcpp::build::BuildProgramEnv bpEnv;
@@ -1933,6 +1948,7 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
         bpEnv.packStageDir = state.overrides.pack_stage_dir;
         bpEnv.packStrip           = state.overrides.pack_strip;
         bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
+        bpEnv.requested       = pkg.selectedMember;
         bpEnv.languageModules = pkg.manifest.language.modules;
         bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;
         if (auto dit = state.deviceSourcesByPackage.find(pkg.root.string());

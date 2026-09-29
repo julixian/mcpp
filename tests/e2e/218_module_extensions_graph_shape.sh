@@ -67,16 +67,23 @@ fingerprint() {
 FP_BEFORE="$(fingerprint)"
 [ -n "$FP_BEFORE" ] || { echo "FAIL: could not read the fingerprint"; exit 1; }
 
+# Whether the last build planned: the full path writes build.ninja (or moves
+# its time when the text is unchanged), and the fast path replays it untouched.
+# A `Compiling` line no longer tells the two apart: it states that a package's
+# steps ran, on either path (build progress design 2026-09-29).
+planned_since() { find target -name build.ninja -newer "$1" 2>/dev/null | grep -q .; }
+touch .before-b1; sleep 1
 "$MCPP" build > b1.log 2>&1 || { cat b1.log; echo "FAIL: no-change build"; exit 1; }
-grep -q "Compiling" b1.log && {
+planned_since .before-b1 && {
     cat b1.log; echo "FAIL: fast path did not engage — the rest proves nothing"; exit 1; }
 echo "  ok: fast path engages on a no-change build"
 
 # ── 1. A NEW import inside the .ixx must invalidate the graph ──────────────
+touch .before-b2; sleep 1
 printf 'export module gshape.face;\nimport std;\nimport gshape.helper;\nexport auto face() -> int { return helper() + 1; }\n' > src/face.ixx
 
 "$MCPP" build > b2.log 2>&1 || { cat b2.log; echo "FAIL: build after .ixx edit"; exit 1; }
-grep -q "Compiling" b2.log || {
+planned_since .before-b2 || {
     cat b2.log
     echo "FAIL: editing a .ixx did not invalidate the fast path"
     echo "      (the freshness sweep is not classifying it as a graph-shape input)"

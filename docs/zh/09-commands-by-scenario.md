@@ -209,6 +209,48 @@ commit 记进 `mcpp.toml`;`mcpp index unpin` 移除它。
 当 mcpp 驱动的 xlings 为索引刷新发出进度事件时（xlings 2026.9.28.1+），索引刷新
 逐步报告。较旧的 xlings 下，它显示其状态行，然后安静地结束，与以前相同。
 
+## 构建输出
+
+构建在每一步的结果已知时报告一次（2026.9.29.5+）：
+
+```console
+$ mcpp build --workspace
+  build.mcpp gpp.core                     ran 16.00s
+  build.mcpp gpp.gui                      ran 6.70s
+   Compiling gpp.core (GalTranslPP)       done 3m12s
+   Compiling 23 dependencies              done 6m20s
+   Compiling gpp.gui (GPPGUI)             done 38m05s
+
+    Finished fast-release [unoptimized + debuginfo] in 41m53s · plan 1m13s · programs 32s · build 40m08s · longest gpp.gui: vcpkg install 22m10s
+```
+
+- 包的行写出包名与结果：`done` 后接其各步骤的跨度，`cached` 表示由全局缓存提供，
+  `failed`，或者在失败的构建于该包完成前停止时，写出它已运行的步骤数。没有工作
+  的包不写行。
+- 命令被要求构建的包（根包或被选中的成员）逐个列出；它们依赖的包折叠为一行，
+  失败的依赖单独写出名字。
+- 构建程序的行写出 `ran` 及其耗时、`cached` 或 `failed`。
+- 一个步骤失败时立即报告，连同其诊断；ninja 此时仍在等待正在运行的步骤。
+- `Finished` 写出整条命令的耗时。十秒及以上的命令还写出时间的分布，并在某一步
+  占构建阶段四分之一以上时写出这一步。
+
+在终端上，仍在运行的步骤与一行状态行绘制在输出下方，并原地更新：
+
+```
+   Compiling gpp.gui (GPPGUI)             61 steps
+
+Building 612/1203 · 14:32 · gpp.gui: vcpkg install 6:10
+```
+
+状态行给出构建的步骤计数、自命令开始以来的时间，以及运行最久的 `check` 或
+`prepare` 动作；其他步骤 ninja 只在完成时报告。输出不是终端时（CI 日志、管道），
+只写最终的行，并在输出静默一分钟时写一次状态行。`TERM=dumb` 在终端上也选择
+这种形式。
+
+`--verbose` 列出每个包（包括没有工作的包，记为 `fresh`），写出每个构建程序的编译
+与运行耗时，并按 ninja 的报告打印每一步（`[f/t] <命令>` 及其输出）。`--quiet`
+不打印这些。机器输出（`--message-format json`）不变。
+
 ## 发布前校验描述符
 
 `mcpp xpkg parse` 用解析器自己的文法读一个描述符，所以它报告的就是解析时

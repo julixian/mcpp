@@ -35,9 +35,15 @@ cd app
 "$MCPP" build > b2.log 2>&1 || { cat b2.log; exit 1; }
 
 # The fast path must actually be in play, or the rest of this test is asserting
-# on a path it never took. A fast-path build prints no "Compiling" line.
+# Whether the last build planned: the full path writes build.ninja (or moves
+# its time when the text is unchanged), and the fast path replays it untouched.
+# A `Compiling` line no longer tells the two apart: it states that a package's
+# steps ran, on either path (build progress design 2026-09-29).
+planned_since() { find target -name build.ninja -newer "$1" 2>/dev/null | grep -q .; }
+# on a path it never took.
+touch .before-warm; sleep 1
 "$MCPP" build > warm.log 2>&1 || { cat warm.log; exit 1; }
-if grep -q "Compiling" warm.log; then
+if planned_since .before-warm; then
     echo "NOTE: the fast path was not taken on a warm build; the assertion below"
     echo "      still holds but tests less than it means to."
     cat warm.log

@@ -83,7 +83,7 @@ int main() {
 }
 EOF
 "$MCPP" build > build2.log 2>&1 || { cat build2.log; echo "FAIL: rebuild failed"; exit 1; }
-grep -q "build.mcpp running" build2.log && {
+grep -qE "^ *build\.mcpp .* ran [0-9]" build2.log && {
     cat build2.log; echo "FAIL: unchanged build.mcpp re-ran"; exit 1; } || true
 out="$("$MCPP" run 2>&1 | grep '^ANSWER2=' | tail -1)"
 [[ "$out" == "ANSWER2=42" ]] || { echo "FAIL: cached include-dir record lost: $out"; exit 1; }

@@ -49,6 +49,7 @@ import mcpp.build.schedule.policy;   // resolve_jobs — one answer to "how many
 import mcpp.fetcher.progress;
 import mcpp.project;
 import mcpp.ui;
+import mcpp.build.progress;
 
 namespace mcpp::build {
 
@@ -925,99 +926,16 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
         for (auto& note : ctx.workspaceMembers.front().manifest.inferredNotes)
             mcpp::ui::status("Inferred", note);
 
-    // Announce the package being built (and any deps). A dep served from the
-    // global cache says "Cached" and HOW MANY translation units that saved. The
-    // count is the point: the bare word "Cached" was printed for three months
-    // while ninja recompiled every one of those units behind it, and no output
-    // contradicted it. A number that has to match the edges ninja actually skips
-    // cannot be quietly wrong in the same way.
-    std::map<std::string, std::size_t> cachedUnits;
-    for (auto& dep : ctx.cachedDeps) cachedUnits[dep.name] = dep.units;
-    std::set<std::string> announced;
-    announced.insert(ctx.manifest.package.name);
-    // A workspace plan's virtual root compiles nothing; its members are
-    // announced as its dependencies, by their directories (§15).
-    if (!ctx.manifest.package.virtualRoot)
-        mcpp::ui::status("Compiling",
-            std::format("{} v{} (.)",
-                        ctx.manifest.package.name, ctx.manifest.package.version));
-    // The packages announced: the root's dependencies, and in a workspace
-    // plan each member followed by the member's own dependencies (§15), as
-    // the member's own build announced them.
-    // A member that another member depends on is announced from its own
-    // member edge, by its directory, not as that member's path dependency.
-    std::set<std::filesystem::path> memberRoots;
-    for (auto const& m : ctx.workspaceMembers) {
-        std::error_code ec;
-        memberRoots.insert(std::filesystem::weakly_canonical(m.root, ec));
-    }
-    std::vector<std::pair<std::string, mcpp::manifest::DependencySpec>> announcedDeps;
-    for (auto const& [name, spec] : ctx.manifest.dependencies) {
-        announcedDeps.emplace_back(name, spec);
-        if (!spec.workspaceMember) continue;
-        for (auto const& m : ctx.workspaceMembers) {
-            std::error_code e1, e2;
-            if (std::filesystem::weakly_canonical(spec.path, e1)
-                != std::filesystem::weakly_canonical(m.root, e2))
-                continue;
-            for (auto const& [dn, ds] : m.manifest.dependencies) {
-                if (ds.isPath()) {
-                    const std::filesystem::path dp{ds.path};
-                    std::error_code e3;
-                    if (memberRoots.contains(std::filesystem::weakly_canonical(
-                            dp.is_absolute() ? dp : m.root / dp, e3)))
-                        continue;
-                }
-                announcedDeps.emplace_back(dn, ds);
-            }
-        }
-    }
-    for (auto& [name, spec] : announcedDeps) {
-        if (announced.contains(name)) continue;
-        announced.insert(name);
-        // Two keys that resolved to one identity (#634, A2) are one package
-        // and one compile, so they are announced once.
-        if (!spec.shortName.empty()
-            && !announced.insert(std::format("identity:{}.{}", spec.namespace_,
-                                             spec.shortName)).second)
-            continue;
-        // `spec.version` is the constraint the manifest WROTE. Announcing it
-        // printed "Compiling compat.imgui v^1.92.8" — a banner naming a version
-        // that does not exist (mcpp#363). prepare_build hands the resolution
-        // result over in ctx.resolvedVersions; fall back to the spec only for
-        // deps that never went through resolution (git, or an exact pin).
-        auto rit = ctx.resolvedVersions.find(name);
-        // A git dependency has no version to announce: `spec.version` is empty
-        // for it, and the banner used to read "Compiling spike.fw v" (#649 E7).
-        // It names the reference the manifest wrote instead, shortening a
-        // commit to the length `git` itself abbreviates to.
-        auto gitReference = [&] {
-            std::string ref = spec.gitRev;
-            if (spec.gitRefKind == "rev" && ref.size() > 12) ref.resize(12);
-            return std::format("(git {} {})",
-                               spec.gitRefKind.empty() ? "rev" : spec.gitRefKind, ref);
-        };
-        auto memberDir = [&] {
-            auto rel = std::filesystem::path(spec.path).lexically_normal()
-                           .lexically_relative(ctx.projectRoot.lexically_normal()).generic_string();
-            return std::format("({})", rel.empty() ? std::string(".") : rel);
-        };
-        std::string ver = spec.workspaceMember
-            ? memberDir()
-            : spec.isPath()
-            ? "(path)"
-            : spec.isGit()
-            ? gitReference()
-            : std::string("v") + (rit != ctx.resolvedVersions.end() ? rit->second
-                                                                    : spec.version);
-        auto it = cachedUnits.find(name);
-        if (it == cachedUnits.end()) {
-            mcpp::ui::status("Compiling", std::format("{} {}", name, ver));
-        } else {
-            mcpp::ui::status("Cached", std::format("{} {} ({} unit{})",
-                name, ver, it->second, it->second == 1 ? "" : "s"));
-        }
-    }
+    // The packages are no longer announced before ninja runs: each package's
+    // line is written when its outcome is known, with that outcome (build
+    // progress design 2026-09-29, §4.2). The plan names them
+    // (`BuildPlan::packages`), and a dependency served from the global cache
+    // states how many units that saved, as the `Cached` line did: a number
+    // that has to match the edges ninja actually skips cannot be quietly
+    // wrong, where the bare word was printed for three months over full
+    // recompiles.
+    mcpp::build::progress::programs_done();
+    mcpp::build::progress::Build report(ctx.outputDir);
 
     // RECLAIM THE STALE CONCURRENCY TOKENS, HERE AND NOT IN prepare.
     //
@@ -1046,15 +964,13 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
     mcpp::build::BuildOptions opts;
     opts.verbose = verbose;
     opts.parallelJobs = static_cast<std::size_t>(ctx.plan.scheduleNinjaJobs);
+    if (!mcpp::ui::is_quiet()) opts.progress = &report;
     auto r = be->build(ctx.plan, opts);
     if (!r) {
-        std::fflush(stdout);
-        mcpp::ui::error(r.error().message);
-        if (!r.error().diagnosticOutput.empty()) {
-            std::fputs(r.error().diagnosticOutput.c_str(), stderr);
-            if (r.error().diagnosticOutput.back() != '\n')
-                std::fputc('\n', stderr);
-        }
+        // A failed step was reported when it failed; what follows is the
+        // advice that reads the whole output.
+        if (!r.error().reported) mcpp::ui::error(r.error().message);
+        mcpp::ui::block(r.error().diagnosticOutput);
         return 1;
     }
 
@@ -1158,7 +1074,7 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
             mcpp::build::realises_optimization(bc) ? "optimized" : "unoptimized";
         if (bc.debug) descriptor += " + debuginfo";
         if (bc.lto)   descriptor += " + lto";
-        mcpp::ui::finished(ctx.profile, r->elapsed, descriptor);
+        mcpp::build::progress::finished(ctx.profile, descriptor);
     }
     report_freestanding_size(ctx);
     return 0;
@@ -1327,8 +1243,11 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
                                   const std::string& runtimeEnvKey,
                                   const std::string& runtimeEnvValue,
                                   std::chrono::milliseconds* elapsedOut = nullptr) {
+    // Read as it runs, into this directory's report, unless nothing is to be
+    // shown (build progress design 2026-09-29, §6.1).
+    const bool reporting = !mcpp::ui::is_quiet();
     std::vector<std::string> argv{ninjaProgram};
-    if (!verbose) argv.push_back("--quiet");
+    if (!verbose && !reporting) argv.push_back("--quiet");
     argv.push_back("-C");
     argv.push_back(outputDir.string());
     if (verbose) argv.push_back("-v");
@@ -1371,42 +1290,58 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
     auto t0 = std::chrono::steady_clock::now();
     // capture_exec merges stderr into the captured output (replacing `2>&1`),
     // so is_stale_ninja_failure / filter_ninja_output still see ninja errors.
-    auto r = mcpp::platform::process::capture_exec(argv, childEnv);
-    std::string out = r.output;
-    int status = r.exit_code;
+    std::string out;
+    int status = 0;
+    bool reported = false;
+    const auto prefixes = read_ninja_command_prefixes(ninjaPath);
+    if (reporting) {
+        mcpp::build::progress::Build report(outputDir);
+        auto run = mcpp::build::run_ninja_reporting(argv, childEnv, std::chrono::milliseconds{0},
+                                                    report, verbose, prefixes);
+        out = std::move(run.output);
+        status = run.exitCode;
+        reported = run.reported;
+        // A stale graph is not this build's outcome: the full path plans
+        // again and builds, and reports the packages then.
+        if (status == 0 || reported || !is_stale_ninja_failure(out))
+            report.finish(status == 0);
+    } else {
+        // Nobody reads this ninja's progress: it reports no action start
+        // (build progress design 2026-09-29, §6.4).
+        childEnv.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
+        auto r = mcpp::platform::process::capture_exec(argv, childEnv);
+        out = std::move(r.output);
+        status = r.exit_code;
+    }
     if (status != 0) {
-        if (is_stale_ninja_failure(out))
+        if (!reported && is_stale_ninja_failure(out))
             return std::nullopt;
-        std::fflush(stdout);
-        mcpp::ui::error("build failed");
-        auto prefixes = read_ninja_command_prefixes(ninjaPath);
-        auto diagnostics = verbose ? out : mcpp::build::filter_ninja_output(out, prefixes);
-        if (!diagnostics.empty()) {
-            std::fputs(diagnostics.c_str(), stderr);
-            if (diagnostics.back() != '\n')
-                std::fputc('\n', stderr);
-        }
+        // A failed step was reported when it failed (and every line, under
+        // --verbose); what remains is the advice below.
+        if (!reported) mcpp::ui::error("build failed");
+        if (!reported && !(reporting && verbose))
+            mcpp::ui::block(verbose ? out : mcpp::build::filter_ninja_output(out, prefixes));
         // Read from the RAW output, not from `diagnostics`: the filter drops
         // command lines, and a future filter change must not be able to
         // silently remove the advice along with them.
         if (auto advice = mcpp::build::link_failure_advice(out); !advice.empty())
-            std::fputs(advice.c_str(), stderr);
+            mcpp::ui::block(advice);
         // mcpp#662, the fast-path form: no `BuildPlan` here to name the C
         // library from (the whole point of this path is skipping `prepare`),
         // so both name arguments are empty — the note still fires (it reads
         // the isolation token in `out` itself) but names no package.
         if (auto advice = mcpp::build::graph_c_library_isolation_advice(out);
             !advice.empty())
-            std::fputs(advice.c_str(), stderr);
+            mcpp::ui::block(advice);
         // #696, the fast-path form of the same unnamed shape.
         if (auto advice = mcpp::build::graph_link_library_advice(out); !advice.empty())
-            std::fputs(advice.c_str(), stderr);
+            mcpp::ui::block(advice);
         // #690: the consumer-include note, from the list the plan wrote beside
         // build.ninja (`write_consumer_include_sidecar`).
         if (auto advice = mcpp::build::consumer_include_scope_advice(
                 out, mcpp::build::read_consumer_include_sidecar(ninjaPath.parent_path()));
             !advice.empty())
-            std::fputs(advice.c_str(), stderr);
+            mcpp::ui::block(advice);
         // THE SAME ADVICE THE PLAN PATH GIVES, FROM THE LIST THE PLAN WROTE
         // DOWN. This path has no `BuildPlan` by construction, so the C
         // library's `[c-abi-absent]` table reaches it through a file beside
@@ -1418,11 +1353,11 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
                 ninjaPath.parent_path());
             if (auto advice = mcpp::build::c_abi_absent_facility_advice(
                     out, cAbiName, absent); !advice.empty())
-                std::fputs(advice.c_str(), stderr);
+                mcpp::ui::block(advice);
         }
         return 1;
     }
-    if (verbose && !out.empty())
+    if (verbose && !reporting && !out.empty())
         std::fputs(out.c_str(), stdout);
     // What the edges that ran had to say on success: the same reader the full
     // path calls (mcpp.build.advice), because this path skips `prepare` and a
@@ -1754,7 +1689,7 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
             *validatedBefore))
         return fast_path_declined("build", "ninja relinked an artifact, whose closure the full path validates"); // relinked: full path reconstructs + validates closure
 
-    mcpp::ui::finished(want->profile, elapsed);
+    mcpp::build::progress::finished(want->profile, "");
     return 0;
 }
 
@@ -1847,12 +1782,13 @@ export std::optional<int> try_fast_workspace_build(
         profile = want->profile;
     }
 
-    std::chrono::milliseconds total{};
     if (ready.size() > 1) {
         std::vector<std::filesystem::path> dirs;
         for (auto const& r : ready) dirs.push_back(r.outputDir);
         publish_workspace_compile_commands(wsRoot, dirs);
     }
+    // With more than one configuration, a package's line names its own.
+    mcpp::build::progress::configurations(ready.size());
     for (auto& r : ready) {
         if (ready.size() == 1) restore_root_compile_commands(wsRoot, r.outputDir);
         std::chrono::milliseconds elapsed{};
@@ -1862,9 +1798,8 @@ export std::optional<int> try_fast_workspace_build(
         if (*rc != 0) return rc;
         if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(r.validated))
             return fast_path_declined("workspace", "ninja relinked an artifact, whose closure the full path validates");
-        total += elapsed;
     }
-    mcpp::ui::finished(profile, total);
+    mcpp::build::progress::finished(profile, "");
     return 0;
 }
 
@@ -2021,6 +1956,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
 
     auto exe = outputDir / chosen->second;
     auto pathCtx = mcpp::fetcher::make_path_ctx(/*cfg=*/nullptr, projectRoot);
+    mcpp::build::progress::close();   // the program owns the terminal
     mcpp::ui::status("Running",
         std::format("`{}`", mcpp::ui::shorten_path(exe, pathCtx)));
     std::println("");
@@ -2211,11 +2147,13 @@ int run_artifact_via_runner(mcpp::build::BuildContext& ctx,
                                                              : slotName;
         if (!isRunSlot && !runner_from_format && !verb.empty())
             verb[0] = static_cast<char>(std::toupper(verb[0]));
+        mcpp::build::progress::close();   // the program owns the terminal
         mcpp::ui::status(verb, std::format("`{} … {}`", choice.tmpl.front(),
                                            mcpp::ui::shorten_path(exe, pathCtx)));
     } else {
         argv.push_back(exe.string());
         for (auto& a : passthrough) argv.push_back(a);
+        mcpp::build::progress::close();   // the program owns the terminal
         mcpp::ui::status("Running",
             std::format("`{}`", mcpp::ui::shorten_path(exe, pathCtx)));
     }
@@ -2402,7 +2340,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
         ov2.will_run       = true;
         auto ctx2 = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false,
                                   /*extraTargets=*/{}, ov2);
-        if (!ctx2) { std::println(stderr, "error: {}", ctx2.error()); return 2; }
+        if (!ctx2) { mcpp::ui::error(std::format("{}", ctx2.error())); return 2; }
         if (auto rc = run_build_plan(*ctx2, /*verbose=*/false, no_cache, target_triple);
             rc != 0)
             return rc;
@@ -2457,7 +2395,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
     ov.will_run       = true;
     auto ctx = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false,
                              /*extraTargets=*/{}, ov);
-    if (!ctx) { std::println(stderr, "error: {}", ctx.error()); return 2; }
+    if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); return 2; }
     // `target_triple` IS PASSED, AND OMITTING IT WROTE A CROSS BUILD INTO
     // THE HOST'S CACHE SLOT.
     //
@@ -2648,6 +2586,9 @@ export int run_tests(std::span<const std::string> passthrough,
     // JSON mode: stdout carries NDJSON only. All ui::status/info lines print
     // to stdout, so silence them wholesale; errors already go to stderr.
     if (json) mcpp::ui::set_quiet(true);
+    // The report covers the planning and the package's own build (Phase A);
+    // it is closed before the tests' own lines.
+    mcpp::build::progress::open(mcpp::log::is_verbose());
 
     auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
     if (!root) {
@@ -2841,10 +2782,19 @@ export int run_tests(std::span<const std::string> passthrough,
     for (auto& lu : ctx->plan.linkUnits)
         if (lu.kind != mcpp::build::LinkUnit::TestBinary)
             pkgTargets.push_back(lu.output.generic_string());
+    mcpp::build::progress::programs_done();
     if (!pkgTargets.empty()) {
         mcpp::build::BuildOptions aOpts;
         aOpts.ninjaTargets = pkgTargets;
         aOpts.buildTimeoutSecs = static_cast<unsigned>(testOpts.buildTimeoutSecs);
+        // Phase A is the package's own build, and is reported as `mcpp build`
+        // reports one (build progress design 2026-09-29); the tests' own
+        // builds and runs below keep their per-test lines.
+        std::optional<mcpp::build::progress::Build> phaseReport;
+        if (!json && !mcpp::ui::is_quiet()) {
+            phaseReport.emplace(ctx->outputDir);
+            aOpts.progress = &*phaseReport;
+        }
         auto tPhaseA = std::chrono::steady_clock::now();
         auto a = backend->build(ctx->plan, aOpts);
         summary.buildMs += std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2856,15 +2806,12 @@ export int run_tests(std::span<const std::string> passthrough,
             if (json)
                 std::println("{{\"error\":\"package\",\"compile_output\":\"{}\"}}",
                              test_json_escape(a.error().diagnosticOutput));
-            mcpp::ui::error(a.error().message);
             // Surface the compiler/linker stderr (parity with run_build_plan) —
             // otherwise `mcpp test` failures show only "build failed" with no
-            // diagnostic, which is undebuggable (notably on CI).
-            if (!a.error().diagnosticOutput.empty()) {
-                std::fputs(a.error().diagnosticOutput.c_str(), stderr);
-                if (a.error().diagnosticOutput.back() != '\n')
-                    std::fputc('\n', stderr);
-            }
+            // diagnostic, which is undebuggable (notably on CI). A failed step
+            // was reported when it failed.
+            if (!a.error().reported) mcpp::ui::error(a.error().message);
+            mcpp::ui::block(a.error().diagnosticOutput);
             return 1;
         }
 
@@ -2883,6 +2830,8 @@ export int run_tests(std::span<const std::string> passthrough,
         // prerequisites. Printing a success banner right before per-test
         // failures read as a contradiction; the final summary carries timing.
     }
+    // The tests' own lines follow, as they always have.
+    mcpp::build::progress::close();
 
     // 6. Phase B. First a single keep-going bulk build over every selected
     //    test goal — ninja parallelizes across tests and a failing test does

@@ -98,12 +98,12 @@ fi
 }
 
 rm -rf target
-"$MCPP" build > build2.log 2>&1 || {
+"$MCPP" build -v > build2.log 2>&1 || {
     cat build2.log
     exit 1
 }
 
-grep -q "Cached compat.widget v1.0.0" build2.log || {
+grep -qE "Compiling compat\.widget v1\.0\.0 +cached [0-9]+ unit" build2.log || {
     echo "FAIL: cached namespaced dependency should be reported as compat.widget"
     cat build2.log
     exit 1

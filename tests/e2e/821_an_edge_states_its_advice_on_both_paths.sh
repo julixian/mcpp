@@ -60,13 +60,19 @@ EOF
     || fail "A1: the full path did not report the edge's advice exactly once" b1.log
 echo "ok: A1 the full path reports the advice once"
 
+# Whether the last build planned: the full path writes build.ninja (or moves
+# its time when the text is unchanged), and the fast path replays it untouched.
+# A `Compiling` line no longer tells the two apart: it states that a package's
+# steps ran, on either path (build progress design 2026-09-29).
+planned_since() { find target -name build.ninja -newer "$1" 2>/dev/null | grep -q .; }
+touch .before-b2
 sleep 1   # a coarse file system clock must see the input as newer
 printf 'second\n' > data/probe.in
 "$MCPP" build > b2.log 2>&1 || fail "the second build failed" b2.log
 # The fast path serves only ELF products (#400): on Linux the second build
 # must take it, or A2 tests nothing new; elsewhere it declines, and A2 reads
 # the full path again.
-if grep -q "Compiling" b2.log; then
+if planned_since .before-b2; then
     case "$(uname -s)" in
         Linux) fail "A2: the second build planned again, so the fast path was not exercised" b2.log ;;
         *)     echo "READING 821: the fast path declines on $(uname -s) (#400); A2 reads the full path" ;;

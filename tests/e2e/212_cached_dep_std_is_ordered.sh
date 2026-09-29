@@ -114,7 +114,7 @@ cd "$TMP/projmiss"
 # ── project two: cache HIT. This is the one that used to fail. ───────────────
 make_project projhit projhit
 cd "$TMP/projhit"
-if ! "$MCPP" build > build.log 2>&1; then
+if ! "$MCPP" build -v > build.log 2>&1; then
     echo "FAIL: second project (cache hit) did not build"
     if grep -q 'Bad import dependency\|std.gcm' build.log; then
         echo "      this is mcpp#405: the restored BMI's std edge is not in the graph"
@@ -127,7 +127,7 @@ N="$(find_ninja "$TMP/projhit")"
 [[ -n "$N" ]] || { echo "FAIL: projhit has no build.ninja"; exit 1; }
 
 # The hit actually happened — otherwise the assertion below proves nothing.
-grep -qE 'Cached local-dev\.stdlib-dep v1\.0\.0 \([0-9]+ unit' build.log || {
+grep -qE 'Compiling local-dev\.stdlib-dep v1\.0\.0 +cached [0-9]+ unit' build.log || {
     echo "FAIL: the second project did not hit the cache, so #405 was not exercised"
     cat build.log
     exit 1

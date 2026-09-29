@@ -89,13 +89,13 @@ tos="${BASH_REMATCH[1]}"; tarch="${BASH_REMATCH[2]}"
 # before build.mcpp, or the build.mcpp cache hits — both are fine; a "running"
 # line is not).
 "$MCPP" build > build2.log 2>&1
-grep -q "build.mcpp running" build2.log && {
+grep -qE "^ *build\.mcpp .* ran [0-9]" build2.log && {
     cat build2.log; echo "identical build re-ran build.mcpp"; exit 1; } || true
 
 # Feature change → contract hash changes → re-run, and the program observes
 # the feature.
 "$MCPP" build --features extra > build3.log 2>&1 || { cat build3.log; echo "build 3 failed"; exit 1; }
-grep -q "build.mcpp running" build3.log || {
+grep -qE "^ *build\.mcpp .* ran [0-9]" build3.log || {
     cat build3.log; echo "feature change did not re-run build.mcpp"; exit 1; }
 bin="$(ls -t $(find target -name 'envbp' -type f) | head -1)"
 out="$("./$bin" | tail -1)"
@@ -104,7 +104,7 @@ out="$("./$bin" | tail -1)"
 
 # Profile change also re-runs.
 "$MCPP" build --release > build4.log 2>&1 || { cat build4.log; echo "build 4 failed"; exit 1; }
-grep -q "build.mcpp running" build4.log || {
+grep -qE "^ *build\.mcpp .* ran [0-9]" build4.log || {
     cat build4.log; echo "profile change did not re-run build.mcpp"; exit 1; }
 bin="$(ls -t $(find target -name 'envbp' -type f) | head -1)"
 out="$("./$bin" | tail -1)"

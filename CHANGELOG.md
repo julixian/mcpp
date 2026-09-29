@@ -10,9 +10,41 @@ This release completes the workspace build graph in the commands around the
 build, from the validation project's post-release run of 2026.9.29.4: build
 programs are reused across selections and run dependencies first, the build
 database and `--configure-only` plan by configuration, and the output names
-what it reports.
+what it reports. A build now reports each step when its outcome is known, and
+shows what runs while it runs (`.agents/docs/2026-09-29-build-progress-display-design.md`).
+
+### Added
+
+- **A build reports each step once, with its outcome.** A package's line is
+  written when every step the graph assigns to it has run (`done` with the
+  span of its steps, read from ninja's log), when the global cache supplied it
+  (`cached N units`), when a step of it failed (`failed`), or when the build
+  ends. A package with nothing to do has no line. The packages the command was
+  asked to build are listed; their dependencies are folded into one line, and
+  a dependency that fails is named. `--verbose` lists every package and prints
+  each step as ninja reports it (e2e 842).
+- **A status line states the build.** On a terminal the steps still running
+  and one status line, `Building 612/1203 · 14:32 · gpp.gui: vcpkg install
+  6:10`, are drawn below the output and updated in place; the status line
+  names the longest-running `check` or `prepare` action, which the engine's
+  action wrapper reports when it starts. In a log (CI, a pipe) only final lines
+  are written, and the status line is written when the log has been silent for
+  a minute (e2e 842, 843).
+- **`Finished` states the whole command's time**, and for a command of ten
+  seconds or more how it was spent (`plan`, `programs`, `build`) and the step
+  that took at least a quarter of the build.
 
 ### Fixed
+
+- **A failed step is reported when it fails.** Its diagnostics were printed
+  after ninja exited, that is, after every step still running had finished:
+  a compile error beside a twenty-minute vcpkg install appeared twenty minutes
+  late (e2e 842).
+- **macOS and Windows terminals are terminals.** Terminal detection was
+  compiled only under `__unix__`, which Apple's compilers do not define, so
+  the download bar and colours were drawn on Linux alone. A Windows console
+  now receives mcpp's lines as UTF-16, so `·`, `→` and non-ASCII paths appear
+  as written whatever its code page.
 
 - **A member's build program is reused whichever members a command selects.**
   Its graph document listed every requester in the plan, the virtual root
@@ -37,9 +69,16 @@ what it reports.
 
 ### Behaviour changes
 
-- **The build program status lines name the package**:
-  `build.mcpp compiling <package>`, `running <package>`,
-  `up to date <package> (cached)` (e2e 839).
+- **A build program has one line, which names its package and states its
+  outcome**: `build.mcpp <package>  ran <time>`, `cached` or `failed`, in
+  place of `build.mcpp compiling <package>` and `running <package>`, and of
+  `up to date <package> (cached)` (e2e 839, 842). The programs of the
+  requested packages are listed, and those of their dependencies are folded
+  into one line.
+- **`Compiling <package>` is written when the package's steps have run**, with
+  their outcome, rather than for every direct dependency before ninja starts;
+  the per-dependency `Cached <package> (N units)` line is `--verbose` output,
+  as `cached N units` (e2e 842).
 - **A selected member is announced by its directory** in a `--workspace`
   build, also where another member depends on it (e2e 839).
 - **`mcpp pack` summarises many outputs.** A format that reports more than

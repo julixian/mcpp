@@ -170,18 +170,18 @@ cd blinky
 mcpp run
 ```
 
-实测输出：
+输出（2026.9.29.5；耗时因机器而异）：
 
 ```
    Resolving toolchain
     Resolved llvm@22.1.8 → riscv64-none-elf → @mcpp/registry/data/xpkgs/xim-x-llvm/22.1.8/bin/clang++
     Resolved host toolchain for build.mcpp: clang 22.1.8 (x86_64-unknown-linux-gnu)
-  build.mcpp compiling blinky
-  build.mcpp running blinky
+  build.mcpp blinky  ran 0.41s
     Inferred sources [src/**/*.{cppm,cpp,cc,c,S,s,asm}]
     Inferred target blinky (bin from src/main.cpp)
-   Compiling blinky v0.1.0 (.)
-      Cached riscv-virt-rt v0.3.0 (1 unit)
+   Compiling blinky v0.1.0 (.)  done 0.04s
+   Compiling 1 dependency       cached
+
     Finished dev [unoptimized + debuginfo] in 0.05s
         Size blinky  text 8572  data 80  bss 5668  total 14320
      Running `…/xim-x-qemu-riscv/9.2.4-1/bin/qemu-system-riscv64 … target/riscv64-none-elf/…/bin/blinky`
