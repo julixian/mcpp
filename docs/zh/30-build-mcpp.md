@@ -848,7 +848,7 @@ mcpp 会写出 `<暂存树>.stage-manifest` —— 一个兄弟文件，永不�
 | 变量 | 含义 |
 |---|---|
 | `${mcpp.out_dir}` | 构建输出目录 |
-| `${mcpp.bin_dir}` | 产出的二进制所在目录 |
+| `${mcpp.bin_dir}` | 产出的二进制所在目录:`bin/`;工作区成员的构建程序声明的 action 中为该成员的产物目录(2026.9.29.4+) |
 | `${mcpp.compile_db}` | `compile_commands.json` 的路径（clang-tidy 的 `-p` 要的就是它） |
 | `${mcpp.target_file:<name>}` | target `<name>` 构建出的文件 |
 | `${mcpp.stage_dir}` *(2026.9.11.1+)* | `mcpp pack` 暂存出的那棵树，绝对路径。仅 `artifact` role 可用，且仅在 `mcpp pack --format <name>` 下可用 |
