@@ -1201,8 +1201,11 @@ int stream_exec(const std::vector<std::string>& argv,
     if (timed_out) *timed_out = false;
     if (spawn_error) *spawn_error = 0;
     if (argv.empty()) return 127;
+    // Its own process group, registered with the signal guard, as
+    // capture_exec's child is: a build's ninja must not outlive the mcpp that
+    // started it when that mcpp alone is signalled (e2e 340).
     auto r = dispatch_bounded(argv, extraEnv, {}, deadline, /*capture=*/true, {},
-                              std::chrono::milliseconds{0}, /*ownGroup=*/false, &on_line);
+                              std::chrono::milliseconds{0}, /*ownGroup=*/true, &on_line);
     if (!r.supported) {
         if (r.spawn_error != 0) {
             if (spawn_error) *spawn_error = r.spawn_error;
