@@ -89,6 +89,8 @@ namespace mcpp::build {
 // names are this file's own, not part of mcpp.build.prepare's surface;
 // the two records steps live in records.cpp and are declared in `:state`.
 
+static void step13_report_packages(PrepareState& state, BuildContext& ctx);
+
 static std::expected<void, std::string> step13_source_packages(PrepareState& state, BuildContext& ctx) {
     {
         std::error_code ec;
@@ -812,7 +814,8 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
     // own target, and the output directory is shared with plain builds because
     // the fingerprint covers neither input. Stamping it on the plan is what
     // lets the graph say so about itself.
-    ctx.plan.graphShape = (state.includeDevDeps || !state.extraTargets.empty())
+    ctx.plan.graphShape = (state.includeDevDeps || !state.extraTargets.empty()
+                           || !state.memberTargets.empty())
         ? mcpp::build::GraphShape::WithTests
         : mcpp::build::GraphShape::Normal;
     // The device variant an override chose is stamped for the same reason: the
@@ -1603,6 +1606,7 @@ static std::expected<void, std::string> step13_windows_resources(PrepareState& s
                             "[resources] two resource scripts are named '{}.rc'; "
                             "they would produce the same artifact. Rename one.", stem));
                     mcpp::build::ResourceUnit ru;
+                    ru.package = mcpp::build::qualified_package_name(M);
                     ru.source = src;
                     ru.output = resRel / (std::string(stem) + std::string(outExt));
                     ru.includeDirs = rcIncludes;
@@ -2281,9 +2285,64 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     if (auto r = step13_abi_enforcement(state, ctx); !r) return std::unexpected(r.error());
     step13_resolution_json(state, ctx);
     if (auto r = step13_empty_link_check(state, ctx); !r) return std::unexpected(r.error());
+    step13_report_packages(state, ctx);
 
     ctx.planNotes = std::move(state.planNotes);
     return ctx;
+}
+
+// How the report names each package of the plan (build progress design
+// 2026-09-29, §4.2): as the requester wrote its key, with where it comes from.
+// A package is named after the edge from the root (or the virtual root) when
+// there is one, and after its first requester otherwise.
+static void step13_report_packages(PrepareState& state, BuildContext& ctx) {
+    std::vector<mcpp::build::PlanPackage> out;
+    out.reserve(state.packages.size());
+    const auto base = ctx.projectRoot.lexically_normal();
+    for (std::size_t i = 0; i < state.packages.size(); ++i) {
+        const auto& pkg = state.packages[i];
+        const auto& m = pkg.manifest;
+        mcpp::build::PlanPackage p;
+        p.name = mcpp::build::qualified_package_name(m);
+        if (i == 0) {
+            if (m.package.virtualRoot) continue;
+            p.requested = true;
+            p.subject = std::format("{} v{} (.)", m.package.name, m.package.version);
+            out.push_back(std::move(p));
+            continue;
+        }
+        p.requested = pkg.selectedMember;
+        const GraphRequest* edge = nullptr;
+        for (auto const& r : state.graphRequests) {
+            if (r.dependencyPackageIndex != i || r.consumerPackageIndex == i) continue;
+            if (!edge || r.consumerPackageIndex == 0) edge = &r;
+            if (r.consumerPackageIndex == 0) break;
+        }
+        const std::string key = edge ? edge->key : p.name;
+        const mcpp::manifest::DependencySpec* spec = nullptr;
+        if (edge) {
+            const auto& deps = state.packages[edge->consumerPackageIndex].manifest.dependencies;
+            if (auto it = deps.find(key); it != deps.end()) spec = &it->second;
+        }
+        std::string origin;
+        if (pkg.selectedMember || (spec && spec->workspaceMember)) {
+            auto rel = pkg.root.lexically_normal().lexically_relative(base).generic_string();
+            origin = std::format("({})", rel.empty() ? std::string(".") : rel);
+        } else if (spec && spec->isPath()) {
+            origin = "(path)";
+        } else if (spec && spec->isGit()) {
+            std::string ref = spec->gitRev;
+            if (spec->gitRefKind == "rev" && ref.size() > 12) ref.resize(12);
+            origin = std::format("(git {} {})", spec->gitRefKind.empty() ? "rev" : spec->gitRefKind, ref);
+        } else if (!m.package.version.empty()) {
+            origin = "v" + m.package.version;
+        }
+        p.subject = origin.empty() ? key : std::format("{} {}", key, origin);
+        for (auto const& c : ctx.cachedDeps)
+            if (c.name == p.name) p.cachedUnits = c.units;
+        out.push_back(std::move(p));
+    }
+    ctx.plan.packages = std::move(out);
 }
 
 void focus_on_member(BuildContext& ctx) {

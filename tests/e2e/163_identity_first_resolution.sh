@@ -80,13 +80,13 @@ EOF
 # ── 1. short-name descriptor installs ───────────────────────────────
 mkidx idx1 a/acme.widget.lua acme widget
 mkapp app1 acme ../idx1 acme widget
-(cd app1 && "$MCPP" build > out.txt 2>&1) || { cat app1/out.txt; exit 1; }
+(cd app1 && "$MCPP" build -v > out.txt 2>&1) || { cat app1/out.txt; exit 1; }
 # Either verb: what this test is about is that the descriptor was found BY
 # IDENTITY and the package became part of the build. Whether its objects were
 # compiled here or served from the global build cache is a different subsystem's
 # business — and now that the cache actually works, a sibling app dir under the
 # same MCPP_HOME (or a restored CI sandbox) can legitimately supply them.
-grep -qE "(Compiling|Cached) acme\.widget" app1/out.txt || {
+grep -qE "Compiling acme\.widget" app1/out.txt || {
     cat app1/out.txt
     echo "FAIL: acme.widget was neither compiled nor served from cache"
     exit 1

@@ -92,7 +92,8 @@ using OutputSink = void (*)(void* ctx, const char* data, unsigned long len);
 // written nothing for that long. It is meaningful only with a sink, and it is
 // what lets a long, progressing child (a download that prints progress) run to
 // completion while a wedged one does not (#648). With `idleMs` positive a
-// non-positive `deadlineMs` means "no total bound".
+// non-positive `deadlineMs` means "no total bound", and so it does with a sink
+// and neither bound: a build's ninja, read line by line for its progress.
 //
 // `ownGroup` non-zero places the child in a process group of its own, kills
 // the GROUP at a bound, and registers the group with the signal guard for the
@@ -210,7 +211,11 @@ DeadlineRun capture_with_deadline(const char* const* argvEntries,
 {
     DeadlineRun out;
     const bool idleBound = idleMs > 0 && sink != nullptr;
-    if ((deadlineMs <= 0 && !idleBound) || argvCount == 0 || !argvEntries) return out;
+    // A child with no bound at all is accepted only with a sink: that caller
+    // reads the output as it arrives (a build's progress) and has no untimed
+    // path that could deliver it.
+    if ((deadlineMs <= 0 && !idleBound && sink == nullptr) || argvCount == 0 || !argvEntries)
+        return out;
 
     // The child's environment: ours, minus anything overridden, plus the
     // overrides. Names are case-SENSITIVE here (unlike the Windows peer).

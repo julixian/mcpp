@@ -106,8 +106,7 @@ int run_configure_plan(BuildContext& ctx, bool verbose) {
     auto result = backend->build(ctx.plan, options);
     if (!result) {
         mcpp::ui::error(result.error().message);
-        if (!result.error().diagnosticOutput.empty())
-            std::fputs(result.error().diagnosticOutput.c_str(), stderr);
+        mcpp::ui::block(result.error().diagnosticOutput);
         return 1;
     }
     if (!mcpp::diag::flush(ctx.strict)) return 1;

@@ -70,7 +70,7 @@ cd app
 LOGS="$TMP/logs"; mkdir -p "$LOGS"
 printf 'a\n' > inputs/a.in
 
-ran()    { grep -q "build.mcpp running" "$1"; }
+ran()    { grep -qE "^ *build\.mcpp .* ran [0-9]" "$1"; }
 cached() { grep -q "build.mcpp.*cached" "$1"; }
 
 "$MCPP" build > "$LOGS/b1.log" 2>&1 || { cat "$LOGS/b1.log"; echo "FAIL: first build failed"; exit 1; }

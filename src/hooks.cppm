@@ -59,6 +59,10 @@ public:
     // that a failed `build_start` produces. Already reported.
     bool ok() const { return ok_; }
 
+    // Whether the command writes to the terminal while the build runs, beside
+    // the build's own lines (build progress design 2026-09-29, §5.3).
+    bool writes_to_terminal() const { return started_ && inheritOutput_; }
+
     // Close the interval and report what happened while it was open. Returns
     // whether the build may keep its result.
     //

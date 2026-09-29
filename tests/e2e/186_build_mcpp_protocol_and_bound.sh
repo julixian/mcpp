@@ -175,13 +175,13 @@ cp "$CACHE" "$TMP/good.cache"
 # the build.mcpp cache) actually runs.
 touch src/main.cpp
 "$MCPP" build > b6.log 2>&1 || { cat b6.log; echo "FAIL: build failed"; exit 1; }
-grep -q "up to date (cached)" b6.log || {
+grep -qE "^ *build\.mcpp .* cached" b6.log || {
     cat b6.log; echo "FAIL: an unchanged build.mcpp was re-run"; exit 1; }
 
 sed 's/^epoch .*/epoch 987654/' "$TMP/good.cache" > "$CACHE"
 touch src/main.cpp
 "$MCPP" build > b7.log 2>&1 || { cat b7.log; echo "FAIL: build failed"; exit 1; }
-grep -q "build.mcpp running" b7.log || {
+grep -qE "^ *build\.mcpp .* ran [0-9]" b7.log || {
     cat b7.log; echo "FAIL: a foreign cache epoch did not force a re-run"; exit 1; }
 
 # A `d` record this mcpp cannot interpret (a cache written by a NEWER mcpp)
@@ -191,7 +191,7 @@ cp "$TMP/good.cache" "$CACHE"
 echo "d some-future-tag /x" >> "$CACHE"
 touch src/main.cpp
 "$MCPP" build > b8.log 2>&1 || { cat b8.log; echo "FAIL: build failed"; exit 1; }
-grep -q "build.mcpp running" b8.log || {
+grep -qE "^ *build\.mcpp .* ran [0-9]" b8.log || {
     cat b8.log; echo "FAIL: an unknown cache record did not force a re-run"; exit 1; }
 
 echo "OK"

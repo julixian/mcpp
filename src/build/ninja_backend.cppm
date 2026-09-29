@@ -46,6 +46,7 @@ import mcpp.xlings;
 import mcpp.platform;
 import mcpp.ui;
 import mcpp.log;
+import mcpp.build.progress;
 
 export namespace mcpp::build {
 
@@ -72,9 +73,34 @@ std::string emit_ninja_string(const BuildPlan& plan);
 // The same, and when the plan places two or more files beside its programs,
 // the placement list the one `stage_list` edge reads (#734 E4), for the caller
 // to write as `<outputDir>/placements.list`. Empty when there is no such edge.
-std::string emit_ninja_string(const BuildPlan& plan, std::string* placements);
+std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
+                              mcpp::build::progress::Attribution* attribution = nullptr);
 std::string filter_ninja_output(std::string_view output,
                                 std::span<const std::string> commandPrefixes);
+
+// One ninja run read line by line into its build's report (build progress
+// design 2026-09-29, §6.1). `argv` must not carry `--quiet`: the status lines
+// are the report's clock. A failed step is reported when ninja prints it: its
+// package's line, `error: build failed` once per command, and the step's
+// diagnostics filtered as `filter_ninja_output` filters them (every line
+// under `verbose`, which also prints each step as `[f/t] <command>`).
+struct NinjaRun {
+    int         exitCode   = 0;
+    bool        timedOut   = false;
+    std::string output;             // every line ninja wrote
+    bool        reported   = false; // a failed step was reported as it failed
+};
+NinjaRun run_ninja_reporting(const std::vector<std::string>& argv,
+                             std::vector<std::pair<std::string, std::string>> env,
+                             std::chrono::milliseconds deadline,
+                             mcpp::build::progress::Build& progress,
+                             bool verbose,
+                             std::span<const std::string> commandPrefixes);
+
+// The step record of a plan (design §6.3): how the plan names its packages,
+// and which package each statement of `attribution` is for.
+mcpp::build::progress::Record step_record(const BuildPlan& plan,
+                                          const mcpp::build::progress::Attribution& attribution);
 
 // The link flags one executable's `windows_subsystem` / `windows_entry` render
 // to (#618). Empty on every object format other than PE, and for the pair of
@@ -1113,6 +1139,9 @@ std::string filter_ninja_output(std::string_view output,
         if (trimmed.starts_with("ninja: Entering directory")
             || trimmed.starts_with("ninja: build stopped")
             || is_ninja_progress_line(trimmed)
+            // The report's status marker (build progress design 2026-09-29),
+            // and a nested ninja's copy of it, its escape sequence stripped.
+            || trimmed.starts_with("\x1b[0m@@mcpp ") || trimmed.starts_with("@@mcpp ")
             || is_command_line(trimmed, commandPrefixes)) {
             continue;
         }
@@ -1141,6 +1170,64 @@ std::string filter_ninja_output(std::string_view output,
     return filtered;
 }
 
+NinjaRun run_ninja_reporting(const std::vector<std::string>& argv,
+                             std::vector<std::pair<std::string, std::string>> env,
+                             std::chrono::milliseconds deadline,
+                             mcpp::build::progress::Build& progress,
+                             bool verbose,
+                             std::span<const std::string> commandPrefixes) {
+    NinjaRun run;
+    for (auto& kv : progress.environment()) env.push_back(std::move(kv));
+    progress.pass_begin();
+    // The lines after `FAILED:` up to the next status line are the failed
+    // step's command and output; the lines after a status line alone are a
+    // successful step's output, which only --verbose shows (as before).
+    bool inFailure = false;
+    auto on_line = [&](std::string_view line) {
+        // A status line is the report's, not ninja's output: the advice and
+        // the failure report read `output`, and must not see the markers.
+        if (auto st = mcpp::build::progress::parse_status(line)) {
+            inFailure = false;
+            progress.status(*st);
+            if (verbose)
+                mcpp::ui::line(std::format("[{}/{}] {}", st->finished, st->total, st->text));
+            return;
+        }
+        run.output.append(line).push_back('\n');
+        auto trimmed = line;
+        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t'))
+            trimmed.remove_prefix(1);
+        if (trimmed.starts_with("FAILED:")) {
+            inFailure = true;
+            if (progress.failed(trimmed.substr(std::string_view("FAILED:").size())))
+                mcpp::ui::error("build failed");
+            run.reported = true;
+        }
+        if (inFailure) {
+            if (verbose) mcpp::ui::block(line);
+            else if (auto f = filter_ninja_output(line, commandPrefixes); !f.empty())
+                mcpp::ui::block(f);
+            return;
+        }
+        if (verbose) mcpp::ui::line(line);
+    };
+    // A ninja that cannot be started is reported through `on_line`, into the
+    // output the failure report reads.
+    run.exitCode = mcpp::platform::process::stream_exec(argv, env, deadline, on_line,
+                                                        &run.timedOut);
+    progress.pass_end();
+    return run;
+}
+
+mcpp::build::progress::Record step_record(const BuildPlan& plan,
+                                          const mcpp::build::progress::Attribution& attribution) {
+    std::vector<mcpp::build::progress::PackageInfo> declared;
+    declared.reserve(plan.packages.size());
+    for (auto const& p : plan.packages)
+        declared.push_back({p.name, p.requested, p.subject, p.cachedUnits, 0});
+    return attribution.record(declared);
+}
+
 // The aggregate target for everything staged out of the global cache. Named
 // with a leading underscore so it cannot collide with a module or target name
 // (both of which are identifiers or paths).
@@ -1150,7 +1237,8 @@ std::string emit_ninja_string(const BuildPlan& plan) {
     return emit_ninja_string(plan, nullptr);
 }
 
-std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
+std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
+                              mcpp::build::progress::Attribution* attribution) {
     // dyndep requires P1689 scanning capability:
     //   GCC: built-in -fdeps-format=p1689r5
     //   Clang: external clang-scan-deps tool (same P1689 output format)
@@ -1181,7 +1269,13 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
                        && !traits.bmiOnlyFlags.empty();
     const auto& dial = mcpp::toolchain::dialect_for(plan.toolchain);
     std::string out;
-    auto append = [&](std::string s) { out += std::move(s); };
+    auto append = [&](std::string s) {
+        if (attribution) attribution->statement(s);
+        out += std::move(s);
+    };
+    auto attribute = [&](std::string_view package) {
+        if (attribution) attribution->owner(package);
+    };
 
     append("# Auto-generated by mcpp v0.0.1. Do not edit by hand.\n");
     // #407: the graph declares which mode produced it, because three modes
@@ -2106,6 +2200,9 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     auto ios_init_src = std::filesystem::path("obj") / "mcpp_ios_init.c";
     auto ios_init_obj = std::filesystem::path("obj")
                       / std::format("mcpp_ios_init{}", dial.objExt);
+    // Each statement is recorded with the package it is for (build progress
+    // design 2026-09-29, §6.3); the shim is the build's own.
+    attribute("");
     if (need_ios_init_shim) {
         append(std::format("build {} : ios_init_object {}\n",
                            escape_ninja_path(ios_init_obj),
@@ -2180,6 +2277,8 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     auto unit_needs_cxx_runtime = [&](const LinkUnit& lu) {
         return mcpp::build::link_unit_holds_cxx(plan, lu);
     };
+    // The standard library module is a dependency of the build: `std`.
+    attribute("std");
     if (has_std_artifacts) {
         append(std::format("build {} : stage_file {}\n", escape_ninja_path(std_bmi_dst),
                            escape_ninja_path(plan.stdBmiPath)));
@@ -2195,6 +2294,9 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
                         / std::format("std.compat{}", traits.bmiExt);
     auto compat_o_dst = std::filesystem::path("obj")
                       / std::format("std.compat{}", dial.objExt);
+    // `std.compat` is built only when something imports it, so it belongs to
+    // no package: a step that never runs would keep its package open (§3.2).
+    attribute("");
     if (has_std_compat) {
         // std.compat.pcm depends on std.pcm — ensure std.pcm is staged first
         // so clang can resolve the transitive dependency when loading std.compat.pcm.
@@ -2308,6 +2410,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     {
         std::vector<std::string> staged;
         for (auto& cu : plan.compileUnits) {
+            attribute(cu.packageName);
             if (!cu.servedFromCache) continue;
             if (cu.cachedObject.empty()) continue;
             auto obj = escape_ninja_path(cu.object);
@@ -2424,12 +2527,15 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
         // -fmodules which is exactly what C support is here to avoid.
         std::vector<std::string> ddi_paths;
         ddi_paths.reserve(plan.compileUnits.size());
+        std::unordered_map<std::string, std::string> ddiOwner;
         for (auto& cu : plan.compileUnits) {
+            attribute(cu.packageName);
             if (cu.servedFromCache) continue;   // staged, never scanned
             if (is_scan_exempt(cu))
                 continue;
             auto ddi = (cu.object.parent_path() / cu.source.filename()).string() + ".ddi";
             ddi_paths.push_back(ddi);
+            ddiOwner[ddi] = cu.packageName;
             append(std::format("build {} : cxx_scan {}{}\n", escape_ninja_path(ddi),
                                escape_ninja_path(cu.source), order_only_for(cu)));
             // `-o` and `-fdeps-target` are DIFFERENT under the split shape and
@@ -2527,6 +2633,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
             }
         }
         for (auto& ddi : ddi_paths) {
+            attribute(ddiOwner[ddi]);
             auto dd = ddi + ".dd";   // e.g. obj/cli.cppm.ddi.dd
             ddi_to_dd[ddi] = dd;
             append(std::format("build {} : cxx_dyndep {}\n", dd, ddi));
@@ -2541,6 +2648,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
         // Each compile edge references its OWN .dd file instead of a global one.
         // P2: module compile edges get a $bmi_out variable for BMI preservation.
         for (auto& cu : plan.compileUnits) {
+            attribute(cu.packageName);
             if (cu.servedFromCache) continue;   // a stage_file edge owns these outputs
             std::string rule = pick_rule(cu);
 
@@ -2683,6 +2791,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     } else {
         // ── Static-deps mode (M3.2 and earlier). ────────────────────────
         for (auto& cu : plan.compileUnits) {
+            attribute(cu.packageName);
             if (cu.servedFromCache) continue;   // a stage_file edge owns these outputs
             std::string rule = pick_rule(cu);
 
@@ -2745,6 +2854,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // path smuggled through ldflags that this replaces, editing the icon or the
     // script now actually reaches the linker.
     for (auto const& ru : plan.resourceUnits) {
+        attribute(ru.package);
         std::string implicit;
         for (auto const& in : ru.implicitInputs)
             implicit += " " + escape_ninja_path(in);
@@ -2776,6 +2886,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
 
     // Link units
     for (auto& lu : plan.linkUnits) {
+        attribute(lu.package);
         // A member's unit reads its link group's flags (§15); every other
         // unit reads the plan's.
         const auto& uflags = lu.linkGroup >= 0
@@ -3092,6 +3203,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // exactly one source (every project before this feature, and most
     // packages after it) emits the exact same line as always: the loop below
     // reduces to the one-word case with no change in spelling.
+    attribute("");
     if (placedFiles.size() >= 2) {
         // #734 E4: one edge for the whole list. One entry keeps the per-file
         // edge below, byte for byte.
@@ -3147,6 +3259,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
     // incrementality.
     std::string actionDefaults;
     for (std::size_t i = 0; i < plan.actions.size(); ++i) {
+        attribute(plan.actions[i].packageName);
         auto const& a = plan.actions[i];
         std::string cmd;
         for (auto const& tok : a.command) {
@@ -3280,6 +3393,11 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements) {
         for (auto const& o : a.outputs) outs += " " + escape_ninja_path(o);
         for (auto const& in : a.inputs) ins += " " + escape_ninja_path(in);
         append(std::format("build{} : mcpp_action_{}{}\n", outs, i, ins));
+        // A check or prepare action reports its start through the wrapper,
+        // by its first output (design §6.4); the record gives it its label.
+        if (attribution && stamped)
+            attribution->action(std::filesystem::path(a.outputs.front()).generic_string(),
+                                a.description.empty() ? a.id : a.description);
         append("\n");
         // A Source action's outputs are reachable through the phony its
         // package's compile edges name, and an Object action's through the
@@ -3769,8 +3887,16 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
                                  : std::vector<mcpp::targetside::CAbiAbsentEntry>{});
     write_consumer_include_sidecar(plan.outputDir, root_include_dirs_of(plan));
     std::string placements;
-    auto manifest = emit_ninja_string(plan, &placements);
+    mcpp::build::progress::Attribution attribution;
+    auto manifest = emit_ninja_string(plan, &placements, &attribution);
     stage("emit-ninja");
+    // The step record, beside build.ninja like the other files the fast path
+    // reads (build progress design 2026-09-29, §6.3).
+    {
+        auto record = step_record(plan, attribution);
+        mcpp::build::progress::write_record(plan.outputDir, record);
+        if (opts.progress) opts.progress->set_record(std::move(record));
+    }
     if (!placements.empty()) {
         // Written only when it changes: it is an input of the placement edge.
         const auto listPath = plan.outputDir / "placements.list";
@@ -4026,7 +4152,9 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     // the runtime env to the child ONLY — so a bundled-glibc LD_LIBRARY_PATH
     // can never poison the host shell (the newer-glibc `sh:` crash class).
     std::vector<std::string> nargv{ninjaProgram};
-    if (!opts.verbose)
+    // With a report, ninja's status lines are read as it runs (build progress
+    // design 2026-09-29, §6.1), so they are not suppressed.
+    if (!opts.verbose && !opts.progress)
         nargv.push_back("--quiet");
     nargv.push_back("-C");
     nargv.push_back(plan.outputDir.string());
@@ -4086,20 +4214,45 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     if (manifest.find("\nbuild " + std::string(kStagedCacheGoal) + " : phony") != std::string::npos) {
         std::vector<std::string> pre{ninjaProgram, "--quiet", "-C", plan.outputDir.string(),
                                      std::string(kStagedCacheGoal)};
-        (void)mcpp::platform::process::capture_exec_deadline(pre, nenv,
+        // A ninja whose progress nobody reads reports no action start, not
+        // even into the file of a build that runs this one (design §6.4).
+        auto preEnv = nenv;
+        preEnv.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
+        (void)mcpp::platform::process::capture_exec_deadline(pre, preEnv,
             std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000),
             nullptr);
         stage("ninja-staged-cache");
     }
 
     bool buildTimedOut = false;
-    auto cap = mcpp::platform::process::capture_exec_deadline(
-        nargv, nenv,
-        std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000),
-        &buildTimedOut);
+    bool reported = false;
+    std::string out;
+    int ninjaExit = 0;
+    const auto deadline =
+        std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000);
+    if (opts.progress) {
+        auto run = run_ninja_reporting(nargv, nenv, deadline, *opts.progress, opts.verbose,
+                                       command_prefixes(flags, plan));
+        out = std::move(run.output);
+        ninjaExit = run.exitCode;
+        buildTimedOut = run.timedOut;
+        reported = run.reported;
+    } else {
+        auto quietEnv = nenv;
+        quietEnv.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
+        auto cap = mcpp::platform::process::capture_exec_deadline(
+            nargv, quietEnv, deadline, &buildTimedOut);
+        out = std::move(cap.output);
+        ninjaExit = cap.exit_code;
+    }
     stage("ninja");
-    std::string out = cap.output;
-    bool ok = (cap.exit_code == 0) && !buildTimedOut;
+    bool ok = (ninjaExit == 0) && !buildTimedOut;
+    // Every package gets its final line before what the build has to say
+    // after ninja: validations, advice, `Finished`.
+    if (opts.progress) {
+        opts.progress->finish(ok);
+        if (ok) mcpp::build::progress::checking();
+    }
 
     if (buildTimedOut) {
         // Report as a build failure with the partial ninja output attached —
@@ -4108,9 +4261,14 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         r.exitCode = 1;
         r.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0);
+        // Under a report the failed steps were written as they failed, and
+        // under --verbose every line was: only what is left is attached.
+        std::string partial = !opts.progress ? out
+            : reported || opts.verbose ? std::string{}
+            : filter_ninja_output(out, command_prefixes(flags, plan));
         return std::unexpected(BuildError{
             std::format("build timed out after {}s", opts.buildTimeoutSecs),
-            plan.outputDir / "build.ninja", out, /*timedOut=*/true});
+            plan.outputDir / "build.ninja", std::move(partial), /*timedOut=*/true});
     }
 
     r.exitCode = ok ? 0 : 1;
@@ -4232,7 +4390,8 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
                 "see docs/05 `[build] dependency_linkage`");
         }
         stage("symbol-provision");
-        if (opts.verbose && !out.empty())
+        // Under a report the lines were printed as ninja wrote them.
+        if (opts.verbose && !opts.progress && !out.empty())
             std::fputs(out.c_str(), stdout);
         std::set<std::string> want(opts.ninjaTargets.begin(), opts.ninjaTargets.end());
         for (auto& lu : plan.linkUnits) {
@@ -4244,7 +4403,10 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         }
     } else {
         auto prefixes = command_prefixes(flags, plan);
-        auto diagnostics = opts.verbose ? out : filter_ninja_output(out, prefixes);
+        // What was reported as it happened is not repeated: a failed step's
+        // diagnostics (default output), or every line (--verbose).
+        auto diagnostics = reported || (opts.progress && opts.verbose) ? std::string{}
+                         : opts.verbose ? out : filter_ninja_output(out, prefixes);
         // Appended here as well as on the fast path (execute.cppm): the two
         // paths report failure through different channels, and advice attached
         // to only one of them would appear or not depending on whether
@@ -4267,8 +4429,10 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
                 plan.targetSide.cAbiDecl->absent);
         // (the fast path reads the same list from the sidecar this build
         // wrote beside build.ninja — see `write_c_abi_absent_sidecar`)
-        return std::unexpected(BuildError{"build failed", plan.outputDir / "build.ninja",
-                                          std::move(diagnostics)});
+        BuildError failure{"build failed", plan.outputDir / "build.ninja",
+                           std::move(diagnostics)};
+        failure.reported = reported;
+        return std::unexpected(std::move(failure));
     }
     return r;
 }

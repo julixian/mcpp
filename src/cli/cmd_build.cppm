@@ -21,6 +21,7 @@ import mcpp.build.schedule.detach_codegen;
 import mcpp.build.test_targets;
 import mcpp.build.build_database;
 import mcpp.build.build_program;
+import mcpp.build.progress;         // the report every building command opens
 import mcpp.build.refusal;          // offline-download-required (#648 A1)
 import mcpp.diag;                   // a member's own diagnostics, in the envelope (WS3)
 import mcpp.dyndep;
@@ -137,6 +138,25 @@ workspace_groups(const std::filesystem::path& wsRoot, const std::vector<std::str
     return groups;
 }
 
+// The tests of each member of a configuration group, for a plan of the group
+// that includes them (`--configure-only`, `mcpp emit build-database`): the
+// targets by member path, and the root and globs each member's discovery read.
+struct GroupTests {
+    std::map<std::string, std::vector<mcpp::manifest::Target>>              targets;
+    std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> discovery;
+};
+std::expected<GroupTests, std::string>
+group_tests(const std::filesystem::path& wsRoot, const std::vector<std::string>& group) {
+    GroupTests out;
+    for (auto const& mp : group) {
+        auto d = mcpp::build::discover_test_targets(wsRoot, mp);
+        if (!d) return std::unexpected(std::format("{}: {}", mp, d.error()));
+        if (!d->targets.empty()) out.targets[mp] = std::move(d->targets);
+        out.discovery.emplace_back(d->packageRoot, std::move(d->discover));
+    }
+    return out;
+}
+
 // run_build_plan, wrapped in the project's `[hooks]` lifecycle (#496).
 //
 // The hooks are those of the package being built: the root's, or in a
@@ -168,8 +188,20 @@ int run_build_with_hooks(mcpp::build::BuildContext& ctx, bool verbose,
         if (!spans.back()->ok()) return 1;
     }
 
+    // A hook command writes to the terminal itself, so the build's live
+    // region is erased while one runs (build progress design 2026-09-29,
+    // §5.3); a `during_build` command that writes while the build runs keeps
+    // it erased for the whole build.
+    std::optional<mcpp::ui::SuspendRegion> sharedTerminal;
+    if (std::ranges::any_of(spans, [](auto const& s) { return s->writes_to_terminal(); }))
+        sharedTerminal.emplace();
+    auto invoke = [](auto const& hooks, mcpp::hooks::Event event, auto const& root) {
+        mcpp::ui::SuspendRegion hookOwnsTheTerminal;
+        return mcpp::hooks::invoke(hooks, event, root);
+    };
+
     for (auto const& sub : subjects)
-        if (!mcpp::hooks::invoke(*sub.hooks, mcpp::hooks::Event::BuildStart, sub.root))
+        if (!invoke(*sub.hooks, mcpp::hooks::Event::BuildStart, sub.root))
             return 1;
 
     int rc = mcpp::build::run_build_plan(ctx, verbose, no_cache, targetOverride);
@@ -186,8 +218,9 @@ int run_build_with_hooks(mcpp::build::BuildContext& ctx, bool verbose,
     // "the notifier failed" for a compile error would answer a question nobody
     // asked. A hook failure only decides the exit code of a build that worked.
     bool hookOk = true;
+    sharedTerminal.reset();
     for (auto const& sub : subjects)
-        hookOk = mcpp::hooks::invoke(*sub.hooks, terminalEvent, sub.root) && hookOk;
+        hookOk = invoke(*sub.hooks, terminalEvent, sub.root) && hookOk;
     return rc != 0 ? rc : ((spanOk && hookOk) ? 0 : 1);
 }
 
@@ -229,6 +262,9 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
     bool print_fp = parsed.is_flag_set("print-fingerprint");
     bool no_cache = parsed.is_flag_set("no-cache");
     bool configure_only = parsed.is_flag_set("configure-only");
+    // The build's report: its steps, its status line, `Finished` (build
+    // progress design 2026-09-29).
+    mcpp::build::progress::open(verbose);
 
     mcpp::build::BuildOverrides ov = overrides_from_selectors(parsed);
     // --cache global|local|off. --no-cache is the deprecated alias for off; the
@@ -239,11 +275,15 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
 
     // Fan-out prefixes every diagnostic with the member it came from; the
     // single-package path has nothing to disambiguate and passes "".
+    // `configured`, when given, receives the plan's output directory and the
+    // plan leaves the root compile database to the caller, which publishes
+    // it once for every configuration it planned.
     auto configure_member = [&](mcpp::build::BuildOverrides memberOv,
-                                std::string_view label) -> int {
+                                std::string_view label,
+                                std::vector<std::filesystem::path>* configured = nullptr) -> int {
         auto where = [&](std::string_view msg) {
-            if (label.empty()) std::println(stderr, "error: {}", msg);
-            else               std::println(stderr, "error: {}: {}", label, msg);
+            if (label.empty()) mcpp::ui::error(std::format("{}", msg));
+            else               mcpp::ui::error(std::format("{}: {}", label, msg));
         };
         auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
         if (!root) {
@@ -268,6 +308,10 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
             where(ctx.error());
             return 2;
         }
+        if (configured) {
+            ctx->plan.publishRootCompileDb = false;
+            configured->push_back(ctx->outputDir);
+        }
         return mcpp::build::run_configure_plan(*ctx, verbose);
     };
 
@@ -278,24 +322,58 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
     // each), and a failed group does not stop the others; the first non-zero
     // exit wins.
     auto selection = workspace_selection(parsed.is_flag_set("workspace"), ov.package_filter);
-    if (!selection) { std::println(stderr, "error: {}", selection.error()); return 2; }
+    if (!selection) { mcpp::ui::error(std::format("{}", selection.error())); return 2; }
     if (*selection) {
         auto const& members = (*selection)->members;
-        if (configure_only) {
-            int rc = 0;
-            for (auto const& mp : members) {
-                mcpp::build::BuildOverrides mo = ov;
-                mo.package_filter = mp;
-                int r = configure_member(std::move(mo), members.size() > 1 ? mp : "");
-                if (r != 0) rc = r;
-            }
-            return rc;
+        if (configure_only && members.size() == 1) {
+            mcpp::build::BuildOverrides mo = ov;
+            mo.package_filter = members.front();
+            return configure_member(std::move(mo), "");
         }
         auto groups = workspace_groups((*selection)->root, members);
-        if (!groups) { std::println(stderr, "error: {}", groups.error()); return 2; }
+        if (!groups) { mcpp::ui::error(std::format("{}", groups.error())); return 2; }
         std::vector<std::string> request;
         for (auto const& g : *groups)
             for (auto const& mp : g) request.push_back(mp);
+        // Configured as built: one plan per configuration group, with each
+        // member's tests and dev-dependencies (the surface an editor needs,
+        // as for one member), so the compile database of a group describes
+        // each of its packages once.
+        if (configure_only) {
+            int rc = 0;
+            std::vector<std::filesystem::path> configured;
+            for (auto const& g : *groups) {
+                auto configure_one_by_one = [&] {
+                    // Planned member by member, so a member's failure affects
+                    // that member only, as a plan of one member always did.
+                    for (auto const& mp : g) {
+                        mcpp::build::BuildOverrides one = ov;
+                        one.package_filter = mp;
+                        if (int r = configure_member(std::move(one), mp, &configured); r != 0) rc = r;
+                    }
+                };
+                auto tests = group_tests((*selection)->root, g);
+                if (!tests && g.size() > 1) { configure_one_by_one(); continue; }
+                if (!tests) { mcpp::ui::error(std::format("{}", tests.error())); rc = 2; continue; }
+                mcpp::build::BuildOverrides mo = ov;
+                mo.package_filter.clear();
+                mo.project_root = (*selection)->root;
+                mo.workspace_members = g;
+                mo.workspace_request = request;
+                const bool includeDevDeps = !tests->targets.empty();
+                mo.member_targets = std::move(tests->targets);
+                auto ctx = mcpp::build::prepare_build(print_fp, includeDevDeps,
+                                                      /*extraTargets=*/{}, mo);
+                if (!ctx && g.size() > 1) { configure_one_by_one(); continue; }
+                if (!ctx) { mcpp::ui::error(std::format("{}: {}", g.front(), ctx.error())); rc = 2; continue; }
+                ctx->plan.publishRootCompileDb = false;
+                if (int r = mcpp::build::run_configure_plan(*ctx, verbose); r != 0) rc = r;
+                configured.push_back(ctx->outputDir);
+            }
+            if (!configured.empty())
+                mcpp::build::publish_workspace_compile_commands((*selection)->root, configured);
+            return rc;
+        }
         const bool plain = !print_fp && ov.target_triple.empty() && !ov.force_static
             && ov.profile.empty() && ov.features.empty() && !ov.strict
             && ov.capabilities.empty() && ov.cache_mode.empty() && ov.accel.empty();
@@ -319,7 +397,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
             mo.workspace_request = request;
             auto ctx = mcpp::build::prepare_build(print_fp, /*includeDevDeps=*/false,
                                                   /*extraTargets=*/{}, mo);
-            if (!ctx) { std::println(stderr, "error: {}", ctx.error()); rc = 2; continue; }
+            if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); rc = 2; continue; }
             contexts.push_back(std::move(*ctx));
         }
         if (contexts.size() == 1) {
@@ -327,9 +405,16 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
                                                ov.target_triple);
             return r != 0 ? r : rc;
         }
+        // One report for every configuration: each package line names its
+        // configuration, and one `Finished` follows them all (design §9).
+        mcpp::build::progress::configurations(contexts.size());
+        mcpp::build::progress::defer_finished();
         const std::size_t hw = std::max(1u, std::thread::hardware_concurrency());
         std::set<std::filesystem::path> directories;
         for (auto const& c : contexts) directories.insert(c.outputDir.lexically_normal());
+        // The root compile database is the command's, published once below
+        // from every group's (execute.cppm), not by each concurrent build.
+        for (auto& c : contexts) c.plan.publishRootCompileDb = false;
         for (auto& c : contexts) {
             const std::size_t want = c.plan.scheduleNinjaJobs > 0
                 ? static_cast<std::size_t>(c.plan.scheduleNinjaJobs) : hw + 2;
@@ -354,6 +439,10 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
         }
         for (int r : results)
             if (r != 0 && rc == 0) rc = r;
+        std::vector<std::filesystem::path> dirs;
+        for (auto const& c : contexts) dirs.push_back(c.outputDir);
+        mcpp::build::publish_workspace_compile_commands((*selection)->root, dirs);
+        if (rc == 0) mcpp::build::progress::finish_deferred();
         return rc;
     }
 
@@ -387,7 +476,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
 
     auto ctx = mcpp::build::prepare_build(print_fp, /*includeDevDeps=*/false,
                                           /*extraTargets=*/{}, ov);
-    if (!ctx) { std::println(stderr, "error: {}", ctx.error()); return 2; }
+    if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); return 2; }
 
     return run_build_with_hooks(*ctx, verbose, no_cache, ov.target_triple);
 }
@@ -504,16 +593,47 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         return failed("MCPP_BUILD_DATABASE_NO_PROJECT",
                       "no mcpp.toml found in current directory or any parent");
 
-    std::vector<std::pair<std::string, mcpp::build::BuildOverrides>> requests;
-    if (auto members = workspace_fanout_members(parsed.is_flag_set("workspace"),
-                                                ov.package_filter)) {
-        for (auto const& mp : *members) {
-            auto mo = ov;
-            mo.package_filter = mp;
-            requests.emplace_back(mp, std::move(mo));
+    // One plan per configuration group, as `mcpp build` plans a workspace
+    // (workspace design 2026-09-29 §15): a package the members share is one
+    // set of the document, described once. A selection of one member is one
+    // plan of that member, as before.
+    struct PlanRequest {
+        std::string                 member;   // one member's path; empty for a group or a package
+        std::vector<std::string>    group;    // the members of a group plan
+        mcpp::build::BuildOverrides mo;
+    };
+    std::vector<PlanRequest> requests;
+    auto plan_alone = [&](const std::string& mp) {
+        auto one = ov;
+        one.package_filter = mp;
+        requests.push_back({mp, {}, std::move(one)});
+    };
+    std::filesystem::path wsRoot = *root;
+    auto selection = workspace_selection(parsed.is_flag_set("workspace"), ov.package_filter);
+    if (!selection)
+        return failed("MCPP_BUILD_DATABASE_PLAN_FAILED", selection.error());
+    if (*selection && (*selection)->members.size() > 1) {
+        wsRoot = (*selection)->root;
+        // A member whose manifest cannot be read has no configuration; the
+        // members are then planned one by one, and it fails alone (R5.2).
+        auto groups = workspace_groups(wsRoot, (*selection)->members);
+        if (!groups) {
+            for (auto const& mp : (*selection)->members) plan_alone(mp);
+        } else {
+            for (auto const& g : *groups) {
+                auto mo = ov;
+                mo.package_filter.clear();
+                mo.project_root = wsRoot;
+                mo.workspace_members = g;
+                mo.workspace_request = (*selection)->members;
+                requests.push_back({g.size() == 1 ? g.front() : std::string{}, g, std::move(mo)});
+            }
         }
+    } else if (auto members = workspace_fanout_members(parsed.is_flag_set("workspace"),
+                                                       ov.package_filter)) {
+        plan_alone(members->front());
     } else {
-        requests.emplace_back(std::string{}, ov);
+        requests.push_back({std::string{}, {}, ov});
     }
 
     // An offline plan that needs a download is not a defect of the project, and
@@ -533,8 +653,7 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
 
     std::vector<mcpp::build::BuildContext> contexts;
     std::vector<std::filesystem::path>     workDirs;
-    std::vector<std::string>               prefixes;
-    std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> testDiscovery;
+    std::vector<std::vector<std::pair<std::filesystem::path, std::vector<std::string>>>> testDiscovery;
     // The root of every member whose planning failed: `mcpp.toml` and
     // `build.mcpp` (when it exists) join `watch` exactly as a planned
     // member's do (render(), below), so an edit that might fix the failure is
@@ -560,30 +679,72 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         // Planning narrates on stdout and may start programs that inherit it;
         // the document is printed after this scope, alone.
         mcpp::platform::terminal::StdoutToStderr narration;
-        for (auto& [member, mo] : requests) {
-            const auto memberRoot = member.empty() ? *root : *root / member;
-            const auto memberPath = member.empty() ? std::string("mcpp.toml")
-                                                   : member + "/mcpp.toml";
-            auto discovered = mcpp::build::discover_test_targets(*root, mo.package_filter);
-            if (!discovered) {
+        // A group whose plan fails is planned member by member (appended to
+        // `requests` and reached by this same loop), so a member's failure
+        // still affects that member only (SPEC-005 R5.2).
+        for (std::size_t ri = 0; ri < requests.size(); ++ri) {
+            auto req = requests[ri];
+            auto& mo = req.mo;
+            const auto memberRoot = req.member.empty() ? wsRoot : wsRoot / req.member;
+            const auto memberPath = req.member.empty() ? std::string("mcpp.toml")
+                                                       : req.member + "/mcpp.toml";
+            // The roots whose `mcpp.toml` and `build.mcpp` join `watch` when
+            // this plan fails: the member's, or every member's of a group.
+            std::vector<std::filesystem::path> planRoots;
+            if (req.group.empty()) planRoots.push_back(memberRoot);
+            for (auto const& mp : req.group) planRoots.push_back(wsRoot / mp);
+            auto fail_plan = [&](std::string message) {
                 diagnostics.push_back({plan_failure_code(), Severity::Error,
-                    member.empty() ? discovered.error()
-                                   : std::format("{}: {}", member, discovered.error()),
-                    memberPath});
-                failedMemberRoots.push_back(memberRoot);
-                continue;
-            }
+                                       std::move(message), memberPath});
+                for (auto const& r : planRoots) failedMemberRoots.push_back(r);
+            };
             // As `--configure-only`: tests and dev-dependencies are part of the
-            // surface an editor needs.
-            const bool includeDevDeps = !discovered->targets.empty();
-            auto discovery = std::pair{discovered->packageRoot, discovered->discover};
+            // surface an editor needs, each member's own in a group plan.
+            std::vector<mcpp::manifest::Target> extraTargets;
+            std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> discovery;
+            bool includeDevDeps = false;
+            if (req.group.empty()) {
+                auto discovered = mcpp::build::discover_test_targets(*root, mo.package_filter);
+                if (!discovered) {
+                    fail_plan(req.member.empty() ? discovered.error()
+                              : std::format("{}: {}", req.member, discovered.error()));
+                    continue;
+                }
+                includeDevDeps = !discovered->targets.empty();
+                discovery.emplace_back(discovered->packageRoot, discovered->discover);
+                extraTargets = std::move(discovered->targets);
+            } else {
+                auto tests = group_tests(wsRoot, req.group);
+                if (!tests && req.group.size() == 1) { fail_plan(tests.error()); continue; }
+                if (!tests) {
+                    for (auto const& mp : req.group) plan_alone(mp);
+                    continue;
+                }
+                includeDevDeps = !tests->targets.empty();
+                discovery = std::move(tests->discovery);
+                mo.member_targets = std::move(tests->targets);
+            }
             mo.plan_only = true;
-            mo.work_dir  = build_database_work_dir(*root, mo.package_filter);
+            std::string workKey = mo.package_filter;
+            for (auto const& mp : req.group) workKey += (workKey.empty() ? "" : ",") + mp;
+            mo.work_dir = build_database_work_dir(req.group.empty() ? *root : wsRoot, workKey);
             std::error_code ec;
             std::filesystem::remove(mo.work_dir / "mcpp.lock", ec);
+            const auto diagnosticsBefore = diagnostics.size();
             auto ctx = mcpp::build::prepare_build(/*print_fingerprint=*/false,
                                                   includeDevDeps,
-                                                  std::move(discovered->targets), mo);
+                                                  std::move(extraTargets), mo);
+            if (!ctx && req.group.size() > 1) {
+                // What the group's attempt recorded is recorded again, per
+                // member, by the plans below.
+                (void)mcpp::diag::take();
+                (void)mcpp::build::take_notes_on_failure();
+                (void)mcpp::build::refusal::take();
+                diagnostics.erase(diagnostics.begin() + static_cast<std::ptrdiff_t>(diagnosticsBefore),
+                                  diagnostics.end());
+                for (auto const& mp : req.group) plan_alone(mp);
+                continue;
+            }
             take_member_diagnostics(memberPath);
             if (!ctx) {
                 // A wholly-failed member contributes exactly one `error`
@@ -598,8 +759,8 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                 // recorded, then discarded the moment `prepare_build` returned
                 // — never reached the reader (design 2026-09-27 §4.2, mcpp#724
                 // side finding A, fix item 2).
-                std::string message = member.empty() ? ctx.error()
-                                                     : std::format("{}: {}", member, ctx.error());
+                std::string message = req.member.empty() ? ctx.error()
+                                                         : std::format("{}: {}", req.member, ctx.error());
                 for (auto const& note : mcpp::build::take_notes_on_failure())
                     message += note.path.empty()
                         ? std::format("\n       earlier in this pass, {}: {}",
@@ -608,12 +769,11 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                                       note.code, note.path, note.message);
                 diagnostics.push_back({plan_failure_code(), Severity::Error,
                                        std::move(message), memberPath});
-                failedMemberRoots.push_back(memberRoot);
+                for (auto const& r : planRoots) failedMemberRoots.push_back(r);
                 continue;
             }
             contexts.push_back(std::move(*ctx));
             workDirs.push_back(mo.work_dir);
-            prefixes.push_back(member.empty() ? std::string{} : member + "/");
             testDiscovery.push_back(std::move(discovery));
         }
     }
@@ -642,11 +802,20 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                             "would update it", projectLock.string())});
     }
 
+    // A set is named by its package; a document of several configurations
+    // prefixes each name with its configuration's name, the name of the build
+    // directory the configuration is built in (SPEC-005 R3.3), so a package
+    // two configurations compile is a set of each.
+    std::set<std::string> configurations;
+    for (auto const& c : contexts) configurations.insert(c.outputDir.filename().string());
+    auto configurationPrefix = [&](const mcpp::build::BuildContext& c) {
+        return configurations.size() > 1 ? c.outputDir.filename().string() + "/" : std::string{};
+    };
     std::vector<mcpp::build::database::Member> members;
     bool ranBuildPrograms = false;
     for (std::size_t i = 0; i < contexts.size(); ++i) {
-        members.push_back({&contexts[i], prefixes[i], workDirs[i],
-                           testDiscovery[i].first, testDiscovery[i].second});
+        members.push_back({&contexts[i], configurationPrefix(contexts[i]), workDirs[i],
+                           testDiscovery[i]});
         if (!mcpp::build::declared_program_inputs(workDirs[i]).empty())
             ranBuildPrograms = true;
         for (auto const& sp : contexts[i].sourcePackages) {
@@ -663,7 +832,7 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         ov.profile, ov.features, ov.capabilities, ov.accel, ov.force_static,
         ov.package_filter, parsed.is_flag_set("workspace"));
     auto rendered = mcpp::build::database::render(members, failedMemberRoots,
-                                                  *root, selector);
+                                                  wsRoot, selector);
     // A note's severity is its own (E3's program-failure note is an error;
     // every other note today is a warning) and its `path`, when set, already
     // names the file relative to the workspace root — render() rewrote it.
@@ -754,6 +923,8 @@ export int cmd_run(const mcpplibs::cmdline::ParsedArgs& parsed,
     if (parsed.is_flag_set("list-runners"))
         return mcpp::build::list_runners(package_filter, cache_mode, no_cache,
                                          target_triple, features, profile, accel);
+    // Closed before the program starts: the program owns the terminal.
+    mcpp::build::progress::open(mcpp::log::is_verbose());
     return mcpp::build::build_run_target(targetName, passthrough, package_filter,
                                          cache_mode, no_cache, target_triple,
                                          no_runner, runner_name, features,

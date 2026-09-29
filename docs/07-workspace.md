@@ -441,6 +441,14 @@ member that several members use is compiled once.
 - **Resources.** A member's `[resources]` and `windows_code_page` are
   compiled against the member's directory and include directories and embedded
   into that member's programs and shared libraries only (2026.9.29.2+).
+- **Build programs.** The members' build programs run dependencies first, and
+  a program's result is reused by every command whose inputs to it are
+  unchanged, whichever members the command selects (2026.9.29.5+).
+- **Compile database.** `mcpp build --configure-only` and `mcpp emit
+  build-database` plan as the build does, one plan per configuration with each
+  member's tests, so a package the members share is described once per
+  configuration. A command that planned several configurations writes the root
+  `compile_commands.json` once, as the union of their databases (2026.9.29.5+).
 - **No-op builds.** A command repeated with nothing changed is answered by one
   check per configuration, without planning.
 - **Module names.** Members built in one graph share one module namespace:

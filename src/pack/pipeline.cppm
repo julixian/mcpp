@@ -28,6 +28,7 @@ import mcpp.toolchain.model;
 import mcpp.toolchain.probe;
 import mcpp.toolchain.registry;
 import mcpp.toolchain.triple;
+import mcpp.log;
 import mcpp.ui;
 import mcpp.xlings;
 
@@ -205,6 +206,48 @@ build_extra_android_legs(const std::string& targetName,
         out.push_back(std::move(leg));
     }
     return out;
+}
+
+// The human report of what a dispatched format produced. A format may submit
+// one output per file of a distribution tree (1,309 for one program of the
+// validation project), and a line per file then buries the rest of the pass.
+// Up to `kListedOutputs` outputs are named one per line; more are named by the
+// entry each lies in below their common parent, with a count, and --verbose
+// names every one. `--message-format json` lists every output in either case.
+constexpr std::size_t kListedOutputs = 8;
+
+void report_packed(const std::vector<std::filesystem::path>& outputs,
+                   const mcpp::ui::PathContext& pathCtx) {
+    if (outputs.size() <= kListedOutputs || mcpp::log::is_verbose()) {
+        for (auto const& o : outputs)
+            mcpp::ui::status("Packed", mcpp::ui::shorten_path(o, pathCtx));
+        return;
+    }
+    auto parent = outputs.front().parent_path();
+    for (auto const& o : outputs) {
+        auto a = parent.begin(), b = o.begin();
+        std::filesystem::path common;
+        for (; a != parent.end() && b != o.end() && *a == *b; ++a, ++b) common /= *a;
+        parent = common;
+    }
+    // Each entry, in the order first reached, with the outputs below it and
+    // whether it is itself an output (then named alone).
+    struct Entry { std::filesystem::path path; std::size_t outputs = 0; bool isOutput = false; };
+    std::vector<Entry> entries;
+    for (auto const& o : outputs) {
+        // Outputs with no common parent (two drives) are named one by one.
+        const auto rel = parent.empty() ? std::filesystem::path{} : o.lexically_relative(parent);
+        const auto path = rel.empty() || rel == "." ? o : parent / *rel.begin();
+        auto it = std::ranges::find(entries, path, &Entry::path);
+        if (it == entries.end()) it = entries.insert(entries.end(), Entry{path});
+        ++it->outputs;
+        it->isOutput = it->isOutput || path == o;
+    }
+    for (auto const& e : entries)
+        mcpp::ui::status("Packed", e.outputs == 1 && e.isOutput
+            ? mcpp::ui::shorten_path(e.path, pathCtx)
+            : std::format("{} ({} {})", mcpp::ui::shorten_path(e.path, pathCtx), e.outputs,
+                          e.outputs == 1 ? "file" : "files"));
 }
 
 // Everything after CLI option parsing for `mcpp pack`.
@@ -821,9 +864,9 @@ export PackOutcome build_and_pack(Options opts, bool modeFromUser,
                 return PackOutcome{1};
             }
             if (consumed.contains(abs)) { intermediate.push_back(std::move(abs)); continue; }
-            mcpp::ui::status("Packed", mcpp::ui::shorten_path(abs, pathCtx));
             reported.push_back(std::move(abs));
         }
+        report_packed(reported, pathCtx);
         // Every output consumed by another: a cycle a provider should not
         // write, reported as all outputs rather than as nothing.
         if (reported.empty()) reported = std::move(intermediate);

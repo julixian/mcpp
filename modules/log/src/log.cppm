@@ -43,6 +43,28 @@ void set_verbose(bool v);
 bool is_verbose();
 void verbose(std::string_view tag, std::string_view message);
 
+// A record, as a sink receives it: what `verbose` was asked to say.
+struct Record {
+    std::string_view timestamp;   // local wall-clock time, as the file has it
+    std::string_view tag;
+    std::string_view message;
+};
+
+// The one spelling of a verbose record on a terminal: dim, with its time, so
+// that a long step is attributable from the live `--verbose` stream (the log
+// file already has the time). Grep-friendly: "[VERBOSE <ts>]".
+std::string verbose_line(const Record& r, bool colour);
+
+// Where a verbose record is shown. The terminal belongs to mcpp.ui, which
+// installs a sink at start-up and writes the record through the one writer
+// every other line goes through, so that a verbose line is written above a
+// build's live region rather than into it (build progress design 2026-09-29,
+// §5.3). Without a sink the record goes to stderr as `verbose_line` spells it.
+// This module stays a leaf: it states what to say, and the terminal's owner
+// decides how.
+using TerminalSink = void (*)(const Record& record);
+void set_terminal_sink(TerminalSink sink);
+
 // Scoped verbose timer for diagnosing slow steps (e.g. first-run init / bootstrap
 // hangs). Logs "<label>: start" on construction and "<label>: done (Δ=<ms>ms)" on
 // destruction, via verbose() — always to the timestamped log file
@@ -151,15 +173,17 @@ void write_log(Level level, std::string_view tag, std::string_view message) {
         << tag << ": " << message << '\n';
 }
 
+std::atomic<TerminalSink> g_terminalSink{nullptr};
+
 void write_stderr(std::string_view tag, std::string_view message) {
     // Dim gray for verbose output so it doesn't compete with ui::status.
     // Carry the wall-clock timestamp so a long first-run hang is attributable
     // to a specific step from the live --verbose stream (the log file already
     // has it). Grep-friendly: "[VERBOSE <ts>]".
-    std::fprintf(stderr, "\033[2m[VERBOSE %s] %.*s: %.*s\033[0m\n",
-        timestamp().c_str(),
-        static_cast<int>(tag.size()), tag.data(),
-        static_cast<int>(message.size()), message.data());
+    const auto ts = timestamp();
+    const Record record{ts, tag, message};
+    if (auto sink = g_terminalSink.load()) { sink(record); return; }
+    std::fputs(verbose_line(record, true).c_str(), stderr);
 }
 
 } // namespace
@@ -192,6 +216,14 @@ void init(const Config& cfg) {
                 level_str(g_level), g_verbose));
     }
 }
+
+std::string verbose_line(const Record& r, bool colour) {
+    return colour
+        ? std::format("\033[2m[VERBOSE {}] {}: {}\033[0m\n", r.timestamp, r.tag, r.message)
+        : std::format("[VERBOSE {}] {}: {}\n", r.timestamp, r.tag, r.message);
+}
+
+void set_terminal_sink(TerminalSink sink) { g_terminalSink.store(sink); }
 
 void set_verbose(bool v) {
     g_verbose = v;

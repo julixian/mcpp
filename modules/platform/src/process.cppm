@@ -233,6 +233,19 @@ RunResult capture_exec_deadline(
     std::string_view cwd = {},
     int* spawn_error = nullptr);
 
+// Run `argv` with its stdout and stderr on one pipe and hand each line to
+// `on_line` as it arrives, without the line end. `deadline` bounds the run as
+// capture_exec_deadline's does; zero means no bound. A line the child did not
+// end is delivered after it exits. Returns the exit code; 127 with
+// *spawn_error set when the child could not be started. On a build with no
+// bounded launcher the output is delivered after the child exits.
+int stream_exec(const std::vector<std::string>& argv,
+                const std::vector<std::pair<std::string, std::string>>& extraEnv,
+                std::chrono::milliseconds deadline,
+                const std::function<void(std::string_view line)>& on_line,
+                bool* timed_out,
+                int* spawn_error = nullptr);
+
 // Run `command` silently (discard stdout/stderr).
 // On POSIX, stdin is automatically redirected from /dev/null.
 int run_silent(std::string_view command);
@@ -1176,6 +1189,43 @@ void clear_background_guard(const BackgroundCommand& child) {
         mcpp::platform::winproc::unguard_job(child.job);
     else
         mcpp::platform::unixproc::unguard_group(child.group);
+}
+
+int stream_exec(const std::vector<std::string>& argv,
+                const std::vector<std::pair<std::string, std::string>>& extraEnv,
+                std::chrono::milliseconds deadline,
+                const std::function<void(std::string_view line)>& on_line,
+                bool* timed_out,
+                int* spawn_error)
+{
+    if (timed_out) *timed_out = false;
+    if (spawn_error) *spawn_error = 0;
+    if (argv.empty()) return 127;
+    // Its own process group, registered with the signal guard, as
+    // capture_exec's child is: a build's ninja must not outlive the mcpp that
+    // started it when that mcpp alone is signalled (e2e 340).
+    auto r = dispatch_bounded(argv, extraEnv, {}, deadline, /*capture=*/true, {},
+                              std::chrono::milliseconds{0}, /*ownGroup=*/true, &on_line);
+    if (!r.supported) {
+        if (r.spawn_error != 0) {
+            if (spawn_error) *spawn_error = r.spawn_error;
+            else on_line(spawn_failure(argv.front(), r.spawn_error));
+            return 127;
+        }
+        auto whole = capture_exec(argv, extraEnv, {}, spawn_error);
+        std::string_view rest = whole.output;
+        while (!rest.empty()) {
+            const auto nl = rest.find('\n');
+            auto l = rest.substr(0, nl);
+            while (!l.empty() && l.back() == '\r') l.remove_suffix(1);
+            on_line(l);
+            if (nl == std::string_view::npos) break;
+            rest.remove_prefix(nl + 1);
+        }
+        return whole.exit_code;
+    }
+    if (timed_out) *timed_out = r.timed_out;
+    return r.exit_code;
 }
 
 RunResult capture_exec_deadline(

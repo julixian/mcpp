@@ -91,7 +91,7 @@ EOF
 # and that failure is not what this test is about. What must not happen is a
 # RESOLUTION failure: that is what a stale name or a stale version produces, and
 # it is what both historical occurrences looked like.
-"$MCPP" build > paste.log 2>&1 || true
+"$MCPP" build -v > paste.log 2>&1 || true
 
 if grep -qE 'not found in the synced index|package not found|E_NOT_FOUND' paste.log; then
     cat paste.log
@@ -107,7 +107,7 @@ fi
 # ...and the package must actually have entered the graph, so that a build which
 # silently ignored the dependency cannot pass. One of the three verbs mcpp uses
 # for a dependency it resolved has to name it.
-grep -qE '(Downloading|Compiling|Cached).*std-freestanding' paste.log || {
+grep -qE '(Downloading|Compiling).*std-freestanding' paste.log || {
     cat paste.log
     echo "the pasted dependency never entered the build graph"
     exit 1; }

@@ -156,7 +156,7 @@ grep -q '1\.0\.0+b' b6b.log || fail "the exact key must be addressed literally" 
 
 # ── 6. mcpp.lock records the resolution, not the constraint ───────────────
 use_dep im '^1.92.8'
-"$MCPP" build > b7.log 2>&1 || fail "rebuild failed" b7.log
+"$MCPP" build -v > b7.log 2>&1 || fail "rebuild failed" b7.log
 grep -q 'version = "1.92.8"' mcpp.lock \
     || fail "the lock must record the resolved version" mcpp.lock
 grep -q '\^' mcpp.lock \
@@ -164,7 +164,7 @@ grep -q '\^' mcpp.lock \
 # The banner and the lock read the same data, so they cannot disagree. (The dep
 # announces itself as Compiling or Cached depending on the build cache; both go
 # through the same version string, which is the point.)
-grep -qE '(Compiling|Cached) +acme\.im v1\.92\.8' b7.log \
+grep -qE 'Compiling +acme\.im v1\.92\.8' b7.log \
     || fail "the dependency banner must announce the resolved version" b7.log
 grep -q 'acme\.im v\^' b7.log \
     && fail "the banner must never print a constraint as a version" b7.log

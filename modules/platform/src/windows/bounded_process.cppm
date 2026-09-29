@@ -94,12 +94,14 @@ using OutputSink = void (*)(void* ctx, const char* data, unsigned long len);
 // `commandLine` is already quoted for CreateProcess (callers pass the output
 // of windows_command_from_argv). `envEntries` is `envCount` NUL-terminated
 // "KEY=VALUE" strings applied on top of the current environment. `cwd` may be
-// null. A non-positive `deadlineMs` is rejected with supported=false — "no
-// bound" belongs on the caller's untimed path, which needs none of this.
+// null. A non-positive `deadlineMs` without a sink is rejected with
+// supported=false — "no bound" belongs on the caller's untimed path, which
+// needs none of this.
 //
 // `idleMs`, when positive, kills the child once it has written nothing for that
 // long; the POSIX peer states the reason (#648). With `idleMs` positive a
-// non-positive `deadlineMs` means "no total bound". There is no `ownGroup`
+// non-positive `deadlineMs` means "no total bound", and so it does with a sink
+// and neither bound. There is no `ownGroup`
 // parameter: every child here runs in a job object with
 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE already, which is what the POSIX flag
 // buys there.
@@ -261,7 +263,9 @@ DeadlineRun capture_with_deadline(const char*        commandLine,
 {
     DeadlineRun out;
     const bool idleBound = idleMs > 0 && sink != nullptr;
-    if ((deadlineMs <= 0 && !idleBound) || !commandLine || !*commandLine) return out;
+    // A child with no bound at all is accepted only with a sink, as on POSIX.
+    if ((deadlineMs <= 0 && !idleBound && sink == nullptr) || !commandLine || !*commandLine)
+        return out;
 
     const bool capture = (sink != nullptr);
 

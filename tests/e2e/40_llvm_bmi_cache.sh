@@ -64,7 +64,7 @@ EOF
 # an alias for `--cache=off`, which means neither read NOR write, so a build that
 # used it would leave nothing for the second build to reuse. MCPP_HOME is fresh
 # here, so this build is already cold.
-out1=$("$MCPP" build 2>&1)
+out1=$("$MCPP" build -v 2>&1)
 echo "$out1" | grep -q "Compiling.*mcpplibs.cmdline" || {
     echo "FAIL: mcpplibs.cmdline not compiled in the first (cold) build: $out1"
     exit 1
@@ -72,8 +72,8 @@ echo "$out1" | grep -q "Compiling.*mcpplibs.cmdline" || {
 
 # Second build, clean target dir, cache kept — the dependency must be reused.
 rm -rf target
-out2=$("$MCPP" build 2>&1)
-echo "$out2" | grep -q "Cached.*mcpplibs.cmdline" || {
+out2=$("$MCPP" build -v 2>&1)
+echo "$out2" | grep -qE "Compiling .*mcpplibs\.cmdline.* cached [0-9]+ unit" || {
     echo "FAIL: mcpplibs.cmdline not cached on second build: $out2"
     exit 1
 }

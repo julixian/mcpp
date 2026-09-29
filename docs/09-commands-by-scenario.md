@@ -227,6 +227,56 @@ An index refresh is reported step by step when the xlings that mcpp drives
 emits progress events for it (xlings 2026.9.28.1+). With an older xlings it
 shows its status line and finishes silently, as before.
 
+## What a build prints
+
+A build reports each step once, when its outcome is known (2026.9.29.5+):
+
+```console
+$ mcpp build --workspace
+  build.mcpp gpp.core                     ran 16.00s
+  build.mcpp gpp.gui                      ran 6.70s
+   Compiling gpp.core (GalTranslPP)       done 3m12s
+   Compiling 23 dependencies              done 6m20s
+   Compiling gpp.gui (GPPGUI)             done 38m05s
+
+    Finished fast-release [unoptimized + debuginfo] in 41m53s · plan 1m13s · programs 32s · build 40m08s · longest gpp.gui: vcpkg install 22m10s
+```
+
+- A package's line names the package and states its outcome: `done` with the
+  span of its steps, `cached` when the global cache supplied it, `failed`, or
+  the number of its steps that ran when a failed build stopped before the
+  package completed. A package with nothing to do has no line.
+- The packages the command was asked to build (the root package, or the
+  selected members) are listed. The packages they depend on are folded into
+  one line, and a dependency that fails is named.
+- A build program's line states `ran` with its time, `cached`, or `failed`.
+- A failed step is reported when it fails, with its diagnostics, while ninja
+  waits for the steps still running.
+- `Finished` states the whole command's time. A command of ten seconds or
+  more also states how the time was spent, and names the step that took at
+  least a quarter of the build when there is one.
+
+On a terminal, the steps still running and one status line are drawn below
+the output and updated in place:
+
+```
+   Compiling gpp.gui (GPPGUI)             61 steps
+
+Building 612/1203 · 14:32 · gpp.gui: vcpkg install 6:10
+```
+
+The status line counts the build's steps, shows the time since the command
+started, and names the longest-running `check` or `prepare` action; ninja
+reports every other step only when it finishes. When the output is not a
+terminal (a CI log, a pipe), only final lines are written, and the status line
+is written when the output has been silent for a minute. `TERM=dumb` selects
+that form on a terminal too.
+
+`--verbose` lists every package, including those with nothing to do (`fresh`),
+states each build program's compile and run times, and prints every step as
+ninja reports it (`[f/t] <command>` and its output). `--quiet` prints none of
+it. Machine output (`--message-format json`) is unchanged.
+
 ## Validating a descriptor before publishing
 
 `mcpp xpkg parse` reads a descriptor with the resolver's own grammar, so what

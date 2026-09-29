@@ -22,6 +22,7 @@ import mcpp.toolchain.cppfly;        // std_flag (dialect- and c++fly-aware -std
 import mcpp.toolchain.dialect;       // CommandDialect — gnu vs cl.exe spellings
 import mcpp.toolchain.fingerprint;   // hash_file / hash_string (FNV-1a, 16 hex)
 import mcpp.build.directives;        // the directive definition table (own module: see its header)
+import mcpp.build.progress;          // the program's line (build progress design 2026-09-29)
 import mcpp.build.refusal;           // the machine-readable identity of a refusal
 import mcpp.build.hostprogram;       // bundled `mcpp` module compile (own module: see its header)
 import mcpp.build.resources;         // compile_utf8_manifest — the build program speaks UTF-8 (#693)
@@ -74,6 +75,11 @@ inline constexpr std::string_view kBuildInformationKeys[] = {
 };
 
 struct BuildProgramEnv {
+    // The program belongs to a package the command was asked to build (the
+    // root, or a selected member): its line is listed, and the programs of
+    // every other package are folded into one (build progress design
+    // 2026-09-29, §4.3).
+    bool requested = false;
     std::string targetTriple;               // resolved canonical triple; "" = host
     // The resolved toolchain's payload root and the target's own C library
     // root. Both exist so a package can ASK instead of DECLARE — see
@@ -1238,6 +1244,11 @@ std::expected<void, std::string> run_build_program(
         }
     }
 
+    // The package the status lines name: several programs run in one
+    // workspace plan, and a line without its package cannot be attributed.
+    const std::string who = m.package.namespace_.empty()
+        ? m.package.name : m.package.namespace_ + "." + m.package.name;
+
     // Fast path: declared inputs + contract unchanged → reapply cached
     // directives, no run.
     CacheRecord cache = read_cache(bdir);
@@ -1261,9 +1272,38 @@ std::expected<void, std::string> run_build_program(
         for (auto const& a : dirs::advisories(m.package.name, cache.directives))
             mcpp::ui::warning(a);
         report_stated_diagnostics(m.package.name, cache.directives);
-        mcpp::ui::info("build.mcpp", "up to date (cached)");
+        mcpp::build::progress::program_finished(
+            who, env.requested, mcpp::build::progress::ProgramOutcome::Cached, {}, {});
         return {};
     }
+
+    // From here on the program is compiled or run, and every return reports
+    // its outcome: `ran` when the directives were applied, `failed` otherwise.
+    using ProgressClock = std::chrono::steady_clock;
+    struct ProgramReport {
+        const std::string& who;
+        bool requested;
+        ProgressClock::time_point compileStart{}, runStart{};
+        bool ran = false;
+        bool reported = false;
+        ~ProgramReport() { report(); }
+        void report() {
+            if (reported) return;
+            reported = true;
+            using namespace std::chrono;
+            const auto now = ProgressClock::now();
+            const auto zero = ProgressClock::time_point{};
+            const auto compile = compileStart == zero ? milliseconds{0}
+                : duration_cast<milliseconds>((runStart == zero ? now : runStart) - compileStart);
+            const auto run = runStart == zero ? milliseconds{0}
+                : duration_cast<milliseconds>(now - runStart);
+            mcpp::build::progress::program_finished(
+                who, requested,
+                ran ? mcpp::build::progress::ProgramOutcome::Ran
+                    : mcpp::build::progress::ProgramOutcome::Failed,
+                compile, run);
+        }
+    } programReport{who, env.requested};
 
     fs::create_directories(outDir, ec);   // creates bdir too
     // #230: on Windows the capture_exec shell is cmd.exe, which can only launch
@@ -1622,7 +1662,8 @@ std::expected<void, std::string> run_build_program(
             "       arrived. Please report it with the toolchain name and this "
             "line.", *orphan));
     }
-    mcpp::ui::info("build.mcpp", "compiling");
+    mcpp::build::progress::program_compiling(who, env.requested);
+    programReport.compileStart = ProgressClock::now();
     // GCC resolves imported BMIs via gcm.cache/ relative to the compile cwd, so
     // any compile that imports a module — `mcpp`, `std`, a build rule's host
     // module, or any mix — has to run from bdir, where they were staged or
@@ -1663,7 +1704,8 @@ std::expected<void, std::string> run_build_program(
     // produces a baffling failure; a build PROGRAM that runs long is usually
     // stuck — waiting on a network read or spinning — and without a bound the
     // whole build hangs with no diagnostic at all.
-    mcpp::ui::info("build.mcpp", "running");
+    mcpp::build::progress::program_running(who, env.requested);
+    programReport.runStart = ProgressClock::now();
     bool timedOut = false;
     // The bound comes from THIS package's manifest — a dependency's generator
     // is bounded by the dependency's own declaration, because its author is
@@ -1760,6 +1802,9 @@ std::expected<void, std::string> run_build_program(
     }
 
     dirs::apply(m, d);
+    // The program's line comes before what it has to say.
+    programReport.ran = true;
+    programReport.report();
     // The second of the two sites. See the note on the cache-hit path above.
     for (auto const& a : dirs::advisories(m.package.name, d))
         mcpp::ui::warning(a);

@@ -24,6 +24,11 @@ int main(int argc, char* argv[]) {
     // ui::flush() covers the same ground for the ui layer on Windows, where
     // MSVCRT silently treats _IOLBF as _IOFBF.
     mcpp::ui::set_line_buffered();
+    // The status line's clock and `Finished` count from here (build progress
+    // design 2026-09-29, §4.4), and every line, mcpp.log's verbose records
+    // included, is written through mcpp.ui from the first one on.
+    mcpp::ui::mark_command_start();
+    mcpp::ui::init();
 
     int rc;
     try {
@@ -33,12 +38,16 @@ int main(int argc, char* argv[]) {
         // std::terminate — on Windows a silent 0xC0000409 that git-bash
         // reports as a bare exit 127 (mcpp#230 wore that mask). Name the
         // real error and exit with a recognizable internal-error code.
-        std::println(std::cerr, "error: internal: unhandled exception: {}", e.what());
+        mcpp::ui::error(std::format("internal: unhandled exception: {}", e.what()));
         rc = 70;   // EX_SOFTWARE
     } catch (...) {
-        std::println(std::cerr, "error: internal: unhandled non-standard exception");
+        mcpp::ui::error("internal: unhandled non-standard exception");
         rc = 70;
     }
+    // A command that returned early, on an error, may have left its live
+    // region on the screen; the shell's prompt must not follow it on the
+    // status line.
+    mcpp::ui::close_region();
 #ifdef __APPLE__
     // With statically linked libc++ (the macOS release linkage since
     // 0.0.50), static destruction can SIGABRT on exit — same issue xlings

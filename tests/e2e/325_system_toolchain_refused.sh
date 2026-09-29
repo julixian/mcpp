@@ -87,7 +87,7 @@ expect_refusal bp.log "a project with a build.mcpp"
 grep -q "posix_spawnp" bp.log && {
     echo "FAIL: still spawning an empty compiler path instead of refusing"
     cat bp.log; exit 1; }
-grep -q "build.mcpp compiling" bp.log && {
+grep -qE "^ *build\.mcpp " bp.log && {
     echo "FAIL: the refusal arrived after the build program had started"
     cat bp.log; exit 1; }
 

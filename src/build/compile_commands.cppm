@@ -168,6 +168,22 @@ publish_root_compile_commands(
     const std::filesystem::path& mcppHome,
     ReplaceFile replaceFile = mcpp::platform::fs::replace_file);
 
+// The same for a command that planned several configurations (a workspace
+// whose members form more than one configuration group, workspace design
+// 2026-09-29 §15): the root file is the union of their databases, sorted by
+// file as every database is, an entry of an earlier database kept where two
+// have the same file and output. A file two configurations compile has an
+// entry of each (the format allows several; clangd reads the first). The
+// command publishes the file once, after all its plans, so it does not depend
+// on which concurrent build finished last.
+std::expected<CompileCommandsWriteResult, CompileCommandsWriteError>
+publish_root_compile_commands(
+    std::span<const std::filesystem::path> configDbPaths,
+    const std::filesystem::path& rootPath,
+    const std::filesystem::path& targetRoot,
+    const std::filesystem::path& mcppHome,
+    ReplaceFile replaceFile = mcpp::platform::fs::replace_file);
+
 // Writes the configuration's database for `plan`, then publishes the root
 // copy from it. `commandCount` is the configuration database's entry count;
 // `foreignEntries` is the root publish's (see publish_root_compile_commands).
@@ -625,27 +641,56 @@ publish_root_compile_commands(
     const std::filesystem::path& targetRoot,
     const std::filesystem::path& mcppHome,
     ReplaceFile replaceFile) {
-    std::string content;
-    {
-        std::ifstream input(configDbPath, std::ios::binary);
-        if (!input) {
-            return std::unexpected(write_error(std::format(
-                "cannot read configuration compile database '{}'", configDbPath.string())));
-        }
-        std::stringstream ss;
-        ss << input.rdbuf();
-        if (input.bad()) {
-            return std::unexpected(write_error(std::format(
-                "cannot read configuration compile database '{}'", configDbPath.string())));
-        }
-        content = ss.str();
-    }
+    return publish_root_compile_commands(std::span(&configDbPath, 1), rootPath,
+                                         targetRoot, mcppHome, std::move(replaceFile));
+}
 
-    auto configJson = nlohmann::json::parse(content, nullptr, /*allow_exceptions=*/false);
-    if (configJson.is_discarded() || !configJson.is_array()) {
-        return std::unexpected(write_error(std::format(
-            "configuration compile database '{}' is not a JSON array",
-            configDbPath.string())));
+std::expected<CompileCommandsWriteResult, CompileCommandsWriteError>
+publish_root_compile_commands(
+    std::span<const std::filesystem::path> configDbPaths,
+    const std::filesystem::path& rootPath,
+    const std::filesystem::path& targetRoot,
+    const std::filesystem::path& mcppHome,
+    ReplaceFile replaceFile) {
+    // One database is copied byte for byte; several are joined.
+    std::string content;
+    nlohmann::json configJson = nlohmann::json::array();
+    std::set<std::string> described;
+    for (auto const& configDbPath : configDbPaths) {
+        std::string text;
+        {
+            std::ifstream input(configDbPath, std::ios::binary);
+            if (!input) {
+                return std::unexpected(write_error(std::format(
+                    "cannot read configuration compile database '{}'", configDbPath.string())));
+            }
+            std::stringstream ss;
+            ss << input.rdbuf();
+            if (input.bad()) {
+                return std::unexpected(write_error(std::format(
+                    "cannot read configuration compile database '{}'", configDbPath.string())));
+            }
+            text = ss.str();
+        }
+        auto json = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+        if (json.is_discarded() || !json.is_array()) {
+            return std::unexpected(write_error(std::format(
+                "configuration compile database '{}' is not a JSON array",
+                configDbPath.string())));
+        }
+        if (configDbPaths.size() == 1) { content = std::move(text); configJson = std::move(json); break; }
+        for (auto& e : json) {
+            if (!e.is_object() || !e.contains("file") || !e.at("file").is_string()) continue;
+            auto key = dedup_key(resolve_against_directory(e, "file"));
+            if (e.contains("output") && e.at("output").is_string())
+                key += '\x1f' + dedup_key(resolve_against_directory(e, "output"));
+            if (described.insert(std::move(key)).second)
+                configJson.push_back(std::move(e));
+        }
+    }
+    if (configDbPaths.size() != 1) {
+        sort_entries_by_file(configJson);
+        content = configJson.dump(2) + "\n";
     }
 
     auto doc = read_existing_document(rootPath);
@@ -701,6 +746,7 @@ write_compile_commands(const BuildPlan& plan, const CompileFlags& flags) {
     auto configPath = plan.outputDir / "compile_commands.json";
     auto configResult = publish_compile_commands(configPath, fresh, fileExists);
     if (!configResult) return configResult;
+    if (!plan.publishRootCompileDb) return configResult;
 
     // §3.2 items 2-3: the root is a copy of it, replaced whole. `emit`
     // (`mcpp emit build-database`) never reaches this function (SPEC-005

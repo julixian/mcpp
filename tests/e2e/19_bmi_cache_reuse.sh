@@ -73,7 +73,7 @@ main = "src/main.cpp"
 path = "../mylibA"
 EOF
 
-"$MCPP" build > build.log 2>&1 || { cat build.log; exit 1; }
+"$MCPP" build -v > build.log 2>&1 || { cat build.log; exit 1; }
 
 # The cache root exists (env init creates it) but holds no package entry for a
 # path dep.
@@ -84,8 +84,9 @@ if find "$MCPP_HOME/build-cache/v1/pkg" -path "*mylibA*" 2>/dev/null | grep -q .
     exit 1
 fi
 
-# Build output must NOT show "Cached mylibA" (it's a path dep, not a registry dep).
-if grep -q 'Cached mylibA' build.log; then
+# Build output must NOT state that mylibA came from the cache (it's a path
+# dep, not a registry dep). `-v` lists the dependencies the default folds.
+if grep -qE 'Compiling mylibA .*cached [0-9]+ unit' build.log; then
     echo "FAIL: path dep wrongly labeled Cached"
     cat build.log; exit 1
 fi
