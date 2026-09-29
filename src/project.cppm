@@ -687,6 +687,13 @@ load_member_manifest(const mcpp::manifest::Manifest& workspace,
     auto mm = mcpp::manifest::load(dir / "mcpp.toml", {.insideWorkspace = true});
     if (!mm) return std::unexpected(std::format(
         "workspace member '{}': {}", memberPath, mm.error().format()));
+    // A relative `[indices].path` the member declares was written in the
+    // member's directory. The plan's root is the workspace root, so the path
+    // is anchored here, and two members that write the same relative path
+    // for different trees have different root-position keys.
+    for (auto& [_, idx] : mm->indices)
+        if (idx.is_local() && idx.path.is_relative())
+            idx.path = (dir / idx.path).lexically_normal();
     inherit_workspace_config(*mm, workspace, wsRoot);
     if (auto bad = workspace_inheritance_error(*mm, dir)) return std::unexpected(*bad);
     return std::move(*mm);
@@ -694,7 +701,8 @@ load_member_manifest(const mcpp::manifest::Manifest& workspace,
 
 // The values of a member's manifest that are one value per plan: the
 // toolchain request and the target rows, the C++ standard, the graph-wide
-// `[build]` keys, the profiles and the indices. Members whose keys are equal
+// `[build]` keys (among them `linkage`, which chooses the C runtime every
+// object is compiled against), the profiles and the indices. Members whose keys are equal
 // are planned together; the key is a canonical string of those values and
 // nothing else, so a member's own flags, sources and dependencies never
 // separate it from another member.
@@ -727,6 +735,7 @@ export std::string root_position_key(const mcpp::manifest::Manifest& m) {
     field("cxx_runtime_tests", b.cxxRuntimeTests);
     field("cxx_runtime_shared", b.cxxRuntimeShared);
     field("static_stdlib", b.staticStdlib ? "1" : "0");
+    field("linkage", b.linkage);
     field("dependency_linkage", b.dependencyLinkage);
     field("target", b.target);
     field("macos_deployment_target", b.macosDeploymentTarget);
@@ -811,6 +820,7 @@ virtual_workspace_root(const mcpp::manifest::Manifest& workspace,
     b.macosDeploymentTarget = f.macosDeploymentTarget;
     b.iosDeploymentTarget = f.iosDeploymentTarget;
     b.defaultProfile = f.defaultProfile;
+    b.linkage = f.linkage;
     b.dependencyLinkage = f.dependencyLinkage;
     b.cacheMode = f.cacheMode;
     b.platformDependencies = f.platformDependencies;

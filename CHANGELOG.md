@@ -4,6 +4,38 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.9.29.2] - 2026-09-29
+
+This release corrects what a workspace plan reads from its members. The plan's
+root is a virtual root that holds the values shared by the whole graph; five
+statements that a member makes about itself were read from that root in
+2026.9.29.1 and were therefore empty. The mcpp-index sweep of 2026.9.29.1 found
+the first two.
+
+### Fixed
+
+- **A member's own relative `[indices].path` is anchored at the member.** It
+  was resolved against the workspace root, so a member that declares its own
+  index (47 members of mcpp-index do) found no package. Two members that name
+  one tree with different relative paths are now one configuration (e2e 120).
+- **A member whose tests import `std` is tested with the std module built.**
+  The decision read the entry files of the root's targets only, and the virtual
+  root has none; a member whose only sources are its tests failed to compile
+  them (e2e 836).
+- **A member's `[resources]` and `windows_code_page` reach its own images.**
+  Each selected member's resources are compiled against the member's directory
+  and include directories, under `res/<member>/`, and embedded into the
+  member's programs and shared libraries only (e2e 837). A quoted `#include`
+  or resource file in a script is now found through the include directories as
+  the resource compiler finds it, in every build.
+- **`[build] linkage` is a value of the plan.** It chooses the C runtime that
+  every object is compiled against, so members that differ in it are separate
+  configurations, and the plan takes it from its members.
+- **A member's manifest is checked as a root's.** An unknown capability under
+  the reserved `mcpp:` prefix is refused, and a cfg() predicate mcpp cannot
+  evaluate and the other schema warnings are reported, for each selected
+  member (e2e 836).
+
 ## [2026.9.29.1] - 2026-09-29
 
 This release builds a workspace as one graph per configuration. The selected

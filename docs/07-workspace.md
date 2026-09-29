@@ -421,9 +421,11 @@ member that several members use is compiled once.
 
 - **Configurations.** Members are built in one graph when they share their
   toolchain request, target, C++ standard, `dialect_cxxflags`, C++ runtime,
-  profile and the other `[build]` values that apply to a whole graph. Members
-  that differ in one of them are built in separate graphs, at the same time,
-  sharing the command's jobs.
+  `linkage`, profile, indices and the other `[build]` values that apply to a
+  whole graph. Members that differ in one of them are built in separate
+  graphs, at the same time, sharing the command's jobs. A relative path a
+  member writes, such as its own `[indices]` path, is read from the member's
+  directory.
 - **Selection.** `--workspace`, and a virtual root without `-p`, select every
   member. `-p X`, and a command run in X's directory, plan X and what X
   reaches. The two share the build directory, so `mcpp build --workspace`
@@ -436,6 +438,9 @@ member that several members use is compiled once.
   declares it, and is refused when no selected member declares it.
 - **Hooks.** The `[hooks]` of every selected member run around the build, in
   member order.
+- **Resources.** A member's `[resources]` and `windows_code_page` are
+  compiled against the member's directory and include directories and embedded
+  into that member's programs and shared libraries only (2026.9.29.2+).
 - **No-op builds.** A command repeated with nothing changed is answered by one
   check per configuration, without planning.
 - **Module names.** Members built in one graph share one module namespace:

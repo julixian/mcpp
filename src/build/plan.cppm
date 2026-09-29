@@ -176,6 +176,13 @@ struct ResourceUnit {
     // (verified against llvm-rc 22.1.8: /I, /D, no dependency output), so these
     // come from a text scan plus `[resources].extra-inputs`.
     std::vector<std::filesystem::path> implicitInputs;
+    // The directories the script's `#include`s are searched in: its package's
+    // directory and include_dirs. A workspace plan compiles the resources of
+    // several members, each against its own package.
+    std::vector<std::filesystem::path> includeDirs;
+    // The resource compiler's flags for this script. `BuildPlan::rcFlags` are
+    // the first unit's; a unit whose flags differ states its own.
+    std::vector<std::string>           flags;
 };
 
 struct RuntimeCapabilityProvider {

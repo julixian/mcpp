@@ -47,6 +47,107 @@ import mcpp.project;
 
 namespace mcpp::build {
 
+// AND ONLY FOR THE MANIFESTS THE AUTHOR IS LOOKING AT: the root, and in a
+// workspace plan each selected member. A layer name this engine does not know
+// is a typo there, and a version gap in a dependency's. The reserved `mcpp:`
+// prefix exists so the first is an error rather than a silently disabled
+// behaviour; refusing the second as well meant the layer vocabulary could
+// never be extended by a published package (`warn_unknown_xpkg_keys` carries
+// that half).
+static std::expected<void, std::string>
+refuse_unknown_capability(const mcpp::manifest::Manifest& m,
+                          const std::filesystem::path& manifestPath) {
+    if (m.unknownCapabilities.empty()) return {};
+    auto const& cap = m.unknownCapabilities.front();
+    auto why = mcpp::targetside::parse_capability(cap);
+    return std::unexpected(std::format(
+        "{}: {}", manifestPath.string(),
+        why ? std::format("`{}` names no capability mcpp knows.", cap)
+            : why.error()));
+}
+
+// The schema warnings of a manifest the author is looking at, and its cfg()
+// sections that cannot apply. Under --strict they become errors -- same policy
+// as the feature/platform schema checks.
+static std::expected<void, std::string>
+report_manifest_statements(const mcpp::manifest::Manifest& m, bool strict) {
+    std::vector<std::string> warnings = m.schemaWarnings;
+    // #540: a cfg() predicate mcpp cannot evaluate must say so.
+    //
+    // A PREDICATE THAT ANSWERS FALSE AND A PREDICATE THAT WAS NEVER
+    // UNDERSTOOD USED TO READ THE SAME. `cfgpred` returns false for an unknown
+    // key and for an unknown bareword, and a `[target.<pred>.build]` section
+    // whose predicate is false is dropped without a word — so a typo, and every
+    // `cfg(c-abi = …)` section docs/14 documented before this release, produced
+    // a successful build configured as if the section had not been written.
+    //
+    // Reported here rather than in the manifest parser because the vocabulary
+    // lives with the evaluator, and a second copy of it in `toml.cppm` is the
+    // exact defect this release is fixing four other instances of.
+    //
+    // Scoped to the manifests the author is looking at (the root, and in a
+    // workspace plan each selected member), which matches the existing policy
+    // for every other schema warning: a dependency may adopt a predicate a
+    // consumer's older mcpp does not know, and its build stays quiet.
+    for (auto const& cc : m.conditionalConfigs) {
+        auto unknown = cfgpred::unknown_tokens(cc.predicate);
+        if (!unknown.empty()) {
+            std::string names;
+            for (auto const& u : unknown) {
+                if (!names.empty()) names += ", ";
+                names += '\'' + u + '\'';
+            }
+            warnings.push_back(std::format(
+                "[target.'{}'] names {} in its cfg() predicate, which mcpp does "
+                "not know, so the section never applies (ignored). {}",
+                cc.predicate, names, cfgpred::vocabulary_sentence()));
+        }
+        // A RESOLVED layer is answered AFTER dependency resolution, so a
+        // dependency selected by one would form a cycle with the resolution
+        // that produces the answer — docs/14 states this. The section's build
+        // inputs are honoured by the second pass; its dependencies cannot be,
+        // and saying so is the difference between a documented limit and a
+        // silent drop.
+        //
+        // `accelerator` is not one of these (see kCfgEarlyLayerKeys), so
+        // `[target.'cfg(accelerator = "cuda")'.dependencies]` is honoured and
+        // never reaches this warning: nothing about it is circular, because the
+        // accel is an input to the build rather than an answer from the graph.
+        if (cfgpred::uses_layer(cc.predicate)
+            && !(cc.dependencies.empty() && cc.devDependencies.empty()
+                 && cc.buildDependencies.empty() && cc.featureDeps.empty())) {
+            warnings.push_back(std::format(
+                "[target.'{}'] conditions dependencies on a target-side layer "
+                "(ignored). A layer is resolved from the dependency graph, so a "
+                "dependency chosen by one would decide the answer it is asking "
+                "for. Build inputs under this predicate DO apply; move the "
+                "dependency to an unconditional [dependencies] entry, or "
+                "condition it on the triple instead.",
+                cc.predicate));
+        }
+        // The same reason holds for a row's library form: whether a package
+        // is linked shared is decided while the graph is resolved, before a
+        // layer has an answer.
+        if (cfgpred::uses_layer(cc.predicate) && !cc.targetKinds.empty()) {
+            warnings.push_back(std::format(
+                "[target.'{}'] conditions a target's kind or linkage on a "
+                "target-side layer (ignored). A layer is resolved from the "
+                "dependency graph, and a library's form is decided while that "
+                "graph is resolved; condition the statement on the triple "
+                "instead.",
+                cc.predicate));
+        }
+    }
+
+    // Surface non-fatal manifest schema warnings (e.g. unsupported [targets.*]
+    // keys).
+    for (auto const& w : warnings) {
+        if (strict) return std::unexpected(w);
+        mcpp::diag::warning("manifest/schema", w);
+    }
+    return {};
+}
+
 // The plan's root for a selection of workspace members (workspace design
 // 2026-09-29 §15): a virtual root that holds the values the plan shares, and a
 // member edge to each selected member, which puts the member in the graph and
@@ -85,6 +186,10 @@ select_workspace_members(PrepareState& state, const std::filesystem::path& wsRoo
         state.selectedMembers[canonical] = mcpp::project::product_directory_name(all, mp);
         auto member = mcpp::project::load_member_manifest(*state.wsManifest, wsRoot, mp);
         if (!member) return std::unexpected(member.error());
+        if (auto r = refuse_unknown_capability(*member, dir / "mcpp.toml"); !r)
+            return r;
+        if (auto r = report_manifest_statements(*member, state.overrides.strict); !r)
+            return r;
         std::vector<std::string> requested;
         for (auto const& t : tokens) {
             if (auto fwd = mcpp::pm::split_feature_forward_token(t)) {
@@ -395,20 +500,9 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
         state.effective = std::move(*loaded);
     }
 
-    // AND ONLY FOR THE ROOT. A layer name this engine does not know is a
-    // typo in the manifest the author is looking at, and a version gap in a
-    // dependency's. The reserved `mcpp:` prefix exists so the first is an error
-    // rather than a silently disabled behaviour; refusing the second as well
-    // meant the layer vocabulary could never be extended by a published package
-    // (`warn_unknown_xpkg_keys` carries that half).
-    if (!state.m->unknownCapabilities.empty()) {
-        auto const& cap = state.m->unknownCapabilities.front();
-        auto why = mcpp::targetside::parse_capability(cap);
-        return std::unexpected(std::format(
-            "{}: {}", (*state.root / "mcpp.toml").string(),
-            why ? std::format("`{}` names no capability mcpp knows.", cap)
-                : why.error()));
-    }
+    // The root's; a workspace plan's members are refused as they are selected.
+    if (auto r = refuse_unknown_capability(*state.m, *state.root / "mcpp.toml"); !r)
+        return r;
 
     // A DISTRIBUTION package is not a source tree, and building "in" one is a
     // failure that looks like a success: `interface/` holds declarations whose
@@ -495,79 +589,9 @@ std::expected<void, std::string> phase0_manifest_and_workspace(PrepareState& sta
     if (!state.workspacePlan())
         for (auto& t : state.extraTargets) state.m->targets.push_back(t);
 
-    // #540: a cfg() predicate mcpp cannot evaluate must say so.
-    //
-    // A PREDICATE THAT ANSWERS FALSE AND A PREDICATE THAT WAS NEVER
-    // UNDERSTOOD USED TO READ THE SAME. `cfgpred` returns false for an unknown
-    // key and for an unknown bareword, and a `[target.<pred>.build]` section
-    // whose predicate is false is dropped without a word — so a typo, and every
-    // `cfg(c-abi = …)` section docs/14 documented before this release, produced
-    // a successful build configured as if the section had not been written.
-    //
-    // Reported here rather than in the manifest parser because the vocabulary
-    // lives with the evaluator, and a second copy of it in `toml.cppm` is the
-    // exact defect this release is fixing four other instances of.
-    //
-    // Scoped to the root manifest by where it sits, which matches the existing
-    // policy for every other schema warning: a dependency may adopt a predicate
-    // a consumer's older mcpp does not know, and its build stays quiet.
-    for (auto const& cc : state.m->conditionalConfigs) {
-        auto unknown = cfgpred::unknown_tokens(cc.predicate);
-        if (!unknown.empty()) {
-            std::string names;
-            for (auto const& u : unknown) {
-                if (!names.empty()) names += ", ";
-                names += '\'' + u + '\'';
-            }
-            state.m->schemaWarnings.push_back(std::format(
-                "[target.'{}'] names {} in its cfg() predicate, which mcpp does "
-                "not know, so the section never applies (ignored). {}",
-                cc.predicate, names, cfgpred::vocabulary_sentence()));
-        }
-        // A RESOLVED layer is answered AFTER dependency resolution, so a
-        // dependency selected by one would form a cycle with the resolution
-        // that produces the answer — docs/14 states this. The section's build
-        // inputs are honoured by the second pass; its dependencies cannot be,
-        // and saying so is the difference between a documented limit and a
-        // silent drop.
-        //
-        // `accelerator` is not one of these (see kCfgEarlyLayerKeys), so
-        // `[target.'cfg(accelerator = "cuda")'.dependencies]` is honoured and
-        // never reaches this warning: nothing about it is circular, because the
-        // accel is an input to the build rather than an answer from the graph.
-        if (cfgpred::uses_layer(cc.predicate)
-            && !(cc.dependencies.empty() && cc.devDependencies.empty()
-                 && cc.buildDependencies.empty() && cc.featureDeps.empty())) {
-            state.m->schemaWarnings.push_back(std::format(
-                "[target.'{}'] conditions dependencies on a target-side layer "
-                "(ignored). A layer is resolved from the dependency graph, so a "
-                "dependency chosen by one would decide the answer it is asking "
-                "for. Build inputs under this predicate DO apply; move the "
-                "dependency to an unconditional [dependencies] entry, or "
-                "condition it on the triple instead.",
-                cc.predicate));
-        }
-        // The same reason holds for a row's library form: whether a package
-        // is linked shared is decided while the graph is resolved, before a
-        // layer has an answer.
-        if (cfgpred::uses_layer(cc.predicate) && !cc.targetKinds.empty()) {
-            state.m->schemaWarnings.push_back(std::format(
-                "[target.'{}'] conditions a target's kind or linkage on a "
-                "target-side layer (ignored). A layer is resolved from the "
-                "dependency graph, and a library's form is decided while that "
-                "graph is resolved; condition the statement on the triple "
-                "instead.",
-                cc.predicate));
-        }
-    }
-
-    // Surface non-fatal manifest schema warnings (e.g. unsupported [targets.*]
-    // keys). Under --strict they become errors — same policy as the
-    // feature/platform schema checks below.
-    for (auto const& w : state.m->schemaWarnings) {
-        if (state.overrides.strict) return std::unexpected(w);
-        mcpp::diag::warning("manifest/schema", w);
-    }
+    // The root's; a workspace plan's members are reported as they are selected.
+    if (auto r = report_manifest_statements(*state.m, state.overrides.strict); !r)
+        return r;
 
     // Load mcpp.lock once, up front: it is a resolution input for git deps
     // (#329), which decide the commit to build long before anything is

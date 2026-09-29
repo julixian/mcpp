@@ -181,6 +181,33 @@ END
     EXPECT_EQ(s.inputs.size(), 4u);
 }
 
+// A quoted include and a resource file are found where the resource compiler
+// finds them: beside the script, then in the include directories it is given.
+// A name found nowhere stays beside the script, where a file a build action
+// produces is ordered before the compile.
+TEST(BuildResources, InputsAreResolvedThroughTheIncludeDirectories) {
+    TempDir d;
+    fs::create_directories(d.path / "include");
+    d.write("include/ids.h", "#define APP_ICON 101\n");
+    d.write("include/app.ico", "icon");
+    d.write("local.ico", "icon");
+    auto rc = d.write("app.rc", R"(#include "ids.h"
+1 ICON "app.ico"
+2 ICON "local.ico"
+3 ICON "generated.ico"
+)");
+    const std::vector<fs::path> includes = {d.path / "include"};
+    auto s = res::scan_rc(rc, includes);
+    auto at = [&](std::string_view leaf) {
+        for (auto const& p : s.inputs) if (p.filename() == leaf) return p;
+        return fs::path{};
+    };
+    EXPECT_EQ(at("ids.h"), d.path / "include" / "ids.h");
+    EXPECT_EQ(at("app.ico"), d.path / "include" / "app.ico");
+    EXPECT_EQ(at("local.ico"), d.path / "local.ico");
+    EXPECT_EQ(at("generated.ico"), d.path / "generated.ico");
+}
+
 // The numbers of a VERSIONINFO block contain 24 as well; only the TYPE
 // position of a statement declares a manifest.
 TEST(BuildResources, ATwentyFourOutsideTheTypePositionIsNotAManifest) {

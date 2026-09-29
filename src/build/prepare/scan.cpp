@@ -110,7 +110,7 @@ static std::expected<bool, std::string> step11_scan_sources(PrepareState& state)
         return std::unexpected(msg);
     }
 
-    return graph_or_targets_import_std(state.scan.graph, *state.m, *state.root);
+    return graph_or_targets_import_std(state.scan.graph, *state.m, *state.root, state.packages);
 }
 
 static std::expected<void, std::string>
