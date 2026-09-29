@@ -62,7 +62,7 @@ printf 'int main() { return 0; }\n' > ws2/a/src/main.cpp
 if (cd ws2 && "$MCPP" build --workspace > ../m2.log 2>&1); then
     fail "M2 a member's unknown mcpp: capability was not refused" m2.log
 fi
-grep -q 'a/mcpp.toml' m2.log && grep -q 'mcpp:no-such-layer' m2.log \
+grep -qE 'ws2[/\\]a[/\\]mcpp\.toml' m2.log && grep -q 'mcpp:no-such-layer' m2.log \
     || fail "M2 the refusal names the member's manifest and the capability" m2.log
 
 # ── M3 ──────────────────────────────────────────────────────────────────────
