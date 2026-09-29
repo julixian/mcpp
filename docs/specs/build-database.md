@@ -4,10 +4,10 @@
 |---|---|
 | 规范编号 | SPEC-005 |
 | 标题 | mcpp 输出的构建数据库:内容、取值规则与不写工程目录的保证 |
-| 状态 | 评审中 v1.5 |
-| 版本 | 1.5 |
-| 最后修改 | 2026-09-28 |
-| 对应实现 | mcpp >= 2026.9.15.1;v1.3 修改的 R2.5、R3.7、R3.8、R4.1、R5.2 为 mcpp >= 2026.9.26.2;v1.4 修改的 R2.5 为 mcpp >= 2026.9.27.1;v1.5 修改的 R3.7、R3.12、R5.1、R5.2 为 mcpp >= 2026.9.28.1 |
+| 状态 | 评审中 v1.6 |
+| 版本 | 1.6 |
+| 最后修改 | 2026-09-29 |
+| 对应实现 | mcpp >= 2026.9.15.1;v1.3 修改的 R2.5、R3.7、R3.8、R4.1、R5.2 为 mcpp >= 2026.9.26.2;v1.4 修改的 R2.5 为 mcpp >= 2026.9.27.1;v1.5 修改的 R3.7、R3.12、R5.1、R5.2 为 mcpp >= 2026.9.28.1;v1.6 修改的 R2.1、R3.3、R3.4、R3.5、R4.1、R5.2 为 mcpp >= 2026.9.29.5 |
 | 相关设计文档 | `.agents/docs/2026-09-14-636-build-database-and-the-latest-xlings.md`<br>`.agents/docs/2026-09-26-compile-database-and-issue-699-design.md` |
 | 相关 issue | #636, #648, #655, #699, #702, #707 |
 | 依据的外部规范 | S1「C++ Build Database: IDE Profile」profile 0.3.0(§7.2 的 `generated`,Sunrisepeak/mcpp-language-server#28;此前为 0.2.0)与 S2 0.2.0 §3.4,取自 https://github.com/Sunrisepeak/lsp-mcpp-private 提交 `b82859d`(schema 自提交 `28ecd6e` 起未变);S2 0.3.0 §3.4 的部分回答(S2-3.4-12、S2-3.4-13,Sunrisepeak/mcpp-language-server#25);JSON Compilation Database |
@@ -42,7 +42,7 @@ Database 定义,本规范不重复它们的字段定义,只规定 mcpp 作为生
 ## 2. 不写工程目录
 
 - **R2.1** 命令**禁止**写入工程目录,即根包、工作区成员与 path 依赖的源码树。规划
-  写入 `$MCPP_HOME/cache/build-database/<key>`,`<key>` 由工程根与成员决定。该目录
+  写入 `$MCPP_HOME/cache/build-database/<key>`,`<key>` 由工程根与一次规划的成员决定。该目录
   是缓存,可以随时删除。**已实现**
 - **R2.2** 命令不编译:标准库模块被描述而不被编译,也不生成只供链接使用的输入(GCC 的
   `mcpp-clean-link.specs`)。工具链照常被查询(版本、目标三元组、sysroot 等),与
@@ -84,14 +84,18 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 
 ### 3.2 集合
 
-- **R3.3** 每个包一个集合,名为包的限定名(`<namespace>.<name>` 或 `<name>`)。根包
-  测试目标的源文件归入集合 `<包>:test`,标准库模块的单元归入集合 `mcpp:std`。工作区
-  文档中,每个集合名带前缀 `<成员>/`。**已实现**
-- **R3.4** `visible-sets` 列出同一成员的其余所有集合。引擎在一次调用的一张模块图上
+- **R3.3** 每个包一个集合,名为包的限定名(`<namespace>.<name>` 或 `<name>`)。根包与
+  工作区被选成员的测试目标的源文件归入集合 `<包>:test`,标准库模块的单元归入集合
+  `mcpp:std`。工作区按配置规划,与 `mcpp build` 相同:每个配置一次规划,成员共用的包
+  在一个配置中只有一个集合。文档描述多个配置时,每个集合名带前缀 `<配置>/`,`<配置>`
+  为该配置构建目录的名字;只有一个配置时不带前缀。两次规划描述同一配置的同一集合时
+  (见 R5.2 的逐成员规划),该集合只出现一次。**已实现**
+- **R3.4** `visible-sets` 列出同一次规划的其余所有集合。引擎在一次调用的一张模块图上
   解析 import,更窄的闭包会描述一条构建并不执行的规则。**已实现**
 - **R3.5** `family-name` 为包名,`mcpp:std` 集合的为 `mcpp:std`;`ide.configuration`
-  为 profile 名;`ide.kind` 在测试集合为 `test`,在根包集合按其目标为 `library`、
-  `executable` 或 `other`,在依赖包集合与 `mcpp:std` 为 `library`。**已实现**
+  为 profile 名;`ide.kind` 在测试集合为 `test`,在根包与工作区被选成员的集合按其
+  目标为 `library`、`executable` 或 `other`,在依赖包集合与 `mcpp:std` 为 `library`。
+  **已实现**
 - **R3.6** 单元的 `arguments` 依次是驱动、集合的 `baseline-arguments`、单元的
   `local-arguments`,以及单元自己结尾的 `-c <source> -o <object>`(若有;两个操作数
   相对 `work-directory` 指向 `source` 与 `object`)。`baseline-arguments` 是集合中每个
@@ -170,7 +174,8 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 ## 4. `--spec compile-commands`
 
 - **R4.1** 文档为 `mcpp build --configure-only` 在同一组选择器下写入
-  `compile_commands.json` 的条目,差别只在输出路径位于 §2 的工作目录之下。标准库
+  `compile_commands.json` 的条目,差别只在输出路径位于 §2 的工作目录之下;同一文件与
+  同一输出只有一条条目,文档描述多个配置时,一个文件在每个编译它的配置中各有一条。标准库
   模块的单元也在其中,遵循 S1-12-1 的导出规则:S1 文档里 `mcpp:std` 集合的每个
   单元同样导出为一条 `compile_commands.json` 条目。**已实现**
 
@@ -179,8 +184,9 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 - **R5.1** `kind` 为 `mcpp.build-database`,`kindVersion` 为 1。`data` 含 `spec`
   (`{"name": "s1", "version": "0.3.0"}` 或 `{"name": "compile-commands"}`)、
   `database`、`watch` 与 `inputs-fingerprint`。**已实现**
-- **R5.2** 命令独立规划每一个被选中的成员:一个成员规划失败只影响它自己,不影响
-  其余成员的集合(#699 第 1 项)。规划失败的成员不贡献任何集合,只贡献一条 `error`
+- **R5.2** 一个成员规划失败只影响它自己,不影响其余成员的集合(#699 第 1 项)。命令
+  按配置规划被选中的成员;一个配置的规划失败时,该配置的成员逐个规划,因此失败仍归于
+  各自的成员。规划失败的成员不贡献任何集合,只贡献一条 `error`
   诊断,`path` 为该成员的 `mcpp.toml`,相对工作区根目录;诊断码为:不在工程中时
   `MCPP_BUILD_DATABASE_NO_PROJECT`;该成员的规划因离线而需要下载时
   `MCPP_OFFLINE_DOWNLOAD_REQUIRED`,消息指出需要下载的第一项;其他规划失败为
@@ -226,3 +232,4 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 | 1.3 | 2026-09-26 | R2.5:`emit` 下构建失败的宿主工具是警告。R3.7:`work-directory` 是输出目录,模块接口单元的 `arguments` 带语言 flag。R3.8:标准库单元的 `provides` 指向 std 缓存中的 BMI,工具链带 `build-id`。R4.1:compile-commands 文档包含标准库单元(S1-12-1)。R5.2:成员各自规划,构建程序失败的包不带其指令地被描述(#699,#702)。 |
 | 1.4 | 2026-09-26 | R2.5:命令不构建宿主工具;工具库中没有的工具被推迟,输出说明 `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED`,取代 1.3 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`(#707)。 |
 | 1.5 | 2026-09-28 | R3.7:规则声明的设备源不是编译单元,不进入 S1 与 `compile_commands.json`(#724)。新增 R3.12:集合的 `ide.generated` 列出规则生成的文件与目录,给出构建写入的路径与生成它的步骤,S1 0.3.0(#724,Sunrisepeak/mcpp-language-server#28)。R5.1:S1 版本为 0.3.0。R5.2:以构建程序的指令为前提的检查不对其构建程序已失败的包运行,失败路径保留已记录的说明(#724)。 |
+| 1.6 | 2026-09-29 | 工作区按配置规划,与 `mcpp build` 相同(R2.1、R3.3、R3.4、R5.2):成员共用的包在一个配置中只描述一次;集合名的前缀由 `<成员>/` 改为只在文档描述多个配置时出现的 `<配置>/`;一个配置的规划失败时逐成员规划。R3.5:被选成员的集合按其目标给出 `ide.kind`。R4.1:同一文件与输出一条条目。 |

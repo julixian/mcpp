@@ -184,6 +184,8 @@ select_workspace_members(PrepareState& state, const std::filesystem::path& wsRoo
         auto canonical = std::filesystem::weakly_canonical(dir, canonEc);
         if (canonEc) canonical = dir;
         state.selectedMembers[canonical] = mcpp::project::product_directory_name(all, mp);
+        if (auto t = state.overrides.member_targets.find(mp); t != state.overrides.member_targets.end())
+            state.memberTargets[canonical] = t->second;
         auto member = mcpp::project::load_member_manifest(*state.wsManifest, wsRoot, mp);
         if (!member) return std::unexpected(member.error());
         if (auto r = refuse_unknown_capability(*member, dir / "mcpp.toml"); !r)

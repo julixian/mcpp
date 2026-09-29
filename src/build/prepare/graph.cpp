@@ -1763,9 +1763,13 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
                                  && spec.artifacts.empty() && !selectedMember;
         // A root receives the profile's own compile flags; in a workspace plan
         // each selected member does, as it did when it was the root. The
-        // tests `mcpp test` discovered are the selected member's targets.
+        // tests `mcpp test` discovered are the selected member's targets; a
+        // plan of several members receives each member's own.
         if (selectedMember && state.selectedMembers.size() == 1)
             for (auto const& t : state.extraTargets) ctx.dep_manifest->targets.push_back(t);
+        if (selectedMember)
+            if (auto t = state.memberTargets.find(*selectedMember); t != state.memberTargets.end())
+                for (auto const& target : t->second) ctx.dep_manifest->targets.push_back(target);
         if (selectedMember) {
             auto& mbc = ctx.dep_manifest->buildConfig;
             mbc.cflags.insert(mbc.cflags.end(), state.profileCflags.begin(),

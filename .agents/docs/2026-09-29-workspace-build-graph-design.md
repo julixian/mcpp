@@ -563,6 +563,10 @@ read from the member, or made a value of the plan:
 | the runtime files of a program shipped through `artifacts` (2026.9.29.3) | its link waited for the plan's deploy set, which a workspace plan does not place; its own runtime files were not in the member's directory | the link waits for no plan-level file; a member's runtime set includes the closures its `artifacts` edges reach | e2e 833 G9 |
 | the link line of a program shipped through `artifacts` (2026.9.29.4) | the plan's line, which pools the dependencies' flags and not a member's, so a library its package's build program states was missing | a link group of its own closure that places nothing (`LinkGroup::linkOnly`) | e2e 838 |
 | `${mcpp.bin_dir}` in a member's action (2026.9.29.4) | the plan's `bin/` | the declaring member's product directory | e2e 838 A4 |
+| a member program's graph document (2026.9.29.5) | listed every requester in the plan, the virtual root included, so the program's re-run key followed the selection | the requests made inside the program's closure | e2e 839 B3, B4 |
+| the order of the members' programs (2026.9.29.5) | discovery order | dependencies first (a cycle skips its closing edge) | e2e 839 B2 |
+| `emit build-database`, `--configure-only` (2026.9.29.5) | one plan per member | one plan per configuration, each member's tests included; a failed configuration planned member by member | e2e 840 |
+| the root compile database of several configurations (2026.9.29.5) | the last written configuration's, a race under concurrent groups | the union, published once by the command | e2e 840 B |
 
 Each criterion fails on 2026.9.29.1 and passes on 2026.9.29.2. The resource
 case also showed a defect of every build: a quoted `#include` in a script was

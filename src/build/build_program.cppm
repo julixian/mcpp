@@ -1238,6 +1238,11 @@ std::expected<void, std::string> run_build_program(
         }
     }
 
+    // The package the status lines name: several programs run in one
+    // workspace plan, and a line without its package cannot be attributed.
+    const std::string who = m.package.namespace_.empty()
+        ? m.package.name : m.package.namespace_ + "." + m.package.name;
+
     // Fast path: declared inputs + contract unchanged → reapply cached
     // directives, no run.
     CacheRecord cache = read_cache(bdir);
@@ -1261,7 +1266,7 @@ std::expected<void, std::string> run_build_program(
         for (auto const& a : dirs::advisories(m.package.name, cache.directives))
             mcpp::ui::warning(a);
         report_stated_diagnostics(m.package.name, cache.directives);
-        mcpp::ui::info("build.mcpp", "up to date (cached)");
+        mcpp::ui::info("build.mcpp", std::format("up to date {} (cached)", who));
         return {};
     }
 
@@ -1622,7 +1627,7 @@ std::expected<void, std::string> run_build_program(
             "       arrived. Please report it with the toolchain name and this "
             "line.", *orphan));
     }
-    mcpp::ui::info("build.mcpp", "compiling");
+    mcpp::ui::info("build.mcpp", std::format("compiling {}", who));
     // GCC resolves imported BMIs via gcm.cache/ relative to the compile cwd, so
     // any compile that imports a module — `mcpp`, `std`, a build rule's host
     // module, or any mix — has to run from bdir, where they were staged or
@@ -1663,7 +1668,7 @@ std::expected<void, std::string> run_build_program(
     // produces a baffling failure; a build PROGRAM that runs long is usually
     // stuck — waiting on a network read or spinning — and without a bound the
     // whole build hangs with no diagnostic at all.
-    mcpp::ui::info("build.mcpp", "running");
+    mcpp::ui::info("build.mcpp", std::format("running {}", who));
     bool timedOut = false;
     // The bound comes from THIS package's manifest — a dependency's generator
     // is bounded by the dependency's own declaration, because its author is

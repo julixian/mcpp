@@ -641,6 +641,10 @@ export struct BuildOverrides {
     // Every member the COMMAND selected, across its configuration groups: the
     // request a fast-path record names. Empty: `workspace_members`.
     std::vector<std::string> workspace_request;
+    // The test targets each member of `workspace_members` receives, by member
+    // path: what `extraTargets` is for a plan of one member, for a plan of
+    // several (`--configure-only`, `mcpp emit build-database`).
+    std::map<std::string, std::vector<mcpp::manifest::Target>> member_targets;
     // --profile <name>. Empty = fall through to `[build] default-profile`, then
     // to `profile_fallback` below, whose own default is "dev". The comment here
     // said "release" for as long as `mcpp build --help` did, and neither had

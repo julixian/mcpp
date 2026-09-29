@@ -265,6 +265,12 @@ the last is the distributable and only it is printed as `Packed`. A format
 whose chain ends in two files is refused by `mcpp run --format`, naming both,
 because a runner takes one operand.
 
+A format may report many outputs, one per file of a distribution tree. Up to
+eight are printed one per line; more are printed by the entry each lies in
+below their common directory, with a count (`Packed Release/app (1309
+files)`), and `--verbose` prints every one (2026.9.29.5+).
+`--message-format json` lists every output in either case.
+
 An unknown `<name>` is refused naming the format set the resolved graph
 provides, the same set `mcpp pack --format bogus` reports. `--format` together
 with `--no-runner` is refused — an `.apk` or an installed `.app` cannot be

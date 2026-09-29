@@ -1045,6 +1045,11 @@ one. `mcpp::graph_file()` names a JSON document that states the resolved graph:
   `""`.** The root decides the graph, and when its program runs every input of
   that decision is final, which is the reason `dep_linkage` is offered to it
   alone.
+- **In a workspace plan each selected member's program receives the document
+  of its own closure**, in which it is `root`, and `requested_by` lists the
+  requests made inside that closure (2026.9.29.5+). The document, and so the
+  program's re-run key, is therefore the same whichever members a command
+  selects. The members' programs run dependencies first.
 - **`[package.metadata.<tool>]` is the package's statement about itself.** The
   engine does not interpret the table. A path in it is resolved by the reader
   against the entry's `manifest_dir`, because only the reader knows which values
@@ -1513,8 +1518,9 @@ variable, emit `mcpp:rerun-if-changed=config.h` / `mcpp:rerun-if-env-changed=USE
 This replaces the old "process exited 0, so assume it's fine" guesswork with an
 explicit input/output contract — incremental builds stay correct.
 
-When nothing changed the output is `build.mcpp up to date (cached)`; otherwise
-`build.mcpp compiling` / `running`.
+When nothing changed the output is `build.mcpp up to date <package> (cached)`;
+otherwise `build.mcpp compiling <package>` / `running <package>` (the package
+is named from 2026.9.29.5 on).
 
 ## Host tools from a dependency (mcpp 2026.8.5.1+)
 

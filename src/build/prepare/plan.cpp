@@ -812,7 +812,8 @@ static void step13_graph_and_schedule(PrepareState& state, BuildContext& ctx) {
     // own target, and the output directory is shared with plain builds because
     // the fingerprint covers neither input. Stamping it on the plan is what
     // lets the graph say so about itself.
-    ctx.plan.graphShape = (state.includeDevDeps || !state.extraTargets.empty())
+    ctx.plan.graphShape = (state.includeDevDeps || !state.extraTargets.empty()
+                           || !state.memberTargets.empty())
         ? mcpp::build::GraphShape::WithTests
         : mcpp::build::GraphShape::Normal;
     // The device variant an override chose is stamped for the same reason: the

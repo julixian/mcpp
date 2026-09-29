@@ -4,6 +4,52 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.9.29.5] - 2026-09-29
+
+This release completes the workspace build graph in the commands around the
+build, from the validation project's post-release run of 2026.9.29.4: build
+programs are reused across selections and run dependencies first, the build
+database and `--configure-only` plan by configuration, and the output names
+what it reports.
+
+### Fixed
+
+- **A member's build program is reused whichever members a command selects.**
+  Its graph document listed every requester in the plan, the virtual root
+  included, so the program's re-run key followed the selection: `-p`, `mcpp
+  pack` and `mcpp emit build-database` reran the programs a `--workspace`
+  build had run (7 to 15 s each in the validation project). A program's
+  document now lists the requests made inside its own closure (e2e 839).
+- **A member's build program runs after those of the members it depends on.**
+  They ran in discovery order, so a member's program could run before its
+  dependency's had applied its directives (e2e 839).
+- **`mcpp emit build-database` and `mcpp build --configure-only` plan a
+  workspace by configuration, as the build does.** They planned each member
+  separately, so a package two members use was described once per member,
+  each time with other arguments (the validation project's core library three
+  times). A member that is a program is described as one, and its tests as
+  tests. A configuration whose plan fails is planned member by member, so a
+  member's failure still affects that member only (e2e 840; SPEC-005 v1.6).
+- **A command that plans several configurations writes the root
+  `compile_commands.json` once**, as the union of their databases. Each
+  configuration replaced it, and under `mcpp build --workspace`, whose
+  configurations build at the same time, the file was the last one's (e2e 840).
+
+### Behaviour changes
+
+- **The build program status lines name the package**:
+  `build.mcpp compiling <package>`, `running <package>`,
+  `up to date <package> (cached)` (e2e 839).
+- **A selected member is announced by its directory** in a `--workspace`
+  build, also where another member depends on it (e2e 839).
+- **`mcpp pack` summarises many outputs.** A format that reports more than
+  eight outputs is reported by the entry each lies in below their common
+  directory, with a count; `--verbose` names every output, and
+  `--message-format json` lists every one as before (e2e 841).
+- **Build database set names (SPEC-005 v1.6).** A set is named by its package;
+  a document of several configurations prefixes each name with the
+  configuration's build directory name, instead of `<member>/`.
+
 ## [2026.9.29.4] - 2026-09-29
 
 This release links a program that a workspace member ships through

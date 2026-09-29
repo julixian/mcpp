@@ -885,6 +885,9 @@ mcpp 会写出 `<暂存树>.stage-manifest` —— 一个兄弟文件，永不�
 
 - **根包的程序拿到它；依赖包的程序读到 `""`。** 根包决定这张图，而它的程序运行时这个决定的
   每个输入都已确定 —— 这正是 `dep_linkage` 只提供给根包的原因。
+- **在工作区计划中，每个被选成员的程序拿到它自己闭包的文档**，其中它是 `root`，
+  `requested_by` 只列出闭包内部发出的请求（2026.9.29.5+）。因此无论命令选中哪些成员，
+  这份文档以及程序的重跑键都相同。成员的程序按依赖在前的顺序运行。
 - **`[package.metadata.<tool>]` 是包对自身的陈述。** 引擎不解释这张表。其中的路径由读取方
   相对于该条目的 `manifest_dir` 解析，因为只有读取方知道哪些值是路径。旧引擎忽略这张表，
   所以已发布的包可以在其使用方升级之前就写上它。
@@ -1273,8 +1276,8 @@ mcpp **不会**每次构建都重跑 `build.mcpp`。它会缓存程序产出的�
 `mcpp:rerun-if-changed=config.h` / `mcpp:rerun-if-env-changed=USE_FAST`。这用一份明确的
 输入/输出契约取代了过去「进程退出码为 0 就当成功」的猜测——让增量构建保持正确。
 
-无变化时输出 `build.mcpp up to date (cached)`；否则是 `build.mcpp compiling` /
-`running`。
+无变化时输出 `build.mcpp up to date <包名> (cached)`；否则是 `build.mcpp compiling <包名>` /
+`running <包名>`(自 2026.9.29.5 起写出包名)。
 
 ## 依赖产出的 host 工具（mcpp 2026.8.5.1+）
 

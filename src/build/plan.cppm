@@ -375,6 +375,11 @@ struct BuildPlan {
     // (possibly read-only) registry directory, and deriving the path would put
     // an IDE database there. Empty → projectRoot, the historical default.
     std::filesystem::path           compileDbPath;
+    // Whether writing this plan's compile database also publishes the root
+    // copy. False for each plan of a command that planned several
+    // configurations, which publishes the root file itself, once, from all of
+    // them (`publish_root_compile_commands` over a list).
+    bool                            publishRootCompileDb = true;
     // See StdModuleUnit above. Empty when the build does not import `std`.
     std::vector<StdModuleUnit>      stdModuleUnits;
     // GCC only: a specs file that replaces the pristine `*link:`, so the

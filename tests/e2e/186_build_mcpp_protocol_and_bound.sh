@@ -175,7 +175,7 @@ cp "$CACHE" "$TMP/good.cache"
 # the build.mcpp cache) actually runs.
 touch src/main.cpp
 "$MCPP" build > b6.log 2>&1 || { cat b6.log; echo "FAIL: build failed"; exit 1; }
-grep -q "up to date (cached)" b6.log || {
+grep -qE "up to date .*\(cached\)" b6.log || {
     cat b6.log; echo "FAIL: an unchanged build.mcpp was re-run"; exit 1; }
 
 sed 's/^epoch .*/epoch 987654/' "$TMP/good.cache" > "$CACHE"

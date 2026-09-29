@@ -944,6 +944,13 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
     // The packages announced: the root's dependencies, and in a workspace
     // plan each member followed by the member's own dependencies (§15), as
     // the member's own build announced them.
+    // A member that another member depends on is announced from its own
+    // member edge, by its directory, not as that member's path dependency.
+    std::set<std::filesystem::path> memberRoots;
+    for (auto const& m : ctx.workspaceMembers) {
+        std::error_code ec;
+        memberRoots.insert(std::filesystem::weakly_canonical(m.root, ec));
+    }
     std::vector<std::pair<std::string, mcpp::manifest::DependencySpec>> announcedDeps;
     for (auto const& [name, spec] : ctx.manifest.dependencies) {
         announcedDeps.emplace_back(name, spec);
@@ -953,7 +960,16 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
             if (std::filesystem::weakly_canonical(spec.path, e1)
                 != std::filesystem::weakly_canonical(m.root, e2))
                 continue;
-            for (auto const& [dn, ds] : m.manifest.dependencies) announcedDeps.emplace_back(dn, ds);
+            for (auto const& [dn, ds] : m.manifest.dependencies) {
+                if (ds.isPath()) {
+                    const std::filesystem::path dp{ds.path};
+                    std::error_code e3;
+                    if (memberRoots.contains(std::filesystem::weakly_canonical(
+                            dp.is_absolute() ? dp : m.root / dp, e3)))
+                        continue;
+                }
+                announcedDeps.emplace_back(dn, ds);
+            }
         }
     }
     for (auto& [name, spec] : announcedDeps) {
@@ -1561,6 +1577,31 @@ void restore_root_compile_commands(const std::filesystem::path& projectRoot,
     }
 }
 
+// The root compile database of a command that planned configuration groups of
+// a workspace (workspace design 2026-09-29 §15): the union of the groups'
+// databases (one entry per file and output), published once after every
+// group, so the file does not depend on which group's build finished last.
+export void publish_workspace_compile_commands(
+        const std::filesystem::path& wsRoot,
+        const std::vector<std::filesystem::path>& outputDirs) {
+    std::vector<std::filesystem::path> databases;
+    for (auto const& dir : outputDirs) {
+        std::error_code ec;
+        auto db = dir / "compile_commands.json";
+        if (std::filesystem::exists(db, ec) && !ec) databases.push_back(std::move(db));
+    }
+    if (databases.empty()) return;
+    auto result = mcpp::build::publish_root_compile_commands(
+        databases, wsRoot / "compile_commands.json",
+        outputDirs.front().parent_path().parent_path(), mcpp::home::root());
+    if (!result) {
+        mcpp::ui::warning(std::format(
+            "compile_commands.json was not updated: {}", result.error().message));
+    } else if (result->foreignEntries > 0) {
+        mcpp::ui::warning(mcpp::build::foreign_entries_warning(result->foreignEntries));
+    }
+}
+
 // Every xlings payload the entry's build read is still installed (#716). A
 // cache written before the field was recorded declines once.
 bool xlings_payloads_present(const BuildCacheEntry& e) {
@@ -1807,8 +1848,13 @@ export std::optional<int> try_fast_workspace_build(
     }
 
     std::chrono::milliseconds total{};
+    if (ready.size() > 1) {
+        std::vector<std::filesystem::path> dirs;
+        for (auto const& r : ready) dirs.push_back(r.outputDir);
+        publish_workspace_compile_commands(wsRoot, dirs);
+    }
     for (auto& r : ready) {
-        restore_root_compile_commands(wsRoot, r.outputDir);
+        if (ready.size() == 1) restore_root_compile_commands(wsRoot, r.outputDir);
         std::chrono::milliseconds elapsed{};
         auto rc = run_ninja_fast(r.ninjaProgram, r.outputDir, r.outputDir / "build.ninja",
                                  verbose, r.runtimeEnvKey, r.runtimeEnvValue, &elapsed);

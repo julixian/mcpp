@@ -18,6 +18,7 @@ import mcpp.log;
 import mcpp.manifest;
 import mcpp.source_kind;
 import mcpp.modgraph.glob;
+import mcpp.graph;
 import mcpp.modgraph.graph;
 import mcpp.modgraph.scanner;
 import mcpp.modgraph.validate;
@@ -1436,7 +1437,8 @@ static void step9_define_graph_package_entry_closure(PrepareState& state) {
     //
     // The link form is read from `dependencyLinkForms`, which is computed once,
     // before this point, for exactly this program (#642 E2).
-    state.graph_package_entry = [&](std::size_t i, bool forBuildProgram) {
+    state.graph_package_entry = [&](std::size_t i, bool forBuildProgram,
+                                    const std::vector<bool>* requesters) {
         auto const& pm = state.packages[i].manifest;
         const auto id = mcpp::manifest::package_id(pm.package);
         nlohmann::json entry = {
@@ -1452,6 +1454,8 @@ static void step9_define_graph_package_entry_closure(PrepareState& state) {
         nlohmann::json requests = nlohmann::json::array();
         for (auto const& r : state.graphRequests) {
             if (r.dependencyPackageIndex != i) continue;
+            if (requesters && (r.consumerPackageIndex >= requesters->size()
+                               || !(*requesters)[r.consumerPackageIndex])) continue;
             requests.push_back({
                 {"requester", mcpp::manifest::package_id(
                     state.packages[r.consumerPackageIndex].manifest.package).canonical()},
@@ -1630,7 +1634,7 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
             doc["kind"] = "mcpp.graph";
             doc["version"] = 1;
             nlohmann::json list = nlohmann::json::array();
-            for (auto i : order) list.push_back(state.graph_package_entry(i, true));
+            for (auto i : order) list.push_back(state.graph_package_entry(i, true, nullptr));
             doc["packages"] = std::move(list);
             const auto text = doc.dump(2) + "\n";
             const auto graphPath = bpEnv.artifactsDir / "graph.json";
@@ -1854,9 +1858,14 @@ write_graph_document(PrepareState& state, std::size_t subject,
     nlohmann::json doc;
     doc["kind"] = "mcpp.graph";
     doc["version"] = 1;
+    // The requests a document lists are those made by its own packages. A
+    // request from outside the program's closure (another workspace member, a
+    // workspace plan's virtual root) is a fact about the plan, not about the
+    // package, and would make the document, and with it the program's cache
+    // key, depend on which members the command selected.
     nlohmann::json list = nlohmann::json::array();
     for (auto i : order) {
-        auto entry = state.graph_package_entry(i, true);
+        auto entry = state.graph_package_entry(i, true, &reached);
         entry["root"] = i == subject;
         list.push_back(std::move(entry));
     }
@@ -1888,7 +1897,22 @@ write_graph_document(PrepareState& state, std::size_t subject,
 // environment in every selection.
 static std::expected<void, std::string> step9_member_build_programs(PrepareState& state) {
     if (!state.m->package.virtualRoot) return {};
-    for (std::size_t i = 1; i < state.packages.size(); ++i) {
+    // Dependencies first: a member's program runs after the programs of the
+    // members it depends on, whose directives are then in place in the graph
+    // it reads. Discovery order, which the packages are numbered in, puts a
+    // member before its dependency when its key sorts first.
+    mcpp::graph::AdjacencyList deps(state.packages.size());
+    for (auto const& r : state.graphRequests)
+        if (r.consumerPackageIndex < deps.size() && r.dependencyPackageIndex < deps.size()
+            && r.consumerPackageIndex != r.dependencyPackageIndex)
+            deps[r.consumerPackageIndex].push_back(r.dependencyPackageIndex);
+    // Mutual dev-dependencies between members are legal, so a cycle skips its
+    // closing edge and every other dependency still comes first.
+    std::vector<std::size_t> roots(state.packages.size());
+    std::iota(roots.begin(), roots.end(), std::size_t{0});
+    const auto order = *mcpp::graph::depth_first_order(deps, roots, mcpp::graph::Cycles::Skip);
+    for (auto const i : order) {
+        if (i == 0) continue;
         if (!state.isWorkspaceMemberPackage(i)) continue;
         if (!state.compilesHere(i)) continue;
         auto& pkg = state.packages[i];

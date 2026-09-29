@@ -300,6 +300,9 @@ struct PrepareState {
     // declares the dependency key: the forwards its edges receive.
     std::map<std::filesystem::path, std::vector<std::pair<std::string, std::string>>>
         memberCliForwards;
+    // The test targets a selected member receives (`BuildOverrides::
+    // member_targets`), by the same key.
+    std::map<std::filesystem::path, std::vector<mcpp::manifest::Target>> memberTargets;
     // The profile's own compile flags (`[profile.<name>] cflags`/`cxxflags`),
     // which a root receives; in a workspace plan every selected member does.
     std::vector<std::string> profileCflags, profileCxxflags;
@@ -523,7 +526,9 @@ struct PrepareState {
     std::filesystem::path stdCompatObjectPath;
     std::optional<mcpp::toolchain::StdModuleDescription> describedStdModule;
     std::string stdFlagAndDialect;
-    std::function<nlohmann::json(std::size_t, bool)> graph_package_entry;
+    // The entry of package `i`; with `requesters`, only the requests made by
+    // the packages it marks (a build program's closure).
+    std::function<nlohmann::json(std::size_t, bool, const std::vector<bool>*)> graph_package_entry;
     mcpp::modgraph::ScanResult scan;
     mcpp::modgraph::ValidateReport report;
 };

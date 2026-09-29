@@ -240,6 +240,10 @@ mcpp run --target aarch64-ios-sim      --format app
 最后一个是发布物，也只有它以 `Packed` 报出。链的末端产出两个文件的格式会被
 `mcpp run --format` 拒绝并点名两者，因为一个 runner 只接受一个操作数。
 
+一个格式可能报出很多输出，发布目录中的每个文件各一个。不超过八个时逐行打印；更多时按它们
+在共同目录之下所处的条目打印，并附数量（`Packed Release/app (1309 files)`），`--verbose`
+打印全部（2026.9.29.5+）。`--message-format json` 在两种情况下都列出全部输出。
+
 未知的 `<name>` 会被拒绝，点名已解析图提供的格式集合，与
 `mcpp pack --format bogus` 报出的是同一个集合。`--format` 与 `--no-runner`
 同时出现会被拒绝 —— 一个 `.apk` 或一个已安装的 `.app` 无法被直接执行。在

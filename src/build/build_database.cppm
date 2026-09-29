@@ -12,7 +12,7 @@
 //   - `arguments` come from the record the compile database renders
 //     (mcpp.build.compile_commands::unit_invocations), so the two databases
 //     cannot list different command lines for one unit.
-//   - `visible-sets` is every other set of the planned member. The engine
+//   - `visible-sets` is every other set of the same plan. The engine
 //     resolves imports over one graph per invocation; a narrower closure would
 //     describe a rule the build does not enforce.
 //   - The standard library modules are translation units of their own set,
@@ -54,10 +54,10 @@ struct Member {
     // Where the planning pass wrote (BuildOverrides::work_dir): the build
     // programs' caches, and so their declared inputs, are under it.
     std::filesystem::path workDir;
-    // Test discovery (`[test] discover`, relative to `testRoot`): a new file
+    // Test discovery (`[test] discover`, relative to its root), one entry
+    // per package the plan tests (each member of a group plan): a new file
     // matching it is a new test target, and so a new unit in the document.
-    std::filesystem::path    testRoot;
-    std::vector<std::string> testDiscover;
+    std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> tests;
 };
 
 struct Rendered {
@@ -312,6 +312,11 @@ Rendered render(std::span<const Member> members,
     Rendered r;
     nlohmann::json toolchains = nlohmann::json::object();
     nlohmann::json sets = nlohmann::json::array();
+    // Two plans of one configuration (the members of a group whose plan
+    // failed, planned one by one) describe the packages they share alike: a
+    // set is described once, and so is a compile command, keyed by its file
+    // and its output. A file two configurations compile has a command of each.
+    std::set<std::string> describedSets, describedCommands;
 
     std::set<std::string> watch;
     std::set<std::filesystem::path> inputFiles;
@@ -349,12 +354,23 @@ Rendered render(std::span<const Member> members,
         const auto tcId = toolchain_id(ctx.tc, compilerTriple);
 
         const auto rootName = qualified_name(ctx.manifest);
+        // The packages whose own targets this plan builds: the root, or in a
+        // workspace plan each selected member (§15 of the 2026-09-29 workspace
+        // design), with the directory their target entries are written in.
+        std::vector<std::pair<const mcpp::manifest::Manifest*, std::filesystem::path>> subjects;
+        if (ctx.workspaceMembers.empty())
+            subjects.emplace_back(&ctx.manifest, ctx.projectRoot);
+        for (auto const& wm : ctx.workspaceMembers) subjects.emplace_back(&wm.manifest, wm.root);
+        std::map<std::string, const mcpp::manifest::Manifest*> subjectByName;
         std::set<std::filesystem::path> testSources;
-        for (auto const& t : ctx.manifest.targets) {
-            if (t.kind != mcpp::manifest::Target::TestBinary || t.main.empty()) continue;
-            std::filesystem::path main{t.main};
-            testSources.insert((main.is_absolute() ? main : ctx.projectRoot / main)
-                                   .lexically_normal());
+        for (auto const& [sm, sroot] : subjects) {
+            subjectByName[qualified_name(*sm)] = sm;
+            for (auto const& t : sm->targets) {
+                if (t.kind != mcpp::manifest::Target::TestBinary || t.main.empty()) continue;
+                std::filesystem::path main{t.main};
+                testSources.insert((main.is_absolute() ? main : sroot / main)
+                                       .lexically_normal());
+            }
         }
 
         std::vector<std::string> order;
@@ -394,8 +410,9 @@ Rendered render(std::span<const Member> members,
             const auto& cu = *inv.unit;
             const bool isTest = testSources.contains(cu.source.lexically_normal());
             const std::string package = cu.packageName.empty() ? rootName : cu.packageName;
+            const auto subject = subjectByName.find(package);
             const std::string kind = isTest ? "test"
-                                   : package == rootName ? target_kind(ctx.manifest)
+                                   : subject != subjectByName.end() ? target_kind(*subject->second)
                                    : "library";
             auto& set = set_for(member.setPrefix + package + (isTest ? ":test" : ""),
                                 package, kind);
@@ -407,7 +424,8 @@ Rendered render(std::span<const Member> members,
             if (!cu.providesModule.empty()) provides[cu.providesModule] = "";
             nlohmann::json requires_ = nlohmann::json::array();
             for (auto const& name : cu.imports) requires_.push_back(name);
-            r.compileCommands.push_back(nlohmann::json{
+            if (describedCommands.insert(inv.file + '\x1f' + inv.output).second)
+                r.compileCommands.push_back(nlohmann::json{
                 {"directory", inv.directory},
                 {"file",      inv.file},
                 {"arguments", inv.arguments},
@@ -439,7 +457,8 @@ Rendered render(std::span<const Member> members,
                 const auto sourceStr = native_string(unit.source);
                 const auto objectStr = native_string(unit.object);
                 const auto workDirStr = native_string(unit.workDirectory);
-                r.compileCommands.push_back(nlohmann::json{
+                if (describedCommands.insert(sourceStr + '\x1f' + objectStr).second)
+                    r.compileCommands.push_back(nlohmann::json{
                     {"directory", workDirStr},
                     {"file",      sourceStr},
                     {"arguments", unit.arguments},
@@ -516,6 +535,7 @@ Rendered render(std::span<const Member> members,
         }
 
         for (auto const& name : order) {
+            if (!describedSets.insert(name).second) continue;
             auto& set = groups.at(name);
             nlohmann::json visible = nlohmann::json::array();
             for (auto const& other : order)
@@ -545,7 +565,8 @@ Rendered render(std::span<const Member> members,
                 watch_file(sp.root / "build.mcpp");
             for (auto const& g : sp.sources) watch_glob(sp.root, g);
         }
-        for (auto const& g : member.testDiscover) watch_glob(member.testRoot, g);
+        for (auto const& [testRoot, globs] : member.tests)
+            for (auto const& g : globs) watch_glob(testRoot, g);
         // Only an editable package's build program inputs can change: a store
         // package's are fixed by the version its manifest and lock name.
         std::set<std::filesystem::path> editableRoots;

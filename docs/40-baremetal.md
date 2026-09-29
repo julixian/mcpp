@@ -206,8 +206,8 @@ Measured output:
    Resolving toolchain
     Resolved llvm@22.1.8 → riscv64-none-elf → @mcpp/registry/data/xpkgs/xim-x-llvm/22.1.8/bin/clang++
     Resolved host toolchain for build.mcpp: clang 22.1.8 (x86_64-unknown-linux-gnu)
-  build.mcpp compiling
-  build.mcpp running
+  build.mcpp compiling blinky
+  build.mcpp running blinky
     Inferred sources [src/**/*.{cppm,cpp,cc,c,S,s,asm}]
     Inferred target blinky (bin from src/main.cpp)
    Compiling blinky v0.1.0 (.)
