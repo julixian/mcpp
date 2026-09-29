@@ -1,12 +1,11 @@
 ---
 subject: design
-status: accepted
+status: landed
 ---
 
 # Build progress: each step's line states its outcome, and one status line states the build
 
-- Status: accepted (revision 2), implemented in #742 and released with
-  2026.9.29.5
+- Status: landed (revision 2). Implemented in #742, released as 2026.9.29.5
 - Date: 2026-09-29
 - Origin: the cross-verification of #742 on the validation project (run
   36562019799). `mcpp build --workspace` printed its last `Compiling` line at
