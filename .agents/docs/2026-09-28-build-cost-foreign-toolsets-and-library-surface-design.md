@@ -1,13 +1,16 @@
 ---
 subject: design
-status: active
+status: landed
 ---
 
 # Build cost, foreign toolsets, the build-plugin architecture and the library surface: engine, plugin and index design (#734)
 
-**Status:** active, revision 5 (2026-09-28). The design is settled (§11); §13
+**Status:** landed, revision 5 (2026-09-28). The design is settled (§11); §13
 divides it into tasks per repository, with their dependencies and criteria, and
-records their implementation.
+records their implementation. E2 to E6 were released in 2026.9.28.3 and the
+plugin items in mcpp.plugins 0.17.0. E1 is replaced by
+`2026-09-29-workspace-build-graph-design.md`, released as 2026.9.29.1 to
+2026.9.29.4.
 
 - **Revision 1** proposed engine items E1 to E6 and plugin items P1 to P5.
 - **Revision 2** records the first review:

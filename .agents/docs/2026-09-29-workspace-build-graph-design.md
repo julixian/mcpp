@@ -1,11 +1,13 @@
 ---
 subject: design
-status: active
+status: landed
 ---
 
 # The workspace as the unit of build: one graph per configuration, one scheduler, product directories, and a reusable graph module
 
-- Status: design, agreed; implementation in progress (revision 4)
+- Status: landed (revision 4). Released as 2026.9.29.1 (#738); corrections in
+  2026.9.29.2 (#739), 2026.9.29.3 (#740) and 2026.9.29.4 (#741), recorded in
+  section 17.1
 - Date: 2026-09-29
 - Origin: the #734 validation on a five-member Windows workspace (the validation
   project's pull request), and the discussion that followed it
