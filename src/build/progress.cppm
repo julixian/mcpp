@@ -1523,7 +1523,10 @@ void Build::pass_end() {
         std::lock_guard lock(r.m);
         auto& b = *impl_;
         read_log(r, b, out);
-        if (b.record)
+        // A package that only scanned is named when the main pass ends. A
+        // scan pass names nobody at its end: every package scans there, and
+        // naming them all at once put a package before the one it imports.
+        if (b.record && b.kind != PassKind::Scan)
             for (std::size_t i = 0; i < b.packages.size(); ++i)
                 if (b.packages[i].finished > 0) announce(r, b, i, out);
         b.inPass = false;
