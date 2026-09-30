@@ -141,8 +141,9 @@ interface and belongs in the declarative manifest/descriptor
 
 Instead of printing raw strings, `build.mcpp` can be written **modules-first** —
 `import mcpp;`, no `#include` needed. The `mcpp` module is bundled in the
-mcpp binary (so it always matches that mcpp's protocol) and is compiled on demand;
-its functions just emit the directives above:
+mcpp binary (so it always matches that mcpp's protocol) and is compiled on demand,
+once per mcpp version and host compiler, into the build cache (see *Where compiled
+host modules are kept* below); its functions just emit the directives above:
 
 ```cpp
 // build.mcpp
@@ -1526,6 +1527,18 @@ A program whose result is reused did no work and has a line, `build.mcpp
 reads `Running` with the programs finished and scheduled, and names the running
 program with its state (`compiling` or `running`) and a clock.
 
+**A workspace's programs are compiled at the same time and run one after
+another** (2026.10.1.1+). A member's program runs after the programs of the
+members it depends on, because it reads their directives, and that order is
+kept: the directives are applied in it, so the plan, and with it `build.ninja`,
+is the one a build that compiled the programs one by one would write. The
+compiles have no such order, so every program whose result is stale is compiled
+at once, up to the job count (`--jobs`, `MCPP_JOBS`, `[build] jobs`). The
+`compiled` time of a program includes preparing what it imports, which is no
+longer left to `plan`. A compile's output is printed whole; when several
+programs fail to compile, the failure reported is the first in the order the
+programs run in, whichever compile finished first.
+
 ## Host tools from a dependency (mcpp 2026.8.5.1+)
 
 A package can build a binary its consumers need *at build time* — `protoc`, a
@@ -1632,10 +1645,12 @@ import protobufgen;
 int main() { return protobufgen::generate({"schema"}) ? 0 : 1; }
 ```
 
-mcpp compiles that package's lib-root module **for the host, in the same
-command as `build.mcpp`** — which is what makes the BMI usable at all, since a
+mcpp compiles that package's lib-root module **for the host, with the same
+flags as `build.mcpp`** — which is what makes the BMI usable at all, since a
 module interface is only importable by a compile that agrees with it on
-standard, dialect and compiler identity.
+standard, dialect and compiler identity. The compiled module is kept by key, so
+it is compiled once for every program that agrees on those flags (see
+*Placement of compiled host modules*).
 
 Rules are therefore versioned, testable and distributable through the package
 manager already in use, written in **C++** — no second language, which is the
@@ -1669,6 +1684,43 @@ internal fork are all legitimate and indistinguishable from here.
 
 The lib root must be at `src/<name>.cppm` (or wherever `[lib] path` points); a
 missing one is reported as *"host module 'x': no interface unit at …"*.
+
+#### Placement of compiled host modules (2026.10.1.1+)
+
+The bundled `mcpp` module and the host modules a program imports are not
+compiled into each program's own directory. Each is an entry of a store,
+addressed by everything that reaches its compile: the host compiler's identity,
+the standard flag, the flags the compile carries, the BMIs it imports, the
+SHA-256 of the interface file, the mcpp version (for the bundled module) and the
+providing package (for a host module). The inputs are recorded in the entry's
+`entry.json`, and a hit compares them field by field, never the hash alone. Two
+programs whose compiles agree on all of these share one entry, and a program
+whose standard or flags differ has an entry of its own, so a BMI is never taken
+by a compile that does not agree with it.
+
+Where an entry lives depends on where its text comes from:
+
+| Module | Kept in | Reason |
+|---|---|---|
+| the bundled `mcpp` module and its `mcpp.core` alias | the global cache: `$MCPP_HOME/build-cache/v1/pkg/_engine/mcpp-build-module@<mcpp version>/<key>/` | the engine owns its text, which is identical in every project for one mcpp version and one host compiler |
+| a host module of an index package whose sources are in the immutable store | the global cache: `…/pkg/<index>/<package>@<version>/<key>/` | the dependency cache's rule: a name and version identify the bytes |
+| a host module of a `path` or `git` dependency, or of a workspace member | `<workspace>/target/.build-mcpp/host-modules/<key>/` | its sources can change without its name and version changing |
+
+The cache mode applies as it does to dependencies (see
+[04 §2.10](04-mcpp-toml.md)). With `--cache global`, the default, an entry goes to
+the global cache where the table says so. With `--cache local` or `--cache off`
+every entry is kept in the workspace's store, and the programs of one invocation
+still share them. A host module of a `path` dependency is never written to the
+global cache. The key of an entry in the workspace's store also holds a digest of
+the package's source tree, so an edit to a header that the interface includes
+compiles a new entry, and the old one is left where it is.
+
+An entry in the global cache is an entry like a dependency's. `mcpp cache list`
+shows the bundled module as `_engine/mcpp-build-module@<version>`, `mcpp cache
+verify` checks it, and `mcpp cache gc` collects it by last use; an upgrade of mcpp
+leaves the previous version's entry for `gc`. The workspace's store is removed
+with its `target/` by `mcpp clean`. A program sees what it saw before: the same
+modules, compiled with the same flags.
 
 **A package may offer several rules, selected by features** (mcpp 2026.9.5.3+).
 Every module interface unit among the package's resolved `[build] sources` —

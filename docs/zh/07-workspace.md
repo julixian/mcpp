@@ -413,7 +413,9 @@ mcpp test --workspace --workspace-timeout 1800   # whole fan-out (default 0 = no
 - **资源。** 成员的 `[resources]` 与 `windows_code_page` 按该成员的目录与 include 目录编译，
   只嵌入该成员自己的程序与共享库（2026.9.29.2+）。
 - **构建程序。** 成员的构建程序按依赖在前的顺序运行；只要程序的输入不变，无论命令选中哪些
-  成员，程序的结果都被复用（2026.9.29.5+）。
+  成员，程序的结果都被复用（2026.9.29.5+）。它们的编译同时进行，数量以作业数为上限，只有运行
+  遵循这个顺序，因此计划与串行构建写出的相同；多个程序 import 的同一个 host 模块只为它们
+  编译一次（2026.10.1.1+；见 [30 — 构建程序](30-build-mcpp.md)）。
 - **编译数据库。** `mcpp build --configure-only` 与 `mcpp emit build-database` 按构建的方式
   规划，每个配置一次规划并包含各成员的测试，因此成员共用的包在每个配置中只描述一次。规划了
   多个配置的命令只写一次根目录的 `compile_commands.json`，内容为各配置数据库的并集
@@ -468,7 +470,8 @@ myproject/
 - 工作空间根的 `compile_commands.json` 覆盖所有已构建或已配置的成员。
 - 工作空间根的 `mcpp.lock` 记录全体成员的解析结果。`mcpp build --workspace` 写入完整记录；
   `mcpp build -p X` 更新 X 所在图中的条目。
-- 成员的构建程序写入 `<member>/target/.build-mcpp/`。
+- 成员的构建程序写入 `<member>/target/.build-mcpp/`。各程序 import 的 host 模块编译进
+  workspace 自己的 `target/.build-mcpp/host-modules/`，为全体程序只编一次。
 - 早期版本的 mcpp 在成员自己的 `target/` 下留下的构建目录不再被读取；`mcpp clean --stale`
   会删除它们。
 

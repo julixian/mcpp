@@ -126,7 +126,8 @@ manifest/描述符里（`[build] include_dirs`），而不是构建期程序里�
 
 除打印裸字符串外，`build.mcpp` 也可以写成**模块优先**形式——`import mcpp;`，不需要
 `#include`。`mcpp` 模块**内置在 mcpp 二进制里**（因此始终与当前这版 mcpp
-的协议匹配），按需编译；它的函数只是 emit 上面那些指令：
+的协议匹配），按需编译——每个 mcpp 版本与 host 编译器组合只编一次，存入构建缓存
+（见下文*已编译 host 模块的存放位置*）；它的函数只是 emit 上面那些指令：
 
 ```cpp
 // build.mcpp
@@ -1282,6 +1283,13 @@ mcpp **不会**每次构建都重跑 `build.mcpp`。它会缓存程序产出的�
 程序运行期间，状态行显示 `Running`、已完成与已安排的程序数，并给出正在运行的程序、它的状态
 （`compiling` 或 `running`）及计时。
 
+**工作空间的构建程序同时编译，依次运行**（2026.10.1.1+）。成员的程序在它所依赖的成员的程序
+之后运行，因为它要读那些程序的指令；这个顺序保持不变：指令按该顺序应用，因此计划，也就是
+`build.ninja`，与逐个编译程序的构建所写出的完全相同。编译之间没有这样的顺序，所以每个结果已
+过期的程序同时编译，数量以作业数为上限（`--jobs`、`MCPP_JOBS`、`[build] jobs`）。程序报告的
+`compiled` 耗时包含准备它所 import 的模块的时间，不再留给 `plan` 计入。一次编译的输出整体
+打印；若多个程序编译失败，报告的是按运行顺序排在最前的那个，而不论哪次编译先结束。
+
 ## 依赖产出的 host 工具（mcpp 2026.8.5.1+）
 
 一个包能构建出消费者在**构建期**需要的二进制 —— `protoc`、`grpc_cpp_plugin`、
@@ -1370,9 +1378,10 @@ import protobufgen;
 int main() { return protobufgen::generate({"schema"}) ? 0 : 1; }
 ```
 
-mcpp 会把该包的 lib 根模块**为 host 编译，且与 `build.mcpp` 在同一条命令里** ——
+mcpp 会把该包的 lib 根模块**为 host 编译，且与 `build.mcpp` 使用相同的标志** ——
 这正是 BMI 能用的前提：一个模块接口只对「在 standard / dialect / 编译器身份上与
-它一致」的编译可导入。
+它一致」的编译可导入。编译结果按键保存，因此对每组在这些标志上一致的程序只编一次
+（见*已编译 host 模块的存放位置*）。
 
 于是规则**有版本、能测试、能通过既有的包管理器分发**，而且是用 **C++** 写的
 —— 不引入第二门语言，这正是 `build.mcpp` 存在的理由。
@@ -1397,6 +1406,34 @@ mcpp 拒绝这种情形，并点名两个包与各自的 interface 路径。检�
 
 lib 根必须在 `src/<name>.cppm`（或 `[lib] path` 指向的位置）；缺失时报
 *"host module 'x': no interface unit at …"*。
+
+#### 已编译 host 模块的存放位置（2026.10.1.1+）
+
+内置的 `mcpp` 模块与程序 import 的 host 模块不再编译进每个程序自己的目录。每一个都是存储中
+的一个条目，条目的地址由进入它那次编译的一切决定：host 编译器的身份、standard 标志、该次
+编译携带的标志、它 import 的 BMI、interface 文件的 SHA-256、mcpp 版本（对内置模块）与提供者
+包（对 host 模块）。这些输入记录在条目的 `entry.json` 中，命中时逐字段比较，而不只比较哈希。
+两个程序的编译在所有这些上一致时共用一个条目；standard 或标志不同的程序有自己的条目，因此
+BMI 不会被与它不一致的编译取用。
+
+条目放在哪里取决于它的文本从哪里来：
+
+| 模块 | 存放位置 | 依据 |
+|---|---|---|
+| 内置的 `mcpp` 模块及其 `mcpp.core` 别名 | 全局缓存：`$MCPP_HOME/build-cache/v1/pkg/_engine/mcpp-build-module@<mcpp 版本>/<key>/` | 引擎拥有这段文本，对同一 mcpp 版本与同一 host 编译器，它在每个工程中都相同 |
+| 源码位于不可变 store 的索引包的 host 模块 | 全局缓存：`…/pkg/<index>/<package>@<version>/<key>/` | 依赖缓存的规则：名称与版本确定了字节 |
+| `path` 或 `git` 依赖、或 workspace 成员的 host 模块 | `<workspace>/target/.build-mcpp/host-modules/<key>/` | 它的源码可以在名称与版本不变的情况下改变 |
+
+缓存模式的作用与对依赖相同（见 [04 §2.10](04-mcpp-toml.md)）。`--cache global`（默认）下，
+条目按上表放入全局缓存。`--cache local` 或 `--cache off` 下，所有条目都保存在 workspace 的
+存储里，同一次调用中的各程序仍共用它们。`path` 依赖的 host 模块绝不写入全局缓存。workspace
+存储中条目的键还包含包源码树的摘要，因此修改 interface 所 include 的头文件会编出新条目，
+旧条目原样保留。
+
+全局缓存中的条目与依赖的条目一样：`mcpp cache list` 把内置模块显示为
+`_engine/mcpp-build-module@<version>`，`mcpp cache verify` 检查它，`mcpp cache gc` 按最近
+使用回收它；升级 mcpp 会留下上一版本的条目，交给 `gc`。workspace 的存储随 `target/` 由
+`mcpp clean` 一并删除。程序看到的与以前相同：同样的模块，用同样的标志编译。
 
 **一个包可以提供多条规则，由 feature 选择**(mcpp 2026.9.5.3+)。包解析后的
 `[build] sources` 里 —— 含 feature 加入的源文件 —— 每一个模块接口单元都以它自己声明的

@@ -1391,6 +1391,13 @@ What is **not** cached: `path` and `git` dependencies, at any depth, and
 workspace members. Their sources can change without their `name@version`
 changing, so no key over that identity could notice the change.
 
+The modules a build program imports follow the same rule (2026.10.1.1+). The
+bundled `mcpp` module and the host modules of index packages are kept in the
+global cache, and a host module of a `path` or `git` dependency or of a workspace
+member is kept under `target/.build-mcpp/host-modules/`, never in the global
+cache. `--cache local` and `--cache off` keep all of them in the project. See
+[30 — Placement of compiled host modules](30-build-mcpp.md).
+
 Inspection and reclamation:
 
 ```

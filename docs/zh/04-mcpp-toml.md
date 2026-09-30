@@ -1322,6 +1322,11 @@ cache = "global"   # "global" (default) | "local" | "off"
 workspace 成员。它们的源码可以在 `name@version` 不变的情况下改变，
 所以没有任何基于那个身份的键能察觉到变化。
 
+构建程序 import 的模块遵循同一条规则（2026.10.1.1+）。内置的 `mcpp` 模块与索引包的 host
+模块保存在全局缓存中；`path` 或 `git` 依赖、或 workspace 成员的 host 模块保存在
+`target/.build-mcpp/host-modules/` 下，绝不进入全局缓存。`--cache local` 与 `--cache off`
+把它们全部保存在工程内。见 [30 — 已编译 host 模块的存放位置](30-build-mcpp.md)。
+
 查看与回收：
 
 ```

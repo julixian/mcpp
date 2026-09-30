@@ -36,7 +36,9 @@ out="$("$MCPP" run 2>&1 | tail -1)"
 # The rules are build-time only. Asserted on the ARTIFACT: a rule's objects have
 # no business in the consumer's binary, and `Compiling rules-embed (path)` in
 # the log is the host-module compile, not evidence either way.
-mapfile -t objs < <(find target -path '*obj*' -name '*.o' -printf '%f\n' | sort)
+# The store a host module is kept in (`.build-mcpp/host-modules`, #748) has an
+# `obj/` of its own and is not the consumer's: it is left out.
+mapfile -t objs < <(find target -path '*obj*' -not -path '*/.build-mcpp/*' -name '*.o' -printf '%f\n' | sort)
 for o in "${objs[@]}"; do
     case "$o" in
         main.o|embed_greeting.o) ;;

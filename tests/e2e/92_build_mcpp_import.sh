@@ -46,8 +46,12 @@ EOF
 
 "$MCPP" build > b.log 2>&1 || { cat b.log; echo "FAIL: import mcpp build errored"; exit 1; }
 grep -q "build.mcpp" b.log || { cat b.log; echo "FAIL: build.mcpp not invoked"; exit 1; }
-# The bundled module is compiled into target/.build-mcpp/.
-[ -f target/.build-mcpp/mcpp.o ] || { echo "FAIL: bundled mcpp module not compiled"; exit 1; }
+# The bundled module is compiled once and kept by key: in the global cache, where
+# every project of the machine finds it, or, when the cache mode asks for no
+# global entry, in the workspace's own store (#748).
+CACHE_ROOT="$("$MCPP" cache dir | head -1)"
+find "$CACHE_ROOT/pkg/_engine" target/.build-mcpp/host-modules \( -name 'mcpp.o' -o -name 'mcpp.obj' \) 2>/dev/null | grep -q . \
+    || { echo "FAIL: bundled mcpp module not compiled"; exit 1; }
 # The binary returns 0 only if both the module-emitted define AND the generated
 # source took effect.
 "$MCPP" run > r.log 2>&1 || { cat r.log; echo "FAIL: run non-zero (module directives/generated source missing)"; exit 1; }
