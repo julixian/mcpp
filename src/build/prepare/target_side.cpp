@@ -1591,8 +1591,7 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
         bpEnv.profile      = state.effectiveProfile;
         bpEnv.accel        = state.resolvedAccel();
         fill_package_build_env(bpEnv, *state.m);
-        bpEnv.packFormat   = state.overrides.pack_format;
-        bpEnv.packStageDir = state.overrides.pack_stage_dir;
+        state.fillPackEnv(bpEnv, 0);
         bpEnv.languageModules = state.m->language.modules;
         bpEnv.ruleModules  = state.m->buildConfig.ruleModules;
         if (auto dit = state.deviceSourcesByPackage.find(state.root->string()); dit != state.deviceSourcesByPackage.end())
@@ -1643,9 +1642,6 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
         bpEnv.dormantFeatures = state.dormantFeaturesByConsumer.count(0u)
             ? state.dormantFeaturesByConsumer.at(0u)
             : decltype(bpEnv.dormantFeatures){};
-        // #649 E5: the packaging pass's strip decision, beside its format.
-        bpEnv.packStrip           = state.overrides.pack_strip;
-        bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
         // #647 E1: THE RESOLVED GRAPH, FOR THE ROOT'S PROGRAM ONLY.
         //
         // Every package, dependencies before the packages that request them
@@ -1995,10 +1991,9 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
         bpEnv.profile  = state.effectiveProfile;
         bpEnv.accel    = state.resolvedAccel();
         fill_package_build_env(bpEnv, pkg.manifest);
-        bpEnv.packFormat   = state.overrides.pack_format;
-        bpEnv.packStageDir = state.overrides.pack_stage_dir;
-        bpEnv.packStrip           = state.overrides.pack_strip;
-        bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
+        // The stage of the member this program acts for: its own, or the one
+        // packed member that reaches it (`PrepareState::fillPackEnv`).
+        state.fillPackEnv(bpEnv, i);
         bpEnv.requested       = pkg.selectedMember;
         bpEnv.languageModules = pkg.manifest.language.modules;
         bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;
