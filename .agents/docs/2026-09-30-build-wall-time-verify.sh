@@ -146,6 +146,15 @@ if MCPP_VERBOSE=1 "$MCPP" build > s7.log 2>&1 && grep -q 'build/stage: plan scan
     pass "7 CHANGE: planning states its phases under build/stage"
 else fail "7 CHANGE: the planning phase timers" s7.log; fi
 
+# ── 8. the largest consumer: xlings builds from its main branch ────────────
+rm -rf "$W/s8"; mkdir -p "$W/s8"; cd "$W/s8"
+if git clone -q --depth 1 https://github.com/openxlings/xlings.git xlings > s8-clone.log 2>&1; then
+    cd xlings
+    if "$MCPP" build > ../s8.log 2>&1 && "$(bin_of target xlings)" --version 2>/dev/null | grep -q '^xlings '; then
+        pass "8 xlings builds from its main branch and runs: $(grep -a 'Finished' ../s8.log | tail -1 | sed 's/\x1b\[[0-9;]*m//g; s/^ *//')"
+    else fail "8 xlings from its main branch" ../s8.log; fi
+else skip "8 xlings could not be cloned"; fi
+
 echo
 echo "RESULT: $passes passed, $fails failed, $skips skipped (mcpp $VER)"
 [ "$fails" -eq 0 ]
