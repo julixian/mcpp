@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# requires:
+# requires: unix-shell
 # 861 -- compiling a workspace's build programs at the same time plans exactly
 # what compiling them one after another plans.
 #
@@ -7,6 +7,12 @@
 # time and run in the order they always ran in; each run applies its directives
 # to the plan, and the plan is what `build.ninja` states. So the plan, and with
 # it the link line, must not depend on which compile finished first.
+#
+# Each program adds `-Wl,-rpath,/t861/<member>` to the link line, a flag whose
+# order the link line keeps and that no build of this test reads. It is an ELF
+# and Mach-O linker flag, which `lld-link` on Windows refuses; the property is
+# the planner's and holds on every host, so the script runs where the flag is a
+# flag (`unix-shell`: Linux and macOS).
 #
 # The workspace below has three libraries with a build program each, `core`, and
 # `cli` and `gui` that depend on it, and an application that links all of them.
