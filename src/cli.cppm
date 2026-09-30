@@ -641,7 +641,7 @@ int run(int argc, char** argv) {
                 .help("tar (default; .zip for a Windows target) | dir | any "
                       "format the resolved graph provides (e.g. appimage, msi)"))
             .option(cl::Option("output").short_name('o').takes_value()
-                .help("Override output path"))
+                .help("Override output path; with several members, the directory each archive or tree is written below"))
             // Packaging builds RELEASE by default — the artifact leaves this
             // machine. `[build] default-profile` still wins when it is set;
             // this only replaces the "dev" fallback every other command uses.
