@@ -247,6 +247,27 @@ provided=$(find . -name prov.zap | head -1)
     || fail "J: the provider was not given the member's tree" j2.log
 echo "ok: J, a provider several packed members reach is refused for them, and serves one"
 
+# A provider that only one packed member reaches acts for that member, beside a
+# member that provides the format from its own build program.
+mkdir -p "$TMP/mixed" && cd "$TMP/mixed"
+cat > mcpp.toml <<'EOF'
+[workspace]
+members = ["cli3", "gui3"]
+EOF
+write_dist .
+program_member cli3 "prov = { path = \"$PROV_HOST\" }"
+program_member gui3 ""
+provider gui3 submit
+"$MCPP" pack --mode system --workspace --format zap > j3.log 2>&1 || fail "J: a provider one member reaches did not serve it beside another member's own" j3.log
+provided=$(find . -name prov.zap | head -1)
+[ -n "$provided" ] && grep -qx "./bin/cli3" "$provided" && ! grep -q "gui3" "$provided" \
+    || fail "J: the provider was not given cli3's tree alone" j3.log
+own=$(find . -name gui3.zap | head -1)
+[ -n "$own" ] && grep -qx "./bin/gui3" "$own" || fail "J: gui3's own provider was not given gui3's tree" j3.log
+grep -q "Packed .*prov.zap" j3.log && grep -q "Packed .*gui3.zap" j3.log \
+    || fail "J: a distributable was not reported for each member" j3.log
+echo "ok: J, a provider one packed member reaches acts for that member"
+
 # ── K ────────────────────────────────────────────────────────────────────────
 mkdir -p "$TMP/partial" && cd "$TMP/partial"
 cat > mcpp.toml <<'EOF'
