@@ -324,31 +324,52 @@ step3_define_host_tc_closures_and_refresh_index(PrepareState& state) {
     //
     // Nothing here decides anything itself — in particular the "a miss proves
     // nothing for this namespace" rule must not be re-derived; see that module.
-    if (!state.m->dependencies.empty()) {
+    //
+    // The root's declarations, and in a workspace plan each selected member's
+    // (`PrepareState::declaredByRoot`): the virtual root declares only its
+    // members, by `path`, so asking about its edges alone never refreshed for
+    // a member's registry dependency, which each member, planned as its own
+    // root before 2026.9.29.1, did. A member's dependency is routed by the
+    // member's own `[indices]` and directory, as the walk routes it.
+    const bool anyDeclared = !state.m->dependencies.empty()
+        || std::ranges::any_of(state.selectedMemberManifests,
+               [](auto const& mm) { return !mm.second.dependencies.empty(); });
+    if (anyDeclared) {
         if (auto cfg2 = state.get_cfg(true)) {
             auto xlEnv  = mcpp::config::make_xlings_env(**cfg2);
             auto policy = mcpp::pm::policy_for(**cfg2);
+            // Returns true once a refresh has been applied: one sync covers
+            // every dependency.
+            auto consider = [&](const mcpp::pm::IndexRoute& route,
+                                const mcpp::manifest::Manifest& mf) {
+                for (auto& [depName, spec] : mf.dependencies) {
+                    auto decision = mcpp::pm::decide_for_dependency(
+                        route, depName, spec, xlEnv, *state.targetPlatform, policy);
+                    if (!decision.shouldRefresh) {
+                        mcpp::log::verbose("index", std::format(
+                            "{}: {}", decision.subject,
+                            mcpp::pm::reason_text(decision.reason)));
+                        continue;
+                    }
+                    // A failed refresh is not a failed build: the dependency
+                    // walk below may still resolve everything from what is on
+                    // disk, and if it cannot, it reports the actual missing
+                    // package with the index's age attached. Failing here
+                    // instead would turn a transient network blip into a hard
+                    // stop for a build that needed no network at all.
+                    if (auto r = mcpp::pm::apply(decision, xlEnv); !r)
+                        mcpp::ui::warning(r.error());
+                    return true;
+                }
+                return false;
+            };
             // Same routing the dependency walk below uses (the `index_route`
             // lambda is declared further down; this is the identical value).
-            mcpp::pm::IndexRoute route{ &state.m->indices, *state.root, *cfg2 };
-            for (auto& [depName, spec] : state.m->dependencies) {
-                auto decision = mcpp::pm::decide_for_dependency(
-                    route, depName, spec, xlEnv, *state.targetPlatform, policy);
-                if (!decision.shouldRefresh) {
-                    mcpp::log::verbose("index", std::format(
-                        "{}: {}", decision.subject,
-                        mcpp::pm::reason_text(decision.reason)));
-                    continue;
-                }
-                // A failed refresh is not a failed build: the dependency walk
-                // below may still resolve everything from what is on disk, and
-                // if it cannot, it reports the actual missing package with the
-                // index's age attached. Failing here instead would turn a
-                // transient network blip into a hard stop for a build that
-                // needed no network at all.
-                if (auto r = mcpp::pm::apply(decision, xlEnv); !r)
-                    mcpp::ui::warning(r.error());
-                break;   // one sync covers every dependency
+            bool synced = consider(
+                mcpp::pm::IndexRoute{ &state.m->indices, *state.root, *cfg2 }, *state.m);
+            for (auto const& [dir, member] : state.selectedMemberManifests) {
+                if (synced) break;
+                synced = consider(mcpp::pm::IndexRoute{ &member.indices, dir, *cfg2 }, member);
             }
         }
     }

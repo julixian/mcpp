@@ -57,6 +57,69 @@ TEST(MsvcBanner, TripleForArch) {
 
 // ─── install guidance ────────────────────────────────────────────────────
 
+// mcpp#746: the compiler version is read from cl.exe's VS_FIXEDFILEINFO, as
+// clang reads it, and said on the command line.
+namespace {
+std::string fixed_file_info(std::uint32_t ms, std::uint32_t ls,
+                            std::uint32_t strucVersion = 0x00010000u) {
+    std::string out;
+    auto put = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+    };
+    put(0xFEEF04BDu);
+    put(strucVersion);
+    put(ms);
+    put(ls);
+    put(0); put(0);      // product version
+    return out;
+}
+} // namespace
+
+TEST(MsvcCompilerVersion, ReadsTheFixedFileInfoAsClangDoes) {
+    // 19.51.36257.0: MS = 19 << 16 | 51, LS = 36257 << 16 | 0.
+    std::string image(300, 'x');
+    image += fixed_file_info((19u << 16) | 51u, (36257u << 16) | 0u);
+    image += std::string(40, 'y');
+    auto v = mcpp::toolchain::msvc::pe_file_version(image);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(*v, "19.51.36257");
+}
+
+TEST(MsvcCompilerVersion, SkipsASignatureThatIsNotTheStructure) {
+    // The four signature bytes can occur in code; only the structure, whose
+    // next word is 0x00010000, is read.
+    std::string image = fixed_file_info((1u << 16) | 2u, (3u << 16), 0xDEADBEEFu);
+    image += fixed_file_info((19u << 16) | 44u, (35211u << 16) | 7u);
+    EXPECT_EQ(mcpp::toolchain::msvc::pe_file_version(image).value_or(""), "19.44.35211");
+    EXPECT_FALSE(mcpp::toolchain::msvc::pe_file_version("no version here").has_value());
+}
+
+TEST(MsvcCompilerVersion, IsReadFromTheCompilerClangReadsForTheTarget) {
+    // clang reads bin/Host{x64|x86}/<target>/cl.exe; each target's compiler
+    // here carries its own build, under both host directories, so the answer
+    // depends on the target and not on which host runs the test.
+    namespace fs = std::filesystem;
+    const auto tools = fs::temp_directory_path()
+        / std::format("mcpp-746-{}", std::chrono::steady_clock::now().time_since_epoch().count())
+        / "VC" / "Tools" / "MSVC" / "14.51.36231";
+    const std::pair<std::string_view, std::uint32_t> builds[] = {
+        {"x64", 36260u}, {"arm64", 36261u}, {"x86", 36262u}};
+    for (auto host : {"Hostx64", "Hostx86"})
+        for (auto [target, build] : builds) {
+            fs::create_directories(tools / "bin" / host / target);
+            std::ofstream os(tools / "bin" / host / target / "cl.exe", std::ios::binary);
+            os << std::string(64, 'M') << fixed_file_info((19u << 16) | 51u, (build << 16));
+        }
+    namespace msvc = mcpp::toolchain::msvc;
+    EXPECT_EQ(msvc::compiler_version_in_tools_dir(tools, "x86_64"),  "19.51.36260");
+    EXPECT_EQ(msvc::compiler_version_in_tools_dir(tools, "aarch64"), "19.51.36261");
+    EXPECT_EQ(msvc::compiler_version_in_tools_dir(tools, "i686"),    "19.51.36262");
+    // No compiler where clang looks: no version, and clang falls back itself.
+    EXPECT_EQ(msvc::compiler_version_in_tools_dir(tools / "absent", "x86_64"), "");
+    std::error_code ec;
+    fs::remove_all(tools.parent_path().parent_path().parent_path().parent_path(), ec);
+}
+
 TEST(MsvcGuidance, OffersBothOrigins) {
     auto g = msvc::install_guidance();
     ASSERT_FALSE(g.empty());

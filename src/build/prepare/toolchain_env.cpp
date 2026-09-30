@@ -210,6 +210,10 @@ bind_msvc_sysroot(mcpp::toolchain::Toolchain& tc,
 
     tc.msvcToolsDir     = choice->toolsDir;
     tc.msvcToolsVersion = choice->version;
+    // The version of this toolset's cl.exe, read from the file (this row runs
+    // no cl.exe) and said to the driver by the link model, so it is on every
+    // command and in every key rather than chosen by the driver (mcpp#746).
+    tc.msvcCompilerVersion = msvc::compiler_version_in_tools_dir(choice->toolsDir, tt->arch);
     tc.msvcOrigin       = origin;
     tc.msvcProduct      = choice->product;
     // The toolset's own redistributable CRT (#718), reached from the

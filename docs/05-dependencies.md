@@ -174,6 +174,18 @@ disagrees with another dependency, with neither being the root, is never
 settled by guessing which one was declared first — that is exactly the
 "accident of queue order" this section replaces.
 
+**In a workspace (mcpp 2026.9.30.2+).** The root is the package a command
+builds: a rooted workspace's own package, and each member the command selects
+(every member under `--workspace`, `X` under `-p X`). Each holds the root's
+position for its own declarations, as it did when every member was planned as
+its own root, so a member's `path` override of a dependency that another
+package requests by `version` wins, with the warning above. Two selected
+members that declare one identity by two kinds, or by two references of one
+kind, are refused, naming both: one configuration builds one checkout of a
+package. The same holds for `linkage`
+on a selected member's dependency edges, which is honoured, and refused when
+two selected members ask for two forms of one package.
+
 ### The identity of a `path` or `git` dependency (mcpp 2026.9.14.2+)
 
 A `path` or `git` dependency is the package its manifest declares, whatever key

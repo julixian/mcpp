@@ -1018,6 +1018,42 @@ resolved as stated.
   held only `/usr/bin:/bin`. The test's `PATH` now holds System32, as every
   Windows `PATH` does, and as the other Windows tests with a restricted `PATH`
   do.
+- **The release canary on mcpp-language-server.** Its
+  commit of 07:44 overrides `openkal-linux` by `path` in its root package,
+  against the `version` request of `openkal-musl`, which the rule "the root's
+  declaration wins" settles. 2026.9.28.3 builds it; 2026.9.29.1 to 2026.9.30.2
+  refuse it ("Pick one"): the virtual root of the workspace plan declares
+  only its members, and the rule read the virtual root's edges alone. The
+  same reading was inventoried across the planner; a selected member now
+  declares as the root for the kind and reference clashes, the git lock, the
+  identity write-back, `linkage` on its dependency edges, the target-side
+  candidates it names directly, and the index refresh. The refusal to mangle
+  the root's sources stays with the root: a member reaches it only when two
+  members pin two versions of one package, which one plan builds by mangling
+  and which each member built on its own before. Two selected members that
+  disagree about one dependency's checkout (its kind or its reference) or its
+  link form are refused, naming both. An independent review of the change
+  found three defects before it was pushed, each fixed: the arguments of the
+  link-form refusal were out of order, two selected members pointing one
+  dependency at two directories were only warned about, and link-form
+  conflicts were compared by the short key, which two packages can share.
+  e2e 850 states each; every criterion fails on 2026.9.30.2 as released
+  before the fix.
+- **mcpp#746, e2e 760 on Windows.** A job on an older runner image restored
+  the sandbox cache that a job on a newer image had saved; clang refused the
+  std module compiled for `msvc19.51.36260` against a translation unit
+  compiled for `msvc19.51.36257`. The key of the clang MSVC row held the
+  toolset directory, and a directory name does not determine `cl.exe`'s
+  build. The version of the toolset's `cl.exe`, read from its
+  `VS_FIXEDFILEINFO` as clang reads it, is now passed as
+  `-fms-compatibility-version` with the toolset words, so it is on every
+  command and in every key.
+- **A shared member across two configurations (e2e 851).** A member that two
+  members of different configurations use is compiled once in each build
+  directory; in one configuration it is compiled once with the union of the
+  features its consumers ask for, and a consumer's own flags stay out of it.
+  The behaviour was correct; the criterion was absent (e2e 833 builds a
+  member of another standard that uses no shared member).
 
 ## 8. Appendix: readings
 

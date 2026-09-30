@@ -71,6 +71,12 @@ grep -q -- "-Xmicrosoft-windows-sdk-version" "$NINJA" \
     || { echo "FAIL: build.ninja does not pass the SDK to clang"; exit 1; }
 grep -q "MSVC\\\\$EXPECTED\|MSVC/$EXPECTED" "$NINJA" \
     || { echo "FAIL: build.ninja names a toolset other than $EXPECTED"; exit 1; }
+# The compiler version travels with the toolset (mcpp#746): read from that
+# toolset's cl.exe and said on every command, so the std module and the
+# translation units cannot be compiled for two MSVC versions.
+MSVER="$(grep -o -- '-fms-compatibility-version=[0-9.]*' "$NINJA" | sort -u)"
+[[ "$(echo "$MSVER" | wc -l)" -eq 1 && "$MSVER" == -fms-compatibility-version=19.* ]] \
+    || { echo "FAIL: build.ninja does not say one MSVC compiler version: '$MSVER'"; exit 1; }
 
 out=$("$MCPP" run 2>&1) || { echo "FAIL: run: $out"; exit 1; }
 [[ "$out" == *"Hello"* || "$out" == *"hello"* ]] || { echo "FAIL: run output: $out"; exit 1; }
@@ -91,6 +97,11 @@ grep -q "VCToolsInstallDir (14.99.0) is ignored" pinned.log \
     || { echo "FAIL: the ignored VCToolsInstallDir was not reported:"; cat pinned.log; exit 1; }
 grep -q "sysroot msvc@$EXPECTED → MSVC $EXPECTED (system" pinned.log \
     || { echo "FAIL: pinned toolset not taken from the machine:"; cat pinned.log; exit 1; }
+# The declaration the environment makes is ignored for the version too: the
+# pinned build says the same version as the default one.
+PINNED_NINJA="$(find target -name build.ninja | xargs ls -t | head -1)"
+[[ "$(grep -o -- '-fms-compatibility-version=[0-9.]*' "$PINNED_NINJA" | sort -u)" == "$MSVER" ]] \
+    || { echo "FAIL: the pinned build says another MSVC compiler version than $MSVER"; exit 1; }
 
 # ── 3. What is not an MSVC toolset is refused where the manifest is read ──
 sed -i "s|sysroot = \"msvc@$EXPECTED\"|sysroot = \"xim:glibc@2.39\"|" mcpp.toml

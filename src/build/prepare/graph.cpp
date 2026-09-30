@@ -768,8 +768,10 @@ step4b_resolve_identity(PrepareState& state, WorklistItemCtx& ctx) {
         if (auto r = state.selectDependencyCandidate(spec, name); !r) {
             return std::unexpected(r.error());
         }
-        if (item.consumerDepIndex == kMainConsumer) {
-            if (auto it = state.m->dependencies.find(name); it != state.m->dependencies.end()) {
+        // A root's declaration (a selected member's included) states the
+        // identity it selected, for its readers: the lock names, the record.
+        for (auto* mf : state.rootDeclarationManifests(item.consumerDepIndex)) {
+            if (auto it = mf->dependencies.find(name); it != mf->dependencies.end()) {
                 it->second.namespace_ = spec.namespace_;
                 it->second.shortName = spec.shortName;
                 it->second.candidates = spec.candidates;
@@ -901,6 +903,9 @@ step4b_identity_version_merge(PrepareState& state, WorklistItemCtx& ctx,
                     //     the main package — main-package mangling
                     //     would mean rewriting user-authored sources,
                     //     which is too surprising for a fallback path.
+                    //     Only `kMainConsumer`: a selected member reaches here
+                    //     only when two members pin two versions, which one
+                    //     plan builds by mangling (not `declaredByRoot`).
                     //   * The secondary version must be a leaf (no own
                     //     transitive deps) — recursive mangling is
                     //     deferred to a follow-up.
@@ -1186,7 +1191,7 @@ step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
             // edges (dep_spec.cppm).
             if (it->second.source != sourceKind) {
                 const bool existingIsRoot = it->second.fromRoot;
-                const bool incomingIsRoot = item.consumerDepIndex == kMainConsumer;
+                const bool incomingIsRoot = state.declaredByRoot(item.consumerDepIndex);
 
                 if (!existingIsRoot && !incomingIsRoot) {
                     return std::unexpected(std::format(
@@ -1198,6 +1203,12 @@ step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
                         sourceKind, item.requestedBy,
                         key.ns, key.ns.empty() ? "" : ".", key.shortName));
                 }
+                // Two selected members, each a root: refused, naming both.
+                if (it->second.fromSelectedMember && incomingIsRoot && item.consumerDepIndex
+                    != kMainConsumer && it->second.requestedBy != item.requestedBy)
+                    return std::unexpected(state.twoMembersRefusal(key,
+                        std::format("a {} dep by '{}'", it->second.source, it->second.requestedBy),
+                        std::format("a {} dep by '{}'", sourceKind, item.requestedBy)));
                 if (incomingIsRoot && !existingIsRoot) {
                     // FIFO SEEDING MAKES THIS UNREACHABLE. Every root-declared
                     // identity is pushed onto `worklist` before this loop
@@ -1296,7 +1307,7 @@ step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
                     sourceRefOf(state, sourceKind, spec, item.resolveRoot, item.originalConstraint);
                 if (incomingRef != it->second.sourceRef) {
                     const bool existingIsRoot = it->second.fromRoot;
-                    const bool incomingIsRoot = item.consumerDepIndex == kMainConsumer;
+                    const bool incomingIsRoot = state.declaredByRoot(item.consumerDepIndex);
                     if (incomingIsRoot && !existingIsRoot) {
                         // See the identical comment in the kind-clash branch
                         // above: unreachable under FIFO seeding, and refused
@@ -1310,6 +1321,14 @@ step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
                             key.ns, key.ns.empty() ? "" : ".", key.shortName,
                             it->second.requestedBy));
                     }
+                    // Two selected members, as in the kind clash above.
+                    if (it->second.fromSelectedMember && incomingIsRoot && item.consumerDepIndex
+                        != kMainConsumer && it->second.requestedBy != item.requestedBy)
+                        return std::unexpected(state.twoMembersRefusal(key,
+                            std::format("{} '{}' by '{}'", sourceKind, it->second.sourceRef,
+                                        it->second.requestedBy),
+                            std::format("{} '{}' by '{}'", sourceKind, incomingRef,
+                                        item.requestedBy)));
                     // The already-resolved record wins either way: it is the
                     // root's (existingIsRoot) or it is simply the first one
                     // dequeued (neither party is the root). Both are "the
@@ -1324,9 +1343,10 @@ step4b_handle_already_resolved(PrepareState& state, WorklistItemCtx& ctx,
                         key.ns, key.ns.empty() ? "" : ".", key.shortName,
                         sourceKind, it->second.sourceRef, it->second.requestedBy,
                         sourceKind, incomingRef, item.requestedBy,
-                        existingIsRoot ? "the root's declaration"
-                                       : std::format("'{}', declared first",
-                                                     it->second.requestedBy)),
+                        existingIsRoot && !incomingIsRoot
+                            ? std::string("the root's declaration")
+                            : std::format("'{}', declared first",
+                                          it->second.requestedBy)),
                         std::format("declare '{}{}{}' in the root to choose "
                                     "the other.",
                             key.ns, key.ns.empty() ? "" : ".", key.shortName));
@@ -1519,10 +1539,7 @@ step4b_acquire_dependency_source(PrepareState& state, WorklistItemCtx& ctx) {
             }
             // A selected workspace member's own git dependencies are locked
             // as a root's are (workspace design 2026-09-29 §15).
-            const bool consumerIsMember = item.consumerDepIndex != kMainConsumer
-                && item.consumerDepIndex + 1 < state.packages.size()
-                && state.packages[item.consumerDepIndex + 1].selectedMember;
-            if (item.consumerDepIndex == kMainConsumer || consumerIsMember) {
+            if (state.declaredByRoot(item.consumerDepIndex)) {
                 // Only root deps are locked: the writer below walks the root
                 // manifest's [dependencies], so a transitive git branch dep
                 // has no anchor and still resolves over the network.
@@ -1822,7 +1839,9 @@ step4b_finalize_dependency(PrepareState& state, WorklistItemCtx& ctx) {
             .source            = sourceKind,
             .sourceRef         = sourceRefOf(state, sourceKind, spec, item.resolveRoot,
                                              item.originalConstraint),
-            .fromRoot          = item.consumerDepIndex == kMainConsumer,
+            .fromRoot          = state.declaredByRoot(item.consumerDepIndex),
+            .fromSelectedMember = item.consumerDepIndex != kMainConsumer
+                                  && state.declaredByRoot(item.consumerDepIndex),
             .devOnly           = item.devOnly,
             .depIndex          = state.dep_manifests.size() - 1,
             .linkFlagsAdded    = std::move(linkFlagsAdded),

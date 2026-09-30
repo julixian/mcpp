@@ -112,16 +112,24 @@ step9_gather_target_side_candidates(PrepareState& state) {
         // a second lookup of something already in hand.
         using Candidate = TargetSideCandidate;
                 
-        const auto& rootDeps = state.m->dependencies;
+        // The root's own edges, and in a workspace plan the selected members'
+        // (`PrepareState::declaredByRoot`), whose dependencies the author
+        // wrote as directly as a root's.
+        std::vector<const std::map<std::string, mcpp::manifest::DependencySpec>*> rootDeps{
+            &state.m->dependencies};
+        for (std::size_t i = 1; i < state.packages.size(); ++i)
+            if (state.packages[i].selectedMember)
+                rootDeps.push_back(&state.packages[i].manifest.dependencies);
         auto is_direct = [&](std::string_view name) {
-            for (auto const& [k, _] : rootDeps) {
-                if (k == name) return true;
-                // Selectors are `<namespace>.<name>` or a bare tail; a tail
-                // match is what the author sees in their own manifest.
-                if (k.size() > name.size() && k.ends_with(name)
-                    && k[k.size() - name.size() - 1] == '.')
-                    return true;
-            }
+            for (auto const* deps : rootDeps)
+                for (auto const& [k, _] : *deps) {
+                    if (k == name) return true;
+                    // Selectors are `<namespace>.<name>` or a bare tail; a tail
+                    // match is what the author sees in their own manifest.
+                    if (k.size() > name.size() && k.ends_with(name)
+                        && k[k.size() - name.size() - 1] == '.')
+                        return true;
+                }
             return false;
         };
 
@@ -1336,14 +1344,50 @@ static std::expected<void, std::string> step9_dependency_link_forms(PrepareState
         request.wholeIsExplicit = !state.m->buildConfig.dependencyLinkage.empty();
         // ONLY THE ROOT MANIFEST'S EDGES. See DependencySpec::linkage — a
         // package deep in the graph imposing a whole-image layout on its
-        // consumer is a supply-chain property, not a convenience.
-        for (auto const& [depName, spec] : state.m->dependencies) {
-            if (spec.linkage.empty()) continue;
-            if (auto parsed = lf::parse(spec.linkage)) {
-                request.perPackage[depName] = *parsed;
+        // consumer is a supply-chain property, not a convenience. In a
+        // workspace plan the root's edges are the selected members' own
+        // (`PrepareState::declaredByRoot`): the virtual root declares nothing
+        // but the members, so reading only its edges ignored every request.
+        // One configuration builds a package in one form, so two members
+        // that ask for two forms of one package are refused, naming both.
+        //
+        // Compared by the identity each declaration resolved to (its
+        // namespace and name, written back after resolution), not by the key
+        // spelled: `mcpplibs.foo` and `foo` are one package, and `a.foo` and
+        // `b.foo` are two.
+        struct Asked { lf::DepLinkage form; std::string by; };
+        std::map<std::string, Asked, std::less<>> askedFor;
+        auto requestEdges = [&](const mcpp::manifest::Manifest& mf, std::string_view who)
+            -> std::expected<void, std::string> {
+            for (auto const& [depName, spec] : mf.dependencies) {
+                if (spec.linkage.empty()) continue;
+                auto parsed = lf::parse(spec.linkage);
+                if (!parsed) continue;
                 auto shortKey = spec.shortName.empty() ? depName : spec.shortName;
+                const auto identity = spec.namespace_.empty()
+                    ? depName : spec.namespace_ + "." + shortKey;
+                if (auto it = askedFor.find(identity);
+                    it != askedFor.end() && it->second.form != *parsed)
+                    return std::unexpected(std::format(
+                        "dependency '{}' is to be linked as '{}' by '{}' and as "
+                        "'{}' by '{}'.\n"
+                        "       A configuration builds a package in one form: "
+                        "state the same `linkage` in both.",
+                        identity, lf::to_string(it->second.form), it->second.by,
+                        lf::to_string(*parsed), who));
+                askedFor.emplace(identity, Asked{*parsed, std::string(who)});
+                request.perPackage[depName] = *parsed;
                 request.perPackage.emplace(shortKey, *parsed);
             }
+            return {};
+        };
+        if (auto r = requestEdges(*state.m, state.m->package.name); !r)
+            return std::unexpected(r.error());
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {
+            if (!state.packages[i].selectedMember) continue;
+            if (auto r = requestEdges(state.packages[i].manifest,
+                                      state.packages[i].manifest.package.name); !r)
+                return std::unexpected(r.error());
         }
 
         lf::TargetFacts targetFacts;

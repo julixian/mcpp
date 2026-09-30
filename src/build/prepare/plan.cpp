@@ -360,13 +360,16 @@ static std::expected<void, std::string> step13_link_forms(PrepareState& state, B
 
         // A non-root edge that writes the key gets its request IGNORED, and
         // says so — a silently dropped knob is how a knob becomes decoration.
-        for (std::size_t i = 1; i < state.packages.size(); ++i)
+        // A selected workspace member's edges are the root's, and honoured.
+        for (std::size_t i = 1; i < state.packages.size(); ++i) {
+            if (state.packages[i].selectedMember) continue;
             for (auto const& [depName, spec] : state.packages[i].manifest.dependencies)
                 if (!spec.linkage.empty())
                     mcpp::diag::warning("build/dependency-linkage", std::format(
                         "'{}' asks for dependency '{}' to be linked as '{}'; only "
                         "the root project decides link forms, so this is ignored",
                         state.packages[i].manifest.package.name, depName, spec.linkage));
+        }
 
         for (auto const& [i, form] : state.dependencyLinkForms) {
             auto const& answer = form.answer;

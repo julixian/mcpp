@@ -187,6 +187,11 @@ constexpr std::size_t kMainConsumer = static_cast<std::size_t>(-1);
         // `DependencySpec::linkage` is honoured only on the root's own
         // edges — see dep_spec.cppm.
         bool        fromRoot = false;
+        // True when that declaration is a selected workspace member's own:
+        // `fromRoot` without being the virtual root's member edge. Two
+        // selected members that disagree about one dependency are refused,
+        // since neither outranks the other.
+        bool        fromSelectedMember = false;
         // Reached ONLY through [dev-dependencies]. mcpp.lock excludes these:
         // dev-deps are resolved under `mcpp test` and not under `mcpp build`, so
         // recording them makes a VCS-committed file depend on which command ran
@@ -296,6 +301,11 @@ struct PrepareState {
     // `[workspace] members`, in selection order, beside it.
     std::map<std::filesystem::path, std::string> selectedMembers;
     std::vector<std::string> selectedMemberPaths;
+    // Each selected member's directory and manifest, as loaded when the
+    // selection was made: read by what runs before the graph is walked (the
+    // index refresh), which a root's own declarations reach and a member's
+    // must as well (`declaredByRoot`).
+    std::vector<std::pair<std::filesystem::path, mcpp::manifest::Manifest>> selectedMemberManifests;
     // `--features <dependency>/<feature>` tokens, by the selected member that
     // declares the dependency key: the forwards its edges receive.
     std::map<std::filesystem::path, std::vector<std::pair<std::string, std::string>>>
@@ -325,6 +335,50 @@ struct PrepareState {
         if (ec) key = dir.lexically_normal();
         if (selectedMembers.contains(key)) return key;
         return std::nullopt;
+    }
+    // A declaration the root makes: the root manifest's own
+    // (`consumerDepIndex == kMainConsumer`), or, in a workspace plan, a
+    // selected member's. Each selected member stands where the root stood
+    // before a workspace became one plan (workspace design 2026-09-29 §15):
+    // the virtual root of 2026.9.29.1 declares nothing but its members, so a
+    // rule that read only its edges treated a rooted workspace's own
+    // declarations as a dependency's. Every privilege the root's own edges
+    // hold asks this one question: the dependency kind clash and the
+    // reference clash, the git lock, the identity a declaration adopts, a
+    // declared `linkage`, which target-side candidates are direct, and the
+    // index refresh. (The refusal to mangle the root's sources stays with the
+    // root alone; see the multi-version branch in graph.cpp.)
+    bool declaredByRoot(std::size_t consumerDepIndex) const {
+        if (consumerDepIndex == kMainConsumer) return true;
+        const auto i = consumerDepIndex + 1;
+        return i < packages.size() && packages[i].selectedMember;
+    }
+    // The refusal of two selected members that point one dependency at two
+    // checkouts, `first` and `second` each saying how and by whom: neither
+    // outranks the other, and one configuration holds one checkout.
+    std::string twoMembersRefusal(const ResolvedKey& key, std::string_view first,
+                                  std::string_view second) const {
+        const auto name = qualifiedKey(key);
+        return std::format("dependency '{}' is declared as {} and as {}, two members "
+                           "this build selects.\n       A configuration holds one "
+                           "checkout of a package: declare '{}' alike in both.",
+                           name, first, second, name);
+    }
+    // The manifests that hold the root declarations of `consumerDepIndex`:
+    // the root manifest, or a selected member's two copies (its load record
+    // in `dep_manifests` and its package's snapshot). Empty for any other
+    // consumer. A write that states what a root declaration resolved to
+    // writes all of them, so no reader sees the stale one.
+    std::vector<mcpp::manifest::Manifest*> rootDeclarationManifests(std::size_t consumerDepIndex) {
+        if (consumerDepIndex == kMainConsumer) {
+            if (!m) return {};
+            return {&*m};
+        }
+        if (!declaredByRoot(consumerDepIndex)) return {};
+        std::vector<mcpp::manifest::Manifest*> out{&packages[consumerDepIndex + 1].manifest};
+        if (consumerDepIndex < dep_manifests.size() && dep_manifests[consumerDepIndex])
+            out.push_back(dep_manifests[consumerDepIndex].get());
+        return out;
     }
     std::filesystem::path runtimeWorkspaceRoot;
     mcpp::xlings::runtime::RuntimeSelection runtimeSelection;

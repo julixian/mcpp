@@ -197,12 +197,14 @@ static void step4a_define_split_and_identity_closures(PrepareState& state) {
     };
     // A root edge that adopted an identity states it on the root's own
     // declaration too, which is what every later reader of the root manifest
-    // (the build banner, the resolution record) sees.
+    // (the build banner, the resolution record, the lock names) sees; in a
+    // workspace plan a selected member's declaration is the root's.
     state.stateAdoptedIdentity = [&](const WorkItem& item, const ResolvedKey& declared) {
-        if (item.consumerDepIndex != kMainConsumer) return;
-        if (auto it = state.m->dependencies.find(item.name); it != state.m->dependencies.end()) {
-            it->second.namespace_ = declared.ns;
-            it->second.shortName = declared.shortName;
+        for (auto* mf : state.rootDeclarationManifests(item.consumerDepIndex)) {
+            if (auto it = mf->dependencies.find(item.name); it != mf->dependencies.end()) {
+                it->second.namespace_ = declared.ns;
+                it->second.shortName = declared.shortName;
+            }
         }
     };
     // A key that names an identity other than the one its `path` or `git`

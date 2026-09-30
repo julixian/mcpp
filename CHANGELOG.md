@@ -54,6 +54,27 @@ of 10.5 s; a build with nothing to do is unchanged at 0.05 s.
   BMI after that compile, so a fresh build could compile the consumer first and
   fail with `failed to read compiled module`. The stage edge of such a BMI now
   waits for those BMIs (e2e 849).
+- **A selected workspace member declares as the root.** Since 2026.9.29.1 a
+  workspace is planned from a virtual root that declares only its members, and
+  the rules that grant the root's own declarations a privilege read that
+  root's edges alone. A rooted workspace's own package, and a member selected
+  with `-p`, again hold the position each held when planned as its own root:
+  its `path` or `git` override of a dependency that another package requests
+  by another kind wins (the release canary on mcpp-language-server, whose root
+  package overrides `openkal-linux` by `path`, was refused with "Pick one");
+  `linkage` on its dependency edges is honoured; the identity its declarations
+  adopt is written back for the lock names; and its registry dependencies are
+  considered for the index refresh. Two selected members that disagree about
+  one dependency's checkout (its kind or its reference) or its link form are
+  refused, naming both (e2e 850).
+- **The clang MSVC row states the compiler version (mcpp#746).** The version
+  of the toolset's `cl.exe`, read from its file version as clang reads it, is
+  passed as `-fms-compatibility-version` on every command and enters every
+  key. Without it the driver chose the version itself and wrote it into each
+  BMI, and a std module compiled under one runner image's `cl.exe` was served
+  to another image whose `cl.exe` differed under the same toolset directory
+  name (`std.pcm was compiled for ... msvc19.51.36260 ... msvc19.51.36257`).
+  A clang build for `*-windows-msvc` rebuilds once after the upgrade.
 
 ### Changed
 

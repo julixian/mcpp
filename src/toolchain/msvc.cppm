@@ -426,6 +426,19 @@ std::filesystem::path staged_std_bmi_path(const std::filesystem::path& outputDir
 std::filesystem::path std_compat_bmi_path(const std::filesystem::path& cacheDir);
 std::filesystem::path staged_std_compat_bmi_path(const std::filesystem::path& outputDir);
 
+// The file version of a PE image, from its `VS_FIXEDFILEINFO`, as
+// `major.minor.build`: the reading clang makes of cl.exe to choose
+// `-fms-compatibility-version` when none is given. nullopt when the image
+// carries no version resource.
+std::optional<std::string> pe_file_version(std::string_view image);
+
+// The version of the cl.exe of the toolset at `toolsDir` (`.../MSVC/<v>`)
+// that clang reads for a target of `archGnu` ("x86_64", "aarch64", "i686"),
+// read from the file without running it (mcpp#746). Empty when that cl.exe is
+// absent or carries no version, where clang falls back as it always did.
+std::string compiler_version_in_tools_dir(const std::filesystem::path& toolsDir,
+                                          std::string_view archGnu);
+
 } // namespace mcpp::toolchain::msvc
 
 namespace mcpp::toolchain::msvc {
@@ -1397,6 +1410,51 @@ std::filesystem::path std_compat_bmi_path(const std::filesystem::path& cacheDir)
 }
 std::filesystem::path staged_std_compat_bmi_path(const std::filesystem::path& outputDir) {
     return outputDir / "ifc.cache" / "std.compat.ifc";
+}
+
+std::optional<std::string> pe_file_version(std::string_view image) {
+    // VS_FIXEDFILEINFO begins with dwSignature 0xFEEF04BD and dwStrucVersion
+    // 0x00010000, then dwFileVersionMS and dwFileVersionLS, little-endian.
+    // clang's own reading takes HIWORD(MS).LOWORD(MS).HIWORD(LS), and so does
+    // this one, so the version said on the command line is the version the
+    // driver would have chosen from the same file.
+    constexpr std::string_view signature{"\xBD\x04\xEF\xFE", 4};
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t v = 0;
+        for (std::size_t i = 0; i < 4; ++i)
+            v |= static_cast<std::uint32_t>(static_cast<unsigned char>(image[at + i])) << (8 * i);
+        return v;
+    };
+    for (auto at = image.find(signature); at != std::string_view::npos;
+         at = image.find(signature, at + 1)) {
+        if (at + 16 > image.size()) break;
+        if (u32(at + 4) != 0x00010000u) continue;
+        const auto ms = u32(at + 8), ls = u32(at + 12);
+        if ((ms >> 16) == 0) continue;
+        return std::format("{}.{}.{}", ms >> 16, ms & 0xFFFFu, ls >> 16);
+    }
+    return std::nullopt;
+}
+
+std::string compiler_version_in_tools_dir(const std::filesystem::path& toolsDir,
+                                          std::string_view archGnu) {
+    // The one file clang reads (llvm::getSubDirectoryPath, SubDirectoryType::
+    // Bin, for a VS2017-or-newer layout): `bin/Hostx64` when the driver runs
+    // as x86_64 and `bin/Hostx86` otherwise, arm64 included (clang 22 names
+    // no other host directory), then the target's directory. Another cl.exe of the same toolset could carry
+    // another build, and the version said must be the one the driver would
+    // have chosen, or the flag would change what a build compiles for.
+    const std::string_view host =
+        mcpp::platform::host_arch == std::string_view("x86_64") ? "Hostx64" : "Hostx86";
+    std::string_view target = "x64";
+    if (archGnu == "aarch64")                            target = "arm64";
+    else if (archGnu == "i686" || archGnu == "x86")      target = "x86";
+    const auto cl = toolsDir / "bin" / host / target / "cl.exe";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(cl, ec)) return {};
+    std::ifstream is(cl, std::ios::binary);
+    std::string image{std::istreambuf_iterator<char>(is), std::istreambuf_iterator<char>()};
+    return pe_file_version(image).value_or(std::string{});
 }
 
 namespace {

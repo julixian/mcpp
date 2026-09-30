@@ -80,6 +80,7 @@ struct ToolchainLinkModel {
     std::filesystem::path msvcToolsDir;
     std::filesystem::path winSdkRoot;
     std::string           winSdkVersion;
+    std::string           msvcCompilerVersion;
 
     bool clangDriver   = false;  // clang: -isystem headers; gcc: -idirafter
                                  // gcc:   -idirafter (…#include_next), -B/-L only
@@ -117,6 +118,15 @@ struct ToolchainLinkModel {
     // and the SDK always travel together: given only the toolset, the driver
     // stops reading %INCLUDE% and takes the registry's newest SDK instead.
     // Read by the compile line, the link line and the cache key alike.
+    //
+    // THE COMPILER VERSION TRAVELS WITH THEM (mcpp#746). Without
+    // `-fms-compatibility-version` the driver reads it from a cl.exe it
+    // locates itself and writes it into every BMI's target
+    // (`x86_64-pc-windows-msvc19.51.36260`), and a BMI whose version differs
+    // from the importer's is refused. Two runner images held different cl.exe
+    // builds under one toolset directory name, so the directory, which was
+    // the key's only view of the toolset, served one image's std module to
+    // the other. Said here, the version is on every command and in every key.
     std::vector<std::string> msvc_driver_tokens(const PathEscape& esc) const {
         std::vector<std::string> out;
         if (msvcToolsDir.empty()) return out;
@@ -128,6 +138,8 @@ struct ToolchainLinkModel {
             out.push_back("-Xmicrosoft-windows-sdk-version");
             out.push_back(winSdkVersion);
         }
+        if (!msvcCompilerVersion.empty())
+            out.push_back("-fms-compatibility-version=" + msvcCompilerVersion);
         return out;
     }
 
@@ -405,6 +417,7 @@ ToolchainLinkModel resolve_link_model(const Toolchain& tc) {
             lm.msvcToolsDir  = tc.msvcToolsDir;
             lm.winSdkRoot    = tc.windowsSdkRoot;
             lm.winSdkVersion = tc.windowsSdkVersion;
+            lm.msvcCompilerVersion = tc.msvcCompilerVersion;
         }
         return lm;
     }
