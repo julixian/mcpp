@@ -520,10 +520,17 @@ mcpp pack [target] [--format <f>] [--target <triple>...] --message-format json
 | 字段 | |
 |---|---|
 | `artifacts` | 每个产出的产物一条记录：`path`（绝对路径）、`type`（`file` 或 `directory`）、`format`（`--format` 的取值，省略时为 `tar`），以及 `targets`（进入该产物的每条腿的规范三元组）。被分派的格式报告本次请求引入的那些 action 的终端输出；一个多 `--target` 的 Android 打包报告一个产物，其 `targets` 列出每一条腿 |
-| `stage` | 该产物所来自的那棵树：`dir`、`manifest`（即下文的暂存清单）与 `closure`（`walked` 或 `not-walked`）；库包，以及没有暂存任何树的情形，此字段为 `null` |
+| `stage` | 该产物所来自的那棵树：`dir`、`manifest`（即下文的暂存清单）与 `closure`（`walked` 或 `not-walked`）；库包、没有暂存任何树的情形，以及对多个成员的打包，此字段为 `null` |
+| `stages` *（2026.10.1.1+）* | 只在对多个成员的打包（`--workspace`，或重复的 `-p`）中出现：每个成员一条记录，按 `[workspace] members` 的顺序，带 `member`（限定的包名），以及与 `stage` 相同的 `dir`、`manifest`、`closure` |
+
+对多个成员的打包，`artifacts` 按同样的成员顺序列出每个成员的产物，每条记录多出
+`member`，即它所属成员的限定包名。对一个成员的打包既没有 `stages` 也没有 `member`：
+信封与以往完全一样。
 
 失败时省略 `data`，以命令自身的退出码退出，并携带诊断码
-`MCPP_PACK_FAILED`；原因写在 stderr 上。每次运行的 `effects` 是
+`MCPP_PACK_FAILED`；原因写在 stderr 上。对多个成员的打包若有成员失败，则对每个这样的成员
+再多带一条点名它的 `MCPP_PACK_FAILED` 诊断，同样省略 `data`：已经打包的成员在磁盘上，
+并在 stderr 上点名。每次运行的 `effects` 是
 `read-project`、`write-project` 与 `write-global-cache`，若运行了某个构建
 程序则再加上 `exec-build-script`。`--protocol-version` 为 `pack` 声明
 `init-mcpp-home`、`read-project`、`write-project`、`network`、
