@@ -512,7 +512,11 @@ member that several members use is compiled once.
   into that member's programs and shared libraries only (2026.9.29.2+).
 - **Build programs.** The members' build programs run dependencies first, and
   a program's result is reused by every command whose inputs to it are
-  unchanged, whichever members the command selects (2026.9.29.5+).
+  unchanged, whichever members the command selects (2026.9.29.5+). Their
+  compiles run at the same time, up to the job count, and only their runs
+  follow that order, so the plan is the one a serial build writes; a host
+  module that several programs import is compiled once for all of them
+  (2026.10.1.1+; see [30 — Build programs](30-build-mcpp.md)).
 - **Tests.** `mcpp test` over several members plans as `build` does: once per
   configuration, with each member's tests, so a package the members share is
   compiled once, its build program runs once, and its features are the union
@@ -586,7 +590,9 @@ myproject/
 - `mcpp.lock` at the workspace root records the resolution of every member.
   `mcpp build --workspace` writes the whole record; `mcpp build -p X` updates
   the entries of X's graph.
-- A member's build program writes to `<member>/target/.build-mcpp/`.
+- A member's build program writes to `<member>/target/.build-mcpp/`. The host
+  modules the programs import are compiled into the workspace's own
+  `target/.build-mcpp/host-modules/`, once for all of them.
 - Build directories a member held under its own `target/` with an earlier mcpp
   are not read; `mcpp clean --stale` removes them.
 

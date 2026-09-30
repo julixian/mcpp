@@ -132,8 +132,11 @@ run_out=$("$MCPP" run 2>&1) || { echo "FAIL: run (modules): $run_out"; exit 1; }
 [[ "$run_out" == *"msvc-modules-ok"* ]] \
     || { echo "FAIL: run output (modules): $run_out"; exit 1; }
 
-# The .ifc really came from the msvc module pipeline, not a silent fallback.
-find target/.build-mcpp -name "*.ifc" | grep -q . \
+# The .ifc really came from the msvc module pipeline, not a silent fallback. The
+# bundled module is kept by key, in the global cache or the workspace's own store
+# (#748), so both are searched.
+CACHE_ROOT="$("$MCPP" cache dir | head -1)"
+find "$CACHE_ROOT/pkg/_engine" target/.build-mcpp -name "*.ifc" 2>/dev/null | grep -q . \
     || { echo "FAIL: no .ifc produced for the bundled mcpp module"; exit 1; }
 
 echo "PASS: MSVC build.mcpp — include path, link-lib translation, named modules"

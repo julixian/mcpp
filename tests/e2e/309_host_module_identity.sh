@@ -92,13 +92,17 @@ out="$("$MCPP" run 2>&1 | grep '^DIVERGENT=' | tail -1)"
 # rule the object was `protobufgen.o`; under this one it is named for what the
 # source declares. A file listing is platform-independent evidence about which
 # name the engine used, where the successful import is not.
-BM=target/.build-mcpp
-ls "$BM"/acme.rules.protobuf.* >/dev/null 2>&1 || {
+#
+# A host module is kept as an entry of the workspace's store, keyed by what it
+# was compiled from (#748), and the entry names its files as before: the BMI
+# under `bmi/` and the object under `obj/`.
+BM=target/.build-mcpp/host-modules
+[ -n "$(find "$BM" -name 'acme.rules.protobuf.*' 2>/dev/null)" ] || {
     echo "FAIL: the host module was not named for its DECLARED module name"
-    ls -la "$BM" 2>/dev/null
+    find "$BM" 2>/dev/null
     exit 1; }
-if ls "$BM"/protobufgen.* >/dev/null 2>&1; then
-    ls -la "$BM"
+if [ -n "$(find "$BM" -name 'protobufgen.*' 2>/dev/null)" ]; then
+    find "$BM"
     echo "FAIL: the host module is still named for the PACKAGE name"
     exit 1
 fi

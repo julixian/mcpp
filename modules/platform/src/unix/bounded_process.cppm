@@ -79,6 +79,43 @@ struct DeadlineRun {
 
 using OutputSink = void (*)(void* ctx, const char* data, unsigned long len);
 
+// ─── Starting a child is safe for concurrent callers ─────────────────────
+//
+// Two threads that start children at the same time must not pass one child's
+// pipe to the other. A child inherits every descriptor of its parent that is not
+// close-on-exec, so a child started by thread B while thread A holds the write
+// end of A's capture pipe keeps that end open for as long as it lives. A's
+// reader then waits for end of file until B's unrelated child exits: a compile
+// that finished at once is reported only when a longer one does, and a deadline
+// the reader is meant to enforce is enforced late.
+//
+// The pipes are therefore created close-on-exec, and `posix_spawn`'s `dup2`
+// action, which clears the flag on the descriptor it creates, is the only way a
+// descriptor reaches the child. Where the platform has `pipe2` (Linux) that is
+// one atomic call. Where it does not (macOS) the flag is set by a second call,
+// which leaves a window in which another thread's child could be started; every
+// start on such a platform therefore holds one process-wide section, from the
+// creation of the pipe to the parent's close of its write end. On Linux the
+// section is empty.
+//
+// `make_pipe` returns 0 on success and -1 on failure, as `pipe` does. Both ends
+// are close-on-exec. The caller holds a `LaunchSection` across this call and the
+// start of the child.
+int make_pipe(int fds[2]);
+
+class LaunchSection {
+public:
+    LaunchSection();
+    ~LaunchSection();
+    // Leaves the section before the destructor does: a caller that goes on to
+    // wait for its child must not hold it for the child's whole life.
+    void release();
+    LaunchSection(const LaunchSection&) = delete;
+    LaunchSection& operator=(const LaunchSection&) = delete;
+private:
+    bool held_ = false;
+};
+
 // `argvEntries` is `argvCount` NUL-terminated strings; `envEntries` is
 // `envCount` "KEY=VALUE" strings applied on top of the current environment.
 // `cwd` may be null. A non-positive `deadlineMs` is rejected with
@@ -173,6 +210,13 @@ void background_stop(long long group, long long graceMs);
 // Fixed capacity and no allocation: the handler reads this array and may not
 // allocate. Registering past capacity fails loudly rather than silently
 // dropping a group, because a dropped group is an orphan nobody will find.
+//
+// SAFE FOR CONCURRENT CALLERS. Children are started from several threads at once
+// (a workspace's build programs are compiled concurrently), so claiming and
+// releasing a slot is serialized by a mutex, and two threads can no longer claim
+// the same slot. The handler takes no lock: it reads slots that are written one
+// `sig_atomic_t` at a time. The capacity is 256, well above any job count, since
+// one group is held per running child.
 void guard_group_on_signal(long long group);
 void unguard_group(long long group);
 void clear_group_guard();
@@ -262,8 +306,10 @@ DeadlineRun capture_with_deadline(const char* const* argvEntries,
     cargv.push_back(nullptr);
 
     const bool capture = (sink != nullptr);
+    // From the pipe to the parent's close of its write end: see LaunchSection.
+    LaunchSection launch;
     int fds[2] = {-1, -1};
-    if (capture && ::pipe(fds) != 0) return out;
+    if (capture && make_pipe(fds) != 0) return out;
 
     posix_spawn_file_actions_t fa;
     ::posix_spawn_file_actions_init(&fa);
@@ -292,6 +338,7 @@ DeadlineRun capture_with_deadline(const char* const* argvEntries,
     ::posix_spawnattr_destroy(&attr);
     ::posix_spawn_file_actions_destroy(&fa);
     if (capture) ::close(fds[1]);
+    launch.release();
     if (sp != 0) { out.spawn_error = sp; if (capture) ::close(fds[0]); return out; }
     if (ownGroup) guard_group_on_signal(pid);
 
@@ -364,8 +411,14 @@ namespace {
 // Read by a signal handler, so `volatile sig_atomic_t` and nothing else: the
 // handler may run between any two instructions and may not lock, allocate, or
 // call anything that is not async-signal-safe. 0 means "nothing to clean up".
-constexpr int kMaxGuardedGroups = 8;
+constexpr int kMaxGuardedGroups = 256;
 volatile sig_atomic_t g_guardedGroups[kMaxGuardedGroups] = {};
+// Serializes the WRITERS of the registry and of the handlers it installs. The
+// handler never takes it.
+std::mutex g_guardMutex;
+
+// The platforms without `pipe2` share one section across every child start.
+std::mutex g_launchMutex;
 
 // The terminal whose mode the handler restores (-1: none), and that mode.
 volatile sig_atomic_t g_terminalFd = -1;
@@ -395,6 +448,32 @@ extern "C" void background_signal_handler(int sig) {
 }
 
 } // namespace
+
+int make_pipe(int fds[2]) {
+#if defined(__linux__)
+    return ::pipe2(fds, O_CLOEXEC);
+#else
+    if (::pipe(fds) != 0) return -1;
+    ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+#endif
+}
+
+LaunchSection::LaunchSection() {
+#if !defined(__linux__)
+    g_launchMutex.lock();
+    held_ = true;
+#endif
+}
+
+LaunchSection::~LaunchSection() { release(); }
+
+void LaunchSection::release() {
+    if (!held_) return;
+    held_ = false;
+    g_launchMutex.unlock();
+}
 
 BackgroundChild spawn_background(const char* const* argvEntries,
                                  unsigned long      argvCount,
@@ -430,8 +509,14 @@ BackgroundChild spawn_background(const char* const* argvEntries,
     ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
 
     pid_t pid = 0;
-    const int sp = ::posix_spawnp(&pid, cargv[0], &fa, &attr,
-                                  cargv.data(), current_environ());
+    int sp = 0;
+    {
+        // A child that holds no pipe of its own must still not be started in
+        // the window another thread's pipe is open in (see LaunchSection).
+        LaunchSection launch;
+        sp = ::posix_spawnp(&pid, cargv[0], &fa, &attr,
+                            cargv.data(), current_environ());
+    }
     ::posix_spawn_file_actions_destroy(&fa);
     ::posix_spawnattr_destroy(&attr);
     if (sp != 0) return out;
@@ -490,11 +575,14 @@ void background_stop(long long group, long long graceMs) {
 
 void guard_group_on_signal(long long group) {
     if (group <= 0) return;
-    for (int i = 0; i < kMaxGuardedGroups; ++i) {
-        if (g_guardedGroups[i] == 0) {
-            g_guardedGroups[i] = static_cast<sig_atomic_t>(group);
-            install_handlers();
-            return;
+    {
+        std::lock_guard lock(g_guardMutex);
+        for (int i = 0; i < kMaxGuardedGroups; ++i) {
+            if (g_guardedGroups[i] == 0) {
+                g_guardedGroups[i] = static_cast<sig_atomic_t>(group);
+                install_handlers();
+                return;
+            }
         }
     }
     // Out of slots. Say so rather than return silently: an unguarded group is
@@ -510,6 +598,7 @@ void guard_group_on_signal(long long group) {
 // the guard an outer one still needs.
 void unguard_group(long long group) {
     if (group <= 0) return;
+    std::lock_guard lock(g_guardMutex);
     bool any = false;
     for (int i = 0; i < kMaxGuardedGroups; ++i) {
         if (g_guardedGroups[i] == static_cast<sig_atomic_t>(group))
@@ -525,6 +614,7 @@ void unguard_group(long long group) {
 }
 
 void clear_group_guard() {
+    std::lock_guard lock(g_guardMutex);
     for (int i = 0; i < kMaxGuardedGroups; ++i) g_guardedGroups[i] = 0;
     if (g_terminalFd >= 0) return;   // the terminal's guard still needs the handler
     ::signal(SIGINT,  SIG_DFL);
@@ -533,12 +623,14 @@ void clear_group_guard() {
 }
 
 void guard_terminal_mode(int fd) {
+    std::lock_guard lock(g_guardMutex);
     if (fd < 0 || ::tcgetattr(fd, &g_terminalMode) != 0) return;
     g_terminalFd = fd;
     install_handlers();
 }
 
 void unguard_terminal_mode() {
+    std::lock_guard lock(g_guardMutex);
     if (g_terminalFd < 0) return;
     ::tcsetattr(g_terminalFd, TCSANOW, &g_terminalMode);
     g_terminalFd = -1;
@@ -575,6 +667,10 @@ BackgroundChild spawn_background(const char* const*, unsigned long,
 }
 int  background_running(long long, int*) { return -1; }
 void background_stop(long long, long long) {}
+int  make_pipe(int[2]) { return -1; }
+LaunchSection::LaunchSection() {}
+LaunchSection::~LaunchSection() {}
+void LaunchSection::release() {}
 void guard_group_on_signal(long long) {}
 void unguard_group(long long) {}
 void clear_group_guard() {}

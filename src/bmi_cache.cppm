@@ -41,6 +41,18 @@
 // concurrent builds racing to fill the same entry cannot interleave writes, and
 // writes entry.json last so a crash mid-populate leaves a miss, not a
 // half-populated hit.
+//
+// A SECOND KIND OF ENTRY IS PUBLISHED WHOLE (#748, B1). What a build program
+// imports, the bundled `mcpp` module and the host modules of rule packages, is
+// compiled in a directory of its own and then moved into place, so the entry
+// never exists half-written and two threads (or two mcpp processes) compiling
+// the same key cannot interleave their files. `stage_entry` creates that
+// directory beside the entry, on the same file system, and `publish_staged`
+// writes entry.json into it, last, and renames it to the entry's address. The
+// entry has the layout above, so `probe_cached`, `touch_accessed`,
+// `mcpp cache gc`, `list`, `info` and `verify` treat it as they treat any other.
+// Its address is either below the package address, in the global cache, or
+// exactly `CacheKey::directDir`, in a workspace's own store.
 
 module;
 
@@ -73,8 +85,16 @@ struct CacheKey {
     nlohmann::json inputs;
     std::string bmiDirName   = "gcm.cache"; // consumer-side directory name
     std::string manifestTag  = "gcm";       // "gcm" | "pcm"
+    // When set, the entry lives exactly here rather than below the package
+    // address: a workspace's own store of what belongs to that workspace (a host
+    // module from a path dependency, whose sources can change without its name
+    // and version changing). Everything below it is laid out as in the global
+    // cache. `cacheRoot` then names where staging directories go, and is the
+    // workspace store's own root.
+    std::filesystem::path directDir;
 
     std::filesystem::path dir() const {
+        if (!directDir.empty()) return directDir;
         return cacheRoot / "pkg" / indexName
              / std::format("{}@{}", packageName, version) / keyHex;
     }
@@ -164,6 +184,26 @@ std::expected<void, std::string>
 populate_from(const CacheKey& key,
               const std::filesystem::path& projectTargetDir,
               const DepArtifacts& artifacts);
+
+// A fresh directory a producer writes an entry's `bmi/` and `obj/` into, on the
+// same file system as the entry so that `publish_staged` can rename it into
+// place. It is outside every directory `mcpp cache` walks, so a producer that is
+// interrupted leaves nothing for `gc` to report as an incomplete entry.
+std::expected<std::filesystem::path, std::string>
+stage_entry(const CacheKey& key);
+
+// Writes entry.json into `staged`, last, and renames `staged` to the entry's
+// address. `artifacts` lists what `staged` holds (`objFiles[].cacheRel` names
+// the file below `obj/`; `buildRel` is not used). Returns true when this call
+// put the entry in place and false when an entry that satisfies `artifacts` was
+// already there, another thread's or another process's, in which case `staged`
+// is removed and the entry in place is the one to use. An entry that is there
+// and does not satisfy it (a crash that predates the rename, an older layout) is
+// replaced.
+std::expected<bool, std::string>
+publish_staged(const CacheKey& key,
+               const std::filesystem::path& staged,
+               const DepArtifacts& artifacts);
 
 // Absolute paths of an entry's artifacts, for the stage edges.
 std::filesystem::path cached_bmi_path(const CacheKey& key, std::string_view basename);
@@ -379,6 +419,117 @@ populate_from(const CacheKey& key,
     }
     j["accessed"] = now_iso8601();
     return write_entry(key.entryFile(), j);
+}
+
+std::expected<std::filesystem::path, std::string>
+stage_entry(const CacheKey& key) {
+    // Unique across threads, processes and calls without asking the OS for a
+    // process id: a counter for the threads of this process, and the clock and a
+    // random number for the others.
+    static std::atomic<unsigned long long> counter{0};
+    static const unsigned long long salt = [] {
+        std::random_device rd;
+        return (static_cast<unsigned long long>(rd()) << 32) ^ rd();
+    }();
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    // Short: the compiler is handed paths below this directory, and a path of a
+    // few hundred characters is one some Windows tools cannot open.
+    const auto unique = std::format("{:.8}.{:08x}.{}", key.keyHex,
+                                    static_cast<unsigned>(salt ^ static_cast<unsigned long long>(ticks)),
+                                    counter++);
+    const auto base = key.directDir.empty()
+        ? key.cacheRoot / "tmp"
+        : key.directDir.parent_path() / ".tmp";
+    const auto staged = base / unique;
+    std::error_code ec;
+    // A producer that was interrupted (Ctrl-C, a killed build) leaves its staging
+    // directory behind, and nothing else removes it: no listing of the cache
+    // reaches it. One that is a day old belongs to no producer still running.
+    {
+        const auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24);
+        std::error_code lec;
+        for (auto const& old : std::filesystem::directory_iterator(base, lec)) {
+            std::error_code tec;
+            if (std::filesystem::last_write_time(old.path(), tec) < cutoff && !tec)
+                std::filesystem::remove_all(old.path(), tec);
+        }
+    }
+    std::filesystem::create_directories(staged / "bmi", ec);
+    if (ec) return std::unexpected(std::format(
+        "cannot create a staging directory under '{}': {}", base.string(), ec.message()));
+    std::filesystem::create_directories(staged / "obj", ec);
+    if (ec) return std::unexpected(std::format(
+        "cannot create a staging directory under '{}': {}", base.string(), ec.message()));
+    return staged;
+}
+
+std::expected<bool, std::string>
+publish_staged(const CacheKey& key,
+               const std::filesystem::path& staged,
+               const DepArtifacts& arts)
+{
+    std::error_code ec;
+    // Every artifact the entry is about to claim is in the directory now, before
+    // anything names it.
+    for (auto& g : arts.bmiFiles)
+        if (!std::filesystem::exists(staged / "bmi" / g, ec)) {
+            std::filesystem::remove_all(staged, ec);
+            return std::unexpected(std::format("expected build output missing: bmi/{}", g));
+        }
+    for (auto& o : arts.objFiles)
+        if (!std::filesystem::exists(staged / "obj" / std::filesystem::path(o.cacheRel), ec)) {
+            std::filesystem::remove_all(staged, ec);
+            return std::unexpected(std::format("expected build output missing: obj/{}", o.cacheRel));
+        }
+
+    nlohmann::json j;
+    j["created"]  = now_iso8601();
+    j["schema"]   = kEntrySchema;
+    j["key"]      = key.keyHex;
+    j["package"]  = std::format("{}/{}@{}", key.indexName, key.packageName, key.version);
+    j["bmi_dir"]  = key.bmiDirName;
+    j["tag"]      = key.manifestTag;
+    j["inputs"]   = key.inputs;
+    j["bmi"]      = arts.bmiFiles;
+    {
+        auto objs = nlohmann::json::array();
+        for (auto& o : arts.objFiles) objs.push_back(o.cacheRel);
+        j["obj"] = std::move(objs);
+    }
+    j["accessed"] = now_iso8601();
+    // entry.json LAST: it is the sentinel, and it is written into the directory
+    // before the directory has an address, so the entry is never seen without it.
+    if (auto w = write_entry(staged / "entry.json", j); !w) {
+        std::filesystem::remove_all(staged, ec);
+        return std::unexpected(w.error());
+    }
+
+    const auto target = key.dir();
+    std::filesystem::create_directories(target.parent_path(), ec);
+    std::filesystem::rename(staged, target, ec);
+    if (!ec) return true;
+
+    // The target exists (a directory is not replaced by a rename). Another
+    // producer finished first, and its entry is as good as this one when it
+    // satisfies what was asked: use it.
+    if (probe_cached(key, arts).ok) {
+        std::filesystem::remove_all(staged, ec);
+        return false;
+    }
+    // It does not, so it is a remnant, and the next step replaces it.
+    std::filesystem::remove_all(target, ec);
+    std::filesystem::rename(staged, target, ec);
+    if (!ec) return true;
+    // A third producer may have won in between; the entry is usable then.
+    if (probe_cached(key, arts).ok) {
+        std::error_code rm;
+        std::filesystem::remove_all(staged, rm);
+        return false;
+    }
+    std::error_code rm;
+    std::filesystem::remove_all(staged, rm);
+    return std::unexpected(std::format(
+        "cannot publish cache entry '{}': {}", target.string(), ec.message()));
 }
 
 } // namespace mcpp::bmi_cache
