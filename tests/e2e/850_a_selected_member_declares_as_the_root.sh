@@ -52,6 +52,7 @@ REV_A=$(git -C "$FW" rev-parse HEAD)
 printf 'int framework_marker(void) { return 199; }\n' > "$FW/src/framework.c"
 
 # libg: a library outside every workspace that asks for framework at commit A.
+LIBG_HOST="$(host_path "$TMP/libg")"
 mkdir -p "$TMP/libg/src"
 cat > "$TMP/libg/mcpp.toml" <<EOF
 [package]
@@ -84,7 +85,7 @@ name    = "$2"
 version = "0.1.0"
 
 [dependencies]
-libg = { path = "$(host_path "$TMP/libg")" }
+libg = { path = "$LIBG_HOST" }
 $3
 
 [targets.$2]
@@ -128,7 +129,8 @@ grep -q "two members this build selects" "$TMP/c.log" \
     || fail "C: the refusal does not name both members" "$TMP/c.log"
 # The same kind, two references: a second checkout of framework at commit A.
 git clone --quiet "$FW" "$TMP/framework-copy"
-package "$W2/two" two "framework = { path = \"$(host_path "$TMP/framework-copy")\" }"
+FW_COPY_HOST="$(host_path "$TMP/framework-copy")"
+package "$W2/two" two "framework = { path = \"$FW_COPY_HOST\" }"
 if (cd "$W2" && "$MCPP" build --workspace > "$TMP/c2.log" 2>&1); then
     fail "C: two members that point a dependency at two directories were accepted" "$TMP/c2.log"
 fi
