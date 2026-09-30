@@ -691,8 +691,11 @@ std::string sanitize_feature_env(std::string f) {
 }
 
 // The injected contract values, as (NAME, value) pairs for the child process.
+// `warn` is false in the concurrent compile phase (#748, B2): the values are
+// computed again at the program's turn, which states each warning once.
 std::vector<std::pair<std::string, std::string>>
-contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv& env) {
+contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv& env,
+             bool warn = true) {
     std::vector<std::pair<std::string, std::string>> e;
     auto hostT = mcpp::toolchain::triple::host_triple().str();
     // The toolchain and target names an install hook also receives, from the
@@ -811,7 +814,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
         if (inserted) {
             e.emplace_back(var, dir.string());
         } else if (it->second != dir.string()) {
-            mcpp::ui::warning(std::format(
+            if (warn) mcpp::ui::warning(std::format(
                 "build.mcpp: dependency name collides on {} (kept '{}', ignored "
                 "'{}') — rename one dependency to disambiguate", var,
                 it->second, dir.string()));
@@ -828,7 +831,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
         if (inserted) {
             e.emplace_back(var, form);
         } else if (it->second != form) {
-            mcpp::ui::warning(std::format(
+            if (warn) mcpp::ui::warning(std::format(
                 "build.mcpp: dependency name collides on {} (kept '{}', ignored "
                 "'{}') — rename one dependency to disambiguate", var,
                 it->second, form));
@@ -872,7 +875,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
         if (inserted) {
             e.emplace_back(var, path);
         } else if (it->second != path) {
-            mcpp::ui::warning(std::format(
+            if (warn) mcpp::ui::warning(std::format(
                 "build.mcpp: tool name collides on {} (kept '{}', ignored '{}')",
                 var, it->second, path));
         }
@@ -1139,7 +1142,7 @@ std::expected<void, std::string> run_build_program_impl(
 
     fs::path bdir = build_dir(root, env);
     fs::path outDir = bdir / "out";
-    auto childEnv = contract_env(root, outDir, env);
+    auto childEnv = contract_env(root, outDir, env, mode != ProgramMode::Compile);
     std::string ctxHash = contract_hash(childEnv);
     // THE GRAPH DOCUMENT'S CONTENT, NOT ITS PATH. The path is the same on
     // every run; what the document says is what the program's answer depends
@@ -1399,7 +1402,7 @@ std::expected<void, std::string> run_build_program_impl(
                 who, requested,
                 ran ? mcpp::build::progress::ProgramOutcome::Ran
                     : mcpp::build::progress::ProgramOutcome::Failed,
-                compile, run);
+                compile, run, /*compiledAside=*/compileDuration.has_value());
         }
     } programReport{who, env.requested};
     // The compile phase says nothing: what it made is reported, or refused, when

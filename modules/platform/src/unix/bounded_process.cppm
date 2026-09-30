@@ -588,7 +588,7 @@ void guard_group_on_signal(long long group) {
     // Out of slots. Say so rather than return silently: an unguarded group is
     // a process that outlives mcpp, and the whole point of this file is that
     // such a process is never acceptable.
-    std::fputs("mcpp: internal: more than 8 concurrently guarded process "
+    std::fputs("mcpp: internal: more than 256 concurrently guarded process "
                "groups; the newest is NOT guarded and may outlive mcpp\n",
                stderr);
 }

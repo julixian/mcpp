@@ -2661,9 +2661,16 @@ struct TestResult {
     int         exitCode = 0;
     std::string compileOutput;
     std::string runOutput;
-    long long   durationMs = 0;    // build+run wall time for THIS test
+    // The wall time of the step that decided the status: the run for a test
+    // that ran, the build for a `compile_fail`. The meaning `duration_ms` has
+    // always had; the test binary's own build time is `buildMs`.
+    long long   durationMs = 0;
     bool        timedOut = false;  // killed by --timeout
     std::string reason;            // NotRun only: why, in one sentence
+    // The build time of this test's own binary in this invocation: the sum of
+    // its link edge and its main unit's compile edge in `.ninja_log`, 0 when
+    // neither was rebuilt (`build_ms`, 2026.10.1.1+).
+    long long   buildMs = 0;
 };
 
 // Streaming NDJSON: one record per test, emitted as it finishes — a
@@ -2681,12 +2688,12 @@ static void emit_test_json(const std::string& memberName, const TestResult& r) {
                  "\"exit_code\":{},\"signal\":{},"
                  "\"duration_ms\":{},\"timed_out\":{},"
                  "\"compile_output\":\"{}\",\"run_output\":\"{}\","
-                 "\"reason\":\"{}\"}}",
+                 "\"reason\":\"{}\",\"build_ms\":{}}}",
                  test_json_escape(memberName),
                  test_json_escape(r.name), st, r.exitCode, signal, r.durationMs,
                  r.timedOut ? "true" : "false",
                  test_json_escape(r.compileOutput), test_json_escape(r.runOutput),
-                 test_json_escape(r.reason));
+                 test_json_escape(r.reason), r.buildMs);
     std::fflush(stdout);
 }
 
@@ -2803,20 +2810,32 @@ static void test_announce(const BuildContext& ctx) {
         }
     };
     std::set<std::string> announced;
-    announced.insert(ctx.manifest.package.name);
-    mcpp::ui::status("Compiling",
-        std::format("{} v{} (.)",
-                    ctx.manifest.package.name, ctx.manifest.package.version));
-    for (auto& [name, spec] : ctx.manifest.dependencies) {
-        if (announced.contains(name)) continue;
-        announced.insert(name);
-        announce(name, spec, "");
+    auto announce_package = [&](const mcpp::manifest::Manifest& m, std::string_view where) {
+        announced.insert(m.package.name);
+        mcpp::ui::status("Compiling",
+            std::format("{} v{} ({})", m.package.name, m.package.version, where));
+    };
+    auto announce_dependencies = [&](const mcpp::manifest::Manifest& m) {
+        for (auto& [name, spec] : m.dependencies) {
+            if (announced.contains(name)) continue;
+            announced.insert(name);
+            announce(name, spec, "");
+        }
+        for (auto& [name, spec] : m.devDependencies) {
+            if (announced.contains(name)) continue;
+            announced.insert(name);
+            announce(name, spec, " (dev)");
+        }
+    };
+    // A plan of several members has a virtual root, which declares only its
+    // members: the packages are the members, named as their directories.
+    if (ctx.manifest.package.virtualRoot && !ctx.workspaceMembers.empty()) {
+        for (auto const& wm : ctx.workspaceMembers) announce_package(wm.manifest, wm.memberPath);
+        for (auto const& wm : ctx.workspaceMembers) announce_dependencies(wm.manifest);
+        return;
     }
-    for (auto& [name, spec] : ctx.manifest.devDependencies) {
-        if (announced.contains(name)) continue;
-        announced.insert(name);
-        announce(name, spec, " (dev)");
-    }
+    announce_package(ctx.manifest, ".");
+    announce_dependencies(ctx.manifest);
 }
 
 // Phase A goal set: every shared prerequisite — all package/dep compile
@@ -3202,8 +3221,8 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
                         if (!json) mcpp::ui::warning(reason);
                     }
                     if (!json) mcpp::ui::plain(std::format("{} ... not run", r.name));
-                    results.push_back({r.name, TestResult::St::NotRun, 0, {}, {}, ms + r.buildMs, false,
-                                       reason});
+                    results.push_back({r.name, TestResult::St::NotRun, 0, {}, {}, ms, false,
+                                       reason, r.buildMs});
                     std::fflush(stdout);
                     emit_json(results.back());
                     continue;
@@ -3212,18 +3231,18 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
                     if (!json) mcpp::ui::plain(std::format(
                         "{} ... FAIL (timeout after {}s)", r.name, testOpts.timeoutSecs));
                     results.push_back({r.name, TestResult::St::RunFail, exitCode, {},
-                                       runOutput, ms + r.buildMs, true});
+                                       runOutput, ms, true, {}, r.buildMs});
                 } else if (exitCode == 0) {
                     if (!json) mcpp::ui::plain(std::format(
                         "{} ... ok ({:.2f}s)", r.name, static_cast<double>(ms) / 1000.0));
                     results.push_back({r.name, TestResult::St::Pass, 0, {},
-                                       runOutput, ms + r.buildMs});
+                                       runOutput, ms, false, {}, r.buildMs});
                 } else {
                     if (!json) mcpp::ui::plain(std::format(
                         "{} ... FAIL (exit {}, {:.2f}s)", r.name, exitCode,
                         static_cast<double>(ms) / 1000.0));
                     results.push_back({r.name, TestResult::St::RunFail, exitCode, {},
-                                       runOutput, ms + r.buildMs});
+                                       runOutput, ms, false, {}, r.buildMs});
                 }
                 // The captured output belongs directly under its own line, or
                 // it is attributable to nothing.
@@ -3372,7 +3391,7 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
     if (testOpts.noRun) {
         for (auto& r : runnable)
             results.push_back({r.name, TestResult::St::Built, 0, {}, {}, 0,
-                               false, {}});
+                               false, {}, r.buildMs});
     } else {
         run_tests_now(runnable);
     }
@@ -3666,6 +3685,10 @@ export void run_workspace_tests(std::span<const std::string> passthrough,
         bool        noMatch = false;  // no test matches the filter
         bool        packageFailed = false;
         std::string packageOutput;    // the diagnostics of its package's build
+        // Whether `packageOutput` was already printed, as the group's Phase A
+        // failure; a member's own failure that differs from it is printed at
+        // the member's turn, so a second broken member is not reported bare.
+        bool        packageOutputShown = false;
     };
     std::vector<Slot> slots(members.size());
     std::map<std::string, std::size_t> indexOf;
@@ -3803,6 +3826,8 @@ export void run_workspace_tests(std::span<const std::string> passthrough,
                     if (!r) {
                         slots[i].packageFailed = true;
                         slots[i].packageOutput = r.error().diagnosticOutput;
+                        slots[i].packageOutputShown =
+                            r.error().diagnosticOutput == a->diagnosticOutput;
                     }
                 }
             }
@@ -3812,6 +3837,7 @@ export void run_workspace_tests(std::span<const std::string> passthrough,
                 for (auto i : who) {
                     slots[i].packageFailed = true;
                     slots[i].packageOutput = a->diagnosticOutput;
+                    slots[i].packageOutputShown = true;
                 }
         }
         // The test goals of the members that can run.
@@ -3905,6 +3931,7 @@ export void run_workspace_tests(std::span<const std::string> passthrough,
                                  test_json_escape(m.path), test_json_escape(slot.packageOutput));
                 mcpp::ui::error(std::format(
                     "member '{}': its package did not build, so its tests did not run", m.path));
+                if (!json && !slot.packageOutputShown) mcpp::ui::block(slot.packageOutput);
                 rc = 1;
             } else {
                 rc = test_run_member(tb, testOpts, passthrough, json, m.path, slot.owner,

@@ -524,9 +524,11 @@ adds and does not redefine:
   - A consumer that sums `build_ms` over members deduplicates by
     `build_group`.
   - A consumer that does not sum is unaffected.
-- **Each test's `duration_ms`** stays "build+run wall time of this test".
-  Its build part is the sum of that test binary's own edges in
-  `.ninja_log`.
+- **Each test's `duration_ms`** keeps the meaning the code gave it: the run of
+  a test that ran, the build of a `compile_fail`. (The documentation's
+  "build+run" did not describe the measured value; it is corrected.) The test
+  binary's own build time, the sum of its edges in `.ninja_log`, is the added
+  field `build_ms`.
 - **The human report** prints one line per group: members, build time, and
   the slowest edges, for example `slowest: libs/jsc link 88s`. That keeps the
   signal the per-member split existed for: a member whose link, not its

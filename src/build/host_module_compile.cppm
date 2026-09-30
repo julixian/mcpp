@@ -285,7 +285,11 @@ run_step(std::string_view subject, const fs::path& cwd, const CompileEnv& env,
     return {};
 }
 
-// Moves what GCC wrote under `gcm.cache` to the entry's `bmi/`.
+// Moves what GCC wrote under `gcm.cache` to the entry's `bmi/`, and removes
+// what is left there: the copies of the imported BMIs `stage_for_gcc` put in
+// place for the compile (the std module's among them, tens of megabytes). They
+// are inputs of the compile, not part of the entry, and an entry that kept them
+// would carry a copy of `std` for every host module.
 std::expected<void, std::string>
 collect_gcc_bmis(const fs::path& scratch, std::string_view bmiDir,
                  const std::vector<std::string>& files) {
@@ -295,6 +299,7 @@ collect_gcc_bmis(const fs::path& scratch, std::string_view bmiDir,
         if (ec)
             return std::unexpected(std::format("the compiler wrote no {}: {}", f, ec.message()));
     }
+    fs::remove_all(scratch / std::string(bmiDir), ec);
     return {};
 }
 

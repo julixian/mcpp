@@ -201,8 +201,16 @@ void configurations(std::size_t n);
 void program_scheduled(std::string_view package, bool requested);
 void program_compiling(std::string_view package, bool requested);
 void program_running(std::string_view package, bool requested);
+// `compiledAside`: the program was compiled in the concurrent compile phase of
+// a workspace's programs (#748, B2), whose wall time `programs_compiled` states
+// once. Its own `compile` is still shown on its line, and is not added to the
+// command's program time a second time.
 void program_finished(std::string_view package, bool requested, ProgramOutcome outcome,
-                      std::chrono::milliseconds compile, std::chrono::milliseconds run);
+                      std::chrono::milliseconds compile, std::chrono::milliseconds run,
+                      bool compiledAside = false);
+// The wall time of the concurrent compile phase of a workspace's programs:
+// compiles that overlapped are counted once, as the time they took together.
+void programs_compiled(std::chrono::milliseconds wall);
 void programs_done();
 
 // The validations after ninja.
@@ -1265,7 +1273,8 @@ void program_running(std::string_view package, bool /*requested*/) {
 }
 
 void program_finished(std::string_view package, bool /*requested*/, ProgramOutcome outcome,
-                      std::chrono::milliseconds compile, std::chrono::milliseconds run) {
+                      std::chrono::milliseconds compile, std::chrono::milliseconds run,
+                      bool compiledAside) {
     auto& r = report();
     std::vector<std::string> out;
     {
@@ -1275,7 +1284,7 @@ void program_finished(std::string_view package, bool /*requested*/, ProgramOutco
         p.outcome = outcome;
         p.compile = compile;
         p.run     = run;
-        r.programTime += compile + run;
+        r.programTime += run + (compiledAside ? std::chrono::milliseconds{0} : compile);
         // A program whose result is reused did no work (revision 3, §7.1).
         if (outcome != ProgramOutcome::Cached || r.verbose) out.push_back(program_line(r, p));
     }
@@ -1284,6 +1293,12 @@ void program_finished(std::string_view package, bool /*requested*/, ProgramOutco
         outcome == ProgramOutcome::Cached ? "cached"
         : outcome == ProgramOutcome::Failed ? "failed"
         : std::format("compiled {}ms ran {}ms", compile.count(), run.count())));
+}
+
+void programs_compiled(std::chrono::milliseconds wall) {
+    auto& r = report();
+    std::lock_guard lock(r.m);
+    r.programTime += wall;
 }
 
 // The build programs are done and the plan continues. Measured with

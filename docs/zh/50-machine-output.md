@@ -550,7 +550,8 @@ mcpp test [pattern] [--workspace] --message-format json
 | `status` | `pass`、`compile_fail`、`run_fail`、`not_run` 或 `built` |
 | `exit_code` | 该测试的退出状态；`not_run` 与 `built` 时为 `0` |
 | `signal` | 状态编码了信号时为信号编号，否则为 `null` |
-| `duration_ms` | 该测试构建加运行的墙钟时间；构建部分是本次调用中该测试二进制自己的边在 `.ninja_log` 里的耗时之和，因此没有被重新构建的二进制为 `0` *（2026.10.1.1+；此前运行过的测试只报告运行耗时）* |
+| `duration_ms` | 决定该测试状态的那一步的墙钟时间：运行过的测试是运行，`compile_fail` 是构建 |
+| `build_ms` | 本次调用中该测试自身二进制的构建耗时，即它的链接边与主单元编译边在 `.ninja_log` 里的耗时之和；两者都未重新构建时为 `0` *（2026.10.1.1+）* |
 | `timed_out` | 被 `--timeout` 杀掉时为 `true`（`run_fail`） |
 | `compile_output`、`run_output` | 捕获到的诊断输出 |
 | `reason` | 仅 `not_run` 时：一句话说明原因；其余情况为 `""` |
@@ -588,7 +589,8 @@ mcpp test [pattern] [--workspace] --message-format json
 
 组内某个成员的包构建失败时，报告
 `{"error":"package","member":"…","compile_output":"…"}`，该组中包能构建的成员照常
-运行。对一个成员的测试既没有这条记录，也没有 `build_group`。
+运行。用 `-p` 或命令所在目录指定的单个成员的测试，既没有这条记录，也没有 `build_group`；
+全体选择（`--workspace`，或虚拟根下不带 `-p`）即使只含一个成员，也按分组形式报告。
 
 **`built` 与 `not_run` 是两个不同的答案，分开计数。** 两者描述的都是一个
 编译过、没有执行的测试，相似之处到此为止：`not_run` 意味着 mcpp 试过而做不

@@ -72,9 +72,14 @@ for m in a b; do
     [ "$ms" = "$gms" ] || fail "H: $m's build_ms ($ms) is not its group's ($gms)" h.json
     echo "$s" | grep -q '"elapsed_ms":' && echo "$s" | grep -q '"run_ms":' || fail "H: $m's summary lost a field" h.json
     grep -q "\"member\":\"$m\",\"test\":\"test_$m\",\"status\":\"pass\"" h.json || fail "H: no passing record for $m's test" h.json
-    # A test's duration_ms is its build and its run, so it is not below its run.
-    d=$(grep "\"member\":\"$m\",\"test\":" h.json | sed -n 's/.*"duration_ms":\([0-9][0-9]*\).*/\1/p')
+    # duration_ms keeps its meaning, the run of a test that ran; the test
+    # binary's own build is the added build_ms, which a first build makes
+    # non-zero.
+    rec=$(grep "\"member\":\"$m\",\"test\":" h.json)
+    d=$(echo "$rec" | sed -n 's/.*"duration_ms":\([0-9][0-9]*\).*/\1/p')
     [ -n "$d" ] || fail "H: no duration_ms for $m's test" h.json
+    b=$(echo "$rec" | sed -n 's/.*"build_ms":\([0-9][0-9]*\).*/\1/p')
+    [ -n "$b" ] || fail "H: no build_ms for $m's test" h.json
 done
 last=$(tail -1 h.json)
 case "$last" in

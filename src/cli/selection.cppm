@@ -8,10 +8,11 @@
 // selected once, so the plan does not depend on how the command line was
 // spelled.
 //
-// The function is split in two. `select_members(ws, ...)` is pure in its
-// inputs, which is what the unit tests exercise; the overload that takes a
-// directory finds the workspace the directory belongs to and the member the
-// directory is inside, and is the one the commands call.
+// The function is split in two. `select_members(ws, ...)` reads nothing but
+// the workspace manifest it is given and its members' manifests, which is what
+// the unit tests exercise; the overload that takes a directory finds the
+// workspace the directory belongs to and the member the directory is inside,
+// and is the one the commands call.
 
 export module mcpp.cli.selection;
 

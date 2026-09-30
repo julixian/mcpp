@@ -92,8 +92,8 @@ struct DeadlineRun {
 // window: a handle is inheritable from its creation to the moment the parent
 // closes it, and the start of the child lies between the two.)
 //
-// So every start on this platform that can inherit handles, the ones below and
-// the `_popen` calls of mcpp.platform.process, holds one process-wide section
+// So the starts that can run at the same time as another, the ones below and
+// the `_popen` calls of mcpp.platform.process, hold one process-wide section
 // from the creation of the pipe to the parent's close of its write end. The
 // alternative, `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, would restrict what OUR
 // launchers pass and leave `_popen` and any third party passing everything; the

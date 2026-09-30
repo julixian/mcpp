@@ -613,7 +613,8 @@ Per test:
 | `status` | `pass`, `compile_fail`, `run_fail`, `not_run`, or `built` |
 | `exit_code` | the test's exit status; `0` for `not_run` and `built` |
 | `signal` | the signal number when the status encodes one, else `null` |
-| `duration_ms` | build+run wall time of this test; the build part is the sum of this test binary's own edges in `.ninja_log` for this invocation, so it is `0` for a binary that was not rebuilt *(2026.10.1.1+; earlier, a test that ran reported its run alone)* |
+| `duration_ms` | the wall time of the step that decided the status: the run for a test that ran, the build for a `compile_fail` |
+| `build_ms` | the build time of this test's own binary in this invocation, the sum of its link edge and its main unit's compile edge in `.ninja_log`; `0` when neither was rebuilt *(2026.10.1.1+)* |
 | `timed_out` | `true` when `--timeout` killed it (`run_fail`) |
 | `compile_output`, `run_output` | captured diagnostics |
 | `reason` | `not_run` only: why, in one sentence; `""` otherwise |
@@ -654,8 +655,10 @@ stated once. One record per group precedes the group's first test record:
 
 A member whose package does not build in a group reports
 `{"error":"package","member":"…","compile_output":"…"}`, and the members of the
-group whose packages build still run. A test over one member has neither the
-record nor `build_group`.
+group whose packages build still run. A test of one member, named with `-p` or
+by the command's directory, has neither the record nor `build_group`; a
+whole-workspace selection (`--workspace`, or a virtual root without `-p`)
+reports in the per-group form even when it holds one member.
 
 **`built` and `not_run` are different answers and are counted apart.** Both
 describe a test that was compiled and not executed, and that is where the

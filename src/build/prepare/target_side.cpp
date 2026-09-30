@@ -1971,9 +1971,10 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
         return std::filesystem::exists(state.packages[i].root / "build.mcpp", bpEc)
             || !state.packages[i].manifest.buildConfig.ruleModules.empty();
     };
-    // mcpp runs them one after another, in this order, so every program not
-    // yet started is truly waiting; its line says so (build progress design
-    // 2026-09-29, §3.2), named as the program names itself.
+    // Their compiles may overlap (below), and their runs follow this order, so
+    // every program not yet run is waiting for its turn; its line says so
+    // (build progress design 2026-09-29, §3.2), named as the program names
+    // itself.
     for (auto const i : order) {
         if (!hasProgram(i)) continue;
         const auto& m = state.packages[i].manifest;
@@ -2043,10 +2044,11 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
     // run in the order above, each taking the compile made for it.
     //
     // What the compile phase leaves out is what keeps the plan the serial build's
-    // plan: it applies no directive, reports nothing, records no refusal and
-    // writes no cache. The runs below do all of that, in the same order as
-    // before, so `build.ninja` and the directives applied are byte for byte the
-    // serial build's. A program's environment is computed again at its turn, from
+    // plan: it applies no directive, reports no outcome, states no warning and
+    // writes no program cache. (It writes what the compile reads: the graph
+    // document and a program synthesised from rules.) The runs below do the
+    // rest, in the same order as before, so `build.ninja` and the directives
+    // applied are byte for byte the serial build's. A program's environment is computed again at its turn, from
     // the plan as the programs before it left it; the compile is used only when
     // it was made for what that computes, and is made again otherwise.
     std::vector<std::size_t> turns;   // the programs, in the order they run
@@ -2085,8 +2087,10 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
                             pkg.manifest, pkg.root, host->first, host->second,
                             pkg.manifest.cppStandard, *envs[k]);
                     } catch (const std::exception& ex) {
-                        // A compile that threw is a compile that failed; the
-                        // program's turn says so.
+                        // A compile that threw is a compile that failed. Its
+                        // empty stamp matches nothing, so the program's turn
+                        // compiles it again, alone, and reports what that
+                        // compile says.
                         precompiled[k] = {};
                         precompiled[k].compiled = true;
                         precompiled[k].stamp    = {};
@@ -2099,6 +2103,7 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
                     }
                 }
             };
+            const auto phaseBegan = std::chrono::steady_clock::now();
             std::vector<std::thread> pool;
             for (std::size_t w = 1; w < workers; ++w) {
                 // A thread the system cannot start is one fewer worker, and the
@@ -2107,6 +2112,11 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
             }
             work();
             for (auto& t : pool) t.join();
+            // The compiles overlapped, so the time they took is the phase's wall
+            // time, stated once; each program's line still shows its own.
+            mcpp::build::progress::programs_compiled(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - phaseBegan));
         }
     }
 
