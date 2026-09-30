@@ -139,6 +139,86 @@ TEST(DotsScreen, TheChomperStandsAtTheFraction) {
     EXPECT_EQ(sc.at(kWidth - 5, 1), Colour::Yellow);
 }
 
+// ─── Every frame returns (build wall-time plan, F1 and W1) ──────────────
+//
+// The ticker draws a frame while it holds the line lock, and the build joins
+// the ticker when ninja ends: a frame that does not return hangs the build
+// after it has finished. The stack animation did, in about 3% of builds that
+// chose it (66 of 2000 seeded runs of this shape). The property is stated
+// over seeds and input sequences, not by example, and a frame that never
+// returns cannot be joined, so the watchdog ends the test binary.
+
+namespace {
+
+void returns_within(std::chrono::seconds limit, std::string what,
+                    std::function<void()> body) {
+    auto done = std::make_shared<std::promise<void>>();
+    auto finished = done->get_future();
+    std::thread([body = std::move(body), done] {
+        body();
+        done->set_value();
+    }).detach();
+    if (finished.wait_for(limit) != std::future_status::ready) {
+        ADD_FAILURE() << what << " did not return within " << limit.count() << " s";
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
+}
+
+// A build of `total` steps that finishes in bursts at ten frames a second,
+// then `tail` more frames at its end; the failure input on one seed in eight.
+void play_build(Animation& a, std::uint64_t seed, std::size_t total, int tail) {
+    std::mt19937_64 rnd(seed);
+    std::size_t done = 0;
+    const bool fails = seed % 8 == 7;
+    for (int frame = 0; done < total || tail-- > 0; ++frame) {
+        const std::size_t burst = rnd() % 7 == 0 ? rnd() % 12 : rnd() % 2;
+        const std::size_t before = done;
+        done = std::min(total, done + burst);
+        Input in;
+        in.dt = 0.1;
+        in.finished = done - before;
+        in.fraction = static_cast<double>(done) / static_cast<double>(total);
+        in.failed = fails && done * 2 > total;
+        a.update(in);
+        if (frame % 16 == 0) a.package(static_cast<Source>(rnd() % 6));
+    }
+}
+
+} // namespace
+
+TEST(DotsScreen, EveryAnimationReturnsFromEveryFrame) {
+    for (auto name : mcpp::ui::dots_screen::names()) {
+        const std::string n(name);
+        returns_within(std::chrono::seconds(120), "an animation '" + n + "'", [n] {
+            for (std::uint64_t seed = 0; seed < 2000; ++seed) {
+                auto a = make(n, seed);
+                play_build(*a, seed, 240, 120);
+            }
+        });
+    }
+}
+
+TEST(DotsScreenGames, EveryGameReturnsFromEveryFrame) {
+    for (auto name : game_names()) {
+        const std::string n(name);
+        returns_within(std::chrono::seconds(120), "a game '" + n + "'", [n] {
+            constexpr Key kKeys[] = {Key::Up, Key::Down, Key::Left, Key::Right, Key::Space};
+            for (std::uint64_t seed = 0; seed < 500; ++seed) {
+                auto g = make_game(n, seed);
+                std::mt19937_64 rnd(seed);
+                Input in;
+                in.dt = 0.05;
+                for (int frame = 0; frame < 400; ++frame) {
+                    if (rnd() % 3 == 0) g->key(kKeys[rnd() % 5]);
+                    in.failed = frame > 300 && seed % 4 == 3;
+                    g->update(in);
+                }
+            }
+        });
+    }
+}
+
 // ─── The games of --play-game (design §5.14) ─────────────────────────────
 
 namespace {

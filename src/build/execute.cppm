@@ -1290,10 +1290,29 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
     int status = 0;
     bool reported = false;
     const auto prefixes = read_ninja_command_prefixes(ninjaPath);
+    // The scan pass comes first here as on the full path (build wall-time
+    // plan, W2): the same passes, so the same counts.
+    std::optional<std::vector<std::string>> scanArgv;
+    {
+        std::ifstream in(ninjaPath, std::ios::binary);
+        std::string text{std::istreambuf_iterator<char>(in), {}};
+        if (text.find("\nbuild " + std::string(mcpp::build::kScannedGoal) + " : phony")
+            != std::string::npos) {
+            scanArgv = argv;
+            scanArgv->push_back(std::string(mcpp::build::kScannedGoal));
+        }
+    }
     if (reporting) {
         mcpp::build::progress::Build report(outputDir);
-        auto run = mcpp::build::run_ninja_reporting(argv, childEnv, std::chrono::milliseconds{0},
-                                                    report, verbose, prefixes);
+        mcpp::build::NinjaRun run;
+        if (scanArgv)
+            run = mcpp::build::run_ninja_reporting(*scanArgv, childEnv, std::chrono::milliseconds{0},
+                                                   report, verbose, prefixes,
+                                                   mcpp::build::progress::PassKind::Scan);
+        // A failed scan ends the build with its own output.
+        if (run.exitCode == 0 && !run.timedOut)
+            run = mcpp::build::run_ninja_reporting(argv, childEnv, std::chrono::milliseconds{0},
+                                                   report, verbose, prefixes);
         out = std::move(run.output);
         status = run.exitCode;
         reported = run.reported;
@@ -1305,7 +1324,9 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
         // Nobody reads this ninja's progress: it reports no action start
         // (build progress design 2026-09-29, §6.4).
         childEnv.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
-        auto r = mcpp::platform::process::capture_exec(argv, childEnv);
+        mcpp::platform::process::RunResult r;
+        if (scanArgv) r = mcpp::platform::process::capture_exec(*scanArgv, childEnv);
+        if (r.exit_code == 0) r = mcpp::platform::process::capture_exec(argv, childEnv);
         out = std::move(r.output);
         status = r.exit_code;
     }

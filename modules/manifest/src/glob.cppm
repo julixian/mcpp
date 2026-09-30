@@ -127,6 +127,11 @@ void note_unnarrowable_path(const std::filesystem::path& p);
 // ("路径窄化不变式") and the user-facing behaviour in docs/04-mcpp-toml.md.
 std::vector<std::string> take_unnarrowable_paths();
 
+// Does `relative`, a generic spelling relative to the glob's root, match
+// `glob`? The matching half of path_matches_glob, for a caller that already
+// holds the narrowed relative spelling (a cached directory listing).
+bool relative_path_matches_glob(std::string_view relative, std::string_view glob);
+
 // Does `candidate` match `glob`, interpreted relative to `root`?
 //
 // Supports "**" (any number of directory levels) and "*" (within one segment).
@@ -149,7 +154,11 @@ bool path_matches_glob(const std::filesystem::path& candidate,
         note_unnarrowable_path(candidate);
         return false;
     }
+    return relative_path_matches_glob(*rel, glob);
+}
 
+bool relative_path_matches_glob(std::string_view relative, std::string_view glob)
+{
     auto match = [](std::string_view s, std::string_view p) -> bool {
         std::function<bool(std::size_t, std::size_t)> rec =
             [&](std::size_t si, std::size_t pi) -> bool {
@@ -185,7 +194,7 @@ bool path_matches_glob(const std::filesystem::path& candidate,
         };
         return rec(0, 0);
     };
-    return match(*rel, glob);
+    return match(relative, glob);
 }
 
 } // namespace mcpp::modgraph

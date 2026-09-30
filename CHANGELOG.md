@@ -4,6 +4,75 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.9.30.2] - 2026-09-30
+
+This release answers five reports on 2026.9.30.1 while building xlings
+(`.agents/docs/2026-09-30-build-wall-time-progress-count-and-hang-plan.md`): a
+build that did not exit after its status row stopped, a status row whose count
+was mostly bookkeeping, planning that preceded every edit's compile by three
+seconds, mcpp#744, and mcpp#732. On a clean build of xlings the command starts
+ninja at 1.3 s instead of 4.5 s; an edit of one source builds in 8.0 s instead
+of 10.5 s; a build with nothing to do is unchanged at 0.05 s.
+
+### Fixed
+
+- **A build no longer hangs after ninja.** The stack animation could spawn
+  pieces onto cells it already held once its stack reached the right edge
+  short of its target, and its loop then never ended while the status row held
+  the terminal's line lock; the build joined the row's thread and waited for
+  ever (about 1% of interactive builds). Every loop of the animation now grows
+  the stack or ends. A property test drives every animation over 2000 seeds and
+  every game over 500 under a watchdog; it fails on the previous animation.
+- **The status row counts the work of the build.** A clean build of xlings
+  counted 1195 steps, of which 503 placed files the global cache serves and 460
+  were dependency scans, and read 967/1195 when its first compile began. The
+  cache pass is reported by its `Cached` lines and not counted; the scans that
+  wait on no action run first, shown as `Scanning f/t`; and `Building f/t`
+  counts the compiles, links, archives and actions: 0/232 at the first compile
+  of the same build. The fast path runs the same passes (e2e 842, 843).
+- **A vendored xlings is replaced from the newest source (mcpp#744).**
+  `MCPP_VENDORED_XLINGS` when set, otherwise the newer of the xlings released
+  with mcpp and the xlings on `PATH`; the note that no newer source is
+  available was false when a newer xlings was on `PATH`. `Updating` and `Note`
+  are each stated once per process (e2e 846).
+- **A module name is unique within one program, not within one build
+  (mcpp#732).** An `artifacts` program, or a workspace member that shares no
+  program with another, may provide a module of the same name as another
+  program of the build. An import is resolved in the importing package's
+  closure; two BMIs of one name lie below their packages' directories, and each
+  compile is told which one a name means (a module map for GCC,
+  `-fmodule-file=` for Clang, `/reference` for MSVC). Two providers that one
+  program links are refused, naming that program's package, and one file
+  reached as two packages is recognised whatever its spelling. When every name
+  has one provider, `build.ninja` and `compile_commands.json` are byte-identical
+  to 2026.9.30.1's (e2e 847, 848).
+- **A BMI served from the global cache waits for the modules it imports that
+  the build compiles.** A module that a package's build program generates lies
+  below the consumer's target directory and is compiled in every build, also
+  when the rest of the package is staged from the cache (xpkg's `lua_stdlib`,
+  imported by its cached `executor`). Nothing ordered a consumer of the staged
+  BMI after that compile, so a fresh build could compile the consumer first and
+  fail with `failed to read compiled module`. The stage edge of such a BMI now
+  waits for those BMIs (e2e 849).
+
+### Changed
+
+- **Planning walks each package tree once.** A source pattern with an empty
+  literal prefix walked the whole package tree: the 127 patterns of
+  `compat.libarchive`, expanded about three times per plan, opened its 35
+  directories 13,406 times. A walk is now kept per tree for the command and
+  revalidated by its directories' modification times. A planned edit of one
+  xlings source opens 1,749 package directories instead of 30,372, and its
+  scan phase takes 43 ms instead of 0.91 s.
+- **The version of the vendored xlings is asked once.** It is kept per
+  process, and under the home keyed by the binary's path, size and
+  modification time, so a command that loads its configuration no longer runs
+  `xlings --version` (0.35 s) when the binary has not changed.
+- **Planning states where its time goes.** Each phase of planning, and each
+  step of its last phase, logs its duration under `build/stage` in the log
+  file, which `--verbose` or `MCPP_LOG_LEVEL=info` enables. The backend's own
+  stage lines are recorded in the file under the same condition.
+
 ## [2026.9.30.1] - 2026-09-30
 
 This release revises what a build prints, from a report on `mcpp build` in the

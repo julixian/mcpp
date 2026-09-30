@@ -56,6 +56,12 @@ struct CompileUnit {
     // (`_SMF_control` has no matching constructor), and the error names this
     // struct from whichever unit copies a CompileUnit first.
     std::string                     providesModule;
+    // The unit's BMI, relative to the toolchain's BMI directory: the module's
+    // name (`common.gcm`) when one package of the plan provides it, and below
+    // the provider's directory (`gpp.updater/common.gcm`) when two do
+    // (mcpp#732). Empty on a unit that provides nothing, and on a unit built
+    // by hand, which then takes the name.
+    std::string                     bmiFile;
     std::vector<std::string>        imports;           // logical names imported
     // Unit came from a scan_overrides declaration — plan-vs-ddi
     // verification is mandatory for it (ninja_backend emits --expect-*).
@@ -310,6 +316,20 @@ struct PlanPackage {
     std::string source;
 };
 
+// mcpp#732: a package whose closure holds a module name that two packages of
+// the plan provide. Its units are told which BMI each name means: through
+// `mapFile` for GCC, whose mapper does not fall back for a name it does not
+// list, and by one flag per such name for clang and MSVC. The dyndep step
+// reads `mapFile` on every compiler.
+struct ModuleScope {
+    // Relative to the build directory, with a hash of `content` in its name,
+    // so a changed resolution changes the flag that names it.
+    std::filesystem::path mapFile;
+    // `<module name> <BMI path relative to the build directory>` lines, one
+    // per name the package's units may import, sorted by name.
+    std::string           content;
+};
+
 struct BuildPlan {
     mcpp::manifest::Manifest        manifest;
     // Every package of the graph, as the report names it; the backend writes
@@ -417,6 +437,10 @@ struct BuildPlan {
     std::filesystem::path           stdBmiPath;      // absolute path to prebuilt std.gcm
     std::filesystem::path           stdObjectPath;   // absolute path to prebuilt std.o
     std::filesystem::path           stdCompatBmiPath;    // absolute path to prebuilt std.compat.pcm
+    // mcpp#732: by qualified package name. Empty when every module name of the
+    // plan has one provider, and then the build directory is laid out, and
+    // every command spelled, exactly as before.
+    std::map<std::string, ModuleScope, std::less<>> moduleScopes;
     std::filesystem::path           stdCompatObjectPath; // absolute path to prebuilt std.compat.o
     std::filesystem::path           scanDepsPath;    // clang-scan-deps binary (Clang only)
     // NASM assembly (.asm sources). Both resolved in prepare AFTER the plan
@@ -2106,14 +2130,6 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         }
     }
 
-    // 2. Build map of module-name → compile unit (for inter-unit dep resolution)
-    std::map<std::string, std::size_t> producerOf;
-    for (std::size_t i = 0; i < plan.compileUnits.size(); ++i) {
-        if (!plan.compileUnits[i].providesModule.empty()) {
-            producerOf[plan.compileUnits[i].providesModule] = i;
-        }
-    }
-
     // 3. Compute the set of all targets' entry .cpp files. Each entry is
     //    exclusive to its target — when assembling another target's link
     //    image we must NOT pull in foreign entries (they each define
@@ -3160,6 +3176,114 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     // covers the package's own shared targets and its dependencies' alike.
     for (auto const& lu : plan.linkUnits) {
         if (lu.kind == LinkUnit::SharedLibrary) { plan.needsPic = true; break; }
+    }
+
+    // MODULE NAMES ARE RESOLVED IN THE IMPORTER'S CLOSURE (mcpp#732). A module
+    // name identifies one module within one program, and a plan holds several
+    // programs (a package and the programs it ships through `artifacts`, a
+    // workspace's members), so two packages of one plan may each provide
+    // `common` when no closure holds both (the scanner refuses the rest).
+    // Every compiler finds a BMI by name in one directory, so the two BMIs go
+    // below their providers' directories, and the units that may import such a
+    // name are told which one it means. With every name provided once, none of
+    // this applies: no unit moves, no flag is added. At the end of make_plan,
+    // after every producer of a compile unit (a target's `main` included).
+    {
+        const auto traits = mcpp::toolchain::bmi_traits(tc);
+        std::set<std::string, std::less<>> collided;
+        for (auto const& [name, units] : graph.providersOf)
+            if (units.size() > 1) collided.insert(name);
+        auto basename = [&](std::string_view name) {
+            std::string out;
+            for (char c : name) out.push_back(c == ':' ? '-' : c);
+            out += traits.bmiExt;
+            return out;
+        };
+        auto bmi_file = [&](std::string_view provider, std::string_view name) {
+            return collided.contains(name) ? std::string(provider) + "/" + basename(name)
+                                           : basename(name);
+        };
+        for (auto& cu : plan.compileUnits)
+            if (!cu.providesModule.empty())
+                cu.bmiFile = bmi_file(cu.packageName, cu.providesModule);
+
+        if (!collided.empty()) {
+            const bool gcc = traits.moduleFileUsePrefix.empty();
+            std::set<std::string, std::less<>> packagesWithUnits;
+            for (auto const& cu : plan.compileUnits) packagesWithUnits.insert(cu.packageName);
+            std::map<std::string, std::vector<std::string>, std::less<>> flagsOf;
+            for (auto const& pkg : packagesWithUnits) {
+                std::vector<std::pair<std::string, std::string>> entries;   // name -> BMI
+                std::vector<std::pair<std::string, std::string>> bound;     // collided ones
+                for (auto const& [name, units] : graph.providersOf) {
+                    auto provider = mcpp::modgraph::resolve_provider(graph, pkg, name);
+                    if (!provider) continue;
+                    const auto path = std::string(traits.bmiDir) + "/"
+                        + bmi_file(graph.units[*provider].packageName, name);
+                    entries.emplace_back(name, path);
+                    if (collided.contains(name)) bound.emplace_back(name, path);
+                }
+                if (bound.empty()) continue;   // sees no collided name
+                // GCC's mapper answers only what it lists. The standard
+                // library modules, and any name a unit of the package imports
+                // that no unit of the graph provides (a BMI placed by other
+                // means), are listed where GCC's own mapper puts them.
+                if (gcc) {
+                    std::set<std::string, std::less<>> listed;
+                    for (auto const& [name, path] : entries) listed.insert(name);
+                    auto flat = [&](const std::string& name) {
+                        if (listed.insert(name).second)
+                            entries.emplace_back(name, std::string(traits.bmiDir) + "/" + basename(name));
+                    };
+                    flat("std");
+                    flat("std.compat");
+                    for (auto const& cu : plan.compileUnits)
+                        if (cu.packageName == pkg)
+                            for (auto const& imp : cu.imports)
+                                if (!graph.providersOf.contains(imp)) flat(imp);
+                }
+                std::sort(entries.begin(), entries.end());
+                ModuleScope scope;
+                for (auto const& [name, path] : entries) scope.content += name + " " + path + "\n";
+                scope.mapFile = std::filesystem::path("modmap")
+                    / std::format("{}-{}.map", pkg,
+                                  mcpp::toolchain::hash_string(scope.content).substr(0, 8));
+                auto& flags = flagsOf[pkg];
+                if (gcc) {
+                    flags.push_back(mcpp::manifest::flag_element(
+                        "-fmodule-mapper=" + scope.mapFile.generic_string()));
+                } else {
+                    // `-fmodule-file=<name>=<path>` (clang) or `/reference
+                    // <name>=<path>` (MSVC), with an absolute path so the
+                    // compile databases, whose directory is the project,
+                    // name the same file.
+                    std::string_view prefix = traits.moduleFileUsePrefix;
+                    while (!prefix.empty() && prefix.front() == ' ') prefix.remove_prefix(1);
+                    const bool separate = !prefix.empty() && prefix.back() == ' ';
+                    if (separate) prefix.remove_suffix(1);
+                    for (auto const& [name, path] : bound) {
+                        auto bmi = outputDir / std::filesystem::path(path);
+                        bmi.make_preferred();
+                        const auto value = name + "=" + bmi.string();
+                        if (separate) {
+                            flags.push_back(std::string(prefix));
+                            flags.push_back(mcpp::manifest::flag_element(value));
+                        } else {
+                            flags.push_back(mcpp::manifest::flag_element(std::string(prefix) + value));
+                        }
+                    }
+                }
+                plan.moduleScopes.emplace(pkg, std::move(scope));
+            }
+            for (auto& cu : plan.compileUnits) {
+                if (cu.kind != mcpp::SourceKind::ModuleInterface
+                    && cu.kind != mcpp::SourceKind::Cxx)
+                    continue;
+                if (auto f = flagsOf.find(cu.packageName); f != flagsOf.end())
+                    cu.packageCxxflags.insert(cu.packageCxxflags.end(),
+                                              f->second.begin(), f->second.end());
+            }
+        }
     }
 
     return plan;

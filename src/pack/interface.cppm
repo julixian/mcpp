@@ -120,18 +120,23 @@ interface_closure(const mcpp::modgraph::Graph& graph,
         return u.packageName == packageName;
     };
 
-    auto rootIt = graph.producerOf.find(rootModule);
-    if (rootIt == graph.producerOf.end()) {
+    // The package's own import of a name, resolved as every import is
+    // (mcpp#732): a name two packages provide means the one in its closure.
+    auto provider = [&](std::string_view name) {
+        return mcpp::modgraph::resolve_provider(graph, packageName, name);
+    };
+    const auto root = provider(rootModule);
+    if (!root) {
         return std::unexpected(std::format(
             "no module interface unit in this build provides '{}'", rootModule));
     }
-    if (!owned(graph.units[rootIt->second])) {
+    if (!owned(graph.units[*root])) {
         return std::unexpected(std::format(
             "module '{}' is provided by package '{}', not '{}'", rootModule,
-            graph.units[rootIt->second].packageName, packageName));
+            graph.units[*root].packageName, packageName));
     }
 
-    std::vector<std::size_t> stack{ rootIt->second };
+    std::vector<std::size_t> stack{ *root };
     std::set<std::size_t> seen;
     std::set<std::string> unresolved;
 
@@ -154,8 +159,8 @@ interface_closure(const mcpp::modgraph::Graph& graph,
         }
 
         for (auto const& req : u.requires_) {
-            auto it = graph.producerOf.find(req.logicalName);
-            if (it == graph.producerOf.end()) {
+            const auto found = provider(req.logicalName);
+            if (!found) {
                 // Only OUR module's partitions are our problem. A bare name
                 // with no producer is a dependency's module (or `std`), which
                 // this package does not publish and must not complain about.
@@ -163,8 +168,8 @@ interface_closure(const mcpp::modgraph::Graph& graph,
                 if (ours) unresolved.insert(req.logicalName);
                 continue;
             }
-            if (!owned(graph.units[it->second])) continue;   // a dependency's unit
-            if (!seen.contains(it->second)) stack.push_back(it->second);
+            if (!owned(graph.units[*found])) continue;   // a dependency's unit
+            if (!seen.contains(*found)) stack.push_back(*found);
         }
     }
 

@@ -1222,6 +1222,19 @@ export int cmd_dyndep(const mcpplibs::cmdline::ParsedArgs& parsed) {
     if (!bmiExtStorage.empty())
         opts.bmiExt = bmiExtStorage;
     opts.splitModuleEdges = parsed.is_flag_set("split-module");
+    // mcpp#732: the package's module map, when two packages of the plan
+    // provide one module name.
+    std::map<std::string, std::string, std::less<>> moduleMap;
+    if (auto mm = parsed.option_or_empty("module-map").value(); !mm.empty()) {
+        std::ifstream is{mcpp::platform::fs::extended_length(std::filesystem::path{mm})};
+        if (!is) {
+            std::println(stderr, "error: cannot read module map '{}'", mm);
+            return 1;
+        }
+        std::string mapBody{std::istreambuf_iterator<char>(is), {}};
+        moduleMap = mcpp::dyndep::parse_module_map(mapBody);
+        opts.moduleMap = &moduleMap;
+    }
 
     std::expected<std::string, std::string> body;
     if (single) {

@@ -95,7 +95,14 @@ NinjaRun run_ninja_reporting(const std::vector<std::string>& argv,
                              std::chrono::milliseconds deadline,
                              mcpp::build::progress::Build& progress,
                              bool verbose,
-                             std::span<const std::string> commandPrefixes);
+                             std::span<const std::string> commandPrefixes,
+                             mcpp::build::progress::PassKind kind =
+                                 mcpp::build::progress::PassKind::Work);
+
+// The goal of the scan pass (build wall-time plan, W2): the dyndep file of
+// every unit whose scan waits on no action. Present in build.ninja when the
+// graph scans such a unit.
+inline constexpr std::string_view kScannedGoal = "_mcpp_scanned";
 
 // The step record of a plan (design §6.3): how the plan names its packages,
 // and which package each statement of `attribution` is for.
@@ -1175,10 +1182,11 @@ NinjaRun run_ninja_reporting(const std::vector<std::string>& argv,
                              std::chrono::milliseconds deadline,
                              mcpp::build::progress::Build& progress,
                              bool verbose,
-                             std::span<const std::string> commandPrefixes) {
+                             std::span<const std::string> commandPrefixes,
+                             mcpp::build::progress::PassKind kind) {
     NinjaRun run;
     for (auto& kv : progress.environment()) env.push_back(std::move(kv));
-    progress.pass_begin();
+    progress.pass_begin(kind);
     // The lines after `FAILED:` up to the next status line are the failed
     // step's command and output; the lines after a status line alone are a
     // successful step's output, which only --verbose shows (as before).
@@ -1483,12 +1491,16 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // are actually SPLIT bind their record to the BMI. An implementation unit
     // or a plain .cpp still compiles in one edge whose output is the object,
     // and a `--target-bmi` there would name an edge nobody declared.
+    //
+    // `$module_map` (mcpp#732) names the package's module map when two packages
+    // of the plan provide one module name; the rule carries it only then, so
+    // a plan without such a name writes the file it always wrote.
     append(std::format(
         "rule cxx_dyndep\n"
-        "  command = $mcpp dyndep --single --bmi-dir {} --bmi-ext {} $bind $expect --output $out $in\n"
+        "  command = $mcpp dyndep --single --bmi-dir {} --bmi-ext {} $bind $expect{} --output $out $in\n"
         "  description = DYNDEP $out\n"
         "  restat = 1\n\n",
-        traits.bmiDir, traits.bmiExt));
+        traits.bmiDir, traits.bmiExt, plan.moduleScopes.empty() ? "" : " $module_map"));
 
     // P2: cxx_module preserves BMI timestamps when interface is unchanged.
     // GCC always updates the .gcm timestamp even if content is identical.
@@ -2234,21 +2246,43 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // exactly one symbol (`_ZGIW3std`, measured) and an importing TU references
     // it, so a missed unit is an undefined symbol at link time rather than a
     // silent miscompile.
-    std::unordered_map<std::string, const CompileUnit*> byModule;
+    // The module map of each package whose closure holds a name two packages
+    // provide (mcpp#732): module name -> BMI path, as the plan resolved it.
+    std::map<std::string, std::map<std::string, std::string, std::less<>>, std::less<>> scopeBmis;
+    for (auto const& [pkg, scope] : plan.moduleScopes) {
+        auto& m = scopeBmis[pkg];
+        std::istringstream lines(scope.content);
+        for (std::string name, path; lines >> name >> path;) m[name] = path;
+    }
+    std::unordered_map<std::string, std::vector<const CompileUnit*>> byModule;
     for (auto& cu : plan.compileUnits)
-        if (!cu.providesModule.empty()) byModule.emplace(cu.providesModule, &cu);
+        if (!cu.providesModule.empty()) byModule[cu.providesModule].push_back(&cu);
+    // The unit `importer`'s import of `name` means: the one provider, or the
+    // one its package's module map names.
+    auto provider_of = [&](const CompileUnit& importer,
+                           const std::string& name) -> const CompileUnit* {
+        auto it = byModule.find(name);
+        if (it == byModule.end()) return nullptr;
+        if (it->second.size() == 1) return it->second.front();
+        auto sc = scopeBmis.find(importer.packageName);
+        if (sc == scopeBmis.end()) return nullptr;
+        auto m = sc->second.find(name);
+        if (m == sc->second.end()) return nullptr;
+        for (auto const* c : it->second)
+            if (std::string(traits.bmiDir) + "/" + c->bmiFile == m->second) return c;
+        return nullptr;
+    };
 
     auto reaches_std = [&](const CompileUnit& start) {
         std::vector<const CompileUnit*> stack{&start};
-        std::unordered_set<std::string> seen;
+        std::unordered_set<const CompileUnit*> seen;
         while (!stack.empty()) {
             const CompileUnit* cu = stack.back();
             stack.pop_back();
             for (auto& imp : cu->imports) {
                 if (imp == "std" || imp == "std.compat") return true;
-                if (!seen.insert(imp).second) continue;
-                if (auto it = byModule.find(imp); it != byModule.end())
-                    stack.push_back(it->second);
+                auto const* next = provider_of(*cu, imp);
+                if (next && seen.insert(next).second) stack.push_back(next);
             }
         }
         return false;
@@ -2329,6 +2363,19 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         s += traits.bmiExt;
         return s;
     };
+    // The BMI a unit provides, where the plan placed it: below its package's
+    // directory when two packages provide its module name (mcpp#732).
+    auto unit_bmi = [&](const mcpp::build::CompileUnit& cu) {
+        return cu.bmiFile.empty() ? bmi_path(cu.providesModule)
+                                  : std::string(traits.bmiDir) + "/" + cu.bmiFile;
+    };
+    // The BMI `cu`'s import of `name` means: its package's module map when it
+    // has one, and the module's own name otherwise.
+    auto import_bmi = [&](const mcpp::build::CompileUnit& cu, std::string_view name) {
+        if (auto sc = scopeBmis.find(cu.packageName); sc != scopeBmis.end())
+            if (auto it = sc->second.find(name); it != sc->second.end()) return it->second;
+        return bmi_path(name);
+    };
 
     // Rule selection is a pure function of the unit's KIND — never of its
     // extension. mcpp#272 fixed link-object collection while this stayed
@@ -2357,7 +2404,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                                     traits.moduleInterfaceLangFlag);
         if (traits.needsExplicitModuleOutput)
             v += std::format("  module_output ={}{}\n", traits.moduleOutputPrefix,
-                             bmi_path(cu.providesModule));
+                             unit_bmi(cu));
         return v;
     };
 
@@ -2412,24 +2459,58 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // changed BMI still invalidates its consumers — this adds sequencing, not
     // dirtiness. The cost is that a handful of copies finish before compilation
     // starts, which is what used to happen anyway when those units were built.
+    //
+    // The other direction. A staged BMI is read together with the BMIs of the
+    // modules it imports, and one of those can be compiled HERE: a unit of the
+    // package that its cache entry does not hold, such as a source the
+    // package's build program writes below the consumer's target directory
+    // (xpkg's `lua_stdlib`), or a module of a package that is not cached. The
+    // consumer's dyndep names the staged BMI only, so the stage edge itself
+    // waits for those BMIs, and a staged BMI that imports such a stage waits
+    // for it in turn. Such a stage stays out of the aggregate: every compile
+    // edge waits for the aggregate, and the compile the stage waits for is one
+    // of them.
     std::string stagedOrderOnly;
     {
+        const auto is_staged = [](const CompileUnit& cu) {
+            return cu.servedFromCache && !cu.cachedObject.empty();
+        };
+        // Whether the BMI of `cu` exists only after a compile of this build:
+        // it is compiled here, or it is staged and imports such a BMI.
+        std::unordered_map<const CompileUnit*, bool> late;
+        std::function<bool(const CompileUnit&)> after_a_compile =
+            [&](const CompileUnit& cu) -> bool {
+            if (!is_staged(cu)) return true;
+            if (auto it = late.find(&cu); it != late.end()) return it->second;
+            late[&cu] = false;          // module imports form no cycle
+            bool waits = false;
+            for (auto& imp : cu.imports)
+                if (auto const* p = provider_of(cu, imp); p && after_a_compile(*p)) {
+                    waits = true;
+                    break;
+                }
+            return late[&cu] = waits;
+        };
         std::vector<std::string> staged;
         for (auto& cu : plan.compileUnits) {
             attribute(cu.packageName);
-            if (!cu.servedFromCache) continue;
-            if (cu.cachedObject.empty()) continue;
+            if (!is_staged(cu)) continue;
             auto obj = escape_ninja_path(cu.object);
             append(std::format("build {} : stage_file {}\n", obj,
                                escape_ninja_path(cu.cachedObject)));
             append("  verify = --verify size\n");
             staged.push_back(obj);
             if (!cu.providesModule.empty() && !cu.cachedBmi.empty()) {
-                auto bmi = bmi_path(cu.providesModule);
-                append(std::format("build {} : stage_file {}\n", bmi,
-                                   escape_ninja_path(cu.cachedBmi)));
+                auto bmi = unit_bmi(cu);
+                std::string waitsFor;
+                for (auto& imp : cu.imports)
+                    if (auto const* p = provider_of(cu, imp); p && after_a_compile(*p))
+                        waitsFor += " " + import_bmi(cu, imp);
+                append(std::format("build {} : stage_file {}{}\n", bmi,
+                                   escape_ninja_path(cu.cachedBmi),
+                                   waitsFor.empty() ? "" : " ||" + waitsFor));
                 append("  verify = --verify size\n");
-                staged.push_back(bmi);
+                if (waitsFor.empty()) staged.push_back(bmi);
             }
         }
         if (!staged.empty()) {
@@ -2557,7 +2638,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             append(std::format("  compile_target = {}\n", escape_ninja_path(cu.object)));
             append(std::format("  deps_target = {}\n",
                                splitBmi && !cu.providesModule.empty()
-                                   ? bmi_path(cu.providesModule)
+                                   ? unit_bmi(cu)
                                    : escape_ninja_path(cu.object)));
             if (auto includes = local_include_flags(cu, dial); !includes.empty())
                 append(std::format("  local_includes ={}\n", includes));
@@ -2645,10 +2726,29 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             append(std::format("build {} : cxx_dyndep {}\n", dd, ddi));
             if (two_phase_ddi.contains(ddi))
                 append("  bind = --split-module\n");
+            if (auto sc = plan.moduleScopes.find(ddiOwner[ddi]); sc != plan.moduleScopes.end())
+                append(std::format("  module_map = --module-map {}\n",
+                                   escape_ninja_path(sc->second.mapFile)));
             if (auto it = ddi_expect.find(ddi); it != ddi_expect.end())
                 append(std::format("  expect = {}\n", it->second));
         }
         append("\n");
+
+        // THE SCAN PASS'S GOAL (build wall-time plan, W2): the dyndep file of
+        // every unit whose scan waits on no action. A scan waits on its
+        // package's actions that precede compilation (`order_only_for`), and
+        // a pass over those scans would hold every compile behind the longest
+        // such action; they stay in the main pass.
+        {
+            std::string goal;
+            for (auto& ddi : ddi_paths) {
+                auto it = actionOutputsByPackage.find(ddiOwner[ddi]);
+                if (it != actionOutputsByPackage.end() && !it->second.empty()) continue;
+                goal += " " + ddi + ".dd";
+            }
+            if (!goal.empty())
+                append(std::format("build {} : phony{}\n\n", kScannedGoal, goal));
+        }
 
         // ── Phase 3: compile edges with per-file dyndep. ────────────────
         // Each compile edge references its OWN .dd file instead of a global one.
@@ -2660,7 +2760,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
 
             if (splitBmi && !cu.providesModule.empty() &&
                 cu.kind == mcpp::SourceKind::ModuleInterface) {
-                const auto bmi  = bmi_path(cu.providesModule);
+                const auto bmi  = unit_bmi(cu);
                 const auto obj  = escape_ninja_path(cu.object);
                 const auto slot = obj + ".sched";
                 const auto ddi  = (cu.object.parent_path() / cu.source.filename())
@@ -2725,7 +2825,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
 
             if (twoPhase && !cu.providesModule.empty() &&
                 cu.kind == mcpp::SourceKind::ModuleInterface) {
-                const auto bmi = bmi_path(cu.providesModule);
+                const auto bmi = unit_bmi(cu);
                 const auto obj = escape_ninja_path(cu.object);
                 const auto ddi = (cu.object.parent_path() / cu.source.filename())
                                      .string() + ".ddi";
@@ -2757,7 +2857,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
 
             std::string out_line = "build " + escape_ninja_path(cu.object);
             if (!cu.providesModule.empty()) {
-                out_line += " | " + bmi_path(cu.providesModule);
+                out_line += " | " + unit_bmi(cu);
             }
             out_line += std::format(" : {} {}", rule, escape_ninja_path(cu.source));
             if (!is_scan_exempt(cu)) {
@@ -2769,7 +2869,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                     out_line += "\n  dyndep = " + it->second;
                     // P2: set bmi_out for the copy_if_different logic in cxx_module.
                     if (!cu.providesModule.empty()) {
-                        out_line += "\n  bmi_out = " + bmi_path(cu.providesModule);
+                        out_line += "\n  bmi_out = " + unit_bmi(cu);
                     }
                     out_line += "\n";
                     if (rule == "cxx_module") out_line += module_edge_vars(cu);
@@ -2817,7 +2917,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                             implicit += " " + escape_ninja_path(std_bmi_dst);
                         continue;
                     }
-                    implicit += " " + bmi_path(imp);
+                    implicit += " " + import_bmi(cu, imp);
                 }
             }
 
@@ -2825,7 +2925,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             if (!cu.providesModule.empty()) {
                 // Use implicit output (|) so $out only contains the .o file.
                 // GCC writes BMI implicitly; Clang uses -fmodule-output=$bmi_out.
-                out_line += " | " + bmi_path(cu.providesModule);
+                out_line += " | " + unit_bmi(cu);
             }
             out_line += std::format(" : {} {}", rule, escape_ninja_path(cu.source));
             if (!implicit.empty())
@@ -2846,7 +2946,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             }
             // Clang needs $bmi_out to emit -fmodule-output=$bmi_out
             if (!cu.providesModule.empty()) {
-                out_line += "  bmi_out = " + bmi_path(cu.providesModule) + "\n";
+                out_line += "  bmi_out = " + unit_bmi(cu) + "\n";
             }
             if (rule == "cxx_module") out_line += module_edge_vars(cu);
             append(std::move(out_line));
@@ -3862,7 +3962,10 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     // because the only number reported is the total.
     auto tStage = t0;
     auto stage = [&](std::string_view what) {
-        if (!mcpp::log::is_verbose()) { tStage = std::chrono::steady_clock::now(); return; }
+        if (!mcpp::log::is_verbose() && !mcpp::log::is_enabled(mcpp::log::Level::info)) {
+            tStage = std::chrono::steady_clock::now();
+            return;
+        }
         auto now = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - tStage).count();
         tStage = now;
@@ -3916,6 +4019,16 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
             std::filesystem::create_directories(plan.outputDir, lec);
             std::ofstream(listPath, std::ios::binary | std::ios::trunc) << placements;
         }
+    }
+    // mcpp#732: the module maps the units of a package read when two packages
+    // provide one module name. The content's hash is in the name, so a file
+    // that exists is already right; a changed resolution names a new file.
+    for (auto const& [pkg, scope] : plan.moduleScopes) {
+        const auto path = plan.outputDir / scope.mapFile;
+        std::error_code mec;
+        if (std::filesystem::exists(path, mec)) continue;
+        std::filesystem::create_directories(path.parent_path(), mec);
+        std::ofstream(path, std::ios::binary | std::ios::trunc) << scope.content;
     }
 
     // Command-length backstop (see
@@ -4231,7 +4344,8 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
             std::vector<std::string> pre{ninjaProgram, "-C", plan.outputDir.string(),
                                          std::string(kStagedCacheGoal)};
             (void)run_ninja_reporting(pre, nenv, preDeadline, *opts.progress, opts.verbose,
-                                      command_prefixes(flags, plan));
+                                      command_prefixes(flags, plan),
+                                      mcpp::build::progress::PassKind::Placement);
         } else {
             std::vector<std::string> pre{ninjaProgram, "--quiet", "-C", plan.outputDir.string(),
                                          std::string(kStagedCacheGoal)};
@@ -4244,13 +4358,71 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         stage("ninja-staged-cache");
     }
 
+    // THE SCANS THAT WAIT ON NO ACTION RUN IN A PASS OF THEIR OWN, after the
+    // cache pass and before the main pass (build wall-time plan, W2). The
+    // main pass's count then states the work of the build, its compiles,
+    // links, archives and actions, instead of 460 scans of which all end in
+    // the first quarter second; and every dyndep file of those units is
+    // current when the main pass loads them, as the cache pass arranges for
+    // its placements (ninja-build/ninja#2662). A build of named goals (a test,
+    // a target) scans in its main pass: a pass over every scan would scan
+    // units its goals never compile.
     bool buildTimedOut = false;
     bool reported = false;
     std::string out;
     int ninjaExit = 0;
+    bool scanFailed = false;
+    // Under `-k` the build goes on past a failure and states every one, so
+    // the scans run in the main pass there: a failed scan pass would end the
+    // build at its first failure, and running both would state a failed scan
+    // twice.
+    if (goalArg.empty() && !opts.keepGoing
+        && manifest.find("\nbuild " + std::string(kScannedGoal) + " : phony") != std::string::npos) {
+        const auto scanDeadline =
+            std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000);
+        // The main pass's options, and its goal last.
+        std::vector<std::string> scan{ninjaProgram};
+        if (!opts.verbose && !opts.progress) scan.push_back("--quiet");
+        scan.insert(scan.end(), {std::string("-C"), plan.outputDir.string()});
+        if (opts.verbose) scan.push_back("-v");
+        if (const char* topics = std::getenv("MCPP_NINJA_DEBUG"); topics && *topics) {
+            scan.push_back("-d");
+            scan.push_back(topics);
+        }
+        if (opts.parallelJobs) scan.push_back(std::format("-j{}", opts.parallelJobs));
+        scan.push_back(std::string(kScannedGoal));
+        if (opts.progress) {
+            auto run = run_ninja_reporting(scan, nenv, scanDeadline, *opts.progress, opts.verbose,
+                                           command_prefixes(flags, plan),
+                                           mcpp::build::progress::PassKind::Scan);
+            if (run.exitCode != 0 || run.timedOut) {
+                out = std::move(run.output);
+                ninjaExit = run.exitCode;
+                buildTimedOut = run.timedOut;
+                reported = run.reported;
+                scanFailed = true;
+            }
+        } else {
+            auto scanEnv = nenv;
+            scanEnv.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
+            auto cap = mcpp::platform::process::capture_exec_deadline(
+                scan, scanEnv, scanDeadline, &buildTimedOut);
+            if (cap.exit_code != 0 || buildTimedOut) {
+                out = std::move(cap.output);
+                ninjaExit = cap.exit_code;
+                scanFailed = true;
+            }
+        }
+        stage("ninja-scan");
+    }
+
+    // A failed scan ends the build with its own output: the main pass would
+    // run the failed step again and state its diagnostics a second time.
     const auto deadline =
         std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000);
-    if (opts.progress) {
+    if (scanFailed) {
+        // `out`, `ninjaExit`, `buildTimedOut` and `reported` are the scan's.
+    } else if (opts.progress) {
         auto run = run_ninja_reporting(nargv, nenv, deadline, *opts.progress, opts.verbose,
                                        command_prefixes(flags, plan));
         out = std::move(run.output);

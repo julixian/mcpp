@@ -62,11 +62,15 @@ stage_configure_prerequisites(const BuildPlan& plan) {
         if (!unit.servedFromCache || unit.providesModule.empty()
             || unit.cachedBmi.empty()) continue;
 
-        std::string fileName;
-        fileName.reserve(unit.providesModule.size() + traits.bmiExt.size());
-        for (char ch : unit.providesModule)
-            fileName.push_back(ch == ':' ? '-' : ch);
-        fileName += traits.bmiExt;
+        // Where the plan placed the unit's BMI: below its package's directory
+        // when two packages provide its module name (mcpp#732).
+        std::string fileName = unit.bmiFile;
+        if (fileName.empty()) {
+            fileName.reserve(unit.providesModule.size() + traits.bmiExt.size());
+            for (char ch : unit.providesModule)
+                fileName.push_back(ch == ':' ? '-' : ch);
+            fileName += traits.bmiExt;
+        }
 
         auto result = stage_one(
             unit.cachedBmi, plan.outputDir / traits.bmiDir / fileName,

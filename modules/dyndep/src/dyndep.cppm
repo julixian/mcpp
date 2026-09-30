@@ -54,7 +54,17 @@ struct DyndepOptions {
     // A unit that provides nothing (implementation unit, plain .cpp) is not
     // split, so it keeps its single record.
     bool splitModuleEdges = false;
+    // mcpp#732: module name -> BMI path, for a unit whose package's closure
+    // holds a name two packages provide (the plan's module map). A name it
+    // lists takes that path; any other takes `<bmiDir>/<name><bmiExt>`.
+    const std::map<std::string, std::string, std::less<>>* moduleMap = nullptr;
 };
+
+// The BMI path `name` takes under `opts`: the module map's, or the flat one.
+std::string bmi_path_for(std::string_view name, const DyndepOptions& opts);
+
+// Parse a module map: `<module name> <BMI path>` per line.
+std::map<std::string, std::string, std::less<>> parse_module_map(std::string_view body);
 
 // Parse a single .ddi JSON body to a UnitInfo. Returns unexpected on JSON error.
 std::expected<UnitInfo, std::string> parse_ddi(std::string_view body);
@@ -188,6 +198,26 @@ std::size_t find_key(std::string_view s, std::size_t start, std::string_view key
 
 } // namespace
 
+std::string bmi_path_for(std::string_view name, const DyndepOptions& opts) {
+    if (opts.moduleMap)
+        if (auto it = opts.moduleMap->find(name); it != opts.moduleMap->end()) return it->second;
+    return std::string(opts.bmiDir) + "/" + bmi_basename(name, opts.bmiExt);
+}
+
+std::map<std::string, std::string, std::less<>> parse_module_map(std::string_view body) {
+    std::map<std::string, std::string, std::less<>> out;
+    while (!body.empty()) {
+        auto nl = body.find('\n');
+        auto line = body.substr(0, nl);
+        body.remove_prefix(nl == std::string_view::npos ? body.size() : nl + 1);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.remove_suffix(1);
+        auto sp = line.find(' ');
+        if (sp == std::string_view::npos || sp == 0) continue;
+        out.emplace(std::string(line.substr(0, sp)), std::string(line.substr(sp + 1)));
+    }
+    return out;
+}
+
 std::string bmi_basename(std::string_view logicalName,
                           std::string_view ext) {
     std::string out;
@@ -207,8 +237,7 @@ namespace {
 std::vector<std::string> dyndep_targets(const UnitInfo& u, const DyndepOptions& opts) {
     std::vector<std::string> t;
     if (opts.splitModuleEdges && !u.provides.empty()) {
-        t.push_back(std::string(opts.bmiDir) + "/"
-                    + bmi_basename(u.provides.front(), opts.bmiExt));
+        t.push_back(bmi_path_for(u.provides.front(), opts));
     }
     if (!u.primaryOutput.empty()) t.push_back(u.primaryOutput.string());
     return t;
@@ -314,8 +343,7 @@ std::string emit_dyndep(const std::vector<UnitInfo>&     units,
                 bool selfProvides = false;
                 for (auto& p : u.provides) if (p == r) { selfProvides = true; break; }
                 if (selfProvides) continue;
-                std::string bmiDir(opts.bmiDir);
-                add_implicit(bmiDir + "/" + bmi_basename(r, opts.bmiExt));
+                add_implicit(bmi_path_for(r, opts));
             }
             line += "\n  restat = 1\n";
             out += line;
@@ -367,8 +395,7 @@ emit_dyndep_single(const std::filesystem::path& ddiPath,
             for (auto& p : u->provides) if (p == r) { selfProvides = true; break; }
             if (selfProvides) continue;
             if (firstImplicit) { line += " |"; firstImplicit = false; }
-            std::string bmiDir(opts.bmiDir);
-            line += " " + bmiDir + "/" + bmi_basename(r, opts.bmiExt);
+            line += " " + bmi_path_for(r, opts);
         }
         line += "\n  restat = 1\n";
         out += line;

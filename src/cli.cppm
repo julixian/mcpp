@@ -928,6 +928,8 @@ int run(int argc, char** argv) {
                 .help("BMI cache directory name (default: gcm.cache)"))
             .option(cl::Option("bmi-ext").takes_value().value_name("EXT")
                 .help("BMI file extension (default: .gcm)"))
+            .option(cl::Option("module-map").takes_value().value_name("FILE")
+                .help("Module name -> BMI path, one `<name> <path>` per line (mcpp#732)"))
             .option(cl::Option("split-module")
                 .help("Also emit a record for the provided BMI (two-phase "
                       "schedule: BMI and object are separate edges)"))

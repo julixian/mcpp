@@ -1,10 +1,11 @@
 // mcpp.fallback.xlings_binary — xlings binary acquisition chain.
 //
-// Tries multiple strategies to obtain the xlings binary:
-//   1. MCPP_VENDORED_XLINGS env var (explicit override)
-//   2. the xlings released with this mcpp, `<prefix>/registry/bin/xlings`
-//   3. system `which xlings`
-//   4. Fail with user-facing instructions
+// One source is chosen (select_xlings_source) from:
+//   - MCPP_VENDORED_XLINGS (an explicit override, taken when set);
+//   - the xlings released with this mcpp, `<prefix>/registry/bin/xlings`;
+//   - the xlings on PATH;
+// the newer of the last two, the released one on a tie. With none, the error
+// states how to provide one.
 
 module;
 #include <cstdio>
@@ -36,10 +37,37 @@ std::string vendored_xlings_version(const std::filesystem::path& bin);
 // released binary is the one that satisfies the pin by construction.
 std::filesystem::path released_xlings_source(const std::filesystem::path& destBin);
 
-// The version the acquisition chain WOULD install, without installing it.
-// Empty when nothing is available. Replacing a vendored binary is only an
-// improvement when this is newer than what is already there.
-std::string candidate_source_version(const std::filesystem::path& destBin = {});
+// A place an xlings binary can be copied from, with the version it answers.
+struct XlingsSource {
+    std::filesystem::path path;
+    std::string           version;   // empty when it cannot be read
+    std::string           origin;    // how the acquisition line names it
+};
+
+// THE ONE ANSWER TO "WHICH SOURCE" (mcpp#744). `MCPP_VENDORED_XLINGS` when it
+// is set, as an explicit choice. Otherwise the newer of the xlings released
+// with this mcpp and the xlings on PATH, the released one on a tie or when the
+// PATH copy's version cannot be read. The check that decides whether to
+// replace a vendored binary and the copy that replaces it both use this
+// answer, so the version stated is the version copied. Before, the check took
+// the first source that existed, not the newest: a released copy older than
+// the pin hid a newer xlings on PATH, and mcpp stated that no newer source
+// was available.
+std::optional<XlingsSource> choose_xlings_source(std::optional<XlingsSource> override_,
+                                                 std::optional<XlingsSource> released,
+                                                 std::optional<XlingsSource> onPath);
+// The same choice over this process's sources. Their versions are read
+// through `versionMemo` (known_xlings_version).
+std::optional<XlingsSource> select_xlings_source(const std::filesystem::path& destBin = {},
+                                                 const std::filesystem::path& versionMemo = {});
+
+// The version `bin` answers, asked at most once per process. With `memoFile`,
+// the answer is also kept across processes, keyed by the binary's path, size
+// and modification time: an update of xlings writes a new file and is asked
+// again. Asking costs a process of xlings, measured at 0.35 s, and every
+// command that loads the configuration asked (build wall-time plan, F6/W3).
+std::string known_xlings_version(const std::filesystem::path& bin,
+                                 const std::filesystem::path& memoFile = {});
 
 // True when `have` is strictly older than `want`, comparing dot-separated
 // numeric components. Anything unparseable answers false -- a version this
@@ -63,14 +91,27 @@ bool version_is_older(std::string_view have, std::string_view want);
 //
 // Strictly-older, not not-equal: a user who put a newer xlings there on
 // purpose must not be downgraded by an mcpp that happens to pin an older one.
+//
+// ONCE PER PROCESS. The configuration is loaded from about ten call sites, and
+// one `mcpp pack` over a workspace printed its note three times per member
+// (mcpp#744). A home settled once in a process is not examined again, and
+// `Updating` and `Note` are each stated at most once.
 std::expected<std::filesystem::path, std::string>
 acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
-                      std::string_view pinnedVersion = {}) {
+                      std::string_view pinnedVersion = {},
+                      const std::filesystem::path& versionMemo = {}) {
+    static std::mutex m;
+    static std::set<std::filesystem::path> settled;
+    static bool noted = false, updated = false;
+    std::lock_guard lock(m);
+    if (settled.contains(destBin) && std::filesystem::exists(destBin)) return destBin;
     if (std::filesystem::exists(destBin)) {
-        auto have = vendored_xlings_version(destBin);
+        auto have = known_xlings_version(destBin, versionMemo);
         if (pinnedVersion.empty() || have.empty()
-            || !version_is_older(have, pinnedVersion))
+            || !version_is_older(have, pinnedVersion)) {
+            settled.insert(destBin);
             return destBin;
+        }
 
         // Behind the pin -- but replacing is only an improvement if what we
         // would put there is actually newer. The acquisition chain below ends
@@ -81,28 +122,55 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
         // re-acquired, which replaced 2026.8.2.1 with the system's 0.4.51 --
         // older still, and equally missing the feature the check exists to
         // restore. Look before leaping.
-        auto candidate = candidate_source_version(destBin);
-        if (candidate.empty() || !version_is_older(have, candidate)) {
+        auto candidate = select_xlings_source(destBin, versionMemo);
+        if (!candidate || candidate->version.empty()
+            || !version_is_older(have, candidate->version)) {
             // stderr, not stdout. This is a remark about the environment,
             // not output of the command that happens to be running -- and
             // `mcpp test --json` promises every stdout line is NDJSON, a
             // promise this line broke the moment a machine fell behind the
             // pin (e2e 155).
-            if (!quiet)
+            if (!quiet && !noted)
                 std::println(stderr,
                              "{:>12} vendored xlings {} is older than the "
                              "pinned {}, but no newer source is available "
                              "(keeping it; run `xlings self update`)",
                              "Note", have, pinnedVersion);
+            noted = true;
+            settled.insert(destBin);
             return destBin;
         }
-        if (!quiet)
-            std::println(stderr,
-                         "{:>12} vendored xlings {} -> {} (pinned {})",
-                         "Updating", have, candidate, pinnedVersion);
+        // Beside the binary first and renamed over it, so a copy that fails
+        // (a full disk, a running binary) leaves the old one in place.
         std::error_code rec;
-        std::filesystem::remove(destBin, rec);
-        // fall through and re-acquire
+        auto staged = destBin;
+        staged += ".new";
+        std::filesystem::copy_file(candidate->path, staged,
+            std::filesystem::copy_options::overwrite_existing, rec);
+        if (!rec)
+            std::filesystem::permissions(staged,
+                std::filesystem::perms::owner_exec
+              | std::filesystem::perms::group_exec
+              | std::filesystem::perms::others_exec,
+              std::filesystem::perm_options::add, rec);
+        if (!rec) std::filesystem::rename(staged, destBin, rec);
+        if (!rec) {
+            if (!quiet && !updated)
+                std::println(stderr,
+                             "{:>12} vendored xlings {} -> {} from {} (pinned {})",
+                             "Updating", have, candidate->version, candidate->origin,
+                             pinnedVersion);
+            updated = true;
+            // The version is known: it is the one just copied.
+            (void)known_xlings_version(destBin, versionMemo);
+            settled.insert(destBin);
+            return destBin;
+        }
+        // The copy failed: the old binary stays, as it would with no source.
+        std::error_code sec;
+        std::filesystem::remove(staged, sec);
+        settled.insert(destBin);
+        return destBin;
     }
 
     std::error_code ec;
@@ -117,29 +185,11 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
             std::println("{}{} {}", std::string(W - verb.size(), ' '), verb, msg);
     };
 
-    // 1. Explicit override
-    if (auto* e = std::getenv("MCPP_VENDORED_XLINGS"); e && *e) {
-        std::filesystem::path src{e};
-        if (std::filesystem::exists(src)) {
-            std::filesystem::copy_file(src, destBin,
-                std::filesystem::copy_options::overwrite_existing, ec);
-            if (!ec) {
-                std::filesystem::permissions(destBin,
-                    std::filesystem::perms::owner_exec
-                  | std::filesystem::perms::group_exec
-                  | std::filesystem::perms::others_exec,
-                  std::filesystem::perm_options::add, ec);
-                if (!quiet) print_status("Bundled",
-                    std::format("xlings (from MCPP_VENDORED_XLINGS)"));
-                return destBin;
-            }
-        }
-    }
-
-    // 2. The xlings released with this mcpp. Ahead of the system copy, which
-    // may be any version (see released_xlings_source).
-    if (auto released = released_xlings_source(destBin); !released.empty()) {
-        std::filesystem::copy_file(released, destBin,
+    // The first acquisition takes the source a replacement would take
+    // (select_xlings_source): the override, otherwise the newer of the
+    // released copy and the PATH copy.
+    if (auto src = select_xlings_source(destBin, versionMemo)) {
+        std::filesystem::copy_file(src->path, destBin,
             std::filesystem::copy_options::overwrite_existing, ec);
         if (!ec) {
             std::filesystem::permissions(destBin,
@@ -148,34 +198,15 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
               | std::filesystem::perms::others_exec,
               std::filesystem::perm_options::add, ec);
             if (!quiet) print_status("Bundled",
-                std::format("xlings (released with this mcpp: {})", released.string()));
+                std::format("xlings{} (from {}: {})",
+                            src->version.empty() ? std::string{} : " " + src->version,
+                            src->origin, src->path.string()));
+            settled.insert(destBin);
             return destBin;
         }
-        ec.clear();
     }
 
-    // 3. Copy from system (`which xlings`)
-    auto xlings_name = std::string("xlings") + std::string(mcpp::platform::exe_suffix);
-    auto sysXlings = mcpp::platform::fs::which(xlings_name);
-    if (sysXlings) {
-        std::string p = sysXlings->string();
-        if (!p.empty() && std::filesystem::exists(p)) {
-            std::filesystem::copy_file(p, destBin,
-                std::filesystem::copy_options::overwrite_existing, ec);
-            if (!ec) {
-                std::filesystem::permissions(destBin,
-                    std::filesystem::perms::owner_exec
-                  | std::filesystem::perms::group_exec
-                  | std::filesystem::perms::others_exec,
-                  std::filesystem::perm_options::add, ec);
-                if (!quiet) print_status("Bundled",
-                    std::format("xlings (copied from system: {})", p));
-                return destBin;
-            }
-        }
-    }
-
-    // 3. Fail with instructions
+    // Nothing to copy: say how to provide one.
     return std::unexpected(std::format(
         "xlings binary not found. Either:\n"
         "  - install via: curl -fsSL https://raw.githubusercontent.com/d2learn/xlings/refs/heads/main/tools/other/quick_install.sh | bash\n"
@@ -259,18 +290,88 @@ std::filesystem::path released_xlings_source(const std::filesystem::path& destBi
     return released;
 }
 
-std::string candidate_source_version(const std::filesystem::path& destBin) {
+std::optional<XlingsSource> choose_xlings_source(std::optional<XlingsSource> override_,
+                                                 std::optional<XlingsSource> released,
+                                                 std::optional<XlingsSource> onPath) {
+    if (override_) return override_;
+    if (!released) return onPath;
+    if (!onPath || onPath->version.empty()) return released;
+    if (released->version.empty() || version_is_older(released->version, onPath->version))
+        return onPath;
+    return released;
+}
+
+std::optional<XlingsSource> select_xlings_source(const std::filesystem::path& destBin,
+                                                 const std::filesystem::path& versionMemo) {
+    std::optional<XlingsSource> override_, released, onPath;
+    std::error_code ec;
     if (const char* e = std::getenv("MCPP_VENDORED_XLINGS"); e && *e) {
-        std::error_code ec;
-        if (std::filesystem::exists(std::filesystem::path(e), ec))
-            return vendored_xlings_version(std::filesystem::path(e));
+        std::filesystem::path p{e};
+        if (std::filesystem::exists(p, ec))
+            override_ = XlingsSource{p, known_xlings_version(p, versionMemo), "MCPP_VENDORED_XLINGS"};
     }
-    if (auto released = released_xlings_source(destBin); !released.empty())
-        return vendored_xlings_version(released);
-    if (auto sys = mcpp::platform::fs::which(
-            std::string("xlings") + std::string(mcpp::platform::exe_suffix)))
-        return vendored_xlings_version(*sys);
-    return {};
+    if (!override_) {
+        if (auto r = released_xlings_source(destBin); !r.empty())
+            released = XlingsSource{r, known_xlings_version(r, versionMemo),
+                                    "the release of this mcpp"};
+        if (auto sys = mcpp::platform::fs::which(
+                std::string("xlings") + std::string(mcpp::platform::exe_suffix))) {
+            const bool isDest = !destBin.empty() && std::filesystem::equivalent(*sys, destBin, ec);
+            if (!isDest && std::filesystem::exists(*sys, ec))
+                onPath = XlingsSource{*sys, known_xlings_version(*sys, versionMemo), "PATH"};
+        }
+    }
+    return choose_xlings_source(std::move(override_), std::move(released), std::move(onPath));
+}
+
+std::string known_xlings_version(const std::filesystem::path& bin,
+                                 const std::filesystem::path& memoFile) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(bin, ec);
+    if (ec) return {};
+    const auto mtime = std::filesystem::last_write_time(bin, ec);
+    if (ec) return {};
+    const auto u8 = bin.generic_u8string();
+    const auto key = std::format("{}\t{}\t{}",
+        std::string(reinterpret_cast<const char*>(u8.data()), u8.size()),
+        size, mtime.time_since_epoch().count());
+
+    static std::mutex m;
+    static std::map<std::string, std::string> answered;   // key -> version
+    std::lock_guard lock(m);
+    if (auto it = answered.find(key); it != answered.end()) return it->second;
+
+    // The memo holds one line per binary: `<path>\t<size>\t<mtime>\t<version>`.
+    std::vector<std::string> lines;
+    if (!memoFile.empty()) {
+        std::ifstream is(memoFile, std::ios::binary);
+        for (std::string line; std::getline(is, line);) {
+            if (line.starts_with(key + "\t")) {
+                auto v = line.substr(key.size() + 1);
+                if (!v.empty()) return answered[key] = v;
+            }
+            lines.push_back(std::move(line));
+        }
+    }
+    auto version = vendored_xlings_version(bin);
+    answered[key] = version;
+    if (!memoFile.empty() && !version.empty()) {
+        // Replace this binary's line, keep the others, and write the file whole
+        // beside itself before renaming it into place.
+        const auto prefix = key.substr(0, key.find('\t') + 1);
+        std::erase_if(lines, [&](const std::string& l) { return l.starts_with(prefix); });
+        lines.push_back(key + "\t" + version);
+        std::filesystem::create_directories(memoFile.parent_path(), ec);
+        auto tmp = memoFile;
+        tmp += std::format(".tmp-{}", std::chrono::steady_clock::now().time_since_epoch().count());
+        {
+            std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+            for (auto const& l : lines) os << l << '\n';
+        }
+        std::filesystem::rename(tmp, memoFile, ec);
+        if (ec) std::filesystem::remove(tmp, ec);
+    }
+    return version;
 }
 
 } // namespace mcpp::fallback
