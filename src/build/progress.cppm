@@ -1,5 +1,6 @@
 // mcpp.build.progress — what a build reports while it runs, and how
-// (.agents/docs/2026-09-29-build-progress-display-design.md).
+// (.agents/docs/2026-09-29-build-progress-display-design.md, and its revision
+// 3, .agents/docs/2026-09-30-build-output-refinement-design.md).
 //
 // Four sources feed one model, and mcpp.ui draws it:
 //
@@ -13,9 +14,13 @@
 //     `check` or `prepare` action, the only steps whose start is observable.
 //
 // The step record, written beside build.ninja, names the package each step
-// belongs to. A package is complete when every step the record assigns to it
-// has finished in this build (§3.2): the rule can state completion late,
-// never early.
+// belongs to. A PACKAGE IS NAMED WHEN IT DOES WORK (revision 3, §5.3): its line
+// is written when the first of its steps finishes, or when its first check or
+// prepare action starts, and it never changes. Revision 2 wrote a package's
+// line when every step the record assigns to it had finished; the steps of a
+// package the cache serves run in a pass of their own and never counted, so
+// such a package never completed and the folded dependency line waited for
+// ninja to exit (measured: 27 s late in a first build of xlings).
 //
 // LOCKS. The model has one mutex. mcpp.ui asks the model for its frame while
 // holding its own lock, so the model never calls mcpp.ui while holding the
@@ -29,6 +34,7 @@ export module mcpp.build.progress;
 
 import std;
 import mcpp.ui;
+import mcpp.ui.dots_screen;
 import mcpp.log;
 import mcpp.platform;
 
@@ -39,9 +45,11 @@ export namespace mcpp::build::progress {
 struct PackageInfo {
     std::string name;              // qualified name: what the emitter records
     bool        requested   = false;
-    std::string subject;           // as the package's line shows it
+    std::string subject;           // the name as the package's line shows it
     std::size_t cachedUnits = 0;   // units staged from the global cache
     std::size_t steps       = 0;   // steps the graph assigns to it
+    std::string detail;            // its version and origin, shown dim
+    std::string source;            // project, official, index, git or path
 };
 
 struct Record {
@@ -53,7 +61,14 @@ struct Record {
     std::unordered_map<std::string, std::size_t> step;
     // The first output of a check or prepare action, normalised, to its label.
     std::unordered_map<std::string, std::string> actions;
+    // A step, by its identity in `step`, to the source file it reads: its
+    // first input, relative to the package root that holds it. `Finished`
+    // names the longest step by it (build output design revision 3, §7.3).
+    std::unordered_map<std::size_t, std::string> sources;
     std::size_t steps = 0;         // every step of the graph
+    // The profile as `Finished` describes it. The fast path, which has no
+    // plan, reads it from the header line alone (`read_descriptor`).
+    std::string descriptor;
 };
 
 inline constexpr std::string_view kRecordFile = "steps.tsv";
@@ -67,6 +82,9 @@ std::string format_record(const Record& record);
 Record parse_record(std::string_view text);
 void write_record(const std::filesystem::path& buildDir, const Record& record);
 std::optional<Record> read_record(const std::filesystem::path& buildDir);
+// The descriptor in the header of the record in `buildDir`; empty when there
+// is no record or it carries none. Reads the first line only.
+std::string read_descriptor(const std::filesystem::path& buildDir);
 
 // What the emitter states about each step as it writes it: the package whose
 // unit, link, action or staged file the statement is for. `owner("")` marks
@@ -77,6 +95,7 @@ public:
         std::vector<std::string> outputs;   // normalised
         std::string              rule;
         std::string              owner;
+        std::string              input;     // the first explicit input, unescaped
     };
     void owner(std::string_view package);
     // Text appended to build.ninja: each `build` statement in it is recorded
@@ -86,8 +105,12 @@ public:
     void action(std::string_view firstOutput, std::string_view label);
     const std::vector<Step>& steps() const { return steps_; }
     // The record: `declared` states how the packages are shown; an owner that
-    // no entry declares is shown by its qualified name, as a dependency.
-    Record record(const std::vector<PackageInfo>& declared) const;
+    // no entry declares is shown by its qualified name, as a dependency. A
+    // step's source is its first input when that is an absolute path inside
+    // one of `roots`, the package roots of the graph, and is stated relative
+    // to the innermost of them.
+    Record record(const std::vector<PackageInfo>& declared,
+                  const std::vector<std::filesystem::path>& roots = {}) const;
 
 private:
     std::string owner_;
@@ -109,12 +132,18 @@ private:
 // terminal, as it is not here: only the outer ninja's lines keep the leading
 // `ESC [ 0 m`. The outer ninja runs with CLICOLOR_FORCE=0, which keeps that
 // stripping on.
-inline constexpr std::string_view kStatusFormat = "\x1b[0m@@mcpp %f %t %e@@ ";
+//
+// `%u` is the number of steps not yet started. Measured with ninja 1.12.1
+// through a pipe, it reaches 0 when the last step starts, and from then on
+// every one of the `t - f` remaining steps is running: the status row can say
+// `last N running` at the end of a build and be exact.
+inline constexpr std::string_view kStatusFormat = "\x1b[0m@@mcpp %f %t %e %u@@ ";
 
 struct StatusLine {
     std::size_t      finished = 0;
     std::size_t      total    = 0;
     long long        endMs    = 0;
+    std::optional<std::size_t> unstarted;   // absent in a line without `%u`
     std::string_view text;     // the description, or the command under -v
 };
 std::optional<StatusLine> parse_status(std::string_view line);
@@ -154,7 +183,10 @@ void record_action_start(std::string_view stamp);
 enum class ProgramOutcome { Ran, Cached, Failed };
 
 // Opens the report of this command: the region, its frame and its poll.
-// `verbose` lists every package (design §4.3). Idempotent.
+// `verbose` also names the packages with nothing to do and each package's
+// steps and span at the end. The status row's display is chosen here
+// (MCPP_PROGRESS: `random`, the default; an animation's name; `bar`; `plain`;
+// `off`). Idempotent.
 void open(bool verbose);
 // Closes it: the region is erased. Idempotent.
 void close();
@@ -162,8 +194,8 @@ void close();
 // package line names its configuration.
 void configurations(std::size_t n);
 
-// Build programs (design §4.2). `requested` programs are listed, the others
-// folded into one line when `programs_done` is called.
+// Build programs (design §4.2). Every program that runs or fails has a line;
+// a program whose result is reused has one under --verbose.
 void program_scheduled(std::string_view package, bool requested);
 void program_compiling(std::string_view package, bool requested);
 void program_running(std::string_view package, bool requested);
@@ -205,12 +237,15 @@ public:
     // One ninja invocation.
     void pass_begin();
     void status(const StatusLine& line);
-    // A `FAILED: <outputs>` line: the step's package is failed. Returns true
-    // for the command's first failure, after which the caller writes
-    // `error: build failed` and the step's diagnostics.
-    bool failed(std::string_view outputs);
+    // A `FAILED: <outputs>` line. For the command's first failure, returns
+    // the failed step's package as a line names it (empty when the step is
+    // the build's own), after which the caller writes
+    // `error: build failed in <package>` and the step's diagnostics; nothing
+    // for a later failure.
+    std::optional<std::string> failed(std::string_view outputs);
     void pass_end();
-    // The build ended: every package still open gets its final line.
+    // The build ended. Under --verbose, the packages with nothing to do are
+    // named, and each package that did work states its steps and span.
     void finish(bool success);
 
 private:
@@ -268,17 +303,26 @@ long long to_ll(std::string_view s) {
 
 } // namespace
 
-// Format: a header, then `P` lines (packages, in order), `A` lines (actions)
-// and `O` lines (an output and its package's index).
+// Format: a header, then `P` lines (packages, in order), `A` lines (actions),
+// `S` lines (a step's identity and its source) and `O` lines (an output, its
+// package's index and its step's identity). Version 2 adds the profile's
+// descriptor to the header, a package's detail and source to its `P` line,
+// and the `S` lines; a version 1 record (mcpp 2026.9.29.5) is read with all
+// of them empty, and its subject then carries what version 1 wrote there.
 std::string format_record(const Record& r) {
-    std::string out = std::format("# mcpp steps v1\t{}\n", r.steps);
+    std::string out = std::format("# mcpp steps v2\t{}\t{}\n", r.steps, field(r.descriptor));
     for (auto const& p : r.packages)
-        out += std::format("P\t{}\t{}\t{}\t{}\t{}\n", field(p.name), p.requested ? 1 : 0,
-                           p.cachedUnits, p.steps, field(p.subject));
+        out += std::format("P\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", field(p.name),
+                           p.requested ? 1 : 0, p.cachedUnits, p.steps, field(p.subject),
+                           field(p.detail), field(p.source));
     std::vector<std::pair<std::string, std::string>> actions(r.actions.begin(), r.actions.end());
     std::ranges::sort(actions);
     for (auto const& [out1, label] : actions)
         out += std::format("A\t{}\t{}\n", field(out1), field(label));
+    std::vector<std::pair<std::size_t, std::string>> sources(r.sources.begin(), r.sources.end());
+    std::ranges::sort(sources);
+    for (auto const& [id, source] : sources)
+        out += std::format("S\t{}\t{}\n", id, field(source));
     std::vector<std::pair<std::string, std::size_t>> owners(r.owner.begin(), r.owner.end());
     std::ranges::sort(owners);
     for (auto const& [path, index] : owners) {
@@ -298,12 +342,20 @@ Record parse_record(std::string_view text) {
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         if (line.empty()) continue;
         auto f = split_tabs(line);
-        if (f[0] == "# mcpp steps v1" && f.size() >= 2) { r.steps = to_size(f[1]); continue; }
+        if ((f[0] == "# mcpp steps v1" || f[0] == "# mcpp steps v2") && f.size() >= 2) {
+            r.steps = to_size(f[1]);
+            if (f.size() >= 3) r.descriptor = std::string(f[2]);
+            continue;
+        }
         if (f[0] == "P" && f.size() >= 6) {
             r.packages.push_back({std::string(f[1]), f[2] == "1", std::string(f[5]),
-                                  to_size(f[3]), to_size(f[4])});
+                                  to_size(f[3]), to_size(f[4]),
+                                  f.size() >= 8 ? std::string(f[6]) : std::string{},
+                                  f.size() >= 8 ? std::string(f[7]) : std::string{}});
         } else if (f[0] == "A" && f.size() >= 3) {
             r.actions.emplace(std::string(f[1]), std::string(f[2]));
+        } else if (f[0] == "S" && f.size() >= 3) {
+            r.sources.emplace(to_size(f[1]), std::string(f[2]));
         } else if (f[0] == "O" && f.size() >= 4) {
             const auto index = to_size(f[1]);
             if (index < r.packages.size()) {
@@ -327,16 +379,30 @@ std::optional<Record> read_record(const std::filesystem::path& buildDir) {
     return parse_record(text);
 }
 
+std::string read_descriptor(const std::filesystem::path& buildDir) {
+    std::ifstream f(buildDir / kRecordFile, std::ios::binary);
+    std::string header;
+    if (!f || !std::getline(f, header)) return {};
+    return parse_record(header).descriptor;
+}
+
 // ─── Attribution ─────────────────────────────────────────────────────────
 
 void Attribution::owner(std::string_view package) { owner_ = std::string(package); }
 
 namespace {
 
-// The outputs and the rule of a `build` line: tokens up to the first colon
-// ninja does not read as escaped, `|` dropped, `$ ` `$:` `$$` unescaped.
-std::optional<std::pair<std::vector<std::string>, std::string>>
-parse_build_line(std::string_view line) {
+struct BuildLine {
+    std::vector<std::string> outputs;   // normalised
+    std::string              rule;
+    std::string              input;     // the first explicit input, unescaped
+};
+
+// The outputs, the rule and the first explicit input of a `build` line:
+// outputs are the tokens up to the first colon ninja does not read as
+// escaped, with `|` dropped; the input is the token after the rule, unless
+// the explicit inputs are empty. `$ ` `$:` `$$` are unescaped.
+std::optional<BuildLine> parse_build_line(std::string_view line) {
     if (!line.starts_with("build ")) return std::nullopt;
     line.remove_prefix(6);
     std::vector<std::string> outputs;
@@ -362,8 +428,24 @@ parse_build_line(std::string_view line) {
     if (!done) return std::nullopt;
     std::string_view rest = line.substr(i + 1);
     while (!rest.empty() && rest.front() == ' ') rest.remove_prefix(1);
-    auto rule = rest.substr(0, rest.find_first_of(" \n"));
-    return std::pair{std::move(outputs), std::string(rule)};
+    const auto ruleEnd = std::min(rest.find_first_of(" \n"), rest.size());
+    BuildLine b{std::move(outputs), std::string(rest.substr(0, ruleEnd)), {}};
+    rest.remove_prefix(ruleEnd);
+    while (!rest.empty() && rest.front() == ' ') rest.remove_prefix(1);
+    // `|`, `||` and `|@` begin the implicit and order-only inputs; `$` alone
+    // continues the line, where no explicit input is on this one.
+    if (rest.empty() || rest.front() == '|' || rest.front() == '\n' || rest == "$") return b;
+    for (std::size_t k = 0; k < rest.size(); ++k) {
+        const char c = rest[k];
+        if (c == '$' && k + 1 < rest.size()
+            && (rest[k + 1] == ' ' || rest[k + 1] == ':' || rest[k + 1] == '$')) {
+            b.input += rest[++k];
+            continue;
+        }
+        if (c == ' ' || c == '\n') break;
+        b.input += c;
+    }
+    return b;
 }
 
 } // namespace
@@ -374,8 +456,9 @@ void Attribution::statement(std::string_view text) {
         auto line = text.substr(0, nl);
         text.remove_prefix(nl == std::string_view::npos ? text.size() : nl + 1);
         auto parsed = parse_build_line(line);
-        if (!parsed || parsed->second == "phony" || parsed->first.empty()) continue;
-        steps_.push_back({std::move(parsed->first), std::move(parsed->second), owner_});
+        if (!parsed || parsed->rule == "phony" || parsed->outputs.empty()) continue;
+        steps_.push_back({std::move(parsed->outputs), std::move(parsed->rule), owner_,
+                          std::move(parsed->input)});
     }
 }
 
@@ -383,7 +466,28 @@ void Attribution::action(std::string_view firstOutput, std::string_view label) {
     actions_.emplace_back(normalise(firstOutput), std::string(label));
 }
 
-Record Attribution::record(const std::vector<PackageInfo>& declared) const {
+namespace {
+
+// `input` relative to the innermost of `roots` that holds it; empty when it is
+// not an absolute path or no root holds it.
+std::string source_in(std::string_view input, const std::vector<std::filesystem::path>& roots) {
+    const std::filesystem::path in = std::filesystem::path(input).lexically_normal();
+    if (input.empty() || !in.is_absolute()) return {};
+    std::filesystem::path best;
+    for (auto const& root : roots) {
+        auto rel = in.lexically_relative(root.lexically_normal());
+        if (rel.empty() || *rel.begin() == "..") continue;
+        if (best.empty() || std::distance(rel.begin(), rel.end())
+                                < std::distance(best.begin(), best.end()))
+            best = std::move(rel);
+    }
+    return best.generic_string();
+}
+
+} // namespace
+
+Record Attribution::record(const std::vector<PackageInfo>& declared,
+                           const std::vector<std::filesystem::path>& roots) const {
     Record r;
     std::unordered_map<std::string, std::size_t> index;
     for (auto const& d : declared) {
@@ -399,13 +503,14 @@ Record Attribution::record(const std::vector<PackageInfo>& declared) const {
         auto it = index.find(s.owner);
         if (it == index.end()) {
             it = index.emplace(s.owner, r.packages.size()).first;
-            r.packages.push_back({s.owner, false, s.owner, 0, 0});
+            r.packages.push_back({s.owner, false, s.owner, 0, 0, {}, {}});
         }
         ++r.packages[it->second].steps;
         for (auto const& o : s.outputs) {
             r.owner.emplace(o, it->second);
             r.step.emplace(o, id);
         }
+        if (auto src = source_in(s.input, roots); !src.empty()) r.sources.emplace(id, std::move(src));
     }
     for (auto const& [out1, label] : actions_) r.actions.emplace(out1, label);
     return r;
@@ -423,15 +528,18 @@ std::optional<StatusLine> parse_status(std::string_view line) {
     auto nums = line.substr(0, closeEnd);
     StatusLine s;
     s.text = close == std::string_view::npos ? std::string_view{} : line.substr(close + 3);
-    std::array<std::string_view, 3> part;
-    for (std::size_t i = 0; i < 3; ++i) {
+    std::array<std::string_view, 4> part;
+    std::size_t parts = 0;
+    for (; parts < 4; ++parts) {
         auto sp = nums.find(' ');
-        part[i] = nums.substr(0, sp);
-        if (sp == std::string_view::npos) { if (i < 2) return std::nullopt; break; }
+        part[parts] = nums.substr(0, sp);
+        if (sp == std::string_view::npos) { ++parts; break; }
         nums.remove_prefix(sp + 1);
     }
+    if (parts < 3) return std::nullopt;
     s.finished = to_size(part[0]);
     s.total    = to_size(part[1]);
+    if (parts >= 4 && !part[3].empty()) s.unstarted = to_size(part[3]);
     // `%e` is seconds with three decimals: the step's end in milliseconds.
     auto e = part[2];
     auto dot = e.find('.');
@@ -526,11 +634,10 @@ void record_action_start(std::string_view stamp) {
 // ─── The model ───────────────────────────────────────────────────────────
 
 // Not exported, and not TU-local either: `Build::Impl` holds them.
-enum class Phase { Resolving, Programs, Building, Stopping, Checking };
+enum class Phase { Planning, Programs, Building, Stopping, Checking };
 
 struct Program {
     std::string name;
-    bool requested = false;
     enum State { Waiting, Compiling, Running, Done } state = Waiting;
     ProgramOutcome outcome = ProgramOutcome::Ran;
     Clock::time_point since{};
@@ -538,11 +645,10 @@ struct Program {
 };
 
 struct PackageState {
-    std::size_t finished = 0;
-    long long   first    = std::numeric_limits<long long>::max();   // ms since command start
-    long long   last     = 0;
-    bool        failed    = false;
-    bool        committed = false;
+    std::size_t finished  = 0;
+    long long   first     = std::numeric_limits<long long>::max();   // ms since command start
+    long long   last      = 0;
+    bool        announced = false;   // its line was written
 };
 
 struct Running {
@@ -560,11 +666,11 @@ struct Build::Impl {
     bool closed = false;                       // the build's Build object is gone
     std::unordered_set<std::size_t> counted;   // steps already counted
     std::vector<PackageState> packages;
-    bool depsCommitted = false;
     // Passes of ninja.
     long long   passStart = 0;       // ms since command start
     std::size_t doneBefore = 0, totalBefore = 0;   // earlier passes
     std::size_t finished = 0, total = 0;          // this pass
+    std::optional<std::size_t> unstarted;         // this pass, from `%u`
     bool        inPass = false;
     // The log of this pass.
     std::filesystem::path logPath;
@@ -594,20 +700,33 @@ void ensure_record(Build::Impl& b) {
     }
 }
 
+namespace screen = mcpp::ui::dots_screen;
+
 struct Report {
     std::mutex m;
     bool open = false;
     bool verbose = false;
-    Phase phase = Phase::Resolving;
+    Phase phase = Phase::Planning;
     std::size_t configurations = 1;
     std::vector<Program> programs;
-    bool programsCommitted = false;
     ms   programTime{0};
     std::vector<std::shared_ptr<Build::Impl>> builds;
     std::optional<long long> buildStart;   // ms since command start
     bool failureReported = false;
     bool deferred = false;
     std::optional<std::pair<std::string, std::string>> deferredFinish;
+    // The status row's screen (revision 3, §5.9 to §5.13): an animation fed
+    // by the build, or none.
+    std::unique_ptr<screen::Animation> animation;
+    bool animationColour = false;
+    // `--play-game` (revision 3, §5.14): the game, its name, and the keys it
+    // reads. The game is also `animation`'s place on the screen.
+    std::unique_ptr<screen::Game> game;
+    std::string gameName;
+    std::unique_ptr<mcpp::platform::terminal::KeyInput> keys;
+    std::vector<screen::Source> started;   // packages announced since the last frame
+    long long   lastFrame = 0;             // ms since command start
+    std::size_t lastDone  = 0;
 };
 
 Report& report() {
@@ -625,13 +744,26 @@ std::string plural(std::size_t n, std::string_view one, std::string_view many) {
     return std::format("{} {}", n, n == 1 ? one : many);
 }
 
+screen::Source source_of(std::string_view s) {
+    if (s == "project")  return screen::Source::Project;
+    if (s == "official") return screen::Source::Official;
+    if (s == "index")    return screen::Source::Index;
+    if (s == "git")      return screen::Source::Git;
+    return screen::Source::Other;
+}
+
+mcpp::ui::Hue hue_of(std::string_view s) {
+    if (s == "official") return mcpp::ui::Hue::Cyan;
+    if (s == "index")    return mcpp::ui::Hue::Magenta;
+    if (s == "git")      return mcpp::ui::Hue::Blue;
+    return mcpp::ui::Hue::Plain;
+}
+
 // ── Programs ──
 
 std::size_t program_column(const Report& r) {
-    std::size_t w = 0;
-    for (auto const& p : r.programs)
-        if (p.requested || r.verbose) w = std::max(w, mcpp::ui::display_width(p.name));
-    w = std::max<std::size_t>(w, 16);   // "N dependencies"
+    std::size_t w = 16;
+    for (auto const& p : r.programs) w = std::max(w, mcpp::ui::display_width(p.name));
     return std::min(w + 2, kColumnMax);
 }
 
@@ -666,156 +798,56 @@ std::string program_line(const Report& r, const Program& p) {
                                program_tone(p), /*infoVerb=*/true);
 }
 
-// The folded line of the dependencies' programs.
-std::optional<std::string> folded_programs_line(const Report& r) {
-    std::size_t n = 0, ran = 0, cached = 0, failed = 0;
-    ms time{0};
-    for (auto const& p : r.programs) {
-        if (p.requested || r.verbose || p.state != Program::Done) continue;
-        ++n;
-        if (p.outcome == ProgramOutcome::Cached) ++cached;
-        else if (p.outcome == ProgramOutcome::Failed) ++failed;
-        else { ++ran; time += p.compile + p.run; }
-    }
-    if (n == 0) return std::nullopt;
-    std::string state;
-    if (ran) state = std::format("ran {}", mcpp::ui::format_duration(time));
-    if (cached) state += std::format("{}{}", state.empty() ? "" : " · ",
-                                     ran ? std::format("{} cached", cached) : std::string("cached"));
-    if (failed) state += std::format("{}{} failed", state.empty() ? "" : " · ", failed);
-    return mcpp::ui::step_line("build.mcpp", plural(n, "dependency", "dependencies"),
-                               program_column(r), state,
-                               failed ? mcpp::ui::Tone::Bad
-                                      : ran ? mcpp::ui::Tone::Good : mcpp::ui::Tone::Muted,
-                               /*infoVerb=*/true);
-}
-
-Program& program(Report& r, std::string_view name, bool requested) {
+Program& program(Report& r, std::string_view name) {
     for (auto& p : r.programs)
         if (p.name == name && p.state != Program::Done) return p;
-    r.programs.push_back({std::string(name), requested});
+    r.programs.push_back({std::string(name)});
     return r.programs.back();
 }
 
 // ── Packages ──
 
-bool listed(const Report& r, const PackageInfo& p) { return p.requested || r.verbose; }
-
+// The package as its line names it: the name coloured by source, the version
+// and origin dim (revision 3, §5.10).
 std::string subject_of(const Report& r, const Build::Impl& b, const PackageInfo& p) {
-    if (r.configurations <= 1) return p.subject;
-    return std::format("{} [{}]", p.subject, b.dir.filename().string());
+    std::string s = mcpp::ui::hue(p.subject, hue_of(p.source));
+    if (!p.detail.empty()) s += " " + mcpp::ui::hue(p.detail, mcpp::ui::Hue::Dim);
+    if (r.configurations > 1) s += std::format(" [{}]", b.dir.filename().string());
+    return s;
 }
 
-std::size_t package_column(const Report& r, const Build::Impl& b) {
-    std::size_t w = 16;   // "NN dependencies"
-    if (b.record)
-        for (auto const& p : b.record->packages)
-            if (listed(r, p)) w = std::max(w, mcpp::ui::display_width(subject_of(r, b, p)));
-    return std::min(w + 2, kColumnMax);
-}
-
-bool complete(const PackageInfo& p, const PackageState& s) {
-    return p.steps > 0 && s.finished >= p.steps;
-}
-
-std::string span_of(const PackageState& s) {
-    if (s.first > s.last) return {};
-    return mcpp::ui::format_duration(ms(s.last - s.first));
-}
-
-std::string package_line(const Report& r, const Build::Impl& b, std::size_t i, bool final,
-                         bool success) {
+// The same, without colour, for the error line.
+std::string plain_subject(const Build::Impl& b, std::size_t i) {
     const auto& p = b.record->packages[i];
-    const auto& s = b.packages[i];
-    std::string state;
-    auto tone = mcpp::ui::Tone::Plain;
-    if (s.failed) { state = "failed"; tone = mcpp::ui::Tone::Bad; }
-    else if (s.finished == 0 && final) {
-        state = p.cachedUnits > 0 ? std::format("cached {}", plural(p.cachedUnits, "unit", "units"))
-                                  : "fresh";
-        tone = mcpp::ui::Tone::Muted;
-    } else if (p.cachedUnits > 0 && (complete(p, s) || (final && success))) {
-        state = std::format("cached {}", plural(p.cachedUnits, "unit", "units"));
-        tone = mcpp::ui::Tone::Muted;
-    } else if (complete(p, s) || (final && success)) {
-        state = std::format("done {}", span_of(s));
-        tone = mcpp::ui::Tone::Good;
-    } else {
-        state = plural(s.finished, "step", "steps");
-    }
-    return mcpp::ui::step_line("Compiling", subject_of(r, b, p), package_column(r, b), state, tone);
+    return p.detail.empty() ? p.subject : std::format("{} {}", p.subject, p.detail);
 }
 
-// The folded line of the dependencies (design §4.3): those with steps in
-// this build, and at the end also those the global cache supplied whole.
-std::optional<std::string> dependencies_line(const Report& r, const Build::Impl& b, bool final,
-                                             bool success) {
-    std::size_t active = 0, cached = 0, cachedOnly = 0, steps = 0;
-    long long first = std::numeric_limits<long long>::max(), last = 0;
-    for (std::size_t i = 0; i < b.record->packages.size(); ++i) {
-        const auto& p = b.record->packages[i];
-        const auto& s = b.packages[i];
-        if (listed(r, p) || s.committed) continue;
-        if (p.cachedUnits > 0 && final) {
-            ++cached;
-            if (s.finished == 0) ++cachedOnly;
-        }
-        if (s.finished == 0) continue;
-        ++active;
-        steps += s.finished;
-        first = std::min(first, s.first);
-        last  = std::max(last, s.last);
+// A package's line (revision 3, §7.1): `Cached` when the global cache serves
+// its units, `Compiling` otherwise.
+std::string package_line(const Report& r, const Build::Impl& b, std::size_t i) {
+    const auto& p = b.record->packages[i];
+    if (p.cachedUnits > 0) {
+        // The unit count joins the origin's parentheses when there are any:
+        // `v3.6.1 (index acme, 2 units)`, `v6.1.9 (73 units)`.
+        auto q = p;
+        const auto units = plural(p.cachedUnits, "unit", "units");
+        q.detail = !q.detail.empty() && q.detail.ends_with(")")
+            ? std::format("{}, {})", q.detail.substr(0, q.detail.size() - 1), units)
+            : std::format("{}{}({})", q.detail, q.detail.empty() ? "" : " ", units);
+        return mcpp::ui::step_line("Cached", subject_of(r, b, q), 0, "");
     }
-    const std::size_t n = active + cachedOnly;
-    if (active == 0 && (!final || cached == 0)) return std::nullopt;
-    std::string state;
-    auto tone = mcpp::ui::Tone::Plain;
-    if (final && success) {
-        if (active > 0) {
-            state = first <= last
-                ? std::format("done {}", mcpp::ui::format_duration(ms(last - first)))
-                : std::string("done");
-            if (cached) state += std::format(" · {} cached", cached);
-            tone = mcpp::ui::Tone::Good;
-        } else {
-            state = "cached";
-            tone = mcpp::ui::Tone::Muted;
-        }
-    } else {
-        state = plural(steps, "step", "steps");
-    }
-    return mcpp::ui::step_line("Compiling", plural(n, "dependency", "dependencies"),
-                               package_column(r, b), state, tone);
+    return mcpp::ui::step_line("Compiling", subject_of(r, b, p), 0, "");
 }
 
-bool dependencies_complete(const Report& r, const Build::Impl& b) {
-    for (std::size_t i = 0; i < b.record->packages.size(); ++i) {
-        const auto& p = b.record->packages[i];
-        if (listed(r, p) || b.packages[i].committed) continue;
-        if (p.steps > 0 && !complete(p, b.packages[i])) return false;
-    }
-    return true;
-}
-
-// Commits what became final; lines to write are appended to `out`.
-void settle(Report& r, Build::Impl& b, std::vector<std::string>& out) {
-    if (!b.record) return;
-    for (std::size_t i = 0; i < b.record->packages.size(); ++i) {
-        auto& s = b.packages[i];
-        const auto& p = b.record->packages[i];
-        if (s.committed || !listed(r, p) || !complete(p, s)) continue;
-        s.committed = true;
-        out.push_back(package_line(r, b, i, /*final=*/true, /*success=*/true));
-    }
-    if (!b.depsCommitted && dependencies_complete(r, b)) {
-        if (auto l = dependencies_line(r, b, /*final=*/true, /*success=*/true)) {
-            out.push_back(*l);
-            b.depsCommitted = true;
-            for (std::size_t i = 0; i < b.record->packages.size(); ++i)
-                if (!listed(r, b.record->packages[i]) && b.packages[i].finished > 0)
-                    b.packages[i].committed = true;
-        }
-    }
+// Writes a package's line the first time it does work; model lock held. The
+// standard library module is the toolchain's and is not named.
+void announce(Report& r, Build::Impl& b, std::size_t i, std::vector<std::string>& out) {
+    auto& s = b.packages[i];
+    const auto& p = b.record->packages[i];
+    if (s.announced || p.name == "std" || p.name.empty()) return;
+    s.announced = true;
+    out.push_back(package_line(r, b, i));
+    r.started.push_back(p.cachedUnits > 0 ? screen::Source::Cache : source_of(p.source));
 }
 
 void write_lines(const std::vector<std::string>& lines) {
@@ -824,7 +856,7 @@ void write_lines(const std::vector<std::string>& lines) {
 }
 
 // Reads the log of an open pass; model lock held.
-void read_log(Build::Impl& b) {
+void read_log(Report& r, Build::Impl& b, std::vector<std::string>& out) {
     if (!b.inPass || !b.record) return;
     std::error_code ec;
     const auto size = std::filesystem::file_size(b.logPath, ec);
@@ -865,27 +897,43 @@ void read_log(Build::Impl& b) {
     *b.logOffset += consumed;
     for (auto const& st : steps) {
         const long long start = b.passStart + st.start, end = b.passStart + st.end;
-        std::optional<std::size_t> owner;
+        std::optional<std::size_t> owner, stepId;
         bool seen = false;
         for (auto const& o : st.outputs) {
             if (auto it = b.record->owner.find(o); it != b.record->owner.end()) {
                 owner = it->second;
-                if (auto sid = b.record->step.find(o); sid != b.record->step.end())
+                if (auto sid = b.record->step.find(o); sid != b.record->step.end()) {
+                    stepId = sid->second;
                     seen = !b.counted.insert(sid->second).second;
+                }
                 break;
             }
         }
         // The rest of a step whose first entries an earlier read counted.
         if (seen) continue;
+        // An action by its label, a compile by its source file, any other
+        // step by its first output.
         std::string label = st.outputs.front();
         if (auto it = b.record->actions.find(st.outputs.front()); it != b.record->actions.end())
             label = it->second;
+        else if (stepId)
+            if (auto src = b.record->sources.find(*stepId); src != b.record->sources.end())
+                label = src->second;
         if (owner) {
             auto& s = b.packages[*owner];
             ++s.finished;
             s.first = std::min(s.first, start);
             s.last  = std::max(s.last, end);
-            label = std::format("{}: {}", b.record->packages[*owner].name, label);
+            label = std::format("{}: {}", b.record->packages[*owner].subject, label);
+            // A package is named at its first step that is not a scan: a
+            // dependency scan finishes before the compiles it orders, and
+            // naming a package there put a consumer before the package it
+            // imports. A package that only scanned is named when the pass
+            // ends.
+            const bool scan = std::ranges::all_of(st.outputs, [](const std::string& o) {
+                return o.ends_with(".ddi") || o.ends_with(".dd");
+            });
+            if (!scan) announce(r, b, *owner, out);
         }
         if (st.end - st.start > b.longest || !b.anyStep) {
             b.longest = st.end - st.start;
@@ -898,8 +946,9 @@ void read_log(Build::Impl& b) {
     }
 }
 
-// Reads the start file of an open pass; model lock held.
-void read_starts(Build::Impl& b) {
+// Reads the start file of an open pass; model lock held. A check or prepare
+// action that starts names its package: that is work.
+void read_starts(Report& r, Build::Impl& b, std::vector<std::string>& out) {
     if (!b.inPass || !b.record) return;
     std::error_code ec;
     const auto path = b.dir / kStartsFile;
@@ -922,6 +971,7 @@ void read_starts(Build::Impl& b) {
         b.running.push_back({owner->second,
                              label != b.record->actions.end() ? label->second : a.stamp,
                              a.stamp, now_ms() - std::max<long long>(0, nowUnix - a.unixMs)});
+        announce(r, b, owner->second, out);
     }
 }
 
@@ -934,62 +984,112 @@ std::vector<std::shared_ptr<Build::Impl>> live_builds(Report& r) {
     return out;
 }
 
-std::string phase_status(Report& r) {
+// The status row (revision 3, §7.2): the phase aligned with the verbs above
+// it, the screen, the counts, the clock, then what is known to be running.
+std::string phase_status(Report& r, std::string_view cells) {
     const auto clock = mcpp::ui::format_clock(ms(now_ms()));
     std::string current;
     long long oldest = std::numeric_limits<long long>::max();
-    std::size_t done = 0, total = 0;
+    std::size_t done = 0, total = 0, remaining = 0;
+    bool tail = true;   // every build in a pass has started its last step
+    bool anyPass = false;
     for (auto const& b : live_builds(r)) {
         done  += b->doneBefore + b->finished;
         total += b->totalBefore + b->total;
+        if (b->inPass) {
+            anyPass = true;
+            if (!b->unstarted || *b->unstarted > 0) tail = false;
+            else remaining += b->total > b->finished ? b->total - b->finished : 0;
+        }
         for (auto const& a : b->running)
             if (a.since < oldest) {
                 oldest  = a.since;
-                current = std::format("{}: {} {}", b->record->packages[a.package].name, a.label,
+                current = std::format("{}: {} {}", b->record->packages[a.package].subject, a.label,
                                       mcpp::ui::format_clock(ms(now_ms() - a.since)));
             }
     }
+    std::string counts;
+    std::string phase;
+    std::vector<std::string> extra;
     switch (r.phase) {
-    case Phase::Resolving:
-        return mcpp::ui::status_line("Resolving", std::format("· {}", clock));
+    case Phase::Planning: phase = "Planning"; break;
     case Phase::Programs: {
-        for (auto const& p : r.programs)
+        phase = "Running";
+        std::size_t finishedPrograms = 0;
+        for (auto const& p : r.programs) {
+            if (p.state == Program::Done) ++finishedPrograms;
             if (p.state == Program::Compiling || p.state == Program::Running)
-                current = std::format("{} {}", p.name, mcpp::ui::format_clock(
-                    std::chrono::duration_cast<ms>(Clock::now() - p.since)));
-        return mcpp::ui::status_line("Running build programs",
-            std::format("· {}{}", clock, current.empty() ? "" : " · " + current));
+                current = std::format("build.mcpp {} {} {}", p.name,
+                    p.state == Program::Compiling ? "compiling" : "running",
+                    mcpp::ui::format_clock(std::chrono::duration_cast<ms>(Clock::now() - p.since)));
+        }
+        counts = std::format("{}/{}", finishedPrograms, r.programs.size());
+        break;
     }
     case Phase::Building:
     case Phase::Stopping:
-        return mcpp::ui::status_line(r.phase == Phase::Building ? "Building" : "Stopping",
-            std::format("{}· {}{}", r.phase == Phase::Building && total > 0
-                                        ? std::format("{}/{} ", done, total) : "",
-                        clock, current.empty() ? "" : " · " + current));
-    case Phase::Checking:
-        return mcpp::ui::status_line("Checking", std::format("· {}", clock));
+        phase = r.phase == Phase::Building ? "Building" : "Stopping";
+        if (total > 0) counts = std::format("{}/{}", done, total);
+        // Once no step is left to start, every step left is running (`%u`).
+        if (r.phase == Phase::Building && anyPass && tail && remaining > 0)
+            extra.push_back(std::format("last {} running", remaining));
+        break;
+    case Phase::Checking: phase = "Checking"; break;
     }
-    return {};
+    std::string rest(cells);
+    if (!counts.empty()) rest += (rest.empty() ? "" : " ") + counts;
+    rest += std::format("{}· {}", rest.empty() ? "" : " ", clock);
+    for (auto const& e : extra) rest += " · " + e;
+    if (!current.empty()) rest += " · " + current;
+    return mcpp::ui::status_line(phase, rest);
 }
 
 mcpp::ui::Frame frame() {
     auto& r = report();
     std::lock_guard lock(r.m);
     mcpp::ui::Frame f;
-    for (auto const& p : r.programs)
-        if (p.state != Program::Done && (p.requested || r.verbose)) f.lines.push_back(program_line(r, p));
-    for (auto const& b : live_builds(r)) {
-        if (!b->record) continue;
-        for (std::size_t i = 0; i < b->record->packages.size(); ++i) {
-            const auto& p = b->record->packages[i];
-            const auto& s = b->packages[i];
-            if (s.committed || s.finished == 0 || !listed(r, p)) continue;
-            f.lines.push_back(package_line(r, *b, i, /*final=*/false, false));
+    std::string cells;
+    std::string score;
+    if (r.game) {
+        const auto now = now_ms();
+        screen::Input in;
+        in.dt     = r.lastFrame ? static_cast<double>(now - r.lastFrame) / 1000.0 : 0.0;
+        in.failed = r.failureReported;
+        for (auto s : r.started) r.game->package(s);
+        r.started.clear();
+        r.game->update(in);
+        r.lastFrame = now;
+        screen::Screen sc;
+        r.game->draw(sc);
+        cells = sc.render(r.animationColour);
+        score = std::format("{} {}", r.gameName, r.game->score());
+    } else if (r.animation) {
+        std::size_t done = 0, total = 0;
+        for (auto const& b : live_builds(r)) {
+            done  += b->doneBefore + b->finished;
+            total += b->totalBefore + b->total;
         }
-        if (!b->depsCommitted)
-            if (auto l = dependencies_line(r, *b, /*final=*/false, false)) f.lines.push_back(*l);
+        const auto now = now_ms();
+        screen::Input in;
+        in.dt       = r.lastFrame ? static_cast<double>(now - r.lastFrame) / 1000.0 : 0.0;
+        in.finished = done > r.lastDone ? done - r.lastDone : 0;
+        in.fraction = total ? std::min(1.0, static_cast<double>(done) / static_cast<double>(total)) : 0.0;
+        in.failed   = r.failureReported;
+        for (auto s : r.started) r.animation->package(s);
+        r.started.clear();
+        r.animation->update(in);
+        r.lastFrame = now;
+        r.lastDone  = done;
+        // The screen takes 25 columns; a terminal narrower than 60 keeps the
+        // counts and the clock instead.
+        if (mcpp::platform::terminal::cols() >= 60) {
+            screen::Screen sc;
+            r.animation->draw(sc);
+            cells = sc.render(r.animationColour);
+        }
     }
-    f.status = phase_status(r);
+    f.status = phase_status(r, cells);
+    if (!score.empty()) f.status += " · " + score;
     return f;
 }
 
@@ -998,25 +1098,96 @@ void poll() {
     std::vector<std::string> out;
     {
         std::lock_guard lock(r.m);
+        if (r.game && r.keys)
+            for (auto k : r.keys->read()) {
+                using TK = mcpp::platform::terminal::Key;
+                r.game->key(k == TK::Up   ? screen::Key::Up
+                          : k == TK::Down ? screen::Key::Down
+                          : k == TK::Left ? screen::Key::Left
+                          : k == TK::Right ? screen::Key::Right : screen::Key::Space);
+            }
         for (auto const& b : live_builds(r)) {
-            read_starts(*b);
-            read_log(*b);
-            settle(r, *b, out);
+            read_starts(r, *b, out);
+            read_log(r, *b, out);
         }
     }
     write_lines(out);
+}
+
+// The status row's screen, as MCPP_PROGRESS asks: `random` (the default) or
+// an animation's name; `plain` keeps the row without a screen; `off` draws no
+// live row at all. The screen needs a terminal that draws braille.
+std::unique_ptr<screen::Animation> choose_animation() {
+    std::string want = mcpp::platform::env::get("MCPP_PROGRESS").value_or("random");
+    for (auto& c : want) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (want == "off") {
+        mcpp::ui::set_live_progress(false);
+        return nullptr;
+    }
+    if (want == "plain" || !mcpp::ui::live_progress()
+        || !mcpp::platform::terminal::unicode_capable())
+        return nullptr;
+    const auto seed = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    auto names = screen::names();
+    if (auto a = screen::make(want, seed)) return a;
+    return screen::make(names[seed % names.size()], seed);
+}
+
+// `--play-game[=NAME]` (revision 3, §5.14): the CLI publishes the request as
+// MCPP_PLAY_GAME (`random` or a name). The game needs what the screen needs,
+// and keys: standard input and standard output on a terminal, with mcpp in
+// its foreground. Otherwise it is off, and one line says why.
+void choose_game(Report& r, std::vector<std::string>& notes) {
+    auto want = mcpp::platform::env::get("MCPP_PLAY_GAME").value_or("");
+    if (want.empty()) return;
+    mcpp::platform::env::unset("MCPP_PLAY_GAME");   // not inherited by what mcpp runs
+    for (auto& c : want) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const auto names = screen::game_names();
+    if (want != "random" && !screen::make_game(want, 0)) {
+        std::string known;
+        for (auto n : names) known += (known.empty() ? "" : ", ") + std::string(n);
+        notes.push_back(std::format("--play-game: no game called '{}' (the games: {}); one is chosen",
+                                    want, known));
+        want = "random";
+    }
+    auto progress = mcpp::platform::env::get("MCPP_PROGRESS").value_or("");
+    for (auto& c : progress) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (mcpp::ui::is_quiet() || !mcpp::ui::live_progress() || progress == "plain" || progress == "off"
+        || !mcpp::platform::terminal::unicode_capable()) {
+        notes.push_back("--play-game: the status row's screen is off here (a terminal that "
+                        "draws braille, without --quiet and MCPP_PROGRESS=plain or off, is needed)");
+        return;
+    }
+    auto keys = std::make_unique<mcpp::platform::terminal::KeyInput>();
+    if (!keys->active()) {
+        notes.push_back("--play-game: standard input is not a terminal in the foreground, "
+                        "so no key can be read");
+        return;
+    }
+    const auto seed = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    r.gameName = want == "random" ? std::string(names[seed % names.size()]) : want;
+    r.game = screen::make_game(r.gameName, seed);
+    r.keys = std::move(keys);
+    mcpp::ui::set_frame_interval(std::chrono::milliseconds(50));
 }
 
 } // namespace
 
 void open(bool verbose) {
     auto& r = report();
+    std::vector<std::string> notes;
     {
         std::lock_guard lock(r.m);
         if (r.open) return;
         r.open = true;
         r.verbose = verbose;
+        choose_game(r, notes);
+        if (!r.game) r.animation = choose_animation();
+        r.animationColour = mcpp::ui::is_color_enabled();
     }
+    for (auto const& n : notes) mcpp::ui::info("Game", n);
     mcpp::ui::open_region(&frame, &poll);
 }
 
@@ -1025,6 +1196,7 @@ void close() {
     auto& r = report();
     std::lock_guard lock(r.m);
     r.open = false;
+    r.keys.reset();   // the terminal's mode is restored here
 }
 
 void configurations(std::size_t n) {
@@ -1033,54 +1205,53 @@ void configurations(std::size_t n) {
     r.configurations = std::max<std::size_t>(1, n);
 }
 
-void program_scheduled(std::string_view package, bool requested) {
+void program_scheduled(std::string_view package, bool /*requested*/) {
     auto& r = report();
     {
         std::lock_guard lock(r.m);
-        program(r, package, requested);
+        program(r, package);
     }
     mcpp::ui::touch_region();
 }
 
-void program_compiling(std::string_view package, bool requested) {
+void program_compiling(std::string_view package, bool /*requested*/) {
     auto& r = report();
     {
         std::lock_guard lock(r.m);
         r.phase = Phase::Programs;
-        auto& p = program(r, package, requested);
+        auto& p = program(r, package);
         p.state = Program::Compiling;
         p.since = Clock::now();
     }
     mcpp::ui::touch_region();
 }
 
-void program_running(std::string_view package, bool requested) {
+void program_running(std::string_view package, bool /*requested*/) {
     auto& r = report();
     {
         std::lock_guard lock(r.m);
         r.phase = Phase::Programs;
-        auto& p = program(r, package, requested);
+        auto& p = program(r, package);
         p.state = Program::Running;
         p.since = Clock::now();
     }
     mcpp::ui::touch_region();
 }
 
-void program_finished(std::string_view package, bool requested, ProgramOutcome outcome,
+void program_finished(std::string_view package, bool /*requested*/, ProgramOutcome outcome,
                       std::chrono::milliseconds compile, std::chrono::milliseconds run) {
     auto& r = report();
     std::vector<std::string> out;
     {
         std::lock_guard lock(r.m);
-        auto& p = program(r, package, requested);
+        auto& p = program(r, package);
         p.state   = Program::Done;
         p.outcome = outcome;
         p.compile = compile;
         p.run     = run;
         r.programTime += compile + run;
-        if (p.requested || r.verbose || outcome == ProgramOutcome::Failed)
-            out.push_back(program_line(r, p));
-        if (outcome == ProgramOutcome::Failed) p.requested = true;   // not folded again
+        // A program whose result is reused did no work (revision 3, §7.1).
+        if (outcome != ProgramOutcome::Cached || r.verbose) out.push_back(program_line(r, p));
     }
     write_lines(out);
     mcpp::log::info("progress", std::format("build.mcpp {} {}", package,
@@ -1089,16 +1260,16 @@ void program_finished(std::string_view package, bool requested, ProgramOutcome o
         : std::format("compiled {}ms ran {}ms", compile.count(), run.count())));
 }
 
+// The build programs are done and the plan continues. Measured with
+// 2026.9.29.5: the status row read `Running build programs` for 13 s after the
+// only program finished, because nothing returned the phase to planning.
 void programs_done() {
     auto& r = report();
-    std::vector<std::string> out;
     {
         std::lock_guard lock(r.m);
-        if (r.programsCommitted) return;
-        r.programsCommitted = true;
-        if (auto l = folded_programs_line(r)) out.push_back(*l);
+        if (r.phase == Phase::Programs) r.phase = Phase::Planning;
     }
-    write_lines(out);
+    mcpp::ui::touch_region();
 }
 
 void checking() {
@@ -1138,8 +1309,9 @@ void finished(std::string_view profile, std::string_view descriptor) {
             return;
         }
         // The breakdown and the longest step explain a wait; a command shorter
-        // than ten seconds has none to explain (design §4.5).
-        if (total >= 10'000) {
+        // than a minute has none worth a longer line (build output design
+        // revision 3, §7.3).
+        if (total >= 60'000) {
             const long long build = r.buildStart ? total - *r.buildStart : 0;
             const long long programs = r.programTime.count();
             const long long plan = std::max<long long>(0, total - build - programs);
@@ -1164,8 +1336,14 @@ void finished(std::string_view profile, std::string_view descriptor) {
     }
     // `Finished` ends the report: the region is erased before it, and not
     // drawn again below it.
+    std::string played;
+    {
+        std::lock_guard lock(r.m);
+        if (r.game) played = std::format("{} · best {}", r.gameName, r.game->best());
+    }
     close();
     mcpp::ui::finished(profile, ms(total), descriptor, detail);
+    if (!played.empty()) mcpp::ui::line(mcpp::ui::step_line("Played", played, 0, ""));
 }
 
 // ─── Build ───────────────────────────────────────────────────────────────
@@ -1224,6 +1402,7 @@ void Build::pass_begin() {
         b.doneBefore  += b.finished;
         b.totalBefore += b.total;
         b.finished = b.total = 0;
+        b.unstarted.reset();
         b.passStart = now_ms();
         if (!r.buildStart) r.buildStart = b.passStart;
         r.phase = Phase::Building;
@@ -1258,21 +1437,21 @@ void Build::status(const StatusLine& line) {
         std::lock_guard lock(r.m);
         auto& b = *impl_;
         ensure_record(b);
-        b.finished = line.finished;
-        b.total    = line.total;
+        b.finished  = line.finished;
+        b.total     = line.total;
+        b.unstarted = line.unstarted;
         b.ends.push_back(line.endMs);
-        read_starts(b);
-        read_log(b);
-        settle(r, b, out);
+        read_starts(r, b, out);
+        read_log(r, b, out);
     }
     write_lines(out);
     mcpp::ui::touch_region();
 }
 
-bool Build::failed(std::string_view outputs) {
+std::optional<std::string> Build::failed(std::string_view outputs) {
     auto& r = report();
     std::vector<std::string> out;
-    bool first = false;
+    std::optional<std::string> first;
     {
         std::lock_guard lock(r.m);
         auto& b = *impl_;
@@ -1292,13 +1471,12 @@ bool Build::failed(std::string_view outputs) {
                 if (auto it = b.record->owner.find(o); it != b.record->owner.end()) owner = it->second;
             rest.remove_prefix(sp == std::string_view::npos ? rest.size() : sp + 1);
         }
-        if (owner && !b.packages[*owner].committed) {
-            b.packages[*owner].failed = true;
-            b.packages[*owner].committed = true;
-            out.push_back(package_line(r, b, *owner, /*final=*/true, /*success=*/false));
-        }
+        // A failed step is not written to ninja's log, so a package whose
+        // first step failed is named here.
+        if (owner) announce(r, b, *owner, out);
         r.phase = Phase::Stopping;
-        first = !r.failureReported;
+        if (!r.failureReported)
+            first = owner ? plain_subject(b, *owner) : std::string{};
         r.failureReported = true;
     }
     write_lines(out);
@@ -1311,8 +1489,10 @@ void Build::pass_end() {
     {
         std::lock_guard lock(r.m);
         auto& b = *impl_;
-        read_log(b);
-        settle(r, b, out);
+        read_log(r, b, out);
+        if (b.record)
+            for (std::size_t i = 0; i < b.packages.size(); ++i)
+                if (b.packages[i].finished > 0) announce(r, b, i, out);
         b.inPass = false;
         b.running.clear();
     }
@@ -1325,32 +1505,24 @@ void Build::finish(bool success) {
     {
         std::lock_guard lock(r.m);
         auto& b = *impl_;
-        if (b.record) {
-            // In the order the packages completed; those with nothing to do
-            // last, in the plan's order.
-            std::vector<std::pair<long long, std::string>> lines;
-            constexpr auto never = std::numeric_limits<long long>::max();
+        // Under --verbose, the packages with nothing to do are named, and each
+        // package that did work states its steps and the span from the start
+        // of its first step to the end of its last, read from ninja's log
+        // (revision 3, §7.4): the exact form of revision 2's `done <span>`.
+        if (b.record && r.verbose) {
             for (std::size_t i = 0; i < b.record->packages.size(); ++i) {
-                auto& s = b.packages[i];
                 const auto& p = b.record->packages[i];
-                if (s.committed || !listed(r, p)) continue;
-                // A package with nothing to do is listed only with --verbose.
-                if (s.finished == 0 && !(r.verbose && success)) continue;
-                s.committed = true;
-                lines.emplace_back(s.finished ? s.last : never,
-                                   package_line(r, b, i, /*final=*/true, success));
+                const auto& s = b.packages[i];
+                if (p.name == "std" || p.name.empty()) continue;
+                if (s.finished == 0) {
+                    if (success) out.push_back(mcpp::ui::step_line("Fresh", subject_of(r, b, p), 0, ""));
+                    continue;
+                }
+                std::string span = s.first <= s.last
+                    ? " · " + mcpp::ui::format_duration(ms(s.last - s.first)) : std::string{};
+                out.push_back(mcpp::ui::step_line("Compiled", std::format("{} · {}{}",
+                    subject_of(r, b, p), plural(s.finished, "step", "steps"), span), 0, ""));
             }
-            if (!b.depsCommitted) {
-                long long last = 0;
-                for (std::size_t i = 0; i < b.record->packages.size(); ++i)
-                    if (!listed(r, b.record->packages[i]) && b.packages[i].finished)
-                        last = std::max(last, b.packages[i].last);
-                if (auto l = dependencies_line(r, b, /*final=*/true, success))
-                    lines.emplace_back(last ? last : never, *l);
-                b.depsCommitted = true;
-            }
-            std::ranges::stable_sort(lines, {}, &std::pair<long long, std::string>::first);
-            for (auto& l : lines) out.push_back(std::move(l.second));
         }
         std::size_t done = 0;
         for (auto const& s : b.packages) done += s.finished;

@@ -6,13 +6,19 @@
 //   can_move_cursor(s)— whether a live display may be drawn on it
 //   cols(), rows()    — the terminal's size
 //   write(s, text)    — UTF-8 text to a standard stream
+//   write_frame(s, b) — a frame of a live display, in one write
+//   same_terminal()   — whether stdout and stderr reach one terminal
+//   KeyInput          — keys read from the terminal while a game plays
 
 module;
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <termios.h>
 #endif
 #if defined(_WIN32)
 #include <io.h>        // _dup, _dup2, _close, _get_osfhandle, _fileno
@@ -34,6 +40,7 @@ module;
 export module mcpp.platform.terminal;
 
 import std;
+import mcpp.platform.unix.bounded_process;
 
 export namespace mcpp::platform::terminal {
 
@@ -69,6 +76,72 @@ std::size_t rows();
 // buffer is flushed first, so the two paths keep their order. Everything else
 // receives the bytes through stdio, unflushed.
 void write(Stream s, std::string_view text);
+
+// Writes a frame of a live display in one operation. The stdio buffers of
+// both streams are flushed first, so that everything written before arrives
+// before; the frame then leaves in one write(2) on POSIX (repeated only for a
+// partial write or an interruption) and in one WriteConsoleW on a Windows
+// console. Written through stdio, a frame whose last row has no line end was
+// flushed in two parts on a line-buffered terminal, and a terminal that
+// painted between them showed the display half-drawn (measured: 184 of 202
+// frames of one build, .agents/docs/2026-09-30-build-output-refinement-design.md
+// F1).
+void write_frame(Stream s, std::string_view bytes);
+
+// Whether standard error reaches the terminal standard output reaches: both
+// are terminals and, on POSIX, the same device; on Windows both are console
+// handles, and a process has at most one console. A line for standard error
+// can then travel in a frame written to standard output.
+bool same_terminal();
+
+// Whether the terminal is likely to draw East Asian ambiguous-width
+// characters (`·`, `…`, `→`, the box-drawing block) two columns wide: a
+// Windows console whose output code page is 932, 936, 949 or 950, or, on
+// POSIX, a locale (LC_ALL, LC_CTYPE, then LANG) for Chinese, Japanese or
+// Korean. The answer is a likelihood; a live display that budgets its width
+// by it is never wider than the terminal either way.
+bool ambiguous_wide();
+
+// Whether the terminal can be expected to draw characters beyond ASCII from
+// its font or a fallback, braille included: on POSIX a UTF-8 locale (LC_ALL,
+// LC_CTYPE, then LANG); on Windows a terminal that names itself (Windows
+// Terminal sets WT_SESSION, VS Code and others TERM_PROGRAM). The console
+// host alone has no glyph fallback, and its long-standing default font lacks
+// the braille block.
+bool unicode_capable();
+
+// The keys a game reads (build output design revision 3, §5.14): the arrows,
+// the space bar, and `wasd` as a second set of arrows.
+enum class Key { Up, Down, Left, Right, Space };
+
+// The keys in `pending`, the bytes a POSIX terminal sent: an arrow is
+// `ESC [ A` to `ESC [ D`, `ESC O A` to `ESC O D` in application mode, or
+// `ESC [ 1 ; 5 A` and the like with a modifier; a sequence for any other key
+// is skipped whole. An incomplete sequence at the end is left in `pending`.
+std::vector<Key> decode_keys(std::string& pending);
+
+// KEYS READ FROM THE TERMINAL FOR THE LIFETIME OF THE OBJECT, without echo and
+// without waiting for a line end; Ctrl-C still interrupts. Active only when
+// standard input and standard output are both terminals and, on POSIX, mcpp
+// is in the terminal's foreground process group: a background job that
+// changed the terminal's mode would be stopped by SIGTTOU. The mode the
+// terminal had is restored when the object is destroyed, and by the signal
+// handler if a signal ends mcpp first (POSIX: `unixproc::guard_terminal_mode`;
+// Windows: a console control handler).
+class KeyInput {
+public:
+    KeyInput();
+    ~KeyInput();
+    KeyInput(const KeyInput&) = delete;
+    KeyInput& operator=(const KeyInput&) = delete;
+    bool active() const { return active_; }
+    // The keys pressed since the last call; never blocks.
+    std::vector<Key> read();
+private:
+    bool active_ = false;
+    std::string pending_;          // an escape sequence not yet complete
+    unsigned long savedMode_ = 0;  // Windows: the console input mode
+};
 
 // EVERYTHING WRITTEN TO STANDARD OUTPUT GOES TO STANDARD ERROR UNTIL THIS IS
 // DESTROYED.
@@ -205,6 +278,216 @@ void write(Stream s, std::string_view text) {
     }
 #endif
     std::fwrite(text.data(), 1, text.size(), file_of(s));
+}
+
+void write_frame(Stream s, std::string_view bytes) {
+    if (bytes.empty()) return;
+    std::fflush(stdout);
+    std::fflush(stderr);
+#if defined(_WIN32)
+    if (HANDLE h; console_of(s, &h)) {
+        const int n = ::MultiByteToWideChar(CP_UTF8, 0, bytes.data(),
+                                            static_cast<int>(bytes.size()), nullptr, 0);
+        if (n > 0) {
+            std::wstring wide(static_cast<std::size_t>(n), L'\0');
+            ::MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()),
+                                  wide.data(), n);
+            DWORD written = 0;
+            if (::WriteConsoleW(h, wide.data(), static_cast<DWORD>(wide.size()), &written, nullptr))
+                return;
+        }
+    }
+    std::fwrite(bytes.data(), 1, bytes.size(), file_of(s));
+    std::fflush(file_of(s));
+#elif defined(__unix__) || defined(__APPLE__)
+    const int fd = ::fileno(file_of(s));
+    const char* p = bytes.data();
+    std::size_t left = bytes.size();
+    while (left > 0) {
+        const auto n = ::write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        p += n;
+        left -= static_cast<std::size_t>(n);
+    }
+#else
+    std::fwrite(bytes.data(), 1, bytes.size(), file_of(s));
+    std::fflush(file_of(s));
+#endif
+}
+
+bool same_terminal() {
+#if defined(_WIN32)
+    return console_of(Stream::Out) && console_of(Stream::Err);
+#elif defined(__unix__) || defined(__APPLE__)
+    const int out = ::fileno(stdout), err = ::fileno(stderr);
+    if (::isatty(out) == 0 || ::isatty(err) == 0) return false;
+    struct stat a{}, b{};
+    if (::fstat(out, &a) != 0 || ::fstat(err, &b) != 0) return false;
+    return a.st_rdev == b.st_rdev;
+#else
+    return false;
+#endif
+}
+
+bool ambiguous_wide() {
+#if defined(_WIN32)
+    if (console_of(Stream::Out)) {
+        const UINT cp = ::GetConsoleOutputCP();
+        if (cp == 932 || cp == 936 || cp == 949 || cp == 950) return true;
+    }
+#endif
+    for (const char* name : {"LC_ALL", "LC_CTYPE", "LANG"}) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) continue;
+        const std::string_view l(v);
+        return l.starts_with("zh") || l.starts_with("ja") || l.starts_with("ko");
+    }
+    return false;
+}
+
+bool unicode_capable() {
+#if defined(_WIN32)
+    for (const char* name : {"WT_SESSION", "TERM_PROGRAM"})
+        if (const char* v = std::getenv(name); v && *v) return true;
+    return false;
+#else
+    for (const char* name : {"LC_ALL", "LC_CTYPE", "LANG"}) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) continue;
+        std::string l(v);
+        for (auto& c : l) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return l.find("utf-8") != std::string::npos || l.find("utf8") != std::string::npos;
+    }
+    return false;
+#endif
+}
+
+namespace {
+
+#if defined(_WIN32)
+HANDLE g_inputHandle = INVALID_HANDLE_VALUE;
+DWORD  g_inputMode   = 0;
+BOOL WINAPI restore_input_mode(DWORD) {
+    if (g_inputHandle != INVALID_HANDLE_VALUE) ::SetConsoleMode(g_inputHandle, g_inputMode);
+    return FALSE;   // the next handler, then the default action, still run
+}
+#endif
+
+} // namespace
+
+std::vector<Key> decode_keys(std::string& pending) {
+    std::vector<Key> keys;
+    std::size_t i = 0;
+    while (i < pending.size()) {
+        const char c = pending[i];
+        if (c == '\x1b') {
+            if (i + 1 >= pending.size()) break;   // wait for the rest
+            if (pending[i + 1] != '[' && pending[i + 1] != 'O') { ++i; continue; }
+            // Parameter and intermediate bytes (0x20 to 0x3F), then one final
+            // byte (0x40 to 0x7E) that names the key.
+            std::size_t end = i + 2;
+            while (end < pending.size()
+                   && static_cast<unsigned char>(pending[end]) >= 0x20
+                   && static_cast<unsigned char>(pending[end]) <= 0x3F)
+                ++end;
+            if (end >= pending.size()) break;     // wait for the final byte
+            switch (pending[end]) {
+            case 'A': keys.push_back(Key::Up);    break;
+            case 'B': keys.push_back(Key::Down);  break;
+            case 'C': keys.push_back(Key::Right); break;
+            case 'D': keys.push_back(Key::Left);  break;
+            default: break;
+            }
+            i = end + 1;
+            continue;
+        }
+        switch (c) {
+        case ' ': keys.push_back(Key::Space); break;
+        case 'w': case 'W': keys.push_back(Key::Up);    break;
+        case 's': case 'S': keys.push_back(Key::Down);  break;
+        case 'a': case 'A': keys.push_back(Key::Left);  break;
+        case 'd': case 'D': keys.push_back(Key::Right); break;
+        default: break;
+        }
+        ++i;
+    }
+    pending.erase(0, i);
+    return keys;
+}
+
+KeyInput::KeyInput() {
+    if (!is_terminal(Stream::Out)) return;
+#if defined(_WIN32)
+    const HANDLE h = ::GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (h == INVALID_HANDLE_VALUE || !::GetConsoleMode(h, &mode)) return;
+    g_inputHandle = h;
+    g_inputMode   = mode;
+    savedMode_    = mode;
+    ::SetConsoleCtrlHandler(restore_input_mode, TRUE);
+    // ENABLE_PROCESSED_INPUT stays: Ctrl-C still interrupts.
+    if (!::SetConsoleMode(h, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))) return;
+    active_ = true;
+#elif defined(__unix__) || defined(__APPLE__)
+    if (::isatty(0) == 0 || ::tcgetpgrp(0) != ::getpgrp()) return;
+    struct termios mode{};
+    if (::tcgetattr(0, &mode) != 0) return;
+    mcpp::platform::unixproc::guard_terminal_mode(0);
+    struct termios raw = mode;
+    raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));   // ISIG stays: Ctrl-C interrupts
+    raw.c_cc[VMIN]  = 0;
+    raw.c_cc[VTIME] = 0;
+    if (::tcsetattr(0, TCSANOW, &raw) != 0) {
+        mcpp::platform::unixproc::unguard_terminal_mode();
+        return;
+    }
+    active_ = true;
+#endif
+}
+
+KeyInput::~KeyInput() {
+    if (!active_) return;
+#if defined(_WIN32)
+    ::SetConsoleMode(g_inputHandle, static_cast<DWORD>(savedMode_));
+    ::SetConsoleCtrlHandler(restore_input_mode, FALSE);
+    g_inputHandle = INVALID_HANDLE_VALUE;
+#elif defined(__unix__) || defined(__APPLE__)
+    mcpp::platform::unixproc::unguard_terminal_mode();
+#endif
+}
+
+std::vector<Key> KeyInput::read() {
+    std::vector<Key> keys;
+    if (!active_) return keys;
+#if defined(_WIN32)
+    DWORD n = 0;
+    while (::GetNumberOfConsoleInputEvents(g_inputHandle, &n) && n > 0) {
+        INPUT_RECORD rec{};
+        DWORD got = 0;
+        if (!::ReadConsoleInputW(g_inputHandle, &rec, 1, &got) || got == 0) break;
+        if (rec.EventType != KEY_EVENT || !rec.Event.KeyEvent.bKeyDown) continue;
+        switch (rec.Event.KeyEvent.wVirtualKeyCode) {
+        case VK_UP:    case 'W': keys.push_back(Key::Up);    break;
+        case VK_DOWN:  case 'S': keys.push_back(Key::Down);  break;
+        case VK_LEFT:  case 'A': keys.push_back(Key::Left);  break;
+        case VK_RIGHT: case 'D': keys.push_back(Key::Right); break;
+        case VK_SPACE:           keys.push_back(Key::Space); break;
+        default: break;
+        }
+    }
+#elif defined(__unix__) || defined(__APPLE__)
+    char buf[64];
+    while (true) {
+        const auto n = ::read(0, buf, sizeof buf);   // VMIN 0, VTIME 0: never blocks
+        if (n <= 0) break;
+        pending_.append(buf, static_cast<std::size_t>(n));
+    }
+    keys = decode_keys(pending_);
+#endif
+    return keys;
 }
 
 StdoutToStderr::StdoutToStderr() {

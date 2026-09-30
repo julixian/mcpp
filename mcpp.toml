@@ -1,6 +1,6 @@
 [package]
 name        = "mcpp"
-version = "2026.9.29.5"
+version = "2026.9.30.1"
 description = "Modern C++ build & package management tool"
 license     = "Apache-2.0"
 authors     = ["mcpp-community"]
@@ -35,10 +35,10 @@ default-profile = "release"
 # Revert is this one line if anything here is ever unexplained.
 bmi_schedule = "on"
 
-# mcpp.exe declares the UTF-8 code page (mcpp#693); see res/mcpp.rc. Only a PE
+# mcpp.exe declares the UTF-8 code page (mcpp#693); see docs/res/mcpp.rc. Only a PE
 # target compiles a resource script, so this changes nothing elsewhere.
 [resources]
-files = ["res/mcpp.rc"]
+files = ["docs/res/mcpp.rc"]
 
 [toolchain]
 default = "gcc@16.1.0"
