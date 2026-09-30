@@ -200,14 +200,9 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
                 break;
             }
         }
-        // Which member each package acts for in a pack of several members, the
-        // members named in selection order as `workspaceMembers` holds them.
+        // Which member each package acts for in a pack of several members.
         state.computePackReach();
-        for (auto const& [package, reach] : state.packReach) {
-            auto& ordered = ctx.packReach[package];
-            for (auto const& m : ctx.workspaceMembers)
-                if (std::ranges::find(reach, m.name) != reach.end()) ordered.push_back(m.name);
-        }
+        ctx.packReach = state.packReach;
     }
     return {};
 }
@@ -935,9 +930,8 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // refusal below can say WHY there is no tree, which is a different
         // sentence from "you are not packaging".
         std::string stageDirWhy;
-        // A package several packed members reach has no stage of its own: one
-        // staged tree belongs to one member, and one run of the package's program
-        // serves every member. Its refusal names the package and those members.
+        // A package several packed members reach has no stage of its own; its
+        // refusal names the package and those members.
         std::string stageDirShared;
         // WHETHER *THIS* ACTION REFERENCED THE STAGED TREE, and deliberately a
         // flag rather than a set keyed on the action's id: an id is unique
@@ -956,10 +950,10 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // the action (§15 of the 2026-09-29 workspace design). Set per
         // package by `collect`.
         std::filesystem::path binDir = ctx.plan.outputDir / "bin";
-        // The staged tree of the package being collected: the stage of the member
-        // it acts for (`PrepareState::packStageOf`), set by `collect` per package.
+        // The stage of the package being collected, as `collect` sets it: that of
+        // the member it acts for (`PrepareState::packStageOf`), or why it has none.
         const BuildOverrides::PackStage* stage = nullptr;
-        std::string stageSharedBy, stagePackage;
+        std::string stageShared;
         bool stagePass = false;
         auto substitute = [&](std::string s, const char* actionId,
                               mcpp::manifest::BuildAction::Role role) {
@@ -988,14 +982,10 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             // edge-declared spelling to agree with. `${mcpp.out_dir}` above is
             // absolute on the same grounds.
             if (s.find("${mcpp.stage_dir}") != std::string::npos) {
-                if (!stagePass && !stageSharedBy.empty()) {
-                    stageDirShared = std::format(
-                        "package '{}' is reached by the packed members {}", stagePackage,
-                        stageSharedBy);
-                    stageDirNoPass.insert(actionId);
-                } else if (!stagePass) {
+                if (!stagePass) {
                     stageDirNoPass.insert(actionId);
                     stageDirWhy = stage ? stage->reason : std::string{};
+                    if (!stageShared.empty()) stageDirShared = stageShared;
                 } else if (role != mcpp::manifest::BuildAction::Role::Artifact) {
                     stageDirWrongRole.insert(actionId);
                 } else {
@@ -1059,15 +1049,8 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             auto owner = mcpp::build::qualified_package_name(mm);
             stage = state.packStageOf(packageIndex);
             stagePass = stage && !stage->dir.empty();
-            stageSharedBy.clear();
-            stagePackage = owner;
-            if (!stage && !state.overrides.pack_stages.empty()) {
-                state.computePackReach();
-                if (auto reach = state.packReach.find(owner);
-                    reach != state.packReach.end() && reach->second.size() > 1)
-                    for (auto const& member : reach->second)
-                        stageSharedBy += (stageSharedBy.empty() ? "'" : ", '") + member + "'";
-            }
+            stageShared = stage || state.overrides.pack_stages.empty()
+                ? std::string{} : state.packSharedWhy(packageIndex);
             binDir = ctx.plan.outputDir / "bin";
             for (auto const& g : ctx.plan.linkGroups)
                 if (!g.linkOnly && g.member == owner) binDir = ctx.plan.outputDir / g.productDir;
@@ -1126,15 +1109,13 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         if (!stageDirNoPass.empty()) {
             std::string ids;
             for (auto const& n : stageDirNoPass) ids += (ids.empty() ? "" : ", ") + n;
-            if (!stageDirShared.empty()) {
+            if (!stageDirShared.empty())
                 return std::unexpected(std::format(
                     "build.mcpp action(s) [{}] reference ${{mcpp.stage_dir}}, and {}.\n"
                     "  A staged tree belongs to one member, and one run of this package's "
-                    "program serves all of them,\n"
-                    "  so there is no tree for it to name.\n"
+                    "program serves all of them.\n"
                     "  use: provide the format from each member's own build program, or pack "
                     "the members one at a time", ids, stageDirShared));
-            }
             if (!stageDirWhy.empty()) {
                 return std::unexpected(std::format(
                     "build.mcpp action(s) [{}] reference ${{mcpp.stage_dir}}, and no "

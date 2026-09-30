@@ -364,6 +364,18 @@ struct PrepareState {
                         .push_back(member);
         }
     }
+    // Why package `i` has no stage when several packed members reach it: such a
+    // package acts for none of them (`pack_owner`). Empty otherwise.
+    std::string packSharedWhy(std::size_t i) {
+        computePackReach();
+        if (i >= packages.size()) return {};
+        const auto name = mcpp::build::qualified_package_name(packages[i].manifest);
+        auto reach = packReach.find(name);
+        if (reach == packReach.end() || reach->second.size() < 2) return {};
+        std::string members;
+        for (auto const& m : reach->second) members += (members.empty() ? "'" : ", '") + m + "'";
+        return std::format("package '{}' is reached by the packed members {}", name, members);
+    }
     // What the packaging pass tells the programs that act for package `i`, or
     // null when there is none to tell: outside a packaging pass, for a package
     // several packed members reach, and for a member that has no stage.

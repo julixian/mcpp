@@ -496,7 +496,7 @@ export struct BuildContext {
     // Which packed member each package acts for, in a plan of several
     // selected members (member selection design 2026-09-30, K1): for every
     // package of the plan, the selected members whose dependency closure
-    // reaches it, in selection order, a member reaching itself. Empty for a
+    // reaches it, in discovery order, a member reaching itself. Empty for a
     // plan of one member or none, where the plan's one subject is what every
     // package acts for. Read through `pack_owner`.
     std::map<std::string, std::vector<std::string>> packReach;

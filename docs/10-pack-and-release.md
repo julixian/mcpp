@@ -222,7 +222,7 @@ packs them all.
 
 **Refused before anything is compiled**, naming what was refused:
 
-| Input | Why |
+| Input | Reason |
 |---|---|
 | a positional target name | it names a target of one package |
 | more than one `--target` | a program is built for one target, and the several-target Android pack stages the legs of one member |
