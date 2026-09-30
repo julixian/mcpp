@@ -18,7 +18,7 @@ superseded_by: 2026-09-07-....md  # when status is superseded
 ---
 ```
 
-319 records.
+320 records.
 
 ## By subject
 
@@ -30,6 +30,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### design
 
+- [The build's wall time, its progress count, a hang after the build, and #732 and #744: measurements and a remediation plan](2026-09-30-build-wall-time-progress-count-and-hang-plan.md) — landed
 - [Build output, revision 3: every package that does work is named, the live display is one line drawn in one write, and a repeated warning is stated once per file](2026-09-30-build-output-refinement-design.md) — landed
 - [The workspace as the unit of build: one graph per configuration, one scheduler, product directories, and a reusable graph module](2026-09-29-workspace-build-graph-design.md) — landed
 - [Build progress: each step's line states its outcome, and one status line states the build](2026-09-29-build-progress-display-design.md) — landed
@@ -110,6 +111,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### 2026-09
 
+- [The build's wall time, its progress count, a hang after the build, and #732 and #744: measurements and a remediation plan](2026-09-30-build-wall-time-progress-count-and-hang-plan.md) — landed
 - [Build output, revision 3: every package that does work is named, the live display is one line drawn in one write, and a repeated warning is stated once per file](2026-09-30-build-output-refinement-design.md) — landed
 - [The workspace as the unit of build: one graph per configuration, one scheduler, product directories, and a reusable graph module](2026-09-29-workspace-build-graph-design.md) — landed
 - [Build progress: each step's line states its outcome, and one status line states the build](2026-09-29-build-progress-display-design.md) — landed

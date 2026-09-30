@@ -277,8 +277,9 @@ On a terminal one status row is drawn below the output and updated in place:
     Building ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢾⡷⠀⠰⣿⠆⠄⠄⠄⠄⠄⠄⠄⠄ 612/707 · 0:35 · gpp.gui: CMAKE ElaWidgetTools 6:10
 ```
 
-- The phase (`Planning`, `Running` for the build programs, `Building`,
-  `Stopping` after a failure, `Checking`) is aligned with the verbs above it.
+- The phase (`Planning`, `Running` for the build programs, `Scanning` for the
+  dependency scans, `Building`, `Stopping` after a failure, `Checking`) is
+  aligned with the verbs above it.
 - Beside it, a screen of 24 braille cells plays one of four animations,
   chosen per command: a chomper whose position is the progress, a snake that
   eats a food in the colour of each package that starts, Tetris on its side
@@ -286,7 +287,13 @@ On a terminal one status row is drawn below the output and updated in place:
   bar. An animation moves slowly while mcpp works and faster as steps finish,
   and it stands still while the build waits.
 - Then come the steps finished and planned, and the time since the command
-  started. When no step is left to start, `last N running` follows.
+  started. When no step is left to start, `last N running` follows. The
+  steps of `Building` are the work of the build: its compiles, links,
+  archives and actions (2026.9.30.2+). Placing what the global cache serves is
+  reported by the `Cached` lines and not counted, and the dependency scans run
+  first, as `Scanning` with a count of their own; a scan that waits for a
+  package's `prepare` or `check` action runs with the build and is counted
+  there.
 - Last comes the longest-running `check` or `prepare` action. ninja reports
   every other step only when it finishes.
 - The row is first drawn half a second into the command. Every change leaves
