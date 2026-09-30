@@ -919,7 +919,10 @@ std::optional<Refusal> stage_member(PackRun& run, GroupJob& g, MemberJob& m) {
                       || !ctx.manifest.buildConfig.ruleModules.empty();
     for (auto const& sp : ctx.sourcePackages)
         if (std::filesystem::exists(sp.root / "build.mcpp", bec)) m.ranBuildPrograms = true;
-    m.pathCtx = mcpp::fetcher::make_path_ctx(&cfg, ctx.projectRoot);
+    // Paths are shown from the directory the command was typed in: a workspace's
+    // root when several members are packed, and otherwise the package's own.
+    m.pathCtx = mcpp::fetcher::make_path_ctx(
+        &cfg, run.selection ? run.selection->root : ctx.projectRoot);
 
     if (opts.format != mcpp::pack::Format::Dispatched) {
         auto outPath = (opts.format == mcpp::pack::Format::Tar)

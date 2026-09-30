@@ -322,10 +322,14 @@ PackMembers pack_members(const mcpplibs::cmdline::ParsedArgs& parsed) {
         // Outside a workspace there is nothing for `-p` to name.
         if (!request.packages.empty()) {
             auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
-            mcpp::ui::error(root
-                ? std::format("-p {}: {} is not a workspace", request.packages.front(),
-                              root->string())
-                : std::string("-p needs a workspace; no mcpp.toml was found here or above"));
+            if (!root) {
+                mcpp::ui::error("-p needs a workspace; no mcpp.toml was found here or above");
+            } else if (auto rm = mcpp::manifest::load(*root / "mcpp.toml"); !rm) {
+                mcpp::ui::error(rm.error().format());
+            } else {
+                mcpp::ui::error(std::format("-p {}: {} is not a workspace",
+                                            request.packages.front(), root->string()));
+            }
             out.rc = 2;
         }
         return out;
