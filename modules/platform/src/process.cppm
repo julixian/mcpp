@@ -364,6 +364,16 @@ std::string windows_shell_command_line(std::string_view command) {
 
 namespace {
 
+// The section every child start holds from the creation of its pipe to the
+// parent's close of the write end (see mcpp.platform.unix.bounded_process, which
+// states why). Each platform's module defines a class on every platform and
+// empties the one that does not apply, so the uses below need no branch.
+#if defined(_WIN32)
+using LaunchSection = mcpp::platform::winproc::LaunchSection;
+#else
+using LaunchSection = mcpp::platform::unixproc::LaunchSection;
+#endif
+
 // Append a non-interactive stdin redirect to prevent child processes from
 // blocking on terminal input.
 //   - POSIX:  "< /dev/null"  — fixes macOS xcrun / xcode-select hangs.
@@ -537,7 +547,13 @@ RunResult capture(std::string_view command) {
     auto cmd = finalize_shell_command(command);
     RunResult result;
 
-    std::FILE* fp = ::popen(cmd.c_str(), "r");
+    std::FILE* fp = nullptr;
+    {
+        // `popen` creates the pipe and starts the child in one call, so the
+        // section is exactly that call.
+        LaunchSection launch;
+        fp = ::popen(cmd.c_str(), "r");
+    }
     if (!fp) {
         result.exit_code = -1;
         return result;
@@ -564,8 +580,21 @@ RunResult capture_with_env(
     const std::vector<std::pair<std::string, std::string>>& env)
 {
 #if defined(_WIN32)
-    for (auto& [k, v] : env)
-        _putenv_s(k.c_str(), v.c_str());
+    // This mutates the calling process's environment, as it always has, and it
+    // is called from several threads at once when a workspace's build programs
+    // are compiled together. A variable is therefore set only when its value
+    // differs, so callers that pass one value (the toolchain's INCLUDE and LIB,
+    // the same for every compile of a build) stop touching the environment block
+    // after the first, and the writes that remain are made under the section the
+    // children are started in.
+    {
+        LaunchSection launch;
+        for (auto& [k, v] : env) {
+            const char* now = std::getenv(k.c_str());
+            if (now && v == now) continue;
+            _putenv_s(k.c_str(), v.c_str());
+        }
+    }
     return capture(command);
 #else
     std::string prefixed;
@@ -595,7 +624,11 @@ int run_streaming(std::string_view command,
                   std::function<void(std::string_view line)> on_line)
 {
     auto cmd = finalize_shell_command(command);
-    std::FILE* fp = ::popen(cmd.c_str(), "r");
+    std::FILE* fp = nullptr;
+    {
+        LaunchSection launch;
+        fp = ::popen(cmd.c_str(), "r");
+    }
     if (!fp) return -1;
 
     std::array<char, 16384> buf{};
@@ -624,7 +657,11 @@ int run_streaming(std::string_view command,
 
 int run_passthrough(std::string_view command, std::string* output) {
     auto cmd = finalize_shell_command(command);
-    std::FILE* fp = ::popen(cmd.c_str(), "r");
+    std::FILE* fp = nullptr;
+    {
+        LaunchSection launch;
+        fp = ::popen(cmd.c_str(), "r");
+    }
     if (!fp) return -1;
 
     std::array<char, 8192> buf{};
@@ -695,7 +732,13 @@ int run_exec(const std::vector<std::string>& argv,
     ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
 
     pid_t pid = 0;
-    int sp = ::posix_spawnp(&pid, cargv[0], nullptr, &attr, cargv.data(), envp.data());
+    int sp = 0;
+    {
+        // A child with no pipe of its own is still started outside the window
+        // another thread's pipe is open in.
+        LaunchSection launch;
+        sp = ::posix_spawnp(&pid, cargv[0], nullptr, &attr, cargv.data(), envp.data());
+    }
     ::posix_spawnattr_destroy(&attr);
     if (sp != 0) {
         // Reported once: by the caller when it asked for the errno, here
@@ -756,9 +799,6 @@ RunResult capture_exec(
 #if defined(__linux__) || defined(__APPLE__)
     // posix_spawn + a pipe; stdout and stderr both go to the pipe so the
     // captured text is combined (replaces the old `2>&1`).
-    int fds[2];
-    if (::pipe(fds) != 0) { result.exit_code = 127; return result; }
-
     auto envStore = merged_environ(extraEnv);
     std::vector<char*> envp;
     for (auto& s : envStore) envp.push_back(s.data());
@@ -766,6 +806,18 @@ RunResult capture_exec(
     std::vector<char*> cargv;
     for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
+
+    // Several threads call this at once (a workspace's build programs are
+    // compiled together). The pipe is close-on-exec, so a child another thread
+    // starts while this one is open does not keep it open (see
+    // mcpp.platform.unix.bounded_process for the rule and for what a platform
+    // without `pipe2` does in addition).
+    LaunchSection launch;
+    int fds[2];
+    if (mcpp::platform::unixproc::make_pipe(fds) != 0) {
+        result.exit_code = 127;
+        return result;
+    }
 
     posix_spawn_file_actions_t fa;
     ::posix_spawn_file_actions_init(&fa);
@@ -794,6 +846,7 @@ RunResult capture_exec(
     ::posix_spawnattr_destroy(&attr);
     ::posix_spawn_file_actions_destroy(&fa);
     ::close(fds[1]);
+    launch.release();
     if (sp == 0) mcpp::platform::unixproc::guard_group_on_signal(pid);
     if (sp != 0) {
         ::close(fds[0]);
@@ -845,9 +898,6 @@ RunResult capture_stdout(
     if (spawn_error) *spawn_error = 0;
     if (argv.empty()) { result.exit_code = 127; return result; }
 #if defined(__linux__) || defined(__APPLE__)
-    int fds[2];
-    if (::pipe(fds) != 0) { result.exit_code = 127; return result; }
-
     auto envStore = merged_environ(extraEnv);
     std::vector<char*> envp;
     for (auto& s : envStore) envp.push_back(s.data());
@@ -855,6 +905,14 @@ RunResult capture_stdout(
     std::vector<char*> cargv;
     for (auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
+
+    // The same rule as capture_exec's.
+    LaunchSection launch;
+    int fds[2];
+    if (mcpp::platform::unixproc::make_pipe(fds) != 0) {
+        result.exit_code = 127;
+        return result;
+    }
 
     posix_spawn_file_actions_t fa;
     ::posix_spawn_file_actions_init(&fa);
@@ -876,6 +934,7 @@ RunResult capture_stdout(
     ::posix_spawnattr_destroy(&attr);
     ::posix_spawn_file_actions_destroy(&fa);
     ::close(fds[1]);
+    launch.release();
     if (sp != 0) {
         ::close(fds[0]);
         result.exit_code = 127;
