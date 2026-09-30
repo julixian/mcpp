@@ -3694,6 +3694,14 @@ export void run_workspace_tests(std::span<const std::string> passthrough,
             slots[i].session = id;
             for (auto const& wm : tb->ctx->workspaceMembers)
                 if (wm.memberPath == members[i].path) slots[i].owner = wm.name;
+            // An empty owner selects every test binary of the plan, which is
+            // another member's as well: a member the plan does not name runs
+            // nothing.
+            if (slots[i].owner.empty()) {
+                slots[i].error = std::format(
+                    "member '{}' is not among the members its plan holds", members[i].path);
+                slots[i].session = -1;
+            }
         }
         sessionMembers.push_back(who);
         sessions.push_back(std::move(tb));
@@ -3753,6 +3761,7 @@ export void run_workspace_tests(std::span<const std::string> passthrough,
             }
             if (who.size() > 1) {
                 for (auto i : who) {
+                    if (slots[i].session < 0) continue;
                     const auto goals = member_package_goals(*tb.ctx, slots[i].owner);
                     if (goals.empty()) continue;
                     mcpp::build::BuildOptions own;
@@ -3779,7 +3788,8 @@ export void run_workspace_tests(std::span<const std::string> passthrough,
         // The test goals of the members that can run.
         std::set<std::string> runnable;
         for (auto i : who)
-            if (!slots[i].packageFailed) runnable.insert(slots[i].owner);
+            if (!slots[i].packageFailed && slots[i].session >= 0)
+                runnable.insert(slots[i].owner);
         test_bulk(tb, testOpts, [&](const mcpp::build::LinkUnit& lu) {
             return lu.kind == mcpp::build::LinkUnit::TestBinary
                 && runnable.contains(lu.memberOf)
