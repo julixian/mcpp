@@ -285,13 +285,17 @@ export int new_from_package_template(
         "{} (template {}@{}:{})", project.qualifiedName,
         pkg->selector, pkg->version,
         chosen->name));
-    std::println("Resolved template package: namespace={} name={} route={} "
-                 "descriptor={} payload={}",
-                 pkg->id.namespace_, pkg->id.shortName, pkg->indexRoute,
-                 pkg->descriptorDigest,
-                 pkg->payloadDigest.empty() ? "unavailable" : pkg->payloadDigest);
+    // What `new` says about what it made is narration, like the `Created`
+    // line above it: standard error, so that the project's creation is not
+    // part of what a pipe receives.
+    mcpp::ui::line(std::format(
+        "Resolved template package: namespace={} name={} route={} "
+        "descriptor={} payload={}",
+        pkg->id.namespace_, pkg->id.shortName, pkg->indexRoute,
+        pkg->descriptorDigest,
+        pkg->payloadDigest.empty() ? "unavailable" : pkg->payloadDigest));
     if (!chosen->meta.postMessage.empty())
-        std::println("{}", chosen->meta.postMessage);
+        mcpp::ui::line(chosen->meta.postMessage);
     return 0;
 }
 
@@ -428,10 +432,10 @@ int main() {
         return 1;
     }
 
-    std::println("Created {} package '{}' at {}", gui ? "gui" : "bin",
-                 project.qualifiedName, tx.final_path().string());
-    std::println("Next: cd {} && mcpp build && mcpp run  (or `mcpp test`)",
-                 project.directoryName);
+    mcpp::ui::line(std::format("Created {} package '{}' at {}", gui ? "gui" : "bin",
+                               project.qualifiedName, tx.final_path().string()));
+    mcpp::ui::line(std::format("Next: cd {} && mcpp build && mcpp run  (or `mcpp test`)",
+                               project.directoryName));
     return 0;
 }
 

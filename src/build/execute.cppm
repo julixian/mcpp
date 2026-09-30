@@ -90,6 +90,23 @@ int launcher_status(int spawnErrno) {
     }
 }
 
+// THE STATUS OF A `run` WHOSE PLANNING OR BUILD FAILED (output streams plan
+// 2026-10-01, D7, R2).
+//
+// It used to be the build's own status, 1 or 2, and a program that returns 1
+// reads the same: a script that runs `mcpp run -q` could not tell a compile
+// error from a program that failed. 101 is the status Cargo gives a failed
+// `cargo run` build, and an established convention. It is also rare among the
+// statuses programs return themselves, which is what makes it tell the two
+// apart; it does not collide with the launcher's band above. Only `run` uses
+// it: `build`, `test` and `pack` keep their statuses, and so does a program's
+// own, which passes through unchanged.
+//
+// With a runner (`--runner`, `[target.<triple>].runner`) the status that passes
+// through is the runner's, and a runner that itself returns 101 reads as a
+// failed build. That is accepted, as in Cargo, and documented.
+constexpr int kRunBuildFailed = 101;
+
 // ─── P0: build cache for fast-path rebuilds ─────────────────────────
 
 constexpr std::string_view kBuildCacheFile = "target/.build_cache";
@@ -1374,8 +1391,10 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
         }
         return 1;
     }
+    // Verbose ninja output is narration, so it goes to the narration stream,
+    // whether or not `--quiet` is also given (verbose output survives it).
     if (verbose && !reporting && !out.empty())
-        std::fputs(out.c_str(), stdout);
+        mcpp::ui::block(out);
     // What the edges that ran had to say on success: the same reader the full
     // path calls (mcpp.build.advice), because this path skips `prepare` and a
     // report attached to one path only appears or not depending on whether
@@ -1826,6 +1845,20 @@ export std::optional<int> try_fast_workspace_build(
     return 0;
 }
 
+// THE BLANK LINE AFTER THE `Running` LINE BELONGS TO THAT LINE. It separates
+// mcpp's narration from the program's output on a terminal, so it is narration
+// as well: written to the stream the `Running` line was written to (standard
+// error) and, like it, not under `--quiet`. It used to be a bare `println` to
+// standard output, so `mcpp run -q` wrote one empty line in front of the
+// program's own output, and `mcpp run -q > file` began with it (measured with
+// 2026.9.30.2, `od -c`). Both streams are flushed after it, so that nothing
+// mcpp wrote is still buffered when the program starts writing to the same
+// terminal.
+void run_separator() {
+    mcpp::ui::line("");
+    mcpp::ui::flush();
+}
+
 // mcpp#225 (E2): `mcpp run`'s fast path. Mirrors try_fast_build's
 // fingerprint/freshness gate against the SAME cache entry `mcpp build`
 // wrote (targetTriple == "" — a HOST build; see the precondition below), then
@@ -1972,7 +2005,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, /*verbose=*/false,
                              match->runtimeEnvKey, match->runtimeEnvValue);
     if (!rc) return fast_path_declined("run", "ninja reported a stale graph");
-    if (*rc != 0) return rc;
+    if (*rc != 0) return kRunBuildFailed;
     if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(
             *validatedBefore))
         return fast_path_declined("run", "ninja relinked an artifact, whose closure the full path validates"); // never execute an artifact not validated for this binding
@@ -1982,8 +2015,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     mcpp::build::progress::close();   // the program owns the terminal
     mcpp::ui::status("Running",
         std::format("`{}`", mcpp::ui::shorten_path(exe, pathCtx)));
-    std::println("");
-    std::fflush(stdout);
+    run_separator();
     std::vector<std::string> argv;
     argv.push_back(exe.string());
     for (auto& a : passthrough) argv.push_back(a);
@@ -2180,8 +2212,7 @@ int run_artifact_via_runner(mcpp::build::BuildContext& ctx,
         mcpp::ui::status("Running",
             std::format("`{}`", mcpp::ui::shorten_path(exe, pathCtx)));
     }
-    std::println("");
-    std::fflush(stdout);
+    run_separator();
 
     std::vector<std::pair<std::string, std::string>> childEnv;
     auto [runEnvKey, runEnvValue] = compute_run_env(ctx.plan);
@@ -2336,7 +2367,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
         popts.features     = features;
         auto outcome = mcpp::pack::build_and_pack(
             std::move(popts), /*modeFromUser=*/false, targetName.value_or(std::string{}));
-        if (outcome.rc != 0) return outcome.rc;
+        if (outcome.rc != 0) return kRunBuildFailed;
         if (outcome.artifacts.empty()) {
             // Not reached today: `build_and_pack` returns rc=0 only after
             // confirming at least one reported artifact exists on disk. Kept
@@ -2363,10 +2394,9 @@ export int build_run_target(const std::optional<std::string>& targetName,
         ov2.will_run       = true;
         auto ctx2 = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false,
                                   /*extraTargets=*/{}, ov2);
-        if (!ctx2) { mcpp::ui::error(std::format("{}", ctx2.error())); return 2; }
-        if (auto rc = run_build_plan(*ctx2, /*verbose=*/false, no_cache, target_triple);
-            rc != 0)
-            return rc;
+        if (!ctx2) { mcpp::ui::error(std::format("{}", ctx2.error())); return kRunBuildFailed; }
+        if (run_build_plan(*ctx2, /*verbose=*/false, no_cache, target_triple) != 0)
+            return kRunBuildFailed;
         // ONE DISTRIBUTABLE, OR A SENTENCE. The pack pipeline reports the
         // terminal artifacts of the request (outputs no other introduced
         // action consumes); a format that ends in two files has no single
@@ -2418,7 +2448,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
     ov.will_run       = true;
     auto ctx = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false,
                              /*extraTargets=*/{}, ov);
-    if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); return 2; }
+    if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); return kRunBuildFailed; }
     // `target_triple` IS PASSED, AND OMITTING IT WROTE A CROSS BUILD INTO
     // THE HOST'S CACHE SLOT.
     //
@@ -2437,9 +2467,8 @@ export int build_run_target(const std::optional<std::string>& targetName,
     // The comment on `try_fast_run` records the same defect reached through the
     // MANIFEST's default target, and guards that door alone. This is the other
     // door: the flag. Measured on 2026.8.24.3, from a clean `target/`.
-    if (auto rc = run_build_plan(*ctx, /*verbose=*/false, no_cache, target_triple);
-        rc != 0)
-        return rc;
+    if (run_build_plan(*ctx, /*verbose=*/false, no_cache, target_triple) != 0)
+        return kRunBuildFailed;
     // The program run is the selected member's (workspace design 2026-09-29
     // §15), with its closure's runtime.
     focus_on_member(*ctx);
@@ -3350,14 +3379,14 @@ export int clean_project(bool wipe_bmi) {
         std::println(stderr, "error: cannot remove target/: {}", ec.message());
         return 1;
     }
-    std::println("Cleaned: {}", (*root / "target").string());
+    mcpp::ui::line(std::format("Cleaned: {}", (*root / "target").string()));
 
     if (wipe_bmi) {
         auto cache = mcpp::toolchain::default_cache_root();
         std::filesystem::remove_all(cache, ec);
-        std::println("Cleaned build cache: {}", cache.string());
-        std::println("  (`mcpp cache clean --legacy` also removes the unused "
-                     "pre-v1 cache, if any)");
+        mcpp::ui::line(std::format("Cleaned build cache: {}", cache.string()));
+        mcpp::ui::line("  (`mcpp cache clean --legacy` also removes the unused "
+                       "pre-v1 cache, if any)");
     }
     return 0;
 }

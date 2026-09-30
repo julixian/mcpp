@@ -4584,7 +4584,7 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         stage("symbol-provision");
         // Under a report the lines were printed as ninja wrote them.
         if (opts.verbose && !opts.progress && !out.empty())
-            std::fputs(out.c_str(), stdout);
+            mcpp::ui::block(out);
         std::set<std::string> want(opts.ninjaTargets.begin(), opts.ninjaTargets.end());
         for (auto& lu : plan.linkUnits) {
             if (!want.empty() && !want.contains(lu.output.generic_string())) continue;

@@ -207,9 +207,9 @@ void msvc_print_detected(const mcpp::toolchain::msvc::MsvcInstallation& inst,
         inst.display_version(),
         inst.vsProduct.empty() ? "" : std::format(" (VS {})", inst.vsProduct),
         inst.toolsVersion));
-    std::println("           cl: {}", inst.clPath.string());
-    std::println("           import std: {}",
-        inst.hasStdModules ? "available (std.ixx)" : "not available");
+    mcpp::ui::line(std::format("           cl: {}", inst.clPath.string()));
+    mcpp::ui::line(std::format("           import std: {}",
+        inst.hasStdModules ? "available (std.ixx)" : "not available"));
 }
 
 // The Windows SDK is the OTHER half of a usable MSVC, and a payload that
@@ -398,8 +398,8 @@ void msvc_warn_if_sdk_missing(const mcpp::toolchain::msvc::MsvcInstallation& ins
     // is what the user will believe.
     auto choice = mcpp::toolchain::msvc::resolve_sdk_for(inst.clPath);
     if (choice.sdk) {
-        std::println("           windows sdk: {} ({})",
-                     choice.sdk->version, choice.sdk->root.string());
+        mcpp::ui::line(std::format("           windows sdk: {} ({})",
+                                   choice.sdk->version, choice.sdk->root.string()));
         if (!choice.note.empty()) mcpp::ui::info("note", choice.note);
         return;
     }
@@ -947,11 +947,11 @@ export int toolchain_install(const mcpp::config::GlobalConfig& cfg,
             if (!mcpp::platform::is_windows) return msvc_wrong_host();
             if (auto inst = mcpp::toolchain::msvc::detect_installation()) {
                 msvc_print_detected(*inst);
-                std::println("");
-                std::println("This is the machine's own Visual Studio — mcpp does not manage it.");
-                std::println("Tip: `mcpp toolchain default msvc` to make it the default,");
-                std::println("     or `mcpp toolchain install msvc <toolset>` for a pinned one");
-                std::println("     that does not depend on what this machine has installed.");
+                mcpp::ui::line("");
+                mcpp::ui::line("This is the machine's own Visual Studio — mcpp does not manage it.");
+                mcpp::ui::line("Tip: `mcpp toolchain default msvc` to make it the default,");
+                mcpp::ui::line("     or `mcpp toolchain install msvc <toolset>` for a pinned one");
+                mcpp::ui::line("     that does not depend on what this machine has installed.");
                 return 0;
             }
             mcpp::ui::error(mcpp::toolchain::msvc::install_guidance());
@@ -1040,9 +1040,10 @@ export int toolchain_install(const mcpp::config::GlobalConfig& cfg,
             mcpp::ui::status("Installed",
                 std::format("{} → {}", pkg.display_spec(), inst->clPath.string()));
             if (cfg.defaultToolchain.empty()) {
-                std::println("");
-                std::println("Tip: `mcpp toolchain default {}` to make this the default.",
-                             spec->spec_str());
+                mcpp::ui::line("");
+                mcpp::ui::line(std::format(
+                    "Tip: `mcpp toolchain default {}` to make this the default.",
+                    spec->spec_str()));
             }
             return 0;
         }
@@ -1116,12 +1117,13 @@ export int toolchain_install(const mcpp::config::GlobalConfig& cfg,
         mcpp::ui::status("Installed",
             std::format("{} → {}", pkg.display_spec(), bin.string()));
         if (cfg.defaultToolchain.empty()) {
-            std::println("");
-            std::println("Tip: `mcpp toolchain default {}{}` to make this the default.",
-                         spec->spec_str(),
-                         spec->target.empty()
-                             ? std::string{}
-                             : std::format(" --target {}", spec->target.str()));
+            mcpp::ui::line("");
+            mcpp::ui::line(std::format(
+                "Tip: `mcpp toolchain default {}{}` to make this the default.",
+                spec->spec_str(),
+                spec->target.empty()
+                    ? std::string{}
+                    : std::format(" --target {}", spec->target.str())));
         }
         return 0;
     }

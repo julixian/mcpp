@@ -363,8 +363,8 @@ inline int cmd_add(const mcpplibs::cmdline::ParsedArgs& parsed) {
 
     mcpp::ui::status("Adding", std::format(
         "{} v{} to {}", canonicalSelector, version, table));
-    std::println("");
-    std::println("Run `mcpp build` to fetch and build with the new dependency.");
+    mcpp::ui::line("");
+    mcpp::ui::line("Run `mcpp build` to fetch and build with the new dependency.");
     return 0;
 }
 
@@ -610,8 +610,8 @@ inline int cmd_update(const mcpplibs::cmdline::ParsedArgs& parsed) {
         std::filesystem::remove(lockPath, ec);
         mcpp::ui::status("Updating", "all dependencies (mcpp.lock cleared)");
     }
-    std::println("");
-    std::println("Run `mcpp build` to re-resolve and rewrite mcpp.lock.");
+    mcpp::ui::line("");
+    mcpp::ui::line("Run `mcpp build` to re-resolve and rewrite mcpp.lock.");
     return 0;
 }
 
