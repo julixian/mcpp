@@ -557,31 +557,56 @@ std::vector<std::string> expand_braces(std::string_view glob, int depthGuard) {
 
 namespace {
 
-// mcpp#225: the actual bounded recursive-directory walk for a SINGLE plain
-// glob (no `{` — expand_glob below desugars brace alternation via
-// expand_braces and calls this once per branch, unioning the results).
-std::vector<std::filesystem::path> expand_glob_one(const std::filesystem::path& root,
-                                                    std::string_view glob)
-{
-    namespace fs = std::filesystem;
-    std::vector<fs::path> out;
-    if (!fs::exists(root)) return out;
+// A directory tree as a glob walk sees it, kept for the process.
+//
+// ONE WALK PER TREE (.agents/docs/2026-09-30-build-wall-time-progress-count-
+// and-hang-plan.md, F5 and W8). A package's `sources` are patterns, and a
+// pattern whose literal prefix is empty (`*/libarchive/archive_acl.c`) walked
+// the whole package tree. 127 such patterns, expanded about three times per
+// plan, opened libarchive's 35 directories 13,406 times, and 30,372 directory
+// opens of installed packages preceded the compile of every edited file. A
+// walk is now kept per root and start, and each pattern is matched against the
+// kept list.
+//
+// A KEPT WALK IS CHECKED, NOT TRUSTED. Planning writes files (a build
+// program's output, a descriptor's generated files), so every directory the
+// walk entered is examined again before the list is reused: adding, removing
+// or renaming an entry changes its directory's modification time. A directory
+// modified within two seconds of the walk is never trusted, since a coarse
+// clock could hide a change made in the same tick; a tree being edited is
+// therefore walked every time, as before.
+struct TreeListing {
+    struct File {
+        std::filesystem::path      path;
+        std::optional<std::string> relative;   // to the glob root, generic and narrowed
+    };
+    std::vector<std::pair<std::filesystem::path, std::filesystem::file_time_type>> dirs;
+    std::vector<File> files;
+    bool trusted = true;
+};
 
-    // mcpp#225: bound the walk's start point to the glob's literal
-    // directory prefix instead of always walking the whole root. A prefix
-    // that doesn't exist means the glob can never match anything — return
-    // empty WITHOUT walking (not a full-tree fallback).
-    fs::path prefix = glob_literal_prefix(glob);
-    fs::path start  = prefix.empty() ? root : root / prefix;
-    std::error_code startEc;
-    if (!fs::exists(start, startEc)) return out;
+// mcpp#225: the bounded recursive-directory walk from `start`, with the
+// exclusions and the symlink-cycle guard every glob walk has.
+std::shared_ptr<const TreeListing> walk_tree(const std::filesystem::path& root,
+                                             const std::filesystem::path& start) {
+    namespace fs = std::filesystem;
+    auto listing = std::make_shared<TreeListing>();
+    const auto walkedAt = fs::file_time_type::clock::now();
+    auto note_dir = [&](const fs::path& d) {
+        std::error_code tec;
+        const auto t = fs::last_write_time(d, tec);
+        if (tec) { listing->trusted = false; return; }
+        if (t > walkedAt - std::chrono::seconds(2)) listing->trusted = false;
+        listing->dirs.emplace_back(d, t);
+    };
+    note_dir(start);
 
     // Follow directory symlinks (vendored trees are often symlink farms).
     // Cycle guard: a directory whose canonical path is already on the
     // CURRENT recursion chain is a link loop — only that is pruned; the same
     // real directory reached via a second lexical path (dir + link to it)
     // still walks, because glob matching is lexical. Files reachable twice
-    // are deduped by canonical identity afterwards.
+    // are deduped by canonical identity by the caller.
     std::vector<fs::path> chain;   // canonical dirs of the recursion stack
     std::error_code ec, eec;       // ec: iteration; eec: per-entry probes
     {
@@ -604,15 +629,78 @@ std::vector<std::filesystem::path> expand_glob_one(const std::filesystem::path& 
                 it.disable_recursion_pending();   // link cycle
             } else {
                 chain.push_back(eec ? e.path() : c);
+                note_dir(e.path());
             }
             continue;
         }
         if (!e.is_regular_file(eec) || eec) continue;
-        if (path_matches_glob(e.path(), root, glob)) out.push_back(e.path());
+        auto rel = try_narrow(e.path().lexically_relative(root));
+        // A name the code page cannot spell can never match a glob, and is
+        // recorded as path_matches_glob records it.
+        if (!rel) note_unnarrowable_path(e.path());
+        listing->files.push_back({e.path(), std::move(rel)});
+    }
+    if (ec) listing->trusted = false;
+    return listing;
+}
+
+bool listing_current(const TreeListing& listing) {
+    if (!listing.trusted) return false;
+    std::error_code ec;
+    for (auto const& [dir, time] : listing.dirs) {
+        const auto now = std::filesystem::last_write_time(dir, ec);
+        if (ec || now != time) return false;
+    }
+    return true;
+}
+
+std::shared_ptr<const TreeListing> tree_listing(const std::filesystem::path& root,
+                                                const std::filesystem::path& start) {
+    static std::mutex m;
+    static std::map<std::pair<std::filesystem::path, std::filesystem::path>,
+                    std::shared_ptr<const TreeListing>> kept;
+    std::lock_guard lock(m);
+    auto key = std::pair{root, start};
+    if (auto it = kept.find(key); it != kept.end() && listing_current(*it->second))
+        return it->second;
+    auto listing = walk_tree(root, start);
+    kept[key] = listing;
+    return listing;
+}
+
+// mcpp#225: the walk for a SINGLE plain glob (no `{` — expand_glob below
+// desugars brace alternation via expand_braces and calls this once per
+// branch, unioning the results), over the kept listing of its start.
+std::vector<std::filesystem::path> expand_glob_one(const std::filesystem::path& root,
+                                                    std::string_view glob)
+{
+    namespace fs = std::filesystem;
+    std::vector<fs::path> out;
+    if (!fs::exists(root)) return out;
+
+    // mcpp#225: bound the walk's start point to the glob's literal
+    // directory prefix instead of always walking the whole root. A prefix
+    // that doesn't exist means the glob can never match anything — return
+    // empty WITHOUT walking (not a full-tree fallback).
+    fs::path prefix = glob_literal_prefix(glob);
+    fs::path start  = prefix.empty() ? root : root / prefix;
+    std::error_code startEc;
+    if (!fs::exists(start, startEc)) return out;
+
+    // Every match ends with the text after the glob's last `*`, which the
+    // matcher reads literally: a cheap test that turns most entries away.
+    const auto star = glob.find_last_of('*');
+    const std::string_view tail = star == std::string_view::npos ? glob : glob.substr(star + 1);
+    auto listing = tree_listing(root, start);
+    for (auto const& f : listing->files) {
+        if (!f.relative) continue;
+        if (!tail.empty() && !f.relative->ends_with(tail)) continue;
+        if (relative_path_matches_glob(*f.relative, glob)) out.push_back(f.path);
     }
     std::sort(out.begin(), out.end());
     // Dedup files reachable through more than one directory link (first
     // lexical occurrence wins).
+    std::error_code eec;
     std::set<fs::path> seenFiles;
     out.erase(std::remove_if(out.begin(), out.end(), [&](const fs::path& p) {
         auto c = fs::canonical(p, eec);
