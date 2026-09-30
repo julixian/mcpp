@@ -137,6 +137,38 @@ the answer, and the exit code says the answer is a rejection. §1 still holds �
 parse stdout, do not branch on the code — but a client that treats any non-zero
 exit as "no output" will discard a document it was given.
 
+### Standard output carries the result, standard error the narration
+
+Every command writes to two streams, and the division is the same for all of
+them. Releases up to 2026.9.30.2 wrote the narration to standard output, so a
+consumer that read it there reads standard error now.
+
+| stream | carries |
+|---|---|
+| standard output | the command's **result**: what a program prints under `mcpp run`; a document (an envelope, `mcpp emit`, `mcpp run --list-runners`, `--version`, `--help`); a listing (`mcpp toolchain list`, `mcpp cache list`, `mcpp search`, `mcpp test --list`); and the report of `mcpp test`: each test's verdict, the output of a test that failed, the `test result` line, and the `workspace result` line of a workspace run |
+| standard error | the **narration**: the status lines (`Resolving`, `Compiling`, `Finished`, `Running`, `Packing`, `Packed`, `Downloading`, `Updating` and the others that begin a line with a verb), the progress bars and the status row of a terminal, the blank line that follows `Running`, `warning:`, `error:`, `note:` and `tip:` lines, the compilers' diagnostics, and what `--verbose` adds |
+
+The test for a line is what it is for. A line that says what the command is
+doing or has done is narration. A line that is what the command was asked to
+produce is a result; Cargo prints libtest's report on standard output for the
+same reason, and so does `mcpp test`.
+
+- **A pipe receives the result alone.** `mcpp run -q 2>/dev/null` writes
+  exactly the program's standard output, and `mcpp build >/dev/null` still
+  shows the steps. On a terminal both streams reach the screen, and the status
+  row is drawn on standard error, so `mcpp build 2>/dev/null` shows no row.
+- **`--quiet` suppresses the narration**, including the blank line after
+  `Running`, and leaves warnings, errors and diagnostics.
+- **The machine-readable modes** (`--format json`, `--message-format json`)
+  keep standard output for their document, as before. What they narrate on
+  standard error is unchanged: `mcpp test --message-format json` narrates
+  nothing, and `mcpp pack --message-format json` and `mcpp emit
+  build-database` narrate there while they plan and build.
+- **Both streams on one pipe keep the order of the writes.** `mcpp build 2>&1
+  | tee log` records the steps, and is the spelling for a script that used to
+  write `mcpp build | tee log` (a CI log, which captures both streams, is
+  unaffected).
+
 ## 4. Effects — what a command does before it prints
 
 An IDE with an untrusted-workspace gate has to decide **before** running.
@@ -204,14 +236,20 @@ same thing — one answer, two shapes.
 
 ## 6. Exit status
 
-`mcpp run` REPORTS THE PROGRAM'S OWN EXIT STATUS. Three bands divide the space,
+`mcpp run` REPORTS THE PROGRAM'S OWN EXIT STATUS. Four bands divide the space,
 and only the first belongs to the program:
 
 | range | meaning |
 |---|---|
-| `0`–`124` | the program ran; this is its own status, passed through unchanged |
+| `0`–`124` | the program ran; this is its own status, passed through unchanged. The exception is `101`, below |
+| `101` | `mcpp run` could not build the program: its planning or its build failed, and nothing was started. This is the status Cargo gives a failed `cargo run` build |
 | `125`–`127` | the spawn was attempted and refused — `127` not found, `126` found but not executable, `125` anything else; `126` also answers `mcpp run --format <f>` for a distributable that is a directory and meets no runner, refused before the spawn with the same meaning (2026.9.14.2+) |
-| `2` | mcpp refused before attempting anything: a usage, configuration or resolution error |
+| `2` | mcpp refused the request before building anything, or after building it and before starting anything: a usage error, `--format` with `--no-runner`, a program or a runner that the project does not declare |
+
+Until 2026.9.30.2 a failed build exited `1` and a failed planning `2`, so that
+a compile error and a program that returns `1` could not be told apart by a
+script. A failed build is now `101`; `mcpp build`, `mcpp test` and `mcpp pack`
+keep their statuses.
 
 Until 2026.9.4.3 every non-zero status was folded to `1`, so that `2` could mean
 "could not start" as distinct from "ran and failed". The distinction was worth
@@ -221,13 +259,17 @@ well — so the command this project tells people to type could not be branched 
 
 The middle band is the one `env`, `timeout` and `nice` already use and that
 shells document, so `126` and `127` arrive with their usual meanings rather than
-as numbers this project allocated.
+as numbers this project allocated. `101` is Cargo's, for the same reason.
 
-A PROGRAM MAY ITSELF EXIT `125`–`127`, AND mcpp DOES NOT TRY TO DISAMBIGUATE BY
-NUMBER. What separates the two is that a launcher failure always writes a reason
-to stderr and a program's own status never does. A client that must be certain
-should read stderr, or use `--format json` where the status is a field rather
-than a channel.
+A PROGRAM MAY ITSELF EXIT `101` OR `125`–`127`, AND mcpp DOES NOT TRY TO
+DISAMBIGUATE BY NUMBER. What separates the two is that a launcher or build
+failure always writes a reason to stderr and a program's own status never does.
+A client that must be certain should read stderr, or use `--format json` where
+the status is a field rather than a channel.
+
+With a runner (`--runner`, `[target.<triple>].runner`) the status that passes
+through is the runner's, and a runner that itself returns `101` reads as a
+failed build. This is accepted, as it is in Cargo.
 
 `mcpp test` is unchanged and remains `0` or `1`: it aggregates many programs, so
 there is no single status to pass through. Per-test codes are in the JSON

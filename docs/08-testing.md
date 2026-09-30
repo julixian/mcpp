@@ -82,6 +82,13 @@ configuration it is meant to check rather than against the default one:
 `--build-timeout <secs>` bounds the compile. A test that hangs is reported as a
 failure with its own name, not as a job that stopped.
 
+The report is the command's result and is written to standard output: each
+test's verdict, the output of a test that failed, the `test result` line and, for
+`--workspace`, the `workspace result` line. The build's steps (`Compiling`,
+`Running`) are narration and are written to standard error, so `mcpp test > report.txt`
+collects the report, and `mcpp test 2>&1 | tee test.log` collects both
+([09 — Commands by scenario](09-commands-by-scenario.md#output-streams)).
+
 ## Tests that reach packages the artifact does not
 
 ```toml
