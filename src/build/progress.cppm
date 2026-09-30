@@ -190,6 +190,8 @@ enum class ProgramOutcome { Ran, Cached, Failed };
 void open(bool verbose);
 // Closes it: the region is erased. Idempotent.
 void close();
+// The status row as the region would draw it now.
+std::string status_row();
 // The number of configurations the command builds: with more than one, a
 // package line names its configuration.
 void configurations(std::size_t n);
@@ -215,6 +217,16 @@ void defer_finished();
 void finish_deferred();
 
 // One build directory's ninja runs within this command.
+// WHAT A NINJA PASS IS FOR, AND WHETHER ITS STEPS ARE COUNTED (build wall-time
+// plan, W2). `Building f/t` states the work of the build: its compiles, links,
+// archives and actions. The cache pass places files the global cache serves,
+// which its `Cached` lines report; counted, its 503 placements and the 460
+// dependency scans of a clean build of xlings put the count at 81% when the
+// first compile began. A placement pass is therefore read but not counted, and
+// the scans that wait on no action run in a pass of their own, shown as
+// `Scanning f/t`.
+enum class PassKind { Placement, Scan, Work };
+
 class Build {
 public:
     // Opaque: its definition is this module's own.
@@ -234,8 +246,8 @@ public:
 
     // The environment ninja runs with: NINJA_STATUS and the start file.
     std::vector<std::pair<std::string, std::string>> environment() const;
-    // One ninja invocation.
-    void pass_begin();
+    // One ninja invocation, of the kind `kind` (see PassKind).
+    void pass_begin(PassKind kind = PassKind::Work);
     void status(const StatusLine& line);
     // A `FAILED: <outputs>` line. For the command's first failure, returns
     // the failed step's package as a line names it (empty when the step is
@@ -634,7 +646,7 @@ void record_action_start(std::string_view stamp) {
 // ─── The model ───────────────────────────────────────────────────────────
 
 // Not exported, and not TU-local either: `Build::Impl` holds them.
-enum class Phase { Planning, Programs, Building, Stopping, Checking };
+enum class Phase { Planning, Programs, Scanning, Building, Stopping, Checking };
 
 struct Program {
     std::string name;
@@ -672,6 +684,7 @@ struct Build::Impl {
     std::size_t finished = 0, total = 0;          // this pass
     std::optional<std::size_t> unstarted;         // this pass, from `%u`
     bool        inPass = false;
+    PassKind    kind = PassKind::Work;            // this pass; only Work passes count
     // The log of this pass.
     std::filesystem::path logPath;
     std::string logTail;             // the file's last bytes when the pass began
@@ -991,12 +1004,18 @@ std::string phase_status(Report& r, std::string_view cells) {
     std::string current;
     long long oldest = std::numeric_limits<long long>::max();
     std::size_t done = 0, total = 0, remaining = 0;
+    std::size_t scanDone = 0, scanTotal = 0;
     bool tail = true;   // every build in a pass has started its last step
     bool anyPass = false;
     for (auto const& b : live_builds(r)) {
-        done  += b->doneBefore + b->finished;
-        total += b->totalBefore + b->total;
-        if (b->inPass) {
+        const bool work = b->kind == PassKind::Work;
+        done  += b->doneBefore + (work ? b->finished : 0);
+        total += b->totalBefore + (work ? b->total : 0);
+        if (b->inPass && b->kind == PassKind::Scan) {
+            scanDone  += b->finished;
+            scanTotal += b->total;
+        }
+        if (b->inPass && work) {
             anyPass = true;
             if (!b->unstarted || *b->unstarted > 0) tail = false;
             else remaining += b->total > b->finished ? b->total - b->finished : 0;
@@ -1026,6 +1045,10 @@ std::string phase_status(Report& r, std::string_view cells) {
         counts = std::format("{}/{}", finishedPrograms, r.programs.size());
         break;
     }
+    case Phase::Scanning:
+        phase = "Scanning";
+        if (scanTotal > 0) counts = std::format("{}/{}", scanDone, scanTotal);
+        break;
     case Phase::Building:
     case Phase::Stopping:
         phase = r.phase == Phase::Building ? "Building" : "Stopping";
@@ -1066,8 +1089,9 @@ mcpp::ui::Frame frame() {
     } else if (r.animation) {
         std::size_t done = 0, total = 0;
         for (auto const& b : live_builds(r)) {
-            done  += b->doneBefore + b->finished;
-            total += b->totalBefore + b->total;
+            const bool work = b->kind == PassKind::Work;
+            done  += b->doneBefore + (work ? b->finished : 0);
+            total += b->totalBefore + (work ? b->total : 0);
         }
         const auto now = now_ms();
         screen::Input in;
@@ -1281,6 +1305,10 @@ void checking() {
     mcpp::ui::touch_region();
 }
 
+std::string status_row() {
+    return frame().status;
+}
+
 void defer_finished() {
     auto& r = report();
     std::lock_guard lock(r.m);
@@ -1394,18 +1422,23 @@ std::vector<std::pair<std::string, std::string>> Build::environment() const {
             {std::string(kStartsEnv), (impl_->dir / kStartsFile).string()}};
 }
 
-void Build::pass_begin() {
+void Build::pass_begin(PassKind kind) {
     auto& r = report();
     {
         std::lock_guard lock(r.m);
         auto& b = *impl_;
-        b.doneBefore  += b.finished;
-        b.totalBefore += b.total;
+        if (b.kind == PassKind::Work) {
+            b.doneBefore  += b.finished;
+            b.totalBefore += b.total;
+        }
+        b.kind = kind;
         b.finished = b.total = 0;
         b.unstarted.reset();
         b.passStart = now_ms();
         if (!r.buildStart) r.buildStart = b.passStart;
-        r.phase = Phase::Building;
+        // A placement pass keeps the phase it found (`Planning`).
+        if (kind == PassKind::Work) r.phase = Phase::Building;
+        else if (kind == PassKind::Scan) r.phase = Phase::Scanning;
         b.inPass = true;
         b.ends.clear();
         b.logPath = b.dir / ".ninja_log";

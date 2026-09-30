@@ -95,7 +95,14 @@ NinjaRun run_ninja_reporting(const std::vector<std::string>& argv,
                              std::chrono::milliseconds deadline,
                              mcpp::build::progress::Build& progress,
                              bool verbose,
-                             std::span<const std::string> commandPrefixes);
+                             std::span<const std::string> commandPrefixes,
+                             mcpp::build::progress::PassKind kind =
+                                 mcpp::build::progress::PassKind::Work);
+
+// The goal of the scan pass (build wall-time plan, W2): the dyndep file of
+// every unit whose scan waits on no action. Present in build.ninja when the
+// graph scans such a unit.
+inline constexpr std::string_view kScannedGoal = "_mcpp_scanned";
 
 // The step record of a plan (design §6.3): how the plan names its packages,
 // and which package each statement of `attribution` is for.
@@ -1175,10 +1182,11 @@ NinjaRun run_ninja_reporting(const std::vector<std::string>& argv,
                              std::chrono::milliseconds deadline,
                              mcpp::build::progress::Build& progress,
                              bool verbose,
-                             std::span<const std::string> commandPrefixes) {
+                             std::span<const std::string> commandPrefixes,
+                             mcpp::build::progress::PassKind kind) {
     NinjaRun run;
     for (auto& kv : progress.environment()) env.push_back(std::move(kv));
-    progress.pass_begin();
+    progress.pass_begin(kind);
     // The lines after `FAILED:` up to the next status line are the failed
     // step's command and output; the lines after a status line alone are a
     // successful step's output, which only --verbose shows (as before).
@@ -2691,6 +2699,22 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                 append(std::format("  expect = {}\n", it->second));
         }
         append("\n");
+
+        // THE SCAN PASS'S GOAL (build wall-time plan, W2): the dyndep file of
+        // every unit whose scan waits on no action. A scan waits on its
+        // package's actions that precede compilation (`order_only_for`), and
+        // a pass over those scans would hold every compile behind the longest
+        // such action; they stay in the main pass.
+        {
+            std::string goal;
+            for (auto& ddi : ddi_paths) {
+                auto it = actionOutputsByPackage.find(ddiOwner[ddi]);
+                if (it != actionOutputsByPackage.end() && !it->second.empty()) continue;
+                goal += " " + ddi + ".dd";
+            }
+            if (!goal.empty())
+                append(std::format("build {} : phony{}\n\n", kScannedGoal, goal));
+        }
 
         // ── Phase 3: compile edges with per-file dyndep. ────────────────
         // Each compile edge references its OWN .dd file instead of a global one.
@@ -4286,7 +4310,8 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
             std::vector<std::string> pre{ninjaProgram, "-C", plan.outputDir.string(),
                                          std::string(kStagedCacheGoal)};
             (void)run_ninja_reporting(pre, nenv, preDeadline, *opts.progress, opts.verbose,
-                                      command_prefixes(flags, plan));
+                                      command_prefixes(flags, plan),
+                                      mcpp::build::progress::PassKind::Placement);
         } else {
             std::vector<std::string> pre{ninjaProgram, "--quiet", "-C", plan.outputDir.string(),
                                          std::string(kStagedCacheGoal)};
@@ -4299,13 +4324,62 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
         stage("ninja-staged-cache");
     }
 
+    // THE SCANS THAT WAIT ON NO ACTION RUN IN A PASS OF THEIR OWN, after the
+    // cache pass and before the main pass (build wall-time plan, W2). The
+    // main pass's count then states the work of the build, its compiles,
+    // links, archives and actions, instead of 460 scans of which all end in
+    // the first quarter second; and every dyndep file of those units is
+    // current when the main pass loads them, as the cache pass arranges for
+    // its placements (ninja-build/ninja#2662). A build of named goals (a test,
+    // a target) scans in its main pass: a pass over every scan would scan
+    // units its goals never compile.
     bool buildTimedOut = false;
     bool reported = false;
     std::string out;
     int ninjaExit = 0;
+    bool scanFailed = false;
+    if (goalArg.empty()
+        && manifest.find("\nbuild " + std::string(kScannedGoal) + " : phony") != std::string::npos) {
+        const auto scanDeadline =
+            std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000);
+        std::vector<std::string> scan{ninjaProgram};
+        if (!opts.verbose && !opts.progress) scan.push_back("--quiet");
+        scan.insert(scan.end(), {std::string("-C"), plan.outputDir.string()});
+        if (opts.verbose) scan.push_back("-v");
+        scan.push_back(std::string(kScannedGoal));
+        if (opts.parallelJobs) scan.push_back(std::format("-j{}", opts.parallelJobs));
+        if (opts.progress) {
+            auto run = run_ninja_reporting(scan, nenv, scanDeadline, *opts.progress, opts.verbose,
+                                           command_prefixes(flags, plan),
+                                           mcpp::build::progress::PassKind::Scan);
+            if (run.exitCode != 0 || run.timedOut) {
+                out = std::move(run.output);
+                ninjaExit = run.exitCode;
+                buildTimedOut = run.timedOut;
+                reported = run.reported;
+                scanFailed = true;
+            }
+        } else {
+            auto scanEnv = nenv;
+            scanEnv.emplace_back(std::string(mcpp::build::progress::kStartsEnv), "");
+            auto cap = mcpp::platform::process::capture_exec_deadline(
+                scan, scanEnv, scanDeadline, &buildTimedOut);
+            if (cap.exit_code != 0 || buildTimedOut) {
+                out = std::move(cap.output);
+                ninjaExit = cap.exit_code;
+                scanFailed = true;
+            }
+        }
+        stage("ninja-scan");
+    }
+
+    // A failed scan ends the build with its own output: the main pass would
+    // run the failed step again and state its diagnostics a second time.
     const auto deadline =
         std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000);
-    if (opts.progress) {
+    if (scanFailed) {
+        // `out`, `ninjaExit`, `buildTimedOut` and `reported` are the scan's.
+    } else if (opts.progress) {
         auto run = run_ninja_reporting(nargv, nenv, deadline, *opts.progress, opts.verbose,
                                        command_prefixes(flags, plan));
         out = std::move(run.output);

@@ -390,6 +390,43 @@ TEST(ProgressModel, APackageTheCacheServesIsNamedCachedWithItsUnits) {
     EXPECT_EQ(count(out, "compat.ftxui"), 1u) << out;
 }
 
+// ─── What the count counts (build wall-time plan, W2) ────────────────────
+//
+// `Building f/t` states the work of the build. A clean build of xlings counted
+// 1195 steps, 503 of them placements of the cache pass and 460 dependency
+// scans, and read 967/1195 when its first compile began. A placement pass is
+// read but not counted, a scan pass shows as `Scanning f/t`, and the main pass
+// alone is `Building f/t`.
+TEST(ProgressModel, OnlyTheMainPassIsCountedAsBuilding) {
+    mcpp::ui::disable_color();
+    Tmp tmp;
+    Record rec;
+    rec.packages = {{"app", true, "app", 0, 1, "v0.1.0 (.)", "project"}};
+    rec.steps = 1;
+    Build b(tmp.path);
+    b.set_record(rec);
+    testing::internal::CaptureStdout();
+    b.pass_begin(mcpp::build::progress::PassKind::Placement);
+    b.status({503, 503, 1, 0, {}});
+    const auto placing = mcpp::build::progress::status_row();
+    b.pass_end();
+    b.pass_begin(mcpp::build::progress::PassKind::Scan);
+    b.status({200, 460, 2, 100, {}});
+    const auto scanning = mcpp::build::progress::status_row();
+    b.pass_end();
+    b.pass_begin(mcpp::build::progress::PassKind::Work);
+    b.status({1, 232, 3, 200, {}});
+    const auto building = mcpp::build::progress::status_row();
+    b.pass_end();
+    b.finish(true);
+    testing::internal::GetCapturedStdout();
+    EXPECT_EQ(placing.find("503"), std::string::npos) << placing;
+    EXPECT_NE(scanning.find("Scanning"), std::string::npos) << scanning;
+    EXPECT_NE(scanning.find("200/460"), std::string::npos) << scanning;
+    EXPECT_NE(building.find("Building"), std::string::npos) << building;
+    EXPECT_NE(building.find(" 1/232"), std::string::npos) << building;
+}
+
 TEST(ProgressModel, AFailureNamesItsPackageOnce) {
     mcpp::ui::disable_color();
     Tmp tmp;
