@@ -233,6 +233,16 @@ TEST(MemberSelection, ExcludeIsRefusedWhereItHasNoMeaning) {
     EXPECT_FALSE(mcpp::cli::select_members(rws, r.root, "", request(false, {}, {"a"})).has_value());
 }
 
+// `--workspace` and `-p` state two selections; neither is taken over the other.
+TEST(MemberSelection, WorkspaceTogetherWithDashPIsRefused) {
+    Three f;
+    auto ws = f.ws();
+    auto both = mcpp::cli::select_members(ws, f.root, "", request(true, {"a"}, {}));
+    ASSERT_FALSE(both.has_value());
+    EXPECT_NE(both.error().find("--workspace"), std::string::npos) << both.error();
+    EXPECT_NE(both.error().find("-p"), std::string::npos) << both.error();
+}
+
 // The overload that takes a directory finds the workspace the directory
 // belongs to: from a member's directory, `-p` and `--workspace` still select
 // among the members of the workspace that lists it. Outside a workspace there

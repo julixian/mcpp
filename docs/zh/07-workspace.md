@@ -364,7 +364,7 @@ mcpp build -p server -p cli         # the same members as -p cli -p server
 mcpp test  -p core -p http
 ```
 
-指定不到任何成员的值会在规划任何内容之前被拒绝，拒绝信息列出各成员。`mcpp run` 执行
+指定不到任何成员的值会在规划任何内容之前被拒绝，拒绝信息列出各成员。`-p` 与 `--workspace` 同时出现也会被拒绝：两者陈述了两种选择，任何一方都不会被默认取代另一方。`mcpp run` 执行
 一个程序，所以只作用于一个成员：第二个 `-p` 被拒绝，并点名所有被指定的成员，绝不会被
 理解为"取最后一个"。
 

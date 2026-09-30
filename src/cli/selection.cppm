@@ -82,15 +82,23 @@ member_path_of(const mcpp::manifest::Manifest& ws,
 // | `-p X -p Y`                              | {X, Y}                           |
 // | an "all" form above, with `--exclude Z`  | every member but Z               |
 //
-// Refused, before anything is planned: a `-p` that names no member (the
-// refusal lists the members) or several (it names every match), `--exclude`
-// together with `-p`, `--exclude` without an "all" form, an `--exclude` that
-// names no member, and an `--exclude` that removes every member.
+// Refused, before anything is planned: `--workspace` together with `-p`, a
+// `-p` that names no member (the refusal lists the members) or several (it
+// names every match), `--exclude` together with `-p`, `--exclude` without an
+// "all" form, an `--exclude` that names no member, and an `--exclude` that
+// removes every member.
 std::expected<MemberSelection, std::string>
 select_members(const mcpp::manifest::Manifest& ws,
                const std::filesystem::path& wsRoot,
                std::string_view inside,
                const MemberRequest& req) {
+    // `--workspace` selects every member and `-p` names some of them. The two
+    // together state two selections, and taking either one would drop the
+    // other without a word, which is the defect a repeated `-p` had (#750).
+    if (req.all && !req.packages.empty())
+        return std::unexpected(std::string(
+            "--workspace cannot be combined with -p: --workspace selects every member, "
+            "and -p names the members a command acts on"));
     if (!req.excludes.empty() && !req.packages.empty())
         return std::unexpected(std::string(
             "--exclude cannot be combined with -p: -p names the members a command acts on, "

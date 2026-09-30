@@ -17,7 +17,7 @@
 #      untouched; so does `--exclude c` alone at a virtual root. `--exclude
 #      nosuch`, `-p a --exclude b`, and an `--exclude` that leaves no member
 #      are refused, each before planning; so is `--exclude` where no
-#      whole-workspace form applies.
+#      whole-workspace form applies, and `--workspace` together with `-p`.
 #   F. `mcpp test --workspace --exclude c` tests `a` and `b`, and `mcpp emit
 #      build-database` describes the members a selection names and no others.
 set -e
@@ -66,6 +66,10 @@ refused E3 e3.log "$MCPP" build --workspace --exclude a --exclude b --exclude c
 grep -q "every member" e3.log || fail "E: the refusal does not say that nothing is left" e3.log
 (cd a && refused E4 ../e4.log "$MCPP" build --exclude b) || exit 1
 grep -q -- "--workspace" e4.log || fail "E: the refusal does not name --workspace" e4.log
+# `--workspace` and `-p` state two selections; neither is taken over the other.
+refused E6 e6.log "$MCPP" build --workspace -p a
+grep -q -- "--workspace" e6.log && grep -q -- "-p" e6.log \
+    || fail "E: the refusal of --workspace with -p does not name both" e6.log
 
 "$MCPP" build --workspace --exclude c > e5.log 2>&1 || fail "E: --workspace --exclude c did not build" e5.log
 dir=$(build_dir)

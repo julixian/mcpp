@@ -390,7 +390,9 @@ mcpp test  -p core -p http
 ```
 
 A value that names no member is refused before anything is planned, and the
-refusal lists the members. `mcpp run` executes one program, so it acts on one
+refusal lists the members. `-p` together with `--workspace` is refused as
+well: the two state two selections, and neither is taken over the other.
+`mcpp run` executes one program, so it acts on one
 member: a second `-p` is refused, naming every member asked for, and is never
 read as "the last one".
 
