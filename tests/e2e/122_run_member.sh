@@ -47,9 +47,11 @@ EOF
 
 # `-p memberB` must run memberB's binary — assert its DISTINCT output, not
 # memberA's (and not "no binary target found").
+# Standard output is the program's alone: the status lines are on standard
+# error (output streams plan 2026-10-01, R3), so the capture is exact.
 OUT=$("$MCPP" run -p memberB 2>run_b.log) || { cat run_b.log; echo "FAIL: run -p memberB failed"; exit 1; }
 echo "$OUT"
-[[ "$OUT" == *"hello from memberB"* ]] || {
+[[ "$OUT" == "hello from memberB" ]] || {
     echo "FAIL: expected memberB's output, got: $OUT"
     exit 1
 }
@@ -61,7 +63,7 @@ echo "$OUT"
 # `-p memberA` runs the other one.
 OUT=$("$MCPP" run -p memberA 2>run_a.log) || { cat run_a.log; echo "FAIL: run -p memberA failed"; exit 1; }
 echo "$OUT"
-[[ "$OUT" == *"hello from memberA"* ]] || {
+[[ "$OUT" == "hello from memberA" ]] || {
     echo "FAIL: expected memberA's output, got: $OUT"
     exit 1
 }

@@ -76,6 +76,12 @@ mcpp test -- --verbose    # everything after `--` goes to each test binary
 `--timeout <secs>` 杀掉仍在运行的测试（默认 300；`0` 关闭），`--build-timeout <secs>`
 限制编译耗时。挂起的测试以它自己的名字被报为失败，而不是报成一个停止的任务。
 
+报告是命令的结果，写到标准输出：每个测试的结论、失败测试的输出、`test result` 行，
+以及 `--workspace` 时的 `workspace result` 行。构建的各步骤（`Compiling`、`Running`）
+属于叙述，写到标准错误，因此 `mcpp test > report.txt` 收集报告，
+`mcpp test 2>&1 | tee test.log` 两者都收集
+（见 [09 —— 按场景选命令](09-commands-by-scenario.md#输出流)）。
+
 ### 在工作空间中
 
 ```bash

@@ -4,7 +4,7 @@
 //   is_tty()          — whether stdout is a terminal
 //   is_terminal(s)    — whether a standard stream is a terminal
 //   can_move_cursor(s)— whether a live display may be drawn on it
-//   cols(), rows()    — the terminal's size
+//   cols(s), rows(s)  — the size of the terminal a stream reaches
 //   write(s, text)    — UTF-8 text to a standard stream
 //   write_frame(s, b) — a frame of a live display, in one write
 //   same_terminal()   — whether stdout and stderr reach one terminal
@@ -63,12 +63,15 @@ bool is_terminal(Stream s);
 // that the escape sequences mcpp writes are interpreted rather than printed.
 bool can_move_cursor(Stream s);
 
-// Returns the terminal width in columns. Tries the terminal first (TIOCGWINSZ,
-// or the console's window on Windows), falls back to $COLUMNS, then to 80.
-std::size_t cols();
+// The width in columns of the terminal the stream reaches. Tries that terminal
+// first (TIOCGWINSZ on the stream's descriptor, or the console's window on
+// Windows), falls back to $COLUMNS, then to 80. The stream is a parameter
+// because the display is drawn on one stream while the other may be a pipe: a
+// width asked of a descriptor that is not a terminal is always the fallback.
+std::size_t cols(Stream s);
 
 // The terminal's height in rows, by the same order, with $LINES and 24.
-std::size_t rows();
+std::size_t rows(Stream s);
 
 // Writes UTF-8 text to the stream. A Windows console receives it as UTF-16
 // through WriteConsoleW, so that text outside ASCII (`·`, `→`, a path in
@@ -90,17 +93,18 @@ void write_frame(Stream s, std::string_view bytes);
 
 // Whether standard error reaches the terminal standard output reaches: both
 // are terminals and, on POSIX, the same device; on Windows both are console
-// handles, and a process has at most one console. A line for standard error
-// can then travel in a frame written to standard output.
+// handles, and a process has at most one console. A line for the stream a live
+// display is not drawn on can then travel in the frame written to the stream it
+// is drawn on.
 bool same_terminal();
 
-// Whether the terminal is likely to draw East Asian ambiguous-width
-// characters (`·`, `…`, `→`, the box-drawing block) two columns wide: a
-// Windows console whose output code page is 932, 936, 949 or 950, or, on
-// POSIX, a locale (LC_ALL, LC_CTYPE, then LANG) for Chinese, Japanese or
+// Whether the terminal the stream reaches is likely to draw East Asian
+// ambiguous-width characters (`·`, `…`, `→`, the box-drawing block) two columns
+// wide: a Windows console whose output code page is 932, 936, 949 or 950, or,
+// on POSIX, a locale (LC_ALL, LC_CTYPE, then LANG) for Chinese, Japanese or
 // Korean. The answer is a likelihood; a live display that budgets its width
 // by it is never wider than the terminal either way.
-bool ambiguous_wide();
+bool ambiguous_wide(Stream s);
 
 // Whether the terminal can be expected to draw characters beyond ASCII from
 // its font or a fallback, braille included: on POSIX a UTF-8 locale (LC_ALL,
@@ -122,15 +126,15 @@ std::vector<Key> decode_keys(std::string& pending);
 
 // KEYS READ FROM THE TERMINAL FOR THE LIFETIME OF THE OBJECT, without echo and
 // without waiting for a line end; Ctrl-C still interrupts. Active only when
-// standard input and standard output are both terminals and, on POSIX, mcpp
-// is in the terminal's foreground process group: a background job that
-// changed the terminal's mode would be stopped by SIGTTOU. The mode the
-// terminal had is restored when the object is destroyed, and by the signal
-// handler if a signal ends mcpp first (POSIX: `unixproc::guard_terminal_mode`;
-// Windows: a console control handler).
+// standard input and the stream the display is drawn on (`display`) are both
+// terminals and, on POSIX, mcpp is in the terminal's foreground process group:
+// a background job that changed the terminal's mode would be stopped by
+// SIGTTOU. The mode the terminal had is restored when the object is destroyed,
+// and by the signal handler if a signal ends mcpp first (POSIX:
+// `unixproc::guard_terminal_mode`; Windows: a console control handler).
 class KeyInput {
 public:
-    KeyInput();
+    explicit KeyInput(Stream display);
     ~KeyInput();
     KeyInput(const KeyInput&) = delete;
     KeyInput& operator=(const KeyInput&) = delete;
@@ -234,28 +238,32 @@ std::size_t from_env(const char* name, std::size_t fallback) {
 }
 } // namespace
 
-std::size_t cols() {
+std::size_t cols(Stream s) {
 #if defined(_WIN32)
     CONSOLE_SCREEN_BUFFER_INFO info{};
-    if (HANDLE h; console_of(Stream::Out, &h) && ::GetConsoleScreenBufferInfo(h, &info))
+    if (HANDLE h; console_of(s, &h) && ::GetConsoleScreenBufferInfo(h, &info))
         return static_cast<std::size_t>(info.srWindow.Right - info.srWindow.Left + 1);
 #elif defined(__unix__) || defined(__APPLE__)
     struct winsize w{};
-    if (::ioctl(::fileno(stdout), TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
+    if (::ioctl(::fileno(file_of(s)), TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
         return w.ws_col;
+#else
+    (void)s;
 #endif
     return from_env("COLUMNS", 80);
 }
 
-std::size_t rows() {
+std::size_t rows(Stream s) {
 #if defined(_WIN32)
     CONSOLE_SCREEN_BUFFER_INFO info{};
-    if (HANDLE h; console_of(Stream::Out, &h) && ::GetConsoleScreenBufferInfo(h, &info))
+    if (HANDLE h; console_of(s, &h) && ::GetConsoleScreenBufferInfo(h, &info))
         return static_cast<std::size_t>(info.srWindow.Bottom - info.srWindow.Top + 1);
 #elif defined(__unix__) || defined(__APPLE__)
     struct winsize w{};
-    if (::ioctl(::fileno(stdout), TIOCGWINSZ, &w) == 0 && w.ws_row > 0)
+    if (::ioctl(::fileno(file_of(s)), TIOCGWINSZ, &w) == 0 && w.ws_row > 0)
         return w.ws_row;
+#else
+    (void)s;
 #endif
     return from_env("LINES", 24);
 }
@@ -332,12 +340,14 @@ bool same_terminal() {
 #endif
 }
 
-bool ambiguous_wide() {
+bool ambiguous_wide(Stream s) {
 #if defined(_WIN32)
-    if (console_of(Stream::Out)) {
+    if (console_of(s)) {
         const UINT cp = ::GetConsoleOutputCP();
         if (cp == 932 || cp == 936 || cp == 949 || cp == 950) return true;
     }
+#else
+    (void)s;
 #endif
     for (const char* name : {"LC_ALL", "LC_CTYPE", "LANG"}) {
         const char* v = std::getenv(name);
@@ -418,8 +428,8 @@ std::vector<Key> decode_keys(std::string& pending) {
     return keys;
 }
 
-KeyInput::KeyInput() {
-    if (!is_terminal(Stream::Out)) return;
+KeyInput::KeyInput(Stream display) {
+    if (!is_terminal(display)) return;
 #if defined(_WIN32)
     const HANDLE h = ::GetStdHandle(STD_INPUT_HANDLE);
     DWORD mode = 0;

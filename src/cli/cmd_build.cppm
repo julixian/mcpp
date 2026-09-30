@@ -630,8 +630,9 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         }
     };
     {
-        // Planning narrates on stdout and may start programs that inherit it;
-        // the document is printed after this scope, alone.
+        // mcpp narrates on standard error, but planning may start programs
+        // that inherit standard output (build programs, installers); the
+        // document is printed after this scope, alone.
         mcpp::platform::terminal::StdoutToStderr narration;
         // A group whose plan fails is planned member by member (appended to
         // `requests` and reached by this same loop), so a member's failure
@@ -1182,7 +1183,7 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
         if (totalBuilt)
             notRunCounts += std::format("; {} built, not run", totalBuilt);
         if (failed.empty() && notRun.empty() && unrunnable.empty())
-            mcpp::ui::status("workspace result",
+            mcpp::ui::result("workspace result",
                 std::format("ok. {} member(s); {} passed; 0 failed{}; finished in {:.2f}s",
                             members.size(), totalPassed, notRunCounts,
                             static_cast<double>(wsElapsed) / 1000.0));

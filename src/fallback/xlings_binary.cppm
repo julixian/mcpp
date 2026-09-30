@@ -176,13 +176,14 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
     std::error_code ec;
     std::filesystem::create_directories(destBin.parent_path(), ec);
 
-    // Right-pad verb to 12 columns (matches mcpp::ui::verb_padded layout).
+    // Right-pad verb to 12 columns (matches mcpp::ui::verb_padded layout), on
+    // standard error: the stream mcpp.ui narrates on.
     auto print_status = [](std::string_view verb, std::string_view msg) {
         constexpr std::size_t W = 12;
         if (verb.size() >= W)
-            std::println("{} {}", verb, msg);
+            std::println(stderr, "{} {}", verb, msg);
         else
-            std::println("{}{} {}", std::string(W - verb.size(), ' '), verb, msg);
+            std::println(stderr, "{}{} {}", std::string(W - verb.size(), ' '), verb, msg);
     };
 
     // The first acquisition takes the source a replacement would take

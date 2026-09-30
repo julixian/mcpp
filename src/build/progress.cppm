@@ -1106,7 +1106,7 @@ mcpp::ui::Frame frame() {
         r.lastDone  = done;
         // The screen takes 25 columns; a terminal narrower than 60 keeps the
         // counts and the clock instead.
-        if (mcpp::platform::terminal::cols() >= 60) {
+        if (mcpp::platform::terminal::cols(mcpp::ui::narration_stream()) >= 60) {
             screen::Screen sc;
             r.animation->draw(sc);
             cells = sc.render(r.animationColour);
@@ -1160,8 +1160,9 @@ std::unique_ptr<screen::Animation> choose_animation() {
 
 // `--play-game[=NAME]` (revision 3, §5.14): the CLI publishes the request as
 // MCPP_PLAY_GAME (`random` or a name). The game needs what the screen needs,
-// and keys: standard input and standard output on a terminal, with mcpp in
-// its foreground. Otherwise it is off, and one line says why.
+// and keys: standard input and the stream the screen is drawn on (standard
+// error) on a terminal, with mcpp in its foreground. Otherwise it is off, and
+// one line says why.
 void choose_game(Report& r, std::vector<std::string>& notes) {
     auto want = mcpp::platform::env::get("MCPP_PLAY_GAME").value_or("");
     if (want.empty()) return;
@@ -1183,7 +1184,8 @@ void choose_game(Report& r, std::vector<std::string>& notes) {
                         "draws braille, without --quiet and MCPP_PROGRESS=plain or off, is needed)");
         return;
     }
-    auto keys = std::make_unique<mcpp::platform::terminal::KeyInput>();
+    auto keys = std::make_unique<mcpp::platform::terminal::KeyInput>(
+        mcpp::ui::narration_stream());
     if (!keys->active()) {
         notes.push_back("--play-game: standard input is not a terminal in the foreground, "
                         "so no key can be read");
