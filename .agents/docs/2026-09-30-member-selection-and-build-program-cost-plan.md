@@ -926,7 +926,7 @@ member, and three defects in the pack of several, which are corrected (e2e 870):
 ### 15.4 Verification before the pull request
 
 - Unit tests: 142 passed.
-- The e2e scripts added by this plan (852 to 869) pass under clang and, for
+- The e2e scripts added by this plan (852 to 870) pass under clang and, for
   those that depend on the family, under GCC.
 - The full e2e suite on the integration of T1 to T3, on a machine whose
   default toolchain is clang: 473 passed, 19 failed, 61 skipped. The 19 fail
