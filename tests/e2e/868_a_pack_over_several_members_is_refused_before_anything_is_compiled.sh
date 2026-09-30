@@ -23,6 +23,7 @@
 #      refused by name. `mcpp pack -p <member>` over the same provider works.
 #   K. A member that declared the format and submitted nothing fails alone: the
 #      others are packed, the failure names the member, and the status is not zero.
+#      So does a configuration that cannot be planned, for its members.
 set -e
 source "$(dirname "$0")/_host_path.sh"
 
@@ -289,5 +290,36 @@ grep -q "member 'mute': no action claimed --format 'zap'" k.log \
 [ -n "$(find good -name good.zap | head -1)" ] || fail "K: the member that claimed the format was not packed" k.log
 grep -q "Packed .*good.zap" k.log || fail "K: the member that was packed was not reported" k.log
 echo "ok: K, a member that claimed nothing fails alone, by name, and the others are packed"
+
+# A configuration that cannot be planned fails for its members alone, too: `broken`
+# asks for another standard, so it is planned in a group of its own, and its build
+# program does not compile.
+mkdir -p "$TMP/planfail" && cd "$TMP/planfail"
+cat > mcpp.toml <<'EOF'
+[workspace]
+members = ["fine", "broken"]
+EOF
+program_member fine ""
+mkdir -p broken/src
+cat > broken/mcpp.toml <<'EOF'
+[package]
+name     = "broken"
+version  = "0.1.0"
+standard = "c++26"
+
+[targets.broken]
+kind = "bin"
+main = "src/main.cpp"
+EOF
+printf 'int main() { return 0; }\n' > broken/src/main.cpp
+printf 'this is not C++\n' > broken/build.mcpp
+set +e
+"$MCPP" pack --mode system --workspace > k2.log 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "K: a configuration that could not be planned was reported as packed" k2.log
+grep -q "broken" k2.log || fail "K: the failure does not name the member" k2.log
+[ -n "$(find fine -name 'fine-0.1.0-*.tar.gz' | head -1)" ] || fail "K: the member of the other configuration was not packed" k2.log
+echo "ok: K, a configuration that cannot be planned fails for its members alone"
 
 echo "PASS: 868_a_pack_over_several_members_is_refused_before_anything_is_compiled"

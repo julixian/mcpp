@@ -1,6 +1,8 @@
-// mcpp.pack.pipeline — pack orchestration: build (re-preparing for musl static
-// when needed), pick the main binary, plan + run the bundler.
-// Bodies moved verbatim from the CLI layer. Zero behavior change.
+// mcpp.pack.pipeline — pack orchestration: the plan of each configuration group
+// of the members being packed (re-preparing for musl static when needed), what is
+// refused before anything is compiled, one build per group, then for each member
+// its program, its plan and the bundler, and one dispatch pass per group. The
+// package of one directory is a group of one member, and runs the same steps.
 
 module;
 #include <cstdio>
@@ -1159,6 +1161,7 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
 std::optional<Refusal> check_destinations(PackRun& run, std::vector<GroupJob>& groups) {
     std::map<std::filesystem::path, std::string> writer;
     for (auto& g : groups) {
+        if (g.rc != 0) continue;
         for (auto& m : g.members) {
             std::optional<Refusal> refused;
             mcpp::build::with_member(*g.ctx, m.inWorkspace ? m.name : std::string_view{}, [&] {
@@ -1236,17 +1239,23 @@ PackOutcome run_pack(PackRun run) {
     for (auto& g : groups) {
         if (auto refused = prepare_group(run, g)) {
             mcpp::ui::error(refused->message);
-            return PackOutcome{refused->rc};
+            if (groups.size() == 1) return PackOutcome{refused->rc};
+            // A configuration that cannot be planned fails for its members alone,
+            // as a member that fails to build does (P3): the members are named
+            // as the command named them, and the other groups are packed.
+            g.rc = refused->rc;
+            g.members.clear();
+            for (auto const& mp : g.paths) g.members.push_back(MemberJob{.name = mp});
         }
         memberCount += g.members.size();
-        run.several = memberCount > 1;
     }
     run.several = memberCount > 1;
     for (auto& g : groups)
-        if (auto refused = check_format(run, g)) {
-            mcpp::ui::error(refused->message);
-            return PackOutcome{refused->rc};
-        }
+        if (g.rc == 0)
+            if (auto refused = check_format(run, g)) {
+                mcpp::ui::error(refused->message);
+                return PackOutcome{refused->rc};
+            }
     if (run.several)
         if (auto refused = check_destinations(run, groups)) {
             mcpp::ui::error(refused->message);
@@ -1255,6 +1264,7 @@ PackOutcome run_pack(PackRun run) {
 
     // ─── One build per group, each member staged, one dispatch ───────
     for (auto& g : groups) {
+        if (g.rc != 0) continue;
         mcpp::build::BuildOptions bo;
         auto br = be->build(g.ctx->plan, bo);
         if (!br) {
