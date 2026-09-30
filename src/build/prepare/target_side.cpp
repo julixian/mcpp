@@ -2377,10 +2377,11 @@ static std::expected<void, std::string> step9_rerun_input_prepare_dir(PrepareSta
             if (f.enabled && !f.flags.empty()) dst += std::format(" ({})", f.flags);
             if (!f.enabled) dst += std::format(" ({})", f.reason);
         }
-        std::println("c++fly on {}: {}; enabled: {}; skipped: {}",
-                     state.tc->label(), state.stdFlagAndDialect,
-                     enabled.empty() ? "(none)" : enabled,
-                     skipped.empty() ? "(none)" : skipped);
+        // Narration, like every line that says what the build is doing.
+        mcpp::ui::line(std::format("c++fly on {}: {}; enabled: {}; skipped: {}",
+                                   state.tc->label(), state.stdFlagAndDialect,
+                                   enabled.empty() ? "(none)" : enabled,
+                                   skipped.empty() ? "(none)" : skipped));
     }
     for (auto& f : mcpp::toolchain::cppfly::effective_dialect_flags(
              *state.tc, state.m->cppStandard.experimental,
