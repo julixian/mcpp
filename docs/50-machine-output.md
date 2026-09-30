@@ -556,9 +556,11 @@ mcpp test [pattern] [--workspace] --message-format json
 
 This stream predates the envelope of §2 and is not wrapped in it: it is NDJSON,
 one record per test as each finishes, then one summary record per member. A
-`--workspace` run ends with one `workspace_summary` record. The §7 guarantees
-apply to it — fields are added and never removed, and a field's meaning never
-changes — and the fields below are the contract as of 2026.9.2.1.
+`--workspace` run ends with one `workspace_summary` record. A test over several
+members adds one `group_build` record per group, before the group's first test
+record. The §7 guarantees apply to it — fields are added and never removed, and
+a field's meaning never changes — and the fields below are the contract as of
+2026.9.2.1, with the additions each row dates.
 
 Per test:
 
@@ -569,7 +571,7 @@ Per test:
 | `status` | `pass`, `compile_fail`, `run_fail`, `not_run`, or `built` |
 | `exit_code` | the test's exit status; `0` for `not_run` and `built` |
 | `signal` | the signal number when the status encodes one, else `null` |
-| `duration_ms` | build+run wall time of this test |
+| `duration_ms` | build+run wall time of this test; the build part is the sum of this test binary's own edges in `.ninja_log` for this invocation, so it is `0` for a binary that was not rebuilt *(2026.10.1.1+; earlier, a test that ran reported its run alone)* |
 | `timed_out` | `true` when `--timeout` killed it (`run_fail`) |
 | `compile_output`, `run_output` | captured diagnostics |
 | `reason` | `not_run` only: why, in one sentence; `""` otherwise |
@@ -583,6 +585,35 @@ Summary record, `{"summary": {...}}`:
 | `not_run_reason` | the reason shared by all of them, or `""` |
 | `built` | tests built under `--no-run`, which were not to be executed |
 | `elapsed_ms`, `build_ms`, `run_ms` | wall time, split |
+| `build_group` | *(2026.10.1.1+)* present when the member was planned with others: the `group` of the `group_build` record whose build its tests waited for |
+
+`build_ms` is the wall time this member's tests waited for their build. For a
+member planned alone that is its own build. For a member planned with others it
+is the build of its whole group, the same number for every member of the
+group, and a consumer that sums `build_ms` over members deduplicates by
+`build_group`; a consumer that does not sum it is unaffected. `elapsed_ms` is
+the wall clock for the whole member, planning and the group's build included.
+
+### The group record *(2026.10.1.1+)*
+
+`mcpp test` over several members plans the members of one configuration
+together and builds them once, so the build's time belongs to the group and is
+stated once. One record per group precedes the group's first test record:
+
+```json
+{"group_build":{"group":0,"members":["libs/a","libs/b"],"build_ms":8210}}
+```
+
+| field | |
+|---|---|
+| `group` | the group's number, from 0, in the order the groups were built |
+| `members` | the members planned in it, as `[workspace] members` spells them |
+| `build_ms` | the wall time of the group's build: its packages and every test binary |
+
+A member whose package does not build in a group reports
+`{"error":"package","member":"…","compile_output":"…"}`, and the members of the
+group whose packages build still run. A test over one member has neither the
+record nor `build_group`.
 
 **`built` and `not_run` are different answers and are counted apart.** Both
 describe a test that was compiled and not executed, and that is where the

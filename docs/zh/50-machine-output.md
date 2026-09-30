@@ -513,8 +513,9 @@ mcpp test [pattern] [--workspace] --message-format json
 
 这条流早于 §2 的信封，也不被它包裹：它是 NDJSON，每个测试结束时一条记录，随后
 每个成员一条汇总记录。`--workspace` 运行以一条 `workspace_summary` 记录
-结束。§7 的保证对它同样成立 —— 字段只增不减，字段含义永不改变 —— 下表是
-2026.9.2.1 时点的契约。
+结束。对多个成员的测试会在每个组的第一条测试记录之前增加一条 `group_build` 记录。
+§7 的保证对它同样成立 —— 字段只增不减，字段含义永不改变 —— 下表是
+2026.9.2.1 时点的契约，各行注明其后的新增。
 
 每个测试：
 
@@ -525,7 +526,7 @@ mcpp test [pattern] [--workspace] --message-format json
 | `status` | `pass`、`compile_fail`、`run_fail`、`not_run` 或 `built` |
 | `exit_code` | 该测试的退出状态；`not_run` 与 `built` 时为 `0` |
 | `signal` | 状态编码了信号时为信号编号，否则为 `null` |
-| `duration_ms` | 该测试构建加运行的墙钟时间 |
+| `duration_ms` | 该测试构建加运行的墙钟时间；构建部分是本次调用中该测试二进制自己的边在 `.ninja_log` 里的耗时之和，因此没有被重新构建的二进制为 `0` *（2026.10.1.1+；此前运行过的测试只报告运行耗时）* |
 | `timed_out` | 被 `--timeout` 杀掉时为 `true`（`run_fail`） |
 | `compile_output`、`run_output` | 捕获到的诊断输出 |
 | `reason` | 仅 `not_run` 时：一句话说明原因；其余情况为 `""` |
@@ -539,6 +540,31 @@ mcpp test [pattern] [--workspace] --message-format json
 | `not_run_reason` | 它们共同的原因，或 `""` |
 | `built` | 在 `--no-run` 下构建、本就不打算执行的测试数 |
 | `elapsed_ms`、`build_ms`、`run_ms` | 墙钟时间，分段给出 |
+| `build_group` | *（2026.10.1.1+）* 成员与其他成员一起规划时出现：它的测试所等待的那次构建所属的 `group_build` 记录的 `group` |
+
+`build_ms` 是该成员的测试等待它们的构建所用的墙钟时间。单独规划的成员，它就是自己
+的构建；与其他成员一起规划的成员，它是整个组的构建时间，同一组的每个成员数字相同，
+对 `build_ms` 按成员求和的消费方按 `build_group` 去重；不求和的消费方不受影响。
+`elapsed_ms` 是整个成员的墙钟时间，包含规划与组的构建。
+
+### 组记录*（2026.10.1.1+）*
+
+对多个成员的 `mcpp test` 把同一配置的成员放在一起规划、只构建一次，因此构建的时间
+属于组，只说一次。每个组一条记录，位于该组第一条测试记录之前：
+
+```json
+{"group_build":{"group":0,"members":["libs/a","libs/b"],"build_ms":8210}}
+```
+
+| 字段 | |
+|---|---|
+| `group` | 组的编号，从 0 起，按构建顺序 |
+| `members` | 该组规划的成员，按 `[workspace] members` 的写法 |
+| `build_ms` | 该组构建的墙钟时间：它的包与每个测试二进制 |
+
+组内某个成员的包构建失败时，报告
+`{"error":"package","member":"…","compile_output":"…"}`，该组中包能构建的成员照常
+运行。对一个成员的测试既没有这条记录，也没有 `build_group`。
 
 **`built` 与 `not_run` 是两个不同的答案，分开计数。** 两者描述的都是一个
 编译过、没有执行的测试，相似之处到此为止：`not_run` 意味着 mcpp 试过而做不

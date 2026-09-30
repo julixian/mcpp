@@ -82,6 +82,24 @@ configuration it is meant to check rather than against the default one:
 `--build-timeout <secs>` bounds the compile. A test that hangs is reported as a
 failure with its own name, not as a job that stopped.
 
+### In a workspace
+
+```bash
+mcpp test -p core -p http              # the tests of two members
+mcpp test --workspace --exclude legacy # every member's but legacy's
+```
+
+`-p` may be repeated, and `--exclude` leaves members out of `--workspace` or of
+a virtual root's whole-workspace selection; both are resolved as
+[07 — Workspaces](07-workspace.md#53-the--p---package-option) states. A test over
+several members plans them together and builds once: the members of one
+configuration are one build graph, so a package they share is compiled once,
+and its build program runs once. Then each member's tests run, in
+`[workspace] members` order, each with that member's own runtime directories.
+The command continues past a member that fails, whether a test, its package's
+build or its plan failed, reports each member, and exits non-zero if any did.
+Discovery is scoped per member, so two members may each have a `tests/main.cpp`.
+
 ## Tests that reach packages the artifact does not
 
 ```toml
@@ -169,5 +187,7 @@ here is only that the flag exists and that the human format is the default.
 - `mcpp test --list` over a manifest that does not load lists
   `tests/**/*.cpp`, not the `[test] discover` set it cannot read.
 - `--build-timeout` is POSIX-only.
-- `--workspace-timeout` bounds a `--workspace` fan-out and reports what did run;
-  it does not attribute the timeout to a member.
+- `--workspace-timeout` bounds the runs of a `--workspace` fan-out and reports
+  what did run; it does not attribute the timeout to a member. It is checked
+  before each member's tests start, so it cannot interrupt the build the
+  members share, which `--build-timeout` bounds.
