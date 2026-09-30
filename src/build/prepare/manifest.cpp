@@ -188,6 +188,7 @@ select_workspace_members(PrepareState& state, const std::filesystem::path& wsRoo
             state.memberTargets[canonical] = t->second;
         auto member = mcpp::project::load_member_manifest(*state.wsManifest, wsRoot, mp);
         if (!member) return std::unexpected(member.error());
+        state.selectedMemberManifests.emplace_back(dir, *member);
         if (auto r = refuse_unknown_capability(*member, dir / "mcpp.toml"); !r)
             return r;
         if (auto r = report_manifest_statements(*member, state.overrides.strict); !r)

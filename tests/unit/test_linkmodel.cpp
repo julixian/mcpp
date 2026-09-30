@@ -295,6 +295,21 @@ TEST(LinkModel, ClangOnTheMsvcAbiNamesItsToolsetAndSdk) {
     EXPECT_TRUE(lm.compile_tokens(ident).empty());
 }
 
+// mcpp#746. The compiler version travels with the toolset: two runner images
+// held different cl.exe builds under one toolset directory name, and a key
+// that saw only the directory served one image's std module to the other.
+TEST(LinkModel, TheCompilerVersionIsSaidWithTheToolset) {
+    auto t = clang_msvc();
+    t.msvcCompilerVersion = "19.44.35211";
+    auto words = tc::resolve_link_model(t).msvc_driver_tokens(ident);
+    ASSERT_FALSE(words.empty());
+    EXPECT_EQ(words.back(), "-fms-compatibility-version=19.44.35211");
+    // A second build of cl.exe under the same directory is a different word.
+    auto other = t;
+    other.msvcCompilerVersion = "19.44.35217";
+    EXPECT_NE(tc::resolve_link_model(other).msvc_driver_tokens(ident), words);
+}
+
 TEST(LinkModel, TheToolsetWithoutAnSdkOmitsTheSdkWords) {
     auto t = clang_msvc();
     t.windowsSdkRoot.clear();

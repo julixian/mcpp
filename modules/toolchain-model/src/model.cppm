@@ -279,6 +279,10 @@ struct Toolchain {
     // the cl.exe row carries the same answer in its own path and envOverrides.
     std::filesystem::path               msvcToolsDir;       // <vs>/VC/Tools/MSVC/<v>
     std::string                         msvcToolsVersion;   // "14.44.35207"
+    // The version of that toolset's cl.exe ("19.44.35211"), from its file
+    // version: what clang would otherwise read from the same file itself, and
+    // what a toolset directory name does not determine (mcpp#746).
+    std::string                         msvcCompilerVersion;
     std::string                         msvcOrigin;         // "system" | "managed"
     std::string                         msvcProduct;        // for the one printed line
     std::filesystem::path               windowsSdkRoot;     // <kits>/10 or the payload

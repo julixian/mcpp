@@ -158,6 +158,24 @@ if git clone -q --depth 1 https://github.com/openxlings/xlings.git xlings > s8-c
     else fail "8 xlings from its main branch" ../s8.log; fi
 else skip "8 xlings could not be cloned"; fi
 
+# ── 9. CHANGE: a rooted workspace's own path override wins ────────────────
+# The shape of the release canary on mcpp-language-server: the workspace's
+# own package declares `framework` by `path`, a library it uses asks for it by
+# `git`. 2026.9.30.1 refuses it ("Pick one").
+rm -rf "$W/s9"; mkdir -p "$W/s9/fw/src" "$W/s9/libg/src" "$W/s9/ws/src"; cd "$W/s9"
+git init -q fw && git -C fw config user.email t@l && git -C fw config user.name t
+printf '[package]\nname = "framework"\nversion = "0.1.0"\n\n[build]\nsources = ["src/*.c"]\n\n[targets.framework]\nkind = "lib"\n' > fw/mcpp.toml
+printf 'int framework_marker(void) { return 101; }\n' > fw/src/framework.c
+git -C fw add -A && git -C fw commit -qm A && rev=$(git -C fw rev-parse HEAD)
+printf 'int framework_marker(void) { return 199; }\n' > fw/src/framework.c
+printf '[package]\nname = "libg"\nversion = "0.1.0"\n\n[build]\nsources = ["src/*.c"]\n\n[targets.libg]\nkind = "lib"\n\n[dependencies.framework]\ngit = "%s"\nrev = "%s"\n' "$W/s9/fw" "$rev" > libg/mcpp.toml
+printf 'extern int framework_marker(void);\nint libg_marker(void) { return framework_marker(); }\n' > libg/src/libg.c
+printf '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nframework = { path = "%s" }\nlibg = { path = "%s" }\n\n[targets.app]\nkind = "bin"\nmain = "src/main.cpp"\n\n[workspace]\nmembers = ["."]\n' "$W/s9/fw" "$W/s9/libg" > ws/mcpp.toml
+printf '#include <cstdio>\nextern "C" int libg_marker(void);\nint main() { std::printf("%%d\\n", libg_marker()); }\n' > ws/src/main.cpp
+if (cd ws && "$MCPP" build > ../s9.log 2>&1) && [ "$("$(bin_of ws/target app)")" = 199 ]; then
+    pass "9 CHANGE: a rooted workspace's own path override wins over a library's git declaration"
+else fail "9 CHANGE: the rooted workspace's override" s9.log; fi
+
 echo
 echo "RESULT: $passes passed, $fails failed, $skips skipped (mcpp $VER)"
 [ "$fails" -eq 0 ]

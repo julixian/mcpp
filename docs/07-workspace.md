@@ -435,7 +435,18 @@ member that several members use is compiled once.
   that member's commands. Editing them recompiles that member and what
   imports it; the build directory stays the same.
 - **Features.** `--features f` activates `f` in each selected member that
-  declares it, and is refused when no selected member declares it.
+  declares it, and is refused when no selected member declares it. A package
+  that several members of one configuration use is compiled once, with the
+  union of the features they ask for; a package that members of two
+  configurations use is compiled once in each.
+- **The root's declarations.** Each selected member declares as the root did
+  when it was planned alone: its `path` or `git` override of a dependency wins
+  over another package's declaration, `linkage` on its dependency edges is
+  honoured, and its registry dependencies are considered for the index
+  refresh (2026.9.30.2+). Two selected members that disagree about one
+  dependency's checkout (its kind or its reference) or its link form are
+  refused, naming both. See
+  [05 — When two declarations of one dependency disagree](05-dependencies.md#when-two-declarations-of-one-dependency-disagree).
 - **Hooks.** The `[hooks]` of every selected member run around the build, in
   member order.
 - **Resources.** A member's `[resources]` and `windows_code_page` are
