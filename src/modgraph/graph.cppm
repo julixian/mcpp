@@ -113,13 +113,44 @@ struct SourceUnit {
     bool                            scanOverridden     = false;
 };
 
+// A package's closure: the qualified names of the packages whose modules its
+// units may import, itself included (mcpp#732). It is the package and every
+// package it reaches through code and workspace-member edges; an `artifacts`
+// edge ships a separate program and is not followed.
+using Closures = std::map<std::string, std::set<std::string>, std::less<>>;
+
 struct Graph {
     std::vector<SourceUnit>                                  units;
-    // logical-name -> index into units
+    // logical-name -> index into units, for a name ONE unit of the graph
+    // provides. A name two packages provide (mcpp#732) is in providersOf only.
     std::map<std::string, std::size_t, std::less<>>             producerOf;
+    // logical-name -> every unit that provides it, in unit order.
+    std::map<std::string, std::vector<std::size_t>, std::less<>> providersOf;
+    // The closure of each package the plan compiles. Empty when the caller has
+    // none to give, and then a name has to be unique in the whole graph.
+    Closures                                                 closures;
     // edges as (consumer-index, producer-index)
     std::vector<std::pair<std::size_t, std::size_t>>         edges;
 };
+
+// WHICH PROVIDER AN IMPORT MEANS (mcpp#732). A module name identifies one
+// module within one program: GCC and clang mangle a module's entities with its
+// name and give it one initializer named after it, so two modules of one name
+// cannot be linked into one program, and two programs may each have one. A
+// build configuration holds several programs (a package and the programs it
+// ships through `artifacts`, a workspace's members), so a name is resolved in
+// the importer's closure, not in the whole configuration.
+//
+// Among `providerPackages`, the packages that provide one name, the index of
+// the one `importer` means: the only provider, or else the only one in the
+// importer's closure. Nothing when the closure holds none of them or more than
+// one. The one rule the scanner, the plan, the backend and the packer use.
+std::optional<std::size_t> choose_provider(std::span<const std::string> providerPackages,
+                                           std::string_view importer,
+                                           const Closures& closures);
+// The unit of `g` that `importer`'s import of `name` means.
+std::optional<std::size_t> resolve_provider(const Graph& g, std::string_view importer,
+                                            std::string_view name);
 
 // Topological order: returns indices of units in producer-before-consumer order.
 // Returns std::unexpected with the cycle if any, as the ordered path that
@@ -132,6 +163,38 @@ std::expected<std::vector<std::size_t>, CycleError> topo_sort(const Graph& g);
 } // namespace mcpp::modgraph
 
 namespace mcpp::modgraph {
+
+std::optional<std::size_t> choose_provider(std::span<const std::string> providerPackages,
+                                           std::string_view importer,
+                                           const Closures& closures) {
+    if (providerPackages.size() == 1) return 0;
+    auto closure = closures.find(importer);
+    if (closure == closures.end()) return std::nullopt;
+    std::optional<std::size_t> found;
+    for (std::size_t i = 0; i < providerPackages.size(); ++i) {
+        if (!closure->second.contains(providerPackages[i])) continue;
+        if (found) return std::nullopt;
+        found = i;
+    }
+    return found;
+}
+
+std::optional<std::size_t> resolve_provider(const Graph& g, std::string_view importer,
+                                            std::string_view name) {
+    auto it = g.providersOf.find(name);
+    if (it == g.providersOf.end() || it->second.empty()) {
+        // A graph built without `providersOf` (by hand, in a test) states its
+        // single providers in `producerOf`.
+        if (auto p = g.producerOf.find(name); p != g.producerOf.end()) return p->second;
+        return std::nullopt;
+    }
+    std::vector<std::string> packages;
+    packages.reserve(it->second.size());
+    for (auto i : it->second) packages.push_back(g.units[i].packageName);
+    auto chosen = choose_provider(packages, importer, g.closures);
+    if (!chosen) return std::nullopt;
+    return it->second[*chosen];
+}
 
 std::expected<std::vector<std::size_t>, CycleError> topo_sort(const Graph& g) {
     // g.edges: (consumer, producer) pairs, "consumer depends on producer".

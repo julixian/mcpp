@@ -525,6 +525,35 @@ updater = { path = "../updater", artifacts = ["updater"] }
 > by nothing that made a decision: writing it produced a manifest that loaded,
 > no diagnostic, and no effect.
 
+### One module per name in each program (mcpp 2026.9.30.2+)
+
+A module name identifies one module within one program. The compilers name a
+module's entities and its initializer after the module, so a program cannot
+link two modules of one name. A build can hold several programs (a package and
+the programs it ships through `artifacts`, the members of a workspace), and
+each of them may have its own module of one name.
+
+- An import is resolved within the importing package's closure: the package
+  and every package it reaches through its dependencies. The closure does not
+  follow `artifacts`, `tools` or `[build-dependencies]` edges, whose programs
+  are built separately.
+- Two packages that one program links may not provide the same name. The build
+  is refused, and the message names the package whose closure holds both.
+- When two packages of one build provide a name, each BMI lies below its
+  package's directory in the build directory, and every compile that may import
+  the name is told which one it means: through a module map with GCC, through
+  `-fmodule-file=` with Clang, and through `/reference` with MSVC. When every
+  name has one provider, the build directory and every command are as they
+  were before.
+- A package that provides such a name is compiled in the project, not served
+  from the global dependency cache.
+- clangd finds a module by its name in the compilation database, so for a name
+  two packages provide it may show the other program's module. The build is
+  not affected.
+
+A module that several programs share is best provided by one package that the
+others depend on; it is then compiled once.
+
 ## Current limitations
 
 - **Two things need the network, and only two:** resolving a branch that has no

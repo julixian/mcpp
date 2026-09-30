@@ -1334,3 +1334,102 @@ TEST(Scanner, WellFormedNamesSurviveTheIdentityGuard) {
         EXPECT_EQ(u->provides->logicalName, provides) << decl;
     }
 }
+
+// ─── A module name is resolved in the importer's closure (mcpp#732) ─────────
+//
+// GCC and clang mangle a module's entities with its name and give it one
+// initializer named after it, so one program cannot link two modules of one
+// name, and two programs may each have one. A build holds several programs, so
+// an import is resolved in the importing package's closure, and a closure may
+// hold one provider of a name.
+
+TEST(ModuleResolution, OneProviderIsTakenWhereverItIs) {
+    const std::vector<std::string> providers{"lib"};
+    EXPECT_EQ(choose_provider(providers, "app", {}), std::optional<std::size_t>{0});
+}
+
+TEST(ModuleResolution, TwoProvidersResolveInTheImportersClosure) {
+    const std::vector<std::string> providers{"app", "updater"};
+    const Closures closures{{"app", {"app"}}, {"updater", {"updater"}}};
+    EXPECT_EQ(choose_provider(providers, "app", closures), std::optional<std::size_t>{0});
+    EXPECT_EQ(choose_provider(providers, "updater", closures), std::optional<std::size_t>{1});
+}
+
+TEST(ModuleResolution, TwoProvidersInOneClosureOrNoneResolveToNothing) {
+    const std::vector<std::string> providers{"lib1", "lib2"};
+    const Closures closures{{"prog", {"prog", "lib1", "lib2"}}, {"other", {"other"}}};
+    EXPECT_FALSE(choose_provider(providers, "prog", closures));
+    EXPECT_FALSE(choose_provider(providers, "other", closures));
+    EXPECT_FALSE(choose_provider(providers, "prog", {}));
+}
+
+namespace {
+// Two packages under `dir`, each providing module `boost` and importing it.
+std::vector<PackageRoot> two_boost_packages(const std::filesystem::path& dir) {
+    std::vector<PackageRoot> out;
+    for (auto name : {"app", "updater"}) {
+        write(dir / name / "src" / "boost.cppm", "export module boost;\nexport int value();\n");
+        write(dir / name / "src" / "use.cpp", "import boost;\nint use() { return value(); }\n");
+        mcpp::manifest::Manifest m;
+        m.package.name = name;
+        m.modules.sources = {"src/*.cppm", "src/*.cpp"};
+        out.push_back(PackageRoot{dir / name, m});
+    }
+    return out;
+}
+std::string all_errors(const ScanResult& r) {
+    std::string s;
+    for (auto const& e : r.errors) s += e.message + "\n";
+    return s;
+}
+}  // namespace
+
+TEST(ModuleResolution, TwoProgramsEachResolveTheirOwnProvider) {
+    auto dir = make_tempdir("mcpp-732-two-programs");
+    const Closures closures{{"app", {"app"}}, {"updater", {"updater"}}};
+    auto r = scan_packages(two_boost_packages(dir), closures);
+    ASSERT_TRUE(r.errors.empty()) << all_errors(r);
+    ASSERT_EQ(r.graph.providersOf.at("boost").size(), 2u);
+    EXPECT_FALSE(r.graph.producerOf.contains("boost"));
+    // Every edge joins a unit to the provider of its own package.
+    ASSERT_EQ(r.graph.edges.size(), 2u);
+    for (auto [consumer, producer] : r.graph.edges)
+        EXPECT_EQ(r.graph.units[consumer].packageName, r.graph.units[producer].packageName);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(ModuleResolution, TwoProvidersInOneClosureAreRefused) {
+    auto dir = make_tempdir("mcpp-732-one-closure");
+    const Closures closures{{"app", {"app", "updater"}}, {"updater", {"updater"}}};
+    auto r = scan_packages(two_boost_packages(dir), closures);
+    const auto errors = all_errors(r);
+    EXPECT_NE(errors.find("module 'boost' is provided by package"), std::string::npos) << errors;
+    EXPECT_NE(errors.find("closure of package 'app'"), std::string::npos) << errors;
+    std::filesystem::remove_all(dir);
+}
+
+TEST(ModuleResolution, WithoutClosuresANameIsUniqueInTheGraph) {
+    auto dir = make_tempdir("mcpp-732-no-closures");
+    auto r = scan_packages(two_boost_packages(dir));
+    const auto errors = all_errors(r);
+    EXPECT_NE(errors.find("module 'boost' is provided by package"), std::string::npos) << errors;
+    std::filesystem::remove_all(dir);
+}
+
+TEST(ModuleResolution, OneFileReachedTwiceIsNamedAsSuchWhateverItsSpelling) {
+    auto dir = make_tempdir("mcpp-732-one-file");
+    write(dir / "shared" / "boost.cppm", "export module boost;\n");
+    std::vector<PackageRoot> packages;
+    for (auto name : {"lib3", "lib4"}) {
+        std::filesystem::create_directories(dir / name);
+        mcpp::manifest::Manifest m;
+        m.package.name = name;
+        m.modules.sources = {"../shared/boost.cppm"};
+        packages.push_back(PackageRoot{dir / name, m});
+    }
+    const Closures closures{{"lib3", {"lib3", "lib4"}}, {"lib4", {"lib4"}}};
+    auto r = scan_packages(packages, closures);
+    const auto errors = all_errors(r);
+    EXPECT_NE(errors.find("one file is reached as two packages"), std::string::npos) << errors;
+    std::filesystem::remove_all(dir);
+}

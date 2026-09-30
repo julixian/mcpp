@@ -441,6 +441,10 @@ struct BmiTraits {
     std::string_view compileModulesFlag;    // " -fmodules" (GCC) | ""
     std::string_view stdBmiUsePrefix;       // "" | " -fmodule-file=std=" | " /reference std="
     std::string_view stdCompatBmiUsePrefix; // "" | " -fmodule-file=std.compat=" | " /reference std.compat="
+    // Binds one module name to one BMI file for one compile, as `<prefix><name>=<path>`
+    // (mcpp#732: two modules of one name in one build directory). "" for GCC,
+    // which binds names through a mapper file instead.
+    std::string_view moduleFileUsePrefix;   // "" | " -fmodule-file=" | " /reference "
     std::string_view moduleOutputPrefix;    // "" | " -fmodule-output=" | " /ifcOutput "
     std::string_view bmiSearchPrefix;       // "" | " -fprebuilt-module-path=" | " /ifcSearchDir "
     // How this compiler is TOLD that a translation unit is a module interface.
@@ -647,6 +651,7 @@ BmiTraits bmi_traits(const Toolchain& tc) {
             .compileModulesFlag = "",
             .stdBmiUsePrefix = " /reference std=",
             .stdCompatBmiUsePrefix = " /reference std.compat=",
+            .moduleFileUsePrefix = " /reference ",
             .moduleOutputPrefix = " /ifcOutput ",
             .bmiSearchPrefix = " /ifcSearchDir ",
             // Pre-existing behaviour, unchanged: cl has always been told
@@ -670,6 +675,7 @@ BmiTraits bmi_traits(const Toolchain& tc) {
             .compileModulesFlag = "",
             .stdBmiUsePrefix = " -fmodule-file=std=",
             .stdCompatBmiUsePrefix = " -fmodule-file=std.compat=",
+            .moduleFileUsePrefix = " -fmodule-file=",
             .moduleOutputPrefix = " -fmodule-output=",
             .bmiSearchPrefix = " -fprebuilt-module-path=",
             .moduleInterfaceLangFlag = " -x c++-module",
@@ -689,6 +695,7 @@ BmiTraits bmi_traits(const Toolchain& tc) {
         .compileModulesFlag = " -fmodules",
         .stdBmiUsePrefix = "",
         .stdCompatBmiUsePrefix = "",
+        .moduleFileUsePrefix = "",
         .moduleOutputPrefix = "",
         .bmiSearchPrefix = "",
         // GCC decides interface-ness from the content (`export module`), so

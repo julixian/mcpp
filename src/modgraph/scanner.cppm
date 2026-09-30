@@ -157,7 +157,10 @@ struct PackageRoot {
     bool                            selectedMember = false;
     std::string                     memberProducts;
 };
-ScanResult scan_packages(const std::vector<PackageRoot>& packages);
+// `closures` states each compiled package's closure (mcpp#732); a module name
+// is then unique per closure, and without them in the whole graph.
+ScanResult scan_packages(const std::vector<PackageRoot>& packages,
+                         const Closures& closures = {});
 
 // Drop-in replacement that delegates per-file scanning to GCC's P1689r5
 // (.ddi) output instead of regex parsing. Same ScanResult shape — used by
@@ -165,7 +168,8 @@ ScanResult scan_packages(const std::vector<PackageRoot>& packages);
 ScanResult scan_packages_p1689(const std::vector<PackageRoot>&     packages,
                                const mcpp::toolchain::Toolchain&   tc,
                                const std::filesystem::path&        tmpDir,
-                               std::string_view                    cppStandardFlag);
+                               std::string_view                    cppStandardFlag,
+                               const Closures&                     closures = {});
 
 } // namespace mcpp::modgraph
 
@@ -1506,45 +1510,94 @@ void scan_one_into(ScanResult& result,
     }
 }
 
-// Phase 2: producerOf + edges over already-collected units.
+// Phase 2: the providers of each name, the check that a closure holds one of
+// them, and the edges, over already-collected units (mcpp#732).
 void resolve_graph(ScanResult& result) {
     auto& g = result.graph;
-    for (std::size_t i = 0; i < g.units.size(); ++i) {
-        auto& u = g.units[i];
-        if (u.provides) {
-            auto [it, inserted] = g.producerOf.emplace(u.provides->logicalName, i);
-            if (!inserted) {
-                // Name both packages: the same file reached as two packages
-                // and two packages that happen to pick one module name are
-                // different defects, and only the package names tell them
-                // apart.
-                auto const& first = g.units[it->second];
-                result.errors.push_back(ScanError{
-                    u.path, 0,
-                    std::format("module '{}' is provided by package '{}' ({}) "
-                                "and by package '{}' ({}){}",
-                                u.provides->logicalName,
-                                first.packageName, first.path.string(),
-                                u.packageName, u.path.string(),
-                                first.path == u.path
-                                    ? "; one file is reached as two packages"
-                                    : "")});
-            }
+    for (std::size_t i = 0; i < g.units.size(); ++i)
+        if (g.units[i].provides)
+            g.providersOf[g.units[i].provides->logicalName].push_back(i);
+    for (auto const& [name, units] : g.providersOf)
+        if (units.size() == 1) g.producerOf.emplace(name, units.front());
+
+    // TWO PROVIDERS OF ONE NAME MAY NOT MEET IN ONE CLOSURE. A program links
+    // the closure of its root package, and a program that links two modules
+    // of one name defines their entities twice (`value@common()`, and the
+    // module's initializer). Two programs may each have one. Without closures
+    // the name has to be unique in the whole graph, as before.
+    //
+    // Name both packages: the same file reached as two packages and two
+    // packages that happen to pick one module name are different defects, and
+    // only the package names tell them apart. The same file is decided by
+    // identity, not spelling: `a/../x.ixx` and `b/../x.ixx` are one file.
+    auto same_file = [](const std::filesystem::path& a, const std::filesystem::path& b) {
+        std::error_code ec;
+        return a.lexically_normal() == b.lexically_normal()
+            || std::filesystem::equivalent(a, b, ec);
+    };
+    auto refuse = [&](std::string_view name, const SourceUnit& first, const SourceUnit& second,
+                      std::string_view where) {
+        result.errors.push_back(ScanError{
+            second.path, 0,
+            std::format("module '{}' is provided by package '{}' ({}) and by package '{}' ({}){}{}",
+                        name, first.packageName, first.path.string(),
+                        second.packageName, second.path.string(), where,
+                        same_file(first.path, second.path)
+                            ? "; one file is reached as two packages, and a package that "
+                              "both depend on would provide it once"
+                            : "")});
+    };
+    std::set<std::string, std::less<>> withUnits;
+    for (auto const& u : g.units) withUnits.insert(u.packageName);
+    for (auto const& [name, units] : g.providersOf) {
+        if (units.size() < 2) continue;
+        if (g.closures.empty()) {
+            refuse(name, g.units[units[0]], g.units[units[1]], "");
+            continue;
+        }
+        for (auto const& [package, closure] : g.closures) {
+            if (!withUnits.contains(package)) continue;
+            std::vector<std::size_t> inClosure;
+            for (auto u : units)
+                if (closure.contains(g.units[u].packageName)) inClosure.push_back(u);
+            if (inClosure.size() < 2) continue;
+            refuse(name, g.units[inClosure[0]], g.units[inClosure[1]],
+                   std::format(", and both are in the closure of package '{}': a program "
+                               "that links both defines the module twice", package));
+            break;   // one statement per name
         }
     }
+
     for (std::size_t i = 0; i < g.units.size(); ++i) {
         auto& u = g.units[i];
         for (auto const& req : u.requires_) {
-            auto it = g.producerOf.find(req.logicalName);
-            if (it == g.producerOf.end()) {
-                if (req.logicalName == "std" || req.logicalName == "std.compat") continue;
+            if (auto p = resolve_provider(g, u.packageName, req.logicalName)) {
+                g.edges.emplace_back(i, *p);
+                continue;
+            }
+            if (req.logicalName == "std" || req.logicalName == "std.compat") continue;
+            auto it = g.providersOf.find(req.logicalName);
+            if (it == g.providersOf.end()) {
                 result.warnings.push_back(ScanError{
                     u.path, 0,
                     std::format("module '{}' imported but not provided in this build",
                                 req.logicalName)});
                 continue;
             }
-            g.edges.emplace_back(i, it->second);
+            // Two or more providers, and none in the importer's closure (two in
+            // it, or any two without closures, are refused above).
+            if (g.closures.empty()) continue;
+            std::size_t inClosure = 0;
+            if (auto c = g.closures.find(u.packageName); c != g.closures.end())
+                for (auto p : it->second)
+                    if (c->second.contains(g.units[p].packageName)) ++inClosure;
+            if (inClosure > 1) continue;
+            result.errors.push_back(ScanError{
+                u.path, 0,
+                std::format("module '{}' is provided by {} packages, and none of them is "
+                            "a dependency of package '{}'; declare the dependency on the "
+                            "one it means", req.logicalName, it->second.size(),
+                            u.packageName)});
         }
     }
 }
@@ -1563,8 +1616,10 @@ ScanResult scan_package(const std::filesystem::path& root,
     return result;
 }
 
-ScanResult scan_packages(const std::vector<PackageRoot>& packages) {
+ScanResult scan_packages(const std::vector<PackageRoot>& packages,
+                         const Closures& closures) {
     ScanResult result;
+    result.graph.closures = closures;
     for (auto const& p : packages) {
         auto localIncludeDirs = p.usageResolved
             ? p.privateBuild.includeDirs
@@ -1601,9 +1656,11 @@ ScanResult scan_packages(const std::vector<PackageRoot>& packages) {
 ScanResult scan_packages_p1689(const std::vector<PackageRoot>&     packages,
                                const mcpp::toolchain::Toolchain&   tc,
                                const std::filesystem::path&        tmpDir,
-                               std::string_view                    cppStandardFlag)
+                               std::string_view                    cppStandardFlag,
+                               const Closures&                     closures)
 {
     ScanResult result;
+    result.graph.closures = closures;
     for (auto const& p : packages) {
         // Same contract as scan_one_into: each package's own table.
         const auto extTable =

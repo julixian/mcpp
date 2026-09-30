@@ -2049,6 +2049,11 @@ static std::expected<void, std::string> step13_dependency_cache(PrepareState& st
                 // consumer three edges away, which is far harder to read than
                 // one extra compile.
                 if (cu.packageObjectRel.empty()) { addressable = false; break; }
+                // A BMI below its package's directory (a module name two
+                // packages of the plan provide, mcpp#732) has no address in
+                // the entry, whose BMIs are named by module: the package
+                // compiles here instead of being cached.
+                if (cu.bmiFile.find('/') != std::string::npos) { addressable = false; break; }
 
                 if (!cu.providesModule.empty()) {
                     std::string bmi;

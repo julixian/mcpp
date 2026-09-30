@@ -451,9 +451,11 @@ member that several members use is compiled once.
   `compile_commands.json` once, as the union of their databases (2026.9.29.5+).
 - **No-op builds.** A command repeated with nothing changed is answered by one
   check per configuration, without planning.
-- **Module names.** Members built in one graph share one module namespace:
-  two members that each provide a module of the same name cannot be built in
-  one `--workspace` command; build each with `-p`.
+- **Module names.** A module name is unique within one program, not within one
+  graph (2026.9.30.2+). Two members that share no program may each provide a
+  module of the same name, and one `--workspace` command builds both; a member
+  that links both is refused. See
+  [05 — One module per name in each program](05-dependencies.md#one-module-per-name-in-each-program-mcpp-20269302).
 
 ## 6. Directory Layout
 

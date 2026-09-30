@@ -1483,12 +1483,16 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // are actually SPLIT bind their record to the BMI. An implementation unit
     // or a plain .cpp still compiles in one edge whose output is the object,
     // and a `--target-bmi` there would name an edge nobody declared.
+    //
+    // `$module_map` (mcpp#732) names the package's module map when two packages
+    // of the plan provide one module name; the rule carries it only then, so
+    // a plan without such a name writes the file it always wrote.
     append(std::format(
         "rule cxx_dyndep\n"
-        "  command = $mcpp dyndep --single --bmi-dir {} --bmi-ext {} $bind $expect --output $out $in\n"
+        "  command = $mcpp dyndep --single --bmi-dir {} --bmi-ext {} $bind $expect{} --output $out $in\n"
         "  description = DYNDEP $out\n"
         "  restat = 1\n\n",
-        traits.bmiDir, traits.bmiExt));
+        traits.bmiDir, traits.bmiExt, plan.moduleScopes.empty() ? "" : " $module_map"));
 
     // P2: cxx_module preserves BMI timestamps when interface is unchanged.
     // GCC always updates the .gcm timestamp even if content is identical.
@@ -2234,21 +2238,43 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // exactly one symbol (`_ZGIW3std`, measured) and an importing TU references
     // it, so a missed unit is an undefined symbol at link time rather than a
     // silent miscompile.
-    std::unordered_map<std::string, const CompileUnit*> byModule;
+    // The module map of each package whose closure holds a name two packages
+    // provide (mcpp#732): module name -> BMI path, as the plan resolved it.
+    std::map<std::string, std::map<std::string, std::string, std::less<>>, std::less<>> scopeBmis;
+    for (auto const& [pkg, scope] : plan.moduleScopes) {
+        auto& m = scopeBmis[pkg];
+        std::istringstream lines(scope.content);
+        for (std::string name, path; lines >> name >> path;) m[name] = path;
+    }
+    std::unordered_map<std::string, std::vector<const CompileUnit*>> byModule;
     for (auto& cu : plan.compileUnits)
-        if (!cu.providesModule.empty()) byModule.emplace(cu.providesModule, &cu);
+        if (!cu.providesModule.empty()) byModule[cu.providesModule].push_back(&cu);
+    // The unit `importer`'s import of `name` means: the one provider, or the
+    // one its package's module map names.
+    auto provider_of = [&](const CompileUnit& importer,
+                           const std::string& name) -> const CompileUnit* {
+        auto it = byModule.find(name);
+        if (it == byModule.end()) return nullptr;
+        if (it->second.size() == 1) return it->second.front();
+        auto sc = scopeBmis.find(importer.packageName);
+        if (sc == scopeBmis.end()) return nullptr;
+        auto m = sc->second.find(name);
+        if (m == sc->second.end()) return nullptr;
+        for (auto const* c : it->second)
+            if (std::string(traits.bmiDir) + "/" + c->bmiFile == m->second) return c;
+        return nullptr;
+    };
 
     auto reaches_std = [&](const CompileUnit& start) {
         std::vector<const CompileUnit*> stack{&start};
-        std::unordered_set<std::string> seen;
+        std::unordered_set<const CompileUnit*> seen;
         while (!stack.empty()) {
             const CompileUnit* cu = stack.back();
             stack.pop_back();
             for (auto& imp : cu->imports) {
                 if (imp == "std" || imp == "std.compat") return true;
-                if (!seen.insert(imp).second) continue;
-                if (auto it = byModule.find(imp); it != byModule.end())
-                    stack.push_back(it->second);
+                auto const* next = provider_of(*cu, imp);
+                if (next && seen.insert(next).second) stack.push_back(next);
             }
         }
         return false;
@@ -2329,6 +2355,19 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         s += traits.bmiExt;
         return s;
     };
+    // The BMI a unit provides, where the plan placed it: below its package's
+    // directory when two packages provide its module name (mcpp#732).
+    auto unit_bmi = [&](const mcpp::build::CompileUnit& cu) {
+        return cu.bmiFile.empty() ? bmi_path(cu.providesModule)
+                                  : std::string(traits.bmiDir) + "/" + cu.bmiFile;
+    };
+    // The BMI `cu`'s import of `name` means: its package's module map when it
+    // has one, and the module's own name otherwise.
+    auto import_bmi = [&](const mcpp::build::CompileUnit& cu, std::string_view name) {
+        if (auto sc = scopeBmis.find(cu.packageName); sc != scopeBmis.end())
+            if (auto it = sc->second.find(name); it != sc->second.end()) return it->second;
+        return bmi_path(name);
+    };
 
     // Rule selection is a pure function of the unit's KIND — never of its
     // extension. mcpp#272 fixed link-object collection while this stayed
@@ -2357,7 +2396,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                                     traits.moduleInterfaceLangFlag);
         if (traits.needsExplicitModuleOutput)
             v += std::format("  module_output ={}{}\n", traits.moduleOutputPrefix,
-                             bmi_path(cu.providesModule));
+                             unit_bmi(cu));
         return v;
     };
 
@@ -2425,7 +2464,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             append("  verify = --verify size\n");
             staged.push_back(obj);
             if (!cu.providesModule.empty() && !cu.cachedBmi.empty()) {
-                auto bmi = bmi_path(cu.providesModule);
+                auto bmi = unit_bmi(cu);
                 append(std::format("build {} : stage_file {}\n", bmi,
                                    escape_ninja_path(cu.cachedBmi)));
                 append("  verify = --verify size\n");
@@ -2557,7 +2596,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             append(std::format("  compile_target = {}\n", escape_ninja_path(cu.object)));
             append(std::format("  deps_target = {}\n",
                                splitBmi && !cu.providesModule.empty()
-                                   ? bmi_path(cu.providesModule)
+                                   ? unit_bmi(cu)
                                    : escape_ninja_path(cu.object)));
             if (auto includes = local_include_flags(cu, dial); !includes.empty())
                 append(std::format("  local_includes ={}\n", includes));
@@ -2645,6 +2684,9 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             append(std::format("build {} : cxx_dyndep {}\n", dd, ddi));
             if (two_phase_ddi.contains(ddi))
                 append("  bind = --split-module\n");
+            if (auto sc = plan.moduleScopes.find(ddiOwner[ddi]); sc != plan.moduleScopes.end())
+                append(std::format("  module_map = --module-map {}\n",
+                                   escape_ninja_path(sc->second.mapFile)));
             if (auto it = ddi_expect.find(ddi); it != ddi_expect.end())
                 append(std::format("  expect = {}\n", it->second));
         }
@@ -2660,7 +2702,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
 
             if (splitBmi && !cu.providesModule.empty() &&
                 cu.kind == mcpp::SourceKind::ModuleInterface) {
-                const auto bmi  = bmi_path(cu.providesModule);
+                const auto bmi  = unit_bmi(cu);
                 const auto obj  = escape_ninja_path(cu.object);
                 const auto slot = obj + ".sched";
                 const auto ddi  = (cu.object.parent_path() / cu.source.filename())
@@ -2725,7 +2767,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
 
             if (twoPhase && !cu.providesModule.empty() &&
                 cu.kind == mcpp::SourceKind::ModuleInterface) {
-                const auto bmi = bmi_path(cu.providesModule);
+                const auto bmi = unit_bmi(cu);
                 const auto obj = escape_ninja_path(cu.object);
                 const auto ddi = (cu.object.parent_path() / cu.source.filename())
                                      .string() + ".ddi";
@@ -2757,7 +2799,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
 
             std::string out_line = "build " + escape_ninja_path(cu.object);
             if (!cu.providesModule.empty()) {
-                out_line += " | " + bmi_path(cu.providesModule);
+                out_line += " | " + unit_bmi(cu);
             }
             out_line += std::format(" : {} {}", rule, escape_ninja_path(cu.source));
             if (!is_scan_exempt(cu)) {
@@ -2769,7 +2811,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                     out_line += "\n  dyndep = " + it->second;
                     // P2: set bmi_out for the copy_if_different logic in cxx_module.
                     if (!cu.providesModule.empty()) {
-                        out_line += "\n  bmi_out = " + bmi_path(cu.providesModule);
+                        out_line += "\n  bmi_out = " + unit_bmi(cu);
                     }
                     out_line += "\n";
                     if (rule == "cxx_module") out_line += module_edge_vars(cu);
@@ -2817,7 +2859,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
                             implicit += " " + escape_ninja_path(std_bmi_dst);
                         continue;
                     }
-                    implicit += " " + bmi_path(imp);
+                    implicit += " " + import_bmi(cu, imp);
                 }
             }
 
@@ -2825,7 +2867,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             if (!cu.providesModule.empty()) {
                 // Use implicit output (|) so $out only contains the .o file.
                 // GCC writes BMI implicitly; Clang uses -fmodule-output=$bmi_out.
-                out_line += " | " + bmi_path(cu.providesModule);
+                out_line += " | " + unit_bmi(cu);
             }
             out_line += std::format(" : {} {}", rule, escape_ninja_path(cu.source));
             if (!implicit.empty())
@@ -2846,7 +2888,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             }
             // Clang needs $bmi_out to emit -fmodule-output=$bmi_out
             if (!cu.providesModule.empty()) {
-                out_line += "  bmi_out = " + bmi_path(cu.providesModule) + "\n";
+                out_line += "  bmi_out = " + unit_bmi(cu) + "\n";
             }
             if (rule == "cxx_module") out_line += module_edge_vars(cu);
             append(std::move(out_line));
@@ -3919,6 +3961,16 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
             std::filesystem::create_directories(plan.outputDir, lec);
             std::ofstream(listPath, std::ios::binary | std::ios::trunc) << placements;
         }
+    }
+    // mcpp#732: the module maps the units of a package read when two packages
+    // provide one module name. The content's hash is in the name, so a file
+    // that exists is already right; a changed resolution names a new file.
+    for (auto const& [pkg, scope] : plan.moduleScopes) {
+        const auto path = plan.outputDir / scope.mapFile;
+        std::error_code mec;
+        if (std::filesystem::exists(path, mec)) continue;
+        std::filesystem::create_directories(path.parent_path(), mec);
+        std::ofstream(path, std::ios::binary | std::ios::trunc) << scope.content;
     }
 
     // Command-length backstop (see

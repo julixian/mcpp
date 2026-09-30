@@ -75,6 +75,43 @@ static std::expected<bool, std::string> step11_scan_sources(PrepareState& state)
     for (std::size_t i = 0; i < state.packages.size(); ++i)
         if (state.compilesHere(i))
             scannedPackages.push_back(state.packages[i]);
+
+    // THE CLOSURE OF EACH PACKAGE THIS PLAN COMPILES (mcpp#732): the package
+    // and every package it reaches through code and workspace-member edges. A
+    // module name is unique within one program, and a program links its root
+    // package's closure. An `artifacts` edge ships a separate program and a
+    // `[build-dependencies]` edge serves the build, so neither is followed. A
+    // workspace plan's virtual root compiles nothing and has no closure, so
+    // two members that share no program may each provide a module of one name.
+    mcpp::modgraph::Closures closures;
+    {
+        auto qualified = [](const mcpp::manifest::Manifest& m) {
+            return m.package.namespace_.empty() ? m.package.name
+                                                : m.package.namespace_ + "." + m.package.name;
+        };
+        std::map<std::size_t, std::vector<std::size_t>> codeEdges;
+        for (auto const& e : state.dependencyEdges) {
+            if (!e.requestedArtifacts.empty() || e.buildOnly) continue;
+            codeEdges[e.consumerPackageIndex].push_back(e.dependencyPackageIndex);
+        }
+        for (std::size_t i = 0; i < state.packages.size(); ++i) {
+            if (!state.compilesHere(i)) continue;
+            if (i == 0 && state.m->package.virtualRoot) continue;
+            std::set<std::string> names;
+            std::set<std::size_t> seen{i};
+            std::vector<std::size_t> work{i};
+            while (!work.empty()) {
+                const auto k = work.back();
+                work.pop_back();
+                names.insert(qualified(state.packages[k].manifest));
+                if (auto it = codeEdges.find(k); it != codeEdges.end())
+                    for (auto j : it->second)
+                        if (seen.insert(j).second) work.push_back(j);
+            }
+            closures[qualified(state.packages[i].manifest)] = std::move(names);
+        }
+    }
+
     state.scan = [&] {
         const char* sel = std::getenv("MCPP_SCANNER");
         if (sel && std::string_view(sel) == "p1689") {
@@ -82,9 +119,9 @@ static std::expected<bool, std::string> step11_scan_sources(PrepareState& state)
                      / std::format("mcpp_p1689_{}", std::random_device{}());
             std::filesystem::create_directories(tmp);
             return mcpp::modgraph::scan_packages_p1689(scannedPackages, *state.tc, tmp,
-                                                       state.stdFlagAndDialect);
+                                                       state.stdFlagAndDialect, closures);
         }
-        return mcpp::modgraph::scan_packages(scannedPackages);
+        return mcpp::modgraph::scan_packages(scannedPackages, closures);
     }();
     if (!state.scan.errors.empty()) {
         std::string msg = "scanner errors:\n";
@@ -879,14 +916,18 @@ static void step11_public_module_check(PrepareState& state) {
     };
     const std::string rootName = qualified(state.packages[0].manifest);
 
-    std::map<std::string, std::string> providerOf;   // primary module -> package
+    // The package a root import means, by the resolver every other reader
+    // uses (mcpp#732): a name two packages provide means the one in the
+    // root's closure.
+    auto providerOf = [&](const std::string& prim) -> std::optional<std::string> {
+        if (auto p = mcpp::modgraph::resolve_provider(g, rootName, prim))
+            return g.units[*p].packageName;
+        return std::nullopt;
+    };
     std::map<std::string, std::vector<const mcpp::modgraph::SourceUnit*>> unitsOf;
     for (auto const& u : g.units) {
         if (!u.provides) continue;
-        const auto prim = primary(u.provides->logicalName);
-        unitsOf[prim].push_back(&u);
-        if (u.provides->logicalName.find(':') == std::string::npos)
-            providerOf.emplace(prim, u.packageName);
+        unitsOf[primary(u.provides->logicalName)].push_back(&u);
     }
 
     // A member of the root's own workspace is built from source together with
@@ -920,9 +961,9 @@ static void step11_public_module_check(PrepareState& state) {
         if (u.packageName != rootName) continue;
         for (auto const& req : u.requires_) {
             const auto prim = primary(req.logicalName);
-            auto prov = providerOf.find(prim);
-            if (prov == providerOf.end() || prov->second == rootName) continue;
-            auto pub = publicOf.find(prov->second);
+            auto prov = providerOf(prim);
+            if (!prov || *prov == rootName) continue;
+            auto pub = publicOf.find(*prov);
             if (pub == publicOf.end() || pub->second.contains(prim)) continue;
             if (!warned.insert(prim).second) continue;
             std::string names;
@@ -931,10 +972,10 @@ static void step11_public_module_check(PrepareState& state) {
                 mcpp::diag::Severity::Warning, "build/interface",
                 std::format("'{}' imports '{}' of '{}', which is not one of that "
                             "package's public modules", u.relPath.generic_string(),
-                            prim, prov->second),
+                            prim, *prov),
                 std::format("the build succeeds from source, and fails against the "
-                            "packed form of '{}'", prov->second),
-                std::format("import a public module of '{}': {}", prov->second, names));
+                            "packed form of '{}'", *prov),
+                std::format("import a public module of '{}': {}", *prov, names));
         }
     }
 }
