@@ -210,8 +210,9 @@ What each member receives is what `mcpp pack -p <member>` gives it:
   outputs are verified to exist and are reported as `Packed` for that member.
 
 `--workspace` packs a member only if it has a program target, and says which it
-skipped. A member named with `-p` that has none is refused. Members are packed in
-`[workspace] members` order, whatever order `-p` names them in. A member that
+skipped. A member named with `-p` that has none is refused. Members are packed
+one configuration at a time and reported in `[workspace] members` order, whatever
+order `-p` names them in. A member that
 fails, for instance one whose provider submitted nothing for the requested
 format, is reported by name and the others are packed; the exit status is
 non-zero if any member failed. One member, whether named with one `-p` or by the

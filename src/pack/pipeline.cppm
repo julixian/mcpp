@@ -287,6 +287,9 @@ export struct MemberPack {
     // archive or tree is written below, under the name it would have by
     // default. Empty: each member's own `target/dist`.
     std::filesystem::path                 outputDir;
+    // Every packed member, as `[workspace] members` spells it, in that order:
+    // the order the members are reported in, whichever group each is in.
+    std::vector<std::string>              order;
 };
 
 // One member of a pack, and what each step learned of it. A project that is not
@@ -294,6 +297,8 @@ export struct MemberPack {
 struct MemberJob {
     // The member's qualified package name.
     std::string                     name;
+    // The member as `[workspace] members` spells it; empty outside a workspace.
+    std::string                     path;
     // Whether the plan holds workspace members, and the member is read through
     // `with_member`. False for a plain project, whose plan is its own view.
     bool                            inWorkspace = false;
@@ -610,6 +615,7 @@ std::optional<Refusal> prepare_group(PackRun& run, GroupJob& g) {
         for (auto const& wm : g.ctx->workspaceMembers) {
             MemberJob m;
             m.name = wm.name;
+            m.path = wm.memberPath;
             m.inWorkspace = true;
             g.members.push_back(std::move(m));
         }
@@ -971,23 +977,45 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
         return std::nullopt;
 
     g.ov.pack_format = run.opts.formatName;
-    g.ov.pack_stages.clear();
-    for (auto const& m : g.members) {
-        if (m.result.rc != 0) continue;
-        mcpp::build::BuildOverrides::PackStage stage;
-        // Empty when staging was refused, which is what makes
-        // `${mcpp.stage_dir}` refuse with the reason attached rather than
-        // expand to a directory that does not exist.
-        if (m.stageFailure.empty()) stage.dir = m.plan->stagingRoot;
-        stage.reason = m.stageFailure;
-        // #649 E5: the RESOLVED strip decision and debug directory, for a
-        // member that stages libraries of its own and must follow the same
-        // switch `--no-strip` and `--debug-symbols` set for this tree.
-        stage.strip           = m.plan->strip ? "1" : "0";
-        stage.debugSymbolsDir = m.plan->debugDir;
-        g.ov.pack_stages[m.name] = std::move(stage);
-    }
+    auto stage_members = [&] {
+        g.ov.pack_stages.clear();
+        for (auto const& m : g.members) {
+            if (m.result.rc != 0) continue;
+            mcpp::build::BuildOverrides::PackStage stage;
+            // Empty when staging was refused, which is what makes
+            // `${mcpp.stage_dir}` refuse with the reason attached rather than
+            // expand to a directory that does not exist.
+            if (m.stageFailure.empty()) stage.dir = m.plan->stagingRoot;
+            stage.reason = m.stageFailure;
+            // #649 E5: the RESOLVED strip decision and debug directory, for a
+            // member that stages libraries of its own and must follow the same
+            // switch `--no-strip` and `--debug-symbols` set for this tree.
+            stage.strip           = m.plan->strip ? "1" : "0";
+            stage.debugSymbolsDir = m.plan->debugDir;
+            g.ov.pack_stages[m.name] = std::move(stage);
+        }
+    };
+    stage_members();
     auto distCtx = mcpp::build::prepare_build(false, false, {}, g.ov);
+    // A MEMBER WITHOUT A TREE FAILS ALONE (P3). Its provider may name only a
+    // built file and proceed, which is why the member is kept in the pass; when
+    // the pass is refused instead -- a provider read `${mcpp.stage_dir}` -- the
+    // members without a tree are failed by name and the pass is prepared again
+    // for the others.
+    if (!distCtx && run.several
+        && std::ranges::any_of(g.members, [](const MemberJob& m) {
+               return m.result.rc == 0 && !m.stageFailure.empty(); })) {
+        for (auto& m : g.members) {
+            if (m.result.rc != 0 || m.stageFailure.empty()) continue;
+            mcpp::ui::error(about(run, m, std::format(
+                "no staged tree for --format {}: {}", run.opts.formatName, m.stageFailure)));
+            m.result.rc = 1;
+        }
+        if (std::ranges::none_of(g.members, [](const MemberJob& m) { return m.result.rc == 0; }))
+            return std::nullopt;
+        stage_members();
+        distCtx = mcpp::build::prepare_build(false, false, {}, g.ov);
+    }
     if (!distCtx) return Refusal{2, distCtx.error()};
 
     // WHICH ACTIONS ARE THE DISTRIBUTABLE: the artifact actions the REQUEST
@@ -1107,14 +1135,31 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
     // nothing else -- and an explicit goal set is how the 0.0.104 soname
     // aliases went missing, because an edge reachable only through
     // `default` is skipped under one.
+    //
+    // SEVERAL MEMBERS KEEP GOING (P3): one member's distribution step that
+    // fails must not stop another member's, so the drive continues past a
+    // failure, and each member is then judged by its own files below.
+    //
+    // A drive that keeps going and fails cannot say which member's step
+    // failed, and a file a previous pack left in place would then read as this
+    // pack's product. So the members' declared products are removed before the
+    // drive, and a file present after it is one this drive made.
+    if (run.several) {
+        std::error_code rmEc;
+        for (auto const& [name, s] : submitted)
+            for (auto const& o : s.outputs) std::filesystem::remove_all(absolute_of(o), rmEc);
+    }
     mcpp::build::BuildOptions dbo;
+    dbo.keepGoing = run.several;
     auto dr = be.build(distCtx->plan, dbo);
+    const bool driveFailed = !dr.has_value();
     if (!dr) {
         if (!dr.error().diagnosticOutput.empty()) {
             std::fputs(dr.error().diagnosticOutput.c_str(), stderr);
             if (dr.error().diagnosticOutput.back() != '\n') std::fputs("\n", stderr);
         }
-        return Refusal{1, dr.error().message};
+        if (!run.several) return Refusal{1, dr.error().message};
+        if (!dr.error().reported) mcpp::ui::error(dr.error().message);
     }
 
     // THE CRITERION IS THE FILE, NOT THE EXIT CODE. A cached build program
@@ -1135,9 +1180,13 @@ std::optional<Refusal> dispatch_group(PackRun& run, GroupJob& g, mcpp::build::Ba
             auto abs = absolute_of(o);
             if (!std::filesystem::is_regular_file(abs, ec)
                 && !std::filesystem::is_directory(abs, ec)) {
-                mcpp::ui::error(about(run, m, std::format(
-                    "--format {} reported success and produced nothing at {}",
-                    run.opts.formatName, abs.string())));
+                // A drive that failed says why above; its missing file is
+                // the member's failure, not a success that carried nothing.
+                mcpp::ui::error(about(run, m, driveFailed
+                    ? std::format("--format {} did not produce {}: its step failed",
+                                  run.opts.formatName, abs.string())
+                    : std::format("--format {} reported success and produced nothing at {}",
+                                  run.opts.formatName, abs.string())));
                 m.result.rc = 1;
                 produced = false;
                 break;
@@ -1245,7 +1294,7 @@ PackOutcome run_pack(PackRun run) {
             // as the command named them, and the other groups are packed.
             g.rc = refused->rc;
             g.members.clear();
-            for (auto const& mp : g.paths) g.members.push_back(MemberJob{.name = mp});
+            for (auto const& mp : g.paths) g.members.push_back(MemberJob{.name = mp, .path = mp});
         }
         memberCount += g.members.size();
     }
@@ -1305,16 +1354,28 @@ PackOutcome run_pack(PackRun run) {
     //
     // A failing member is reported and the others continue (P3): the status is
     // that of the first member, in member order, that failed.
-    PackOutcome out;
-    for (auto& g : groups) {
-        if (g.rc != 0 && out.rc == 0) out.rc = g.rc;
+    //
+    // The members are reported in `[workspace] members` order, which the groups,
+    // each in that order, keep only within themselves.
+    std::vector<MemberJob*> reported;
+    for (auto& g : groups)
         for (auto& m : g.members) {
             m.result.name = m.name;
             if (g.rc != 0 && m.result.rc == 0) m.result.rc = g.rc;
-            if (m.result.rc != 0 && out.rc == 0) out.rc = m.result.rc;
-            out.ranBuildPrograms = out.ranBuildPrograms || m.ranBuildPrograms;
-            out.members.push_back(m.result);
+            reported.push_back(&m);
         }
+    if (run.selection && !run.selection->order.empty()) {
+        auto rank = [&](const MemberJob* m) {
+            auto it = std::ranges::find(run.selection->order, m->path);
+            return static_cast<std::size_t>(it - run.selection->order.begin());
+        };
+        std::ranges::stable_sort(reported, {}, rank);
+    }
+    PackOutcome out;
+    for (auto* m : reported) {
+        if (m->result.rc != 0 && out.rc == 0) out.rc = m->result.rc;
+        out.ranBuildPrograms = out.ranBuildPrograms || m->ranBuildPrograms;
+        out.members.push_back(m->result);
     }
     if (out.rc != 0) return out;
     for (auto const& m : out.members)

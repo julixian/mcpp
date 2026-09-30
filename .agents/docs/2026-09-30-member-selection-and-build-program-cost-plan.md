@@ -906,6 +906,23 @@ reuse of a stale compile. It found, and the integration corrected:
 - the announcement of a multi-member test plan, which named the virtual root;
 - comments and documentation that no longer described the code.
 
+A second review, of the pack change alone, found no change to the pack of one
+member, and three defects in the pack of several, which are corrected (e2e 870):
+
+- `${mcpp.target_file:<name>}` resolved to the last link unit of that name in
+  the plan, so a member's distributable could be built from another member's
+  program of the same target name. The name is now resolved for the member the
+  action's package acts for, and refused when that is none of the members that
+  define it.
+- One member's failing distribution step, or a member without a staged tree
+  whose provider reads it, failed every member of its configuration. The drive
+  keeps going when several members are packed, each member's declared products
+  are removed before it, so that a file present after it is this pack's, and a
+  member without a tree is failed alone and the pass prepared again for the
+  others.
+- The members were reported in the order of their configurations. They are
+  reported in `[workspace] members` order.
+
 ### 15.4 Verification before the pull request
 
 - Unit tests: 142 passed.

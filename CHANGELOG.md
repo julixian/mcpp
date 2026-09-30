@@ -75,9 +75,12 @@ exits 101 (both under **Changed**).
   configuration. A positional target, several `--target` values, an `--output`
   that is a file, a member no provider of the requested format acts for, and
   two members that would write one destination are refused before anything is
-  compiled. `mcpp pack -p <member>` keeps its meaning. The JSON envelope adds
+  compiled. A member whose distribution step fails is reported by name and the
+  others are packed; the members are reported in `[workspace] members` order,
+  and `${mcpp.target_file:<name>}` names the target of the member an action is
+  for. `mcpp pack -p <member>` keeps its meaning. The JSON envelope adds
   `data.stages` and a `member` field per artifact when several members are
-  packed (e2e 867 to 869).
+  packed (e2e 867 to 870).
 
 ### Fixed
 

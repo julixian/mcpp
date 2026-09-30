@@ -391,6 +391,18 @@ struct PrepareState {
         auto stage = stages.find(pack_owner(name, reach->second));
         return stage == stages.end() ? nullptr : &stage->second;
     }
+    // The selected member package `i` acts for in a plan of several members:
+    // itself when it is one, the one member whose closure reaches it when
+    // exactly one does, and none (empty) otherwise, by `pack_owner`'s rule. It
+    // is what a name the package's actions use is resolved against when two
+    // members give that name to different things (`${mcpp.target_file:}`).
+    std::string actingMemberOf(std::size_t i) {
+        if (selectedMemberCount() < 2 || i >= packages.size()) return {};
+        computePackReach();
+        const auto name = mcpp::build::qualified_package_name(packages[i].manifest);
+        auto reach = packReach.find(name);
+        return reach == packReach.end() ? std::string{} : pack_owner(name, reach->second);
+    }
     // The packaging pass's values of a build program's environment, for the
     // program of package `i`. A package that acts for no packed member is told
     // nothing, not even the format: its answer cannot depend on a request it

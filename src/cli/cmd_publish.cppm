@@ -398,7 +398,7 @@ PackMembers pack_members(const mcpplibs::cmdline::ParsedArgs& parsed) {
         out.rc = 2;
         return out;
     }
-    out.several = mcpp::pack::MemberPack{sel.root, std::move(*groups), {}};
+    out.several = mcpp::pack::MemberPack{sel.root, std::move(*groups), {}, packable};
     return out;
 }
 

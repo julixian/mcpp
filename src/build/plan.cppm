@@ -686,6 +686,19 @@ expand_manifest_include_entry(const std::filesystem::path& root,
 // ends up spelled two ways.
 std::string qualified_package_name(const mcpp::manifest::Manifest& manifest);
 
+// What `${mcpp.target_file:<name>}` names in `plan`: the build-dir-relative
+// output of the link unit of that target name. A plan of several members may
+// hold a target of one name in each of them; the name then means the unit of
+// `actingMember`, the member the referring package acts for. `output` is empty
+// when no unit has the name. `members` is non-empty when the name is ambiguous:
+// several members define it and none of them is `actingMember`.
+struct TargetFileAnswer {
+    std::string              output;
+    std::vector<std::string> members;
+};
+TargetFileAnswer resolve_target_file(const BuildPlan& plan, std::string_view name,
+                                     std::string_view actingMember);
+
 // The objects a package contributes to an image that links it whole: its
 // module units, which link unconditionally, then its implementation units, in
 // plan order. A shared library that carries a private copy of a graph C++
@@ -3287,6 +3300,22 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     }
 
     return plan;
+}
+
+TargetFileAnswer resolve_target_file(const BuildPlan& plan, std::string_view name,
+                                     std::string_view actingMember) {
+    TargetFileAnswer answer;
+    std::set<std::string> members;
+    for (auto const& lu : plan.linkUnits) {
+        if (lu.targetName != name) continue;
+        answer.output = lu.output.generic_string();
+        if (!actingMember.empty() && lu.memberOf == actingMember) return {answer.output, {}};
+        if (!lu.memberOf.empty()) members.insert(lu.memberOf);
+    }
+    // One member's plan, and a name one member defines, resolve as they always
+    // have: to the one unit, or to the last of the units that share the name.
+    if (members.size() > 1) answer.members.assign(members.begin(), members.end());
+    return answer;
 }
 
 std::vector<std::filesystem::path>

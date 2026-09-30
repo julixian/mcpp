@@ -917,6 +917,9 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // become an edge with a blank path, and ninja reports that far away
         // from the typo that caused it.
         std::set<std::string> unresolvedTargets;
+        // Names several members define, used by a package acting for none of
+        // them (`resolve_target_file`): refused, never resolved by member order.
+        std::map<std::string, std::vector<std::string>> ambiguousTargets;
         std::set<std::string> unresolvedArtifacts;
         // `${mcpp.stage_dir}` used where there is no staged tree, and used by an
         // action whose role runs before the link. Both are refusals rather than
@@ -953,6 +956,7 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // The stage of the package being collected, as `collect` sets it: that of
         // the member it acts for (`PrepareState::packStageOf`), or why it has none.
         const BuildOverrides::PackStage* stage = nullptr;
+        std::string actingMember;   // the member the package acts for (actingMemberOf)
         std::string stageShared;
         bool stagePass = false;
         auto substitute = [&](std::string s, const char* actionId,
@@ -1005,12 +1009,10 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
                 // "missing and no known rule to make it". Commands run with
                 // cwd = the build dir, so the relative form is also what the
                 // tool being invoked should receive.
-                std::string resolved;
-                for (auto const& lu : ctx.plan.linkUnits)
-                    if (lu.targetName == name)
-                        resolved = lu.output.generic_string();
-                if (resolved.empty()) unresolvedTargets.insert(name);
-                s.replace(p, close - p + 1, resolved);
+                auto answer = mcpp::build::resolve_target_file(ctx.plan, name, actingMember);
+                if (answer.output.empty()) unresolvedTargets.insert(name);
+                else if (!answer.members.empty()) ambiguousTargets[name] = answer.members;
+                s.replace(p, close - p + 1, answer.output);
             }
             // `${mcpp.artifact:<package>/<target>}` (mcpp#711): a dependency's
             // program that an edge requested with `artifacts = [...]`, spelled
@@ -1048,6 +1050,7 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             // mcpp#534's ordering edge is scoped to this name.
             auto owner = mcpp::build::qualified_package_name(mm);
             stage = state.packStageOf(packageIndex);
+            actingMember = state.actingMemberOf(packageIndex);
             stagePass = stage && !stage->dir.empty();
             stageShared = stage || state.overrides.pack_stages.empty()
                 ? std::string{} : state.packSharedWhy(packageIndex);
@@ -1165,6 +1168,13 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
                 "features are active)",
                 bad, known.empty() ? std::string("none") : known));
         }
+
+        for (auto const& [n, in] : ambiguousTargets)
+            return std::unexpected(std::format(
+                "build.mcpp action references ${{mcpp.target_file:{}}}, a target of "
+                "each of the members {}, and its package acts for none of them.\n"
+                "  use: select one of the members, or give the targets distinct names",
+                n, std::format("{}", in)));
 
         if (!unresolvedArtifacts.empty()) {
             std::string bad, known;
