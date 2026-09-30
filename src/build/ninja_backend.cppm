@@ -2459,13 +2459,42 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // changed BMI still invalidates its consumers — this adds sequencing, not
     // dirtiness. The cost is that a handful of copies finish before compilation
     // starts, which is what used to happen anyway when those units were built.
+    //
+    // The other direction. A staged BMI is read together with the BMIs of the
+    // modules it imports, and one of those can be compiled HERE: a unit of the
+    // package that its cache entry does not hold, such as a source the
+    // package's build program writes below the consumer's target directory
+    // (xpkg's `lua_stdlib`), or a module of a package that is not cached. The
+    // consumer's dyndep names the staged BMI only, so the stage edge itself
+    // waits for those BMIs, and a staged BMI that imports such a stage waits
+    // for it in turn. Such a stage stays out of the aggregate: every compile
+    // edge waits for the aggregate, and the compile the stage waits for is one
+    // of them.
     std::string stagedOrderOnly;
     {
+        const auto is_staged = [](const CompileUnit& cu) {
+            return cu.servedFromCache && !cu.cachedObject.empty();
+        };
+        // Whether the BMI of `cu` exists only after a compile of this build:
+        // it is compiled here, or it is staged and imports such a BMI.
+        std::unordered_map<const CompileUnit*, bool> late;
+        std::function<bool(const CompileUnit&)> after_a_compile =
+            [&](const CompileUnit& cu) -> bool {
+            if (!is_staged(cu)) return true;
+            if (auto it = late.find(&cu); it != late.end()) return it->second;
+            late[&cu] = false;          // module imports form no cycle
+            bool waits = false;
+            for (auto& imp : cu.imports)
+                if (auto const* p = provider_of(cu, imp); p && after_a_compile(*p)) {
+                    waits = true;
+                    break;
+                }
+            return late[&cu] = waits;
+        };
         std::vector<std::string> staged;
         for (auto& cu : plan.compileUnits) {
             attribute(cu.packageName);
-            if (!cu.servedFromCache) continue;
-            if (cu.cachedObject.empty()) continue;
+            if (!is_staged(cu)) continue;
             auto obj = escape_ninja_path(cu.object);
             append(std::format("build {} : stage_file {}\n", obj,
                                escape_ninja_path(cu.cachedObject)));
@@ -2473,10 +2502,15 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             staged.push_back(obj);
             if (!cu.providesModule.empty() && !cu.cachedBmi.empty()) {
                 auto bmi = unit_bmi(cu);
-                append(std::format("build {} : stage_file {}\n", bmi,
-                                   escape_ninja_path(cu.cachedBmi)));
+                std::string waitsFor;
+                for (auto& imp : cu.imports)
+                    if (auto const* p = provider_of(cu, imp); p && after_a_compile(*p))
+                        waitsFor += " " + import_bmi(cu, imp);
+                append(std::format("build {} : stage_file {}{}\n", bmi,
+                                   escape_ninja_path(cu.cachedBmi),
+                                   waitsFor.empty() ? "" : " ||" + waitsFor));
                 append("  verify = --verify size\n");
-                staged.push_back(bmi);
+                if (waitsFor.empty()) staged.push_back(bmi);
             }
         }
         if (!staged.empty()) {

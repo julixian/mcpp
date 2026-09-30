@@ -1456,6 +1456,108 @@ TEST(NinjaBackend, NonCachedEdgesOrderAfterEveryStagedArtifact) {
         << consumerLine;
 }
 
+// The other direction of the same ordering. A staged BMI can import a module
+// compiled HERE: a unit of the package that the cache entry does not hold,
+// such as a source its build program writes below the consumer's target
+// directory (xpkg's `lua_stdlib`). The consumer's dyndep names the staged BMI
+// only, and the stage edge had no input but the cache entry, so a consumer
+// could compile while that module's BMI did not yet exist (`failed to read
+// compiled module: No such file or directory`, observed in CI once the scan
+// pass changed the schedule). The stage edge now waits for those BMIs, and it
+// leaves the aggregate, because every compile edge waits for the aggregate and
+// the compile it waits for is one of them.
+TEST(NinjaBackend, AStagedBmiWaitsForTheModulesItImportsThatCompileHere) {
+    auto plan = minimal_plan();
+    // The generated unit of the cached package, compiled here.
+    plan.compileUnits.push_back({
+        .source = "target/.build-mcpp/deps/dep/out/gen.cppm",
+        .kind = mcpp::SourceKind::ModuleInterface,
+        .object = "obj/gen.m.o",
+        .packageName = "dep",
+        .providesModule = "dep.gen",
+    });
+    // The package's primary interface, served from the cache, imports it.
+    plan.compileUnits.push_back({
+        .source = "/store/dep/src/dep.cppm",
+        .kind = mcpp::SourceKind::ModuleInterface,
+        .object = "obj/dep.m.o",
+        .packageName = "dep",
+        .providesModule = "dep",
+        .imports = {"dep.gen"},
+        .servedFromCache = true,
+        .cachedObject = "/bc/obj/dep.m.o",
+        .cachedBmi = "/bc/bmi/dep.gcm",
+    });
+    // A second staged interface that imports the first: it waits as well.
+    plan.compileUnits.push_back({
+        .source = "/store/dep/src/api.cppm",
+        .kind = mcpp::SourceKind::ModuleInterface,
+        .object = "obj/api.m.o",
+        .packageName = "dep",
+        .providesModule = "dep.api",
+        .imports = {"dep"},
+        .servedFromCache = true,
+        .cachedObject = "/bc/obj/api.m.o",
+        .cachedBmi = "/bc/bmi/dep.api.gcm",
+    });
+    // A staged interface whose imports are all staged: unchanged.
+    plan.compileUnits.push_back({
+        .source = "/store/dep/src/util.cppm",
+        .kind = mcpp::SourceKind::ModuleInterface,
+        .object = "obj/util.m.o",
+        .packageName = "dep",
+        .providesModule = "dep.util",
+        .servedFromCache = true,
+        .cachedObject = "/bc/obj/util.m.o",
+        .cachedBmi = "/bc/bmi/dep.util.gcm",
+    });
+    plan.compileUnits.push_back({
+        .source = "src/main.cpp",
+        .kind = mcpp::SourceKind::Cxx,
+        .object = "obj/main.o",
+        .packageName = "objc_rule_test",
+        .imports = {"dep.api", "dep.util"},
+    });
+
+    auto ninja = emit_ninja_string(plan);
+    auto line_of = [&](std::string_view head) {
+        auto at = ninja.find(head);
+        if (at == std::string::npos) return std::string{};
+        return ninja.substr(at, ninja.find('\n', at) - at);
+    };
+
+    auto dep = line_of("build gcm.cache/dep.gcm : stage_file");
+    ASSERT_FALSE(dep.empty()) << ninja;
+    EXPECT_NE(dep.find("|| gcm.cache/dep.gen.gcm"), std::string::npos) << dep;
+    auto api = line_of("build gcm.cache/dep.api.gcm : stage_file");
+    ASSERT_FALSE(api.empty()) << ninja;
+    EXPECT_NE(api.find("|| gcm.cache/dep.gcm"), std::string::npos) << api;
+    auto util = line_of("build gcm.cache/dep.util.gcm : stage_file");
+    ASSERT_FALSE(util.empty()) << ninja;
+    EXPECT_EQ(util.find("||"), std::string::npos) << util;
+
+    // The aggregate holds the BMIs that wait for nothing, and every object.
+    auto phony = line_of("build _mcpp_staged_cache : phony");
+    ASSERT_FALSE(phony.empty()) << ninja;
+    auto words = [](const std::string& s) {
+        std::set<std::string> w;
+        std::istringstream is(s);
+        for (std::string t; is >> t;) w.insert(t);
+        return w;
+    };
+    auto held = words(phony);
+    EXPECT_FALSE(held.contains("gcm.cache/dep.gcm")) << phony;
+    EXPECT_FALSE(held.contains("gcm.cache/dep.api.gcm")) << phony;
+    EXPECT_TRUE(held.contains("gcm.cache/dep.util.gcm")) << phony;
+    for (auto* o : {"obj/dep.m.o", "obj/api.m.o", "obj/util.m.o"})
+        EXPECT_TRUE(held.contains(o)) << o << " missing from: " << phony;
+
+    // The generated unit still compiles after the aggregate: no cycle.
+    auto gen = line_of("build obj/gen.m.o");
+    ASSERT_FALSE(gen.empty()) << ninja;
+    EXPECT_NE(gen.find("|| _mcpp_staged_cache"), std::string::npos) << gen;
+}
+
 TEST(NinjaBackend, NoStagedPhonyWhenNothingIsCached) {
     auto plan = minimal_plan();
     plan.compileUnits.push_back({

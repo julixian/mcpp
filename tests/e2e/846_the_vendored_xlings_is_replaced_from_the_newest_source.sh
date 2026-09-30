@@ -60,6 +60,9 @@ cp "$MCPP" "$TMP/release/bin/mcpp$EXE"
 chmod +x "$TMP/release/bin/mcpp$EXE" 2>/dev/null || true
 
 BASE_PATH="/usr/bin:/bin"
+# On Windows mcpp finds the PATH copy with `where`, which lies in System32, a
+# directory every Windows PATH holds.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) BASE_PATH="$BASE_PATH:/c/Windows/System32" ;; esac
 if PATH="$BASE_PATH" command -v xlings > /dev/null 2>&1; then
     fail "an xlings is reachable on $BASE_PATH, so the criteria cannot tell the sources apart"
 fi

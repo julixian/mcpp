@@ -46,6 +46,14 @@ of 10.5 s; a build with nothing to do is unchanged at 0.05 s.
   reached as two packages is recognised whatever its spelling. When every name
   has one provider, `build.ninja` and `compile_commands.json` are byte-identical
   to 2026.9.30.1's (e2e 847, 848).
+- **A BMI served from the global cache waits for the modules it imports that
+  the build compiles.** A module that a package's build program generates lies
+  below the consumer's target directory and is compiled in every build, also
+  when the rest of the package is staged from the cache (xpkg's `lua_stdlib`,
+  imported by its cached `executor`). Nothing ordered a consumer of the staged
+  BMI after that compile, so a fresh build could compile the consumer first and
+  fail with `failed to read compiled module`. The stage edge of such a BMI now
+  waits for those BMIs (e2e 849).
 
 ### Changed
 

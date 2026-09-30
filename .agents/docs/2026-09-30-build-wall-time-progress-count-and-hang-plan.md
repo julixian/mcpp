@@ -994,6 +994,31 @@ resolved as stated.
 | W2: the phase is one value for the whole command, so two configurations built at once show the phase of the pass that began last | Recorded; cosmetic |
 | W8: a file symlink whose target is deleted during planning stays listed | Recorded; the per-pattern walk had the same window between its walk and its use |
 
+### 10.6 Found by CI
+
+- **A staged BMI that imports a module compiled here.** The aarch64-linux-musl
+  cross build of xlings failed with `mcpplibs.xpkg.lua_stdlib: failed to read
+  compiled module: No such file or directory`. xpkg's build program generates
+  `lua_stdlib` below the consumer's target directory, so the package's cache
+  entry holds its other five units, and `lua_stdlib` compiles in every build.
+  The consumer's dyndep named the staged `executor` BMI only, and its stage
+  edge had no input but the cache entry: nothing ordered the consumer after
+  `lua_stdlib`. The defect predates this pull request; it needs a warm cache
+  and a fresh build directory (after one build, GCC's depfile records the
+  transitive BMI), and the scan pass changed the schedule so that the consumer
+  compiled first. The stage edge of such a BMI now waits for the BMIs it
+  imports that compile here, and leaves the aggregate that every compile waits
+  for, which would otherwise be a cycle. On xlings, with the generated BMI,
+  one consumer's object and `.ninja_deps` removed, `ninja` asked for that
+  object alone reproduces the CI error with the previous binary and builds
+  with this one; e2e 849 states the same criterion on a fixture and fails on
+  the previous binary under clang.
+- **e2e 846 on Windows.** Leg D found no xlings on the test's `PATH`, because
+  mcpp finds it with `where`, which lies in System32, and the test's `PATH`
+  held only `/usr/bin:/bin`. The test's `PATH` now holds System32, as every
+  Windows `PATH` does, and as the other Windows tests with a restricted `PATH`
+  do.
+
 ## 8. Appendix: readings
 
 - **Clean builds, wall time (s).**
