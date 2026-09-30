@@ -30,7 +30,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### design
 
-- [Member selection, build programs prepared once, a pack over several members, and the output streams of `mcpp run`: the plan for the release after 2026.9.30.2 (#748, #749, #750)](2026-09-30-member-selection-and-build-program-cost-plan.md) — active
+- [Member selection, build programs prepared once, a pack over several members, and the output streams of `mcpp run`: the plan for the release after 2026.9.30.2 (#748, #749, #750)](2026-09-30-member-selection-and-build-program-cost-plan.md) — landed
 - [The build's wall time, its progress count, a hang after the build, and #732 and #744: measurements and a remediation plan](2026-09-30-build-wall-time-progress-count-and-hang-plan.md) — landed
 - [Build output, revision 3: every package that does work is named, the live display is one line drawn in one write, and a repeated warning is stated once per file](2026-09-30-build-output-refinement-design.md) — landed
 - [The workspace as the unit of build: one graph per configuration, one scheduler, product directories, and a reusable graph module](2026-09-29-workspace-build-graph-design.md) — landed
@@ -112,7 +112,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### 2026-09
 
-- [Member selection, build programs prepared once, a pack over several members, and the output streams of `mcpp run`: the plan for the release after 2026.9.30.2 (#748, #749, #750)](2026-09-30-member-selection-and-build-program-cost-plan.md) — active
+- [Member selection, build programs prepared once, a pack over several members, and the output streams of `mcpp run`: the plan for the release after 2026.9.30.2 (#748, #749, #750)](2026-09-30-member-selection-and-build-program-cost-plan.md) — landed
 - [The build's wall time, its progress count, a hang after the build, and #732 and #744: measurements and a remediation plan](2026-09-30-build-wall-time-progress-count-and-hang-plan.md) — landed
 - [Build output, revision 3: every package that does work is named, the live display is one line drawn in one write, and a repeated warning is stated once per file](2026-09-30-build-output-refinement-design.md) — landed
 - [The workspace as the unit of build: one graph per configuration, one scheduler, product directories, and a reusable graph module](2026-09-29-workspace-build-graph-design.md) — landed

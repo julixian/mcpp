@@ -1,11 +1,13 @@
 ---
 subject: design
-status: active
+status: landed
 ---
 
 # Member selection, build programs prepared once, a pack over several members, and the output streams of `mcpp run`: the plan for the release after 2026.9.30.2 (#748, #749, #750)
 
-- Status: revision 3, in implementation.
+- Status: implemented as 2026.10.1.1. Section 15 records what was built,
+  what was measured, and where the implementation departs from sections 3 to
+  6. Revision 3, below, is the plan as it was implemented.
   - Revision 3 settles the open decisions by their recommendations (D3, D6,
     D7), since the review directed that the plan be implemented. It removes
     the stage-specific downstream verification from the plan, adds a review
@@ -826,3 +828,99 @@ the sandbox (`mcpp self config --mirror CN`), a script runs:
 
 Each section reports ok, failed or not run separately. The script's result is
 posted on #748, #749 and #750, which are then closed.
+
+## 15. Implementation record (2026.10.1.1)
+
+The four tasks of section 13 were implemented on separate branches and merged
+into one integration branch in the order T1, T3, T2, T4, followed by an
+independent review of the merged code and its corrections.
+
+### 15.1 B0, measured
+
+A virtual workspace of four members, each with a build program that imports
+one host module of a path dependency, which imports `std` and `mcpp`; clang
+22.1.8, four jobs. Compiler time per step, summed from a trace of the build:
+
+| Step | Before | After, first build | After, second workspace |
+|---|---|---|---|
+| bundled `mcpp` module | 16 commands, 0.559 s | 4 commands, 0.118 s | none |
+| host module | 8 commands, 0.245 s | 2 commands, 0.046 s | 2 commands, 0.054 s |
+| `build.mcpp` compile and link | 4 commands, 0.297 s | 0.306 s, concurrent | 0.290 s |
+
+Steps 1 and 3 of F3 are 73% of the compiler time and all of the preparation
+outside a program's own compile, which confirms the attribution; the `std`
+module is a cache hit. The whole build took 0.89 to 1.22 s before, 0.48 s
+after on a cold home and 0.33 to 0.39 s on a warm one. On this machine the
+preparation is about 0.2 s per program against #748's 7.8 s on a Windows
+runner, so the measurement confirms the shape, not the absolute cost. The
+bundled module's `base` flags contain only payload paths below the home, none
+of the project's (section 11, item 10).
+
+### 15.2 Departures from the plan
+
+- **Selection.** `--workspace` together with `-p` is refused, naming both,
+  like the other contradictions of S1; the S1 table did not list it. `mcpp
+  test --list` over several members keeps its per-member form.
+- **The test stream.** Revision 3 kept `duration_ms` as "build+run". The code
+  of 2026.9.30.2 recorded the run of a test that ran and the build of a
+  `compile_fail`, and that is the meaning kept; the documentation's
+  "build+run" is corrected. The build time of a test's own binary is the
+  added field `build_ms`.
+- **The store key (B1).** Besides the inputs of section 4, the key of a
+  workspace entry includes a digest of the provider package's whole tree, so
+  that an edit of a header the interface includes is not served a stale BMI.
+  A tree of more than 4096 files or 64 MiB is keyed for the process only and
+  loses reuse across commands. The compile code moved from
+  `hostprogram.cppm` into `src/build/host_module_compile.cppm`, and the store
+  is `src/build/host_module_store.cppm`.
+- **Result lines (R3).** A result line is written by `mcpp::ui::result`,
+  which the caller chooses; the stream is not inferred from a verb.
+- **Pack (K1).**
+  - A bare `mcpp pack` at a virtual root keeps its behaviour of 2026.9.30.2 and
+    packs the first member with a program; several members are packed with
+    `--workspace`, `--exclude` or several `-p`.
+  - An action belongs to the package that submitted it. A package acts for
+    itself when it is a packed member, otherwise for the one packed member
+    whose closure reaches it. A provider that several packed members reach is
+    refused, because one run of its program cannot stage a tree per member.
+  - An `--output` that does not exist is created as a directory.
+  - `member_request` and `workspace_groups` moved into `mcpp.cli.selection`:
+    an import of `mcpp.cli.cmd_build` from `mcpp.cli.cmd_publish` made GCC
+    16.1 fail with an internal compiler error.
+  - A provider's program runs once in each of the two passes a dispatched
+    format has always had; a shared member that provides nothing runs once.
+
+### 15.3 Review
+
+An independent review of the merged code found no data race, deadlock or
+reuse of a stale compile. It found, and the integration corrected:
+
+- a member of a group whose package failed after the group's first failure
+  was reported without its own diagnostics;
+- the `duration_ms` change above;
+- a GCC host-module entry that kept the copies of the imported BMIs staged for
+  its compile, the `std` module's among them;
+- the `Finished` breakdown, which added the overlapping compile times of the
+  concurrent phase; the phase is now counted once, as its wall time, and it
+  states no warning of its own;
+- the announcement of a multi-member test plan, which named the virtual root;
+- comments and documentation that no longer described the code.
+
+### 15.4 Verification before the pull request
+
+- Unit tests: 142 passed.
+- The e2e scripts added by this plan (852 to 869) pass under clang and, for
+  those that depend on the family, under GCC.
+- The full e2e suite on the integration of T1 to T3, on a machine whose
+  default toolchain is clang: 473 passed, 19 failed, 61 skipped. The 19 fail
+  with the same message on 2026.9.30.2; 17 of them pass with GCC selected, and
+  the other two need an Android NDK or a Windows host.
+- The sandbox script `.agents/docs/2026-10-01-member-selection-verify.sh`,
+  run on the host against the integration binary: every section passes.
+  Against 2026.9.30.2, every section marked CHANGE fails and every other
+  section passes.
+
+### 15.5 Open
+
+- #751 (section 8).
+- The Windows and macOS paths of B2-0, B1 and R3 are exercised by CI only.
