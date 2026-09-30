@@ -201,8 +201,16 @@ void configurations(std::size_t n);
 void program_scheduled(std::string_view package, bool requested);
 void program_compiling(std::string_view package, bool requested);
 void program_running(std::string_view package, bool requested);
+// `compiledAside`: the program was compiled in the concurrent compile phase of
+// a workspace's programs (#748, B2), whose wall time `programs_compiled` states
+// once. Its own `compile` is still shown on its line, and is not added to the
+// command's program time a second time.
 void program_finished(std::string_view package, bool requested, ProgramOutcome outcome,
-                      std::chrono::milliseconds compile, std::chrono::milliseconds run);
+                      std::chrono::milliseconds compile, std::chrono::milliseconds run,
+                      bool compiledAside = false);
+// The wall time of the concurrent compile phase of a workspace's programs:
+// compiles that overlapped are counted once, as the time they took together.
+void programs_compiled(std::chrono::milliseconds wall);
 void programs_done();
 
 // The validations after ninja.
@@ -1106,7 +1114,7 @@ mcpp::ui::Frame frame() {
         r.lastDone  = done;
         // The screen takes 25 columns; a terminal narrower than 60 keeps the
         // counts and the clock instead.
-        if (mcpp::platform::terminal::cols() >= 60) {
+        if (mcpp::platform::terminal::cols(mcpp::ui::narration_stream()) >= 60) {
             screen::Screen sc;
             r.animation->draw(sc);
             cells = sc.render(r.animationColour);
@@ -1160,8 +1168,9 @@ std::unique_ptr<screen::Animation> choose_animation() {
 
 // `--play-game[=NAME]` (revision 3, §5.14): the CLI publishes the request as
 // MCPP_PLAY_GAME (`random` or a name). The game needs what the screen needs,
-// and keys: standard input and standard output on a terminal, with mcpp in
-// its foreground. Otherwise it is off, and one line says why.
+// and keys: standard input and the stream the screen is drawn on (standard
+// error) on a terminal, with mcpp in its foreground. Otherwise it is off, and
+// one line says why.
 void choose_game(Report& r, std::vector<std::string>& notes) {
     auto want = mcpp::platform::env::get("MCPP_PLAY_GAME").value_or("");
     if (want.empty()) return;
@@ -1183,7 +1192,8 @@ void choose_game(Report& r, std::vector<std::string>& notes) {
                         "draws braille, without --quiet and MCPP_PROGRESS=plain or off, is needed)");
         return;
     }
-    auto keys = std::make_unique<mcpp::platform::terminal::KeyInput>();
+    auto keys = std::make_unique<mcpp::platform::terminal::KeyInput>(
+        mcpp::ui::narration_stream());
     if (!keys->active()) {
         notes.push_back("--play-game: standard input is not a terminal in the foreground, "
                         "so no key can be read");
@@ -1263,7 +1273,8 @@ void program_running(std::string_view package, bool /*requested*/) {
 }
 
 void program_finished(std::string_view package, bool /*requested*/, ProgramOutcome outcome,
-                      std::chrono::milliseconds compile, std::chrono::milliseconds run) {
+                      std::chrono::milliseconds compile, std::chrono::milliseconds run,
+                      bool compiledAside) {
     auto& r = report();
     std::vector<std::string> out;
     {
@@ -1273,7 +1284,7 @@ void program_finished(std::string_view package, bool /*requested*/, ProgramOutco
         p.outcome = outcome;
         p.compile = compile;
         p.run     = run;
-        r.programTime += compile + run;
+        r.programTime += run + (compiledAside ? std::chrono::milliseconds{0} : compile);
         // A program whose result is reused did no work (revision 3, §7.1).
         if (outcome != ProgramOutcome::Cached || r.verbose) out.push_back(program_line(r, p));
     }
@@ -1282,6 +1293,12 @@ void program_finished(std::string_view package, bool /*requested*/, ProgramOutco
         outcome == ProgramOutcome::Cached ? "cached"
         : outcome == ProgramOutcome::Failed ? "failed"
         : std::format("compiled {}ms ran {}ms", compile.count(), run.count())));
+}
+
+void programs_compiled(std::chrono::milliseconds wall) {
+    auto& r = report();
+    std::lock_guard lock(r.m);
+    r.programTime += wall;
 }
 
 // The build programs are done and the plan continues. Measured with

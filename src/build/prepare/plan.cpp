@@ -200,6 +200,9 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
                 break;
             }
         }
+        // Which member each package acts for in a pack of several members.
+        state.computePackReach();
+        ctx.packReach = state.packReach;
     }
     return {};
 }
@@ -914,6 +917,9 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // become an edge with a blank path, and ninja reports that far away
         // from the typo that caused it.
         std::set<std::string> unresolvedTargets;
+        // Names several members define, used by a package acting for none of
+        // them (`resolve_target_file`): refused, never resolved by member order.
+        std::map<std::string, std::vector<std::string>> ambiguousTargets;
         std::set<std::string> unresolvedArtifacts;
         // `${mcpp.stage_dir}` used where there is no staged tree, and used by an
         // action whose role runs before the link. Both are refusals rather than
@@ -923,9 +929,13 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // Section 2 of the design record measured that shape: a valid, empty,
         // 52 KB installer with nothing said about it.
         std::set<std::string> stageDirNoPass, stageDirWrongRole;
-        // Carried from `state.overrides` so the refusal below can say WHY there is
-        // no tree, which is a different sentence from "you are not packaging".
+        // Carried from the stage of the package that declared the action, so the
+        // refusal below can say WHY there is no tree, which is a different
+        // sentence from "you are not packaging".
         std::string stageDirWhy;
+        // A package several packed members reach has no stage of its own; its
+        // refusal names the package and those members.
+        std::string stageDirShared;
         // WHETHER *THIS* ACTION REFERENCED THE STAGED TREE, and deliberately a
         // flag rather than a set keyed on the action's id: an id is unique
         // within the package that declared it and nothing more, so two packages
@@ -943,7 +953,12 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         // the action (§15 of the 2026-09-29 workspace design). Set per
         // package by `collect`.
         std::filesystem::path binDir = ctx.plan.outputDir / "bin";
-        const bool stagePass = !state.overrides.pack_stage_dir.empty();
+        // The stage of the package being collected, as `collect` sets it: that of
+        // the member it acts for (`PrepareState::packStageOf`), or why it has none.
+        const BuildOverrides::PackStage* stage = nullptr;
+        std::string actingMember;   // the member the package acts for (actingMemberOf)
+        std::string stageShared;
+        bool stagePass = false;
         auto substitute = [&](std::string s, const char* actionId,
                               mcpp::manifest::BuildAction::Role role) {
             auto rep = [&](std::string_view what, const std::string& with) {
@@ -973,13 +988,14 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             if (s.find("${mcpp.stage_dir}") != std::string::npos) {
                 if (!stagePass) {
                     stageDirNoPass.insert(actionId);
-                    stageDirWhy = state.overrides.pack_stage_reason;
+                    stageDirWhy = stage ? stage->reason : std::string{};
+                    if (!stageShared.empty()) stageDirShared = stageShared;
                 } else if (role != mcpp::manifest::BuildAction::Role::Artifact) {
                     stageDirWrongRole.insert(actionId);
                 } else {
                     thisActionUsesStageDir = true;
                 }
-                rep("${mcpp.stage_dir}", state.overrides.pack_stage_dir.string());
+                rep("${mcpp.stage_dir}", stage ? stage->dir.string() : std::string{});
             }
             constexpr std::string_view kTf = "${mcpp.target_file:";
             for (std::size_t p; (p = s.find(kTf)) != std::string::npos; ) {
@@ -993,12 +1009,10 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
                 // "missing and no known rule to make it". Commands run with
                 // cwd = the build dir, so the relative form is also what the
                 // tool being invoked should receive.
-                std::string resolved;
-                for (auto const& lu : ctx.plan.linkUnits)
-                    if (lu.targetName == name)
-                        resolved = lu.output.generic_string();
-                if (resolved.empty()) unresolvedTargets.insert(name);
-                s.replace(p, close - p + 1, resolved);
+                auto answer = mcpp::build::resolve_target_file(ctx.plan, name, actingMember);
+                if (answer.output.empty()) unresolvedTargets.insert(name);
+                else if (!answer.members.empty()) ambiguousTargets[name] = answer.members;
+                s.replace(p, close - p + 1, answer.output);
             }
             // `${mcpp.artifact:<package>/<target>}` (mcpp#711): a dependency's
             // program that an edge requested with `artifacts = [...]`, spelled
@@ -1029,12 +1043,17 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             }
             return s;
         };
-        auto collect = [&](const mcpp::manifest::Manifest& mm) {
+        auto collect = [&](const mcpp::manifest::Manifest& mm, std::size_t packageIndex) {
             // The declaring package, recorded here because this is the only
             // place that knows it: the build program emitted the action, and a
             // program has no idea which package the engine loaded it for.
             // mcpp#534's ordering edge is scoped to this name.
             auto owner = mcpp::build::qualified_package_name(mm);
+            stage = state.packStageOf(packageIndex);
+            actingMember = state.actingMemberOf(packageIndex);
+            stagePass = stage && !stage->dir.empty();
+            stageShared = stage || state.overrides.pack_stages.empty()
+                ? std::string{} : state.packSharedWhy(packageIndex);
             binDir = ctx.plan.outputDir / "bin";
             for (auto const& g : ctx.plan.linkGroups)
                 if (!g.linkOnly && g.member == owner) binDir = ctx.plan.outputDir / g.productDir;
@@ -1066,7 +1085,7 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
                 if (thisActionUsesStageDir) {
                     a.consumesStageDir = true;
                     a.inputs.push_back(
-                        mcpp::pack::stage_manifest_path(state.overrides.pack_stage_dir).string());
+                        mcpp::pack::stage_manifest_path(stage->dir).string());
                 }
                 a.packageName = owner;
                 ctx.plan.actions.push_back(std::move(a));
@@ -1074,12 +1093,17 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
             // Every package's declaration, on every pass. Sorted and de-duplicated
             // below so the refusal's list reads the same whatever order resolution
             // walked the graph in.
-            for (auto const& f : mm.buildConfig.packFormats)
+            // ...and who declared each, which a pack over several members reads
+            // to tell which member a format is provided for.
+            for (auto const& f : mm.buildConfig.packFormats) {
                 ctx.plan.providedPackFormats.push_back(f);
+                auto& who = ctx.packFormatProviders[f];
+                if (std::ranges::find(who, owner) == who.end()) who.push_back(owner);
+            }
         };
-        collect(*state.m);
+        collect(*state.m, 0);
         for (std::size_t i = 1; i < state.packages.size(); ++i)
-            collect(state.packages[i].manifest);
+            collect(state.packages[i].manifest, i);
         std::ranges::sort(ctx.plan.providedPackFormats);
         ctx.plan.providedPackFormats.erase(
             std::ranges::unique(ctx.plan.providedPackFormats).begin(),
@@ -1088,6 +1112,13 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
         if (!stageDirNoPass.empty()) {
             std::string ids;
             for (auto const& n : stageDirNoPass) ids += (ids.empty() ? "" : ", ") + n;
+            if (!stageDirShared.empty())
+                return std::unexpected(std::format(
+                    "build.mcpp action(s) [{}] reference ${{mcpp.stage_dir}}, and {}.\n"
+                    "  A staged tree belongs to one member, and one run of this package's "
+                    "program serves all of them.\n"
+                    "  use: provide the format from each member's own build program, or pack "
+                    "the members one at a time", ids, stageDirShared));
             if (!stageDirWhy.empty()) {
                 return std::unexpected(std::format(
                     "build.mcpp action(s) [{}] reference ${{mcpp.stage_dir}}, and no "
@@ -1124,34 +1155,10 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
                 "there is anything to stage.\n"
                 "  use: role = \"artifact\"", ids));
         }
-        if (!unresolvedTargets.empty()) {
-            std::string bad, known;
-            for (auto const& n : unresolvedTargets) bad += (bad.empty() ? "" : ", ") + n;
-            for (auto const& lu : ctx.plan.linkUnits)
-                known += (known.empty() ? "" : ", ") + lu.targetName;
-            return std::unexpected(std::format(
-                "build.mcpp action references unknown target(s) via "
-                "${{mcpp.target_file:...}}: {}\n"
-                "  targets in this build: [{}]\n"
-                "  (a target gated by required_features is absent unless those "
-                "features are active)",
-                bad, known.empty() ? std::string("none") : known));
-        }
-
-        if (!unresolvedArtifacts.empty()) {
-            std::string bad, known;
-            for (auto const& n : unresolvedArtifacts) bad += (bad.empty() ? "" : ", ") + n;
-            for (auto const& lu : ctx.plan.linkUnits)
-                if (!lu.artifactOf.empty())
-                    known += (known.empty() ? "" : ", ") + lu.artifactOf + "/" + lu.targetName;
-            return std::unexpected(std::format(
-                "build.mcpp action references unknown artifact(s) via "
-                "${{mcpp.artifact:<package>/<target>}}: {}\n"
-                "  artifacts in this build: [{}]\n"
-                "  (an artifact exists when a dependency edge requests it with "
-                "`artifacts = [\"<target>\"]`)",
-                bad, known.empty() ? std::string("none") : known));
-        }
+        if (auto refused = mcpp::build::refuse_unresolved_references(
+                ctx.plan, unresolvedTargets, ambiguousTargets, unresolvedArtifacts);
+            !refused)
+            return std::unexpected(refused.error());
 
         // role = "object": the outputs are LINK inputs, so attach them to the
         // link units that should receive them.

@@ -622,7 +622,7 @@ bool is_official_package_index_fresh(const Env& env,
                                      std::string_view packageName,
                                      std::int64_t ttlSeconds);
 
-// Run `xlings update` to refresh all index repos. Streams output to stdout.
+// Run `xlings update` to refresh all index repos. Streams output to stderr.
 // Returns the xlings exit code.
 int update_index(const Env& env, bool quiet = false);
 
@@ -676,13 +676,14 @@ namespace mcpp::xlings {
 
 namespace {
 
-// Right-pad a verb to 12 columns for bootstrap status lines.
+// Right-pad a verb to 12 columns for bootstrap status lines, on standard
+// error: the stream mcpp.ui narrates on.
 void print_status(std::string_view verb, std::string_view msg) {
     constexpr std::size_t W = 12;
     if (verb.size() >= W) {
-        std::println("{} {}", verb, msg);
+        std::println(stderr, "{} {}", verb, msg);
     } else {
-        std::println("{}{} {}", std::string(W - verb.size(), ' '), verb, msg);
+        std::println(stderr, "{}{} {}", std::string(W - verb.size(), ' '), verb, msg);
     }
 }
 
@@ -1856,8 +1857,9 @@ int install_direct(const Env& env, std::string_view target, bool quiet) {
     bool timedOut = false;
     // The streaming runner seals stdin itself. Lines are passed through as the
     // inherited terminal showed them before, unless the caller asked for quiet.
+    // They are xlings' own progress text, narration: standard error.
     int rc = mcpp::platform::process::run_streaming_bounded(cmd,
-        [quiet](std::string_view line) { if (!quiet) std::println("{}", line); },
+        [quiet](std::string_view line) { if (!quiet) std::println(stderr, "{}", line); },
         std::chrono::duration_cast<std::chrono::milliseconds>(kDirectInstallTimeout),
         std::chrono::milliseconds{0}, &timedOut);
     if (timedOut)

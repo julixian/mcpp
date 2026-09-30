@@ -19,6 +19,7 @@ import mcpp.build.coff_exports;
 import mcpp.build.stage;
 import mcpp.build.schedule.detach_codegen;
 import mcpp.build.test_targets;
+import mcpp.cli.selection;
 import mcpp.build.build_database;
 import mcpp.build.build_program;
 import mcpp.build.progress;         // the report every building command opens
@@ -39,103 +40,22 @@ import mcpp.wire;
 
 namespace mcpp::cli {
 
-// Decide whether a build/test invocation acts on several workspace members, and
-// if so which. It does when `--workspace` is given, or at a *virtual* workspace
-// root with no `-p` (the intuitive "act on the whole workspace"). Returns the
-// member paths as `[workspace] members` writes them -- a rooted workspace's own
-// package first, as "." (workspace design 2026-09-29 §7.1) -- or nullopt for
-// the single-package / single-`-p` / rooted-bare path. Inside a member, the
-// workspace is the one that lists it.
-std::optional<std::vector<std::string>>
-workspace_fanout_members(bool wantAll, const std::string& package_filter) {
-    auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
-    if (!root) return std::nullopt;
-    auto m = mcpp::manifest::load(*root / "mcpp.toml");
-    if (m && !m->workspace.present && wantAll) {
-        auto wsRoot = mcpp::project::find_workspace_root(*root);
-        if (wsRoot.empty()) return std::nullopt;
-        m = mcpp::manifest::load(wsRoot / "mcpp.toml");
-    }
-    if (!m || !m->workspace.present || m->workspace.members.empty()) return std::nullopt;
-    bool virtualWs = m->package.name.empty();
-    if (!(wantAll || (virtualWs && package_filter.empty()))) return std::nullopt;
-    std::vector<std::string> members;
-    if (!virtualWs) members.push_back(".");
-    members.insert(members.end(), m->workspace.members.begin(), m->workspace.members.end());
-    return members;
-}
-
-// The workspace a build command acts on and the members it selects (workspace
-// design 2026-09-29 §7.1, §15): `--workspace`, and a virtual root without
-// `-p`, select every member (a rooted workspace's own package first, as ".");
-// `-p X` selects X; a command in a member's directory selects that member; a
-// command at a rooted workspace's root selects the workspace's own package.
-// nullopt outside a workspace.
-struct WorkspaceSelection {
-    std::filesystem::path    root;
-    std::vector<std::string> members;
-};
-std::expected<std::optional<WorkspaceSelection>, std::string>
-workspace_selection(bool wantAll, const std::string& package_filter) {
-    auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
-    if (!root) return std::optional<WorkspaceSelection>{};
-    auto m = mcpp::manifest::load(*root / "mcpp.toml", {.insideWorkspace = true});
-    if (!m) return std::optional<WorkspaceSelection>{};
-    WorkspaceSelection sel{*root, {}};
-    std::string inside;
-    if (!m->workspace.present) {
-        auto wsRoot = mcpp::project::find_workspace_root(*root);
-        if (wsRoot.empty()) return std::optional<WorkspaceSelection>{};
-        sel.root = wsRoot;
-        m = mcpp::manifest::load(wsRoot / "mcpp.toml");
-        if (!m || !m->workspace.present) return std::optional<WorkspaceSelection>{};
-        const auto rel = root->lexically_normal()
-                             .lexically_relative(wsRoot.lexically_normal());
-        for (auto const& mp : m->workspace.members)
-            if (std::filesystem::path(mp).lexically_normal() == rel) inside = mp;
-        if (inside.empty()) return std::optional<WorkspaceSelection>{};
-    }
-    const bool rooted = !m->package.name.empty();
-    std::vector<std::string> all;
-    if (rooted) all.push_back(".");
-    all.insert(all.end(), m->workspace.members.begin(), m->workspace.members.end());
-    if (wantAll) { sel.members = std::move(all); return sel; }
-    if (!package_filter.empty()) {
-        auto dir = mcpp::project::resolve_member_dir(*m, sel.root, package_filter);
-        if (!dir) return std::unexpected(dir.error());
-        auto rel = dir->empty() ? std::string(".")
-            : dir->lexically_normal().lexically_relative(sel.root.lexically_normal()).generic_string();
-        if (rel.empty()) rel = ".";
-        for (auto const& mp : m->workspace.members)
-            if (std::filesystem::path(mp).lexically_normal() == std::filesystem::path(rel))
-                rel = mp;
-        sel.members = {rel};
-        return sel;
-    }
-    if (!inside.empty()) { sel.members = {inside}; return sel; }
-    if (!rooted) { sel.members = std::move(all); return sel; }
-    sel.members = {"."};
-    return sel;
-}
-
-// The workspace a fan-out acts on, and its members grouped by configuration
-// (workspace design 2026-09-29 §15): members whose root-position values are
-// equal are planned together, in one graph, in one build directory.
-std::expected<std::vector<std::vector<std::string>>, std::string>
-workspace_groups(const std::filesystem::path& wsRoot, const std::vector<std::string>& members) {
-    auto ws = mcpp::manifest::load(wsRoot / "mcpp.toml");
-    if (!ws) return std::unexpected(ws.error().format());
-    std::vector<std::vector<std::string>> groups;
-    std::map<std::string, std::size_t> byKey;
-    for (auto const& mp : members) {
-        auto mm = mcpp::project::load_member_manifest(*ws, wsRoot, mp);
-        if (!mm) return std::unexpected(mm.error());
-        const auto key = mcpp::project::root_position_key(*mm);
-        auto [it, fresh] = byKey.try_emplace(key, groups.size());
-        if (fresh) groups.emplace_back();
-        groups[it->second].push_back(mp);
-    }
-    return groups;
+// A member's tests, discovered from the member's own directory. Discovery
+// resolves the path it is given as `-p` would, so a member whose path is also
+// another member's package name would be read as that member: a member is
+// discovered from its own directory or refused, and never from another's.
+std::expected<mcpp::build::TestTargetSet, std::string>
+discover_member_tests(const std::filesystem::path& wsRoot, const std::string& mp) {
+    auto d = mcpp::build::discover_test_targets(wsRoot, mp);
+    if (!d) return d;
+    std::error_code ec;
+    const bool same = std::filesystem::equivalent(d->packageRoot, wsRoot / mp, ec);
+    if (!ec && !same)
+        return std::unexpected(std::format(
+            "the path '{}' is also the name of another member's package, so its tests "
+            "cannot be told from that member's; select it by its package name (-p <name>)",
+            mp));
+    return d;
 }
 
 // The tests of each member of a configuration group, for a plan of the group
@@ -149,7 +69,7 @@ std::expected<GroupTests, std::string>
 group_tests(const std::filesystem::path& wsRoot, const std::vector<std::string>& group) {
     GroupTests out;
     for (auto const& mp : group) {
-        auto d = mcpp::build::discover_test_targets(wsRoot, mp);
+        auto d = discover_member_tests(wsRoot, mp);
         if (!d) return std::unexpected(std::format("{}: {}", mp, d.error()));
         if (!d->targets.empty()) out.targets[mp] = std::move(d->targets);
         out.discovery.emplace_back(d->packageRoot, std::move(d->discover));
@@ -321,7 +241,7 @@ export int cmd_build(const mcpplibs::cmdline::ParsedArgs& parsed) {
     // Groups are independent (a member reached from two groups is a node of
     // each), and a failed group does not stop the others; the first non-zero
     // exit wins.
-    auto selection = workspace_selection(parsed.is_flag_set("workspace"), ov.package_filter);
+    auto selection = mcpp::cli::select_members(member_request(parsed));
     if (!selection) { mcpp::ui::error(std::format("{}", selection.error())); return 2; }
     if (*selection) {
         auto const& members = (*selection)->members;
@@ -609,7 +529,8 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         requests.push_back({mp, {}, std::move(one)});
     };
     std::filesystem::path wsRoot = *root;
-    auto selection = workspace_selection(parsed.is_flag_set("workspace"), ov.package_filter);
+    const auto request = member_request(parsed);
+    auto selection = mcpp::cli::select_members(request);
     if (!selection)
         return failed("MCPP_BUILD_DATABASE_PLAN_FAILED", selection.error());
     if (*selection && (*selection)->members.size() > 1) {
@@ -629,9 +550,10 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
                 requests.push_back({g.size() == 1 ? g.front() : std::string{}, g, std::move(mo)});
             }
         }
-    } else if (auto members = workspace_fanout_members(parsed.is_flag_set("workspace"),
-                                                       ov.package_filter)) {
-        plan_alone(members->front());
+    } else if (*selection && (*selection)->whole) {
+        // The whole workspace, which lists one member (or one is left by
+        // `--exclude`): that member's plan, as a selection of several plans.
+        plan_alone((*selection)->members.front());
     } else {
         requests.push_back({std::string{}, {}, ov});
     }
@@ -676,8 +598,9 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
         }
     };
     {
-        // Planning narrates on stdout and may start programs that inherit it;
-        // the document is printed after this scope, alone.
+        // mcpp narrates on standard error, but planning may start programs
+        // that inherit standard output (build programs, installers); the
+        // document is printed after this scope, alone.
         mcpp::platform::terminal::StdoutToStderr narration;
         // A group whose plan fails is planned member by member (appended to
         // `requests` and reached by this same loop), so a member's failure
@@ -825,12 +748,21 @@ export int cmd_emit_build_database(const mcpplibs::cmdline::ParsedArgs& parsed) 
     }
     // One line per selector: a value never spans lines, and a `\x1f` separator
     // before `f`, `c` or `a` reads as a longer hex escape (clang refuses it).
+    // The members the flags name, each as written and in command-line order.
+    // One `-p` reads as it always has, so the fingerprint of a command that
+    // names one member does not change; `--exclude` adds a line only when it
+    // is given.
+    std::string packages;
+    for (auto const& p : request.packages) packages += (packages.empty() ? "" : ",") + p;
+    std::string excludes;
+    for (auto const& e : request.excludes) excludes += (excludes.empty() ? "" : ",") + e;
     const auto selector = std::format(
         "spec={}\ntarget={}\ntoolchain={}\nprofile={}\nfeatures={}\n"
-        "cap={}\naccel={}\nstatic={}\npackage={}\nworkspace={}",
+        "cap={}\naccel={}\nstatic={}\npackage={}\nworkspace={}{}",
         spec, ov.target_triple, mcpp::platform::env::get("MCPP_TOOLCHAIN").value_or(""),
         ov.profile, ov.features, ov.capabilities, ov.accel, ov.force_static,
-        ov.package_filter, parsed.is_flag_set("workspace"));
+        packages, parsed.is_flag_set("workspace"),
+        excludes.empty() ? std::string{} : std::format("\nexclude={}", excludes));
     auto rendered = mcpp::build::database::render(members, failedMemberRoots,
                                                   wsRoot, selector);
     // A note's severity is its own (E3's program-failure note is an error;
@@ -884,9 +816,23 @@ export int cmd_run(const mcpplibs::cmdline::ParsedArgs& parsed,
     if (parsed.positional_count() > 0) targetName = parsed.positional(0);
     // -p/--package <member>: scope to one workspace member, same flag/rule
     // as `mcpp build -p` / `mcpp test -p` (mcpp::project::resolve_member_dir).
-    // `mcpp run` is single-member only — no `--workspace` fan-out.
+    // `mcpp run` is single-member only — no `--workspace` fan-out — because an
+    // artifact to execute is one program. The option is repeatable on the
+    // commands that act on several members, so a second `-p` here is refused,
+    // naming every member asked for, and never read as "the last one".
+    const auto packages = parsed.option_or_empty("package").values;
+    if (packages.size() > 1) {
+        std::string named;
+        for (std::size_t i = 0; i < packages.size(); ++i)
+            named += std::format("{}'{}'",
+                i == 0 ? "" : (i + 1 == packages.size() ? " and " : ", "), packages[i]);
+        mcpp::ui::error(std::format(
+            "mcpp run runs one program, so it acts on one workspace member, and -p names {}: "
+            "pass one -p (mcpp build and mcpp test accept several)", named));
+        return 2;
+    }
     std::string package_filter;
-    if (auto p = parsed.value("package")) package_filter = *p;
+    if (!packages.empty()) package_filter = packages.front();
     std::string cache_mode;
     bool no_cache = parsed.is_flag_set("no-cache");
     if (auto c = parsed.value("cache")) cache_mode = *c;
@@ -992,11 +938,19 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
         }
     }
 
-    // Workspace fan-out: test every member through run_tests (which scopes its
-    // discovery to the member). Continue-on-failure + per-member summary so one
-    // red member never hides the rest.
-    if (auto members = workspace_fanout_members(parsed.is_flag_set("workspace"),
-                                                ov.package_filter)) {
+    // The members this command tests, by the one selection every command reads
+    // (`mcpp::cli::select_members`). A selection of one member, named or implied
+    // by the directory, is that member's own test run, as it always was. A
+    // selection of several members, or of the whole workspace, fans out: the
+    // members are planned once per configuration group and each group is built
+    // once, then each member's tests run in member order, continuing past a
+    // failing member so that one red member never hides the rest (member
+    // selection design 2026-09-30, S4).
+    auto selection = mcpp::cli::select_members(member_request(parsed));
+    if (!selection) { mcpp::ui::error(std::format("{}", selection.error())); return 2; }
+    if (*selection && ((*selection)->whole || (*selection)->members.size() > 1)) {
+        auto const& sel = **selection;
+        auto const& members = sel.members;
         const bool json = (to.format == mcpp::build::TestMessageFormat::Json);
         // Silence the ui BEFORE the first member, not inside run_tests. The
         // quiet flag used to be set by run_tests itself, so the fan-out's own
@@ -1023,28 +977,37 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
         const long long wsDeadlineMs =
             static_cast<long long>(workspaceTimeoutSecs) * 1000;
 
-        std::size_t idx = 0;
-        for (auto& mp : *members) {
-            ++idx;
-            // Checked BEFORE starting a member rather than after: stopping
-            // mid-member would leave a half-built member reported as neither
-            // run nor skipped.
+        // Asked before a member's tests start. The deadline is checked BEFORE
+        // starting a member rather than after: stopping mid-member would leave
+        // a half-tested member reported as neither run nor skipped. It is
+        // measured from the start of the command, so the build the members
+        // share counts against it, and a member not started by then is listed
+        // as not run; the build itself is bounded by --build-timeout.
+        auto member_begin = [&](std::size_t i, const std::string& mp) -> bool {
             if (wsDeadlineMs > 0 && ws_ms() >= wsDeadlineMs) {
                 notRun.push_back(mp);
-                continue;
+                return false;
             }
-            mcpp::build::BuildOverrides mo = ov;
-            mo.package_filter = mp;
             mcpp::ui::status("Workspace",
-                std::format("testing member '{}' ({}/{})", mp, idx, members->size()));
-            mcpp::build::TestRunSummary sum;
-            int r = mcpp::build::run_tests(passthrough, mo, to, &sum);
+                std::format("testing member '{}' ({}/{})", mp, i + 1, members.size()));
+            return true;
+        };
+        // The member's line: how it ended, and how long its own tests ran. The
+        // build is the group's, stated once by the group's line, so a member's
+        // line does not state it again.
+        auto member_end = [&](std::size_t i, const std::string& mp, int r,
+                              const mcpp::build::TestRunSummary& sum) {
+            const auto idx = i + 1;
             totalPassed += sum.passed;
             totalFailed += sum.failed;
             totalNotRun += sum.notRun;
             totalBuilt  += sum.built;
-            memberTimes.emplace_back(mp, sum.elapsedMs);
-            auto secs = static_cast<double>(sum.elapsedMs) / 1000.0;
+            // Ranked by its run, which is the member's own: a build a group
+            // shares belongs to no one member.
+            memberTimes.emplace_back(mp, sum.buildGroup >= 0 ? sum.runMs : sum.elapsedMs);
+            auto secs = static_cast<double>(sum.buildGroup >= 0 ? sum.runMs : sum.elapsedMs) / 1000.0;
+            const char* took = sum.buildGroup >= 0 ? "run " : "";
+            const char* in   = sum.buildGroup >= 0 ? ", " : " in ";
             if (r == 2 && sum.failed == 0 && sum.notRun > 0) {
                 // Built and not executed (#544): the member did not fail, and
                 // it did not pass. 2 outranks 0 and yields to 1, as it does
@@ -1052,25 +1015,79 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
                 if (rc == 0) rc = 2;
                 unrunnable.push_back(mp);
                 mcpp::ui::status("Workspace",
-                    std::format("member '{}' ({}/{}) NOT RUN — {} passed, {} not run in {:.2f}s",
-                                mp, idx, members->size(), sum.passed, sum.notRun, secs));
+                    std::format("member '{}' ({}/{}) NOT RUN — {} passed, {} not run{}{}{:.2f}s",
+                                mp, idx, members.size(), sum.passed, sum.notRun, in, took, secs));
             } else if (r != 0) {
                 rc = r;
                 failed.push_back(mp);
                 mcpp::ui::status("Workspace",
-                    std::format("member '{}' ({}/{}) FAILED — {} passed, {} failed in {:.2f}s",
-                                mp, idx, members->size(), sum.passed, sum.failed, secs));
+                    std::format("member '{}' ({}/{}) FAILED — {} passed, {} failed{}{}{:.2f}s",
+                                mp, idx, members.size(), sum.passed, sum.failed, in, took, secs));
             } else {
                 // Under `--no-run` nothing passed and nothing was meant to:
                 // reporting "0 passed" for a member whose tests all built is
                 // the same sentence a member with no tests would produce.
                 mcpp::ui::status("Workspace",
                     sum.built
-                        ? std::format("member '{}' ({}/{}) ok — {} built, not run in {:.2f}s",
-                                      mp, idx, members->size(), sum.built, secs)
-                        : std::format("member '{}' ({}/{}) ok — {} passed in {:.2f}s",
-                                      mp, idx, members->size(), sum.passed, secs));
+                        ? std::format("member '{}' ({}/{}) ok — {} built, not run{}{}{:.2f}s",
+                                      mp, idx, members.size(), sum.built, in, took, secs)
+                        : std::format("member '{}' ({}/{}) ok — {} passed{}{}{:.2f}s",
+                                      mp, idx, members.size(), sum.passed, in, took, secs));
             }
+        };
+
+        if (to.list) {
+            // A listing builds nothing, so there is nothing to plan once: each
+            // member lists its own tests.
+            for (std::size_t i = 0; i < members.size(); ++i) {
+                if (!member_begin(i, members[i])) continue;
+                mcpp::build::BuildOverrides mo = ov;
+                mo.package_filter = members[i];
+                mcpp::build::TestRunSummary sum;
+                int r = mcpp::build::run_tests(passthrough, mo, to, &sum);
+                member_end(i, members[i], r, sum);
+            }
+        } else {
+            // Each member's own tests, discovered from the member's own
+            // directory: two members may each have a `tests/main.cpp`.
+            std::vector<mcpp::build::WorkspaceTestMember> inputs;
+            for (auto const& mp : members) {
+                mcpp::build::WorkspaceTestMember wm;
+                wm.path = mp;
+                auto d = discover_member_tests(sel.root, mp);
+                if (!d) {
+                    wm.error = std::format("{}: {}", mp, d.error());
+                } else {
+                    wm.targets = std::move(d->targets);
+                    if (wm.targets.empty()) {
+                        // Names where it looked when the manifest chose the
+                        // place, so that a glob that matches nothing is not
+                        // read as a project without tests.
+                        if (d->discoverDeclared) {
+                            std::string globs;
+                            for (auto const& g : d->discover)
+                                globs += std::format("{}\"{}\"", globs.empty() ? "" : ", ", g);
+                            wm.noTests = std::format("no tests found ([test] discover = [{}])", globs);
+                        } else {
+                            wm.noTests = "no tests found in tests/";
+                        }
+                    }
+                }
+                inputs.push_back(std::move(wm));
+            }
+            // Members whose root-position values are equal are planned together,
+            // as `mcpp build` plans them. A member whose manifest cannot be read
+            // has no configuration: each member is then its own group, and it
+            // fails alone when it is planned.
+            std::vector<std::vector<std::string>> groups;
+            if (auto g = workspace_groups(sel.root, members)) groups = std::move(*g);
+            else for (auto const& mp : members) groups.push_back({mp});
+
+            mcpp::build::WorkspaceTestHooks hooks;
+            hooks.begin = member_begin;
+            hooks.end = member_end;
+            mcpp::build::run_workspace_tests(passthrough, ov, to, sel.root, groups,
+                                             std::move(inputs), hooks);
         }
 
         auto wsElapsed = ws_ms();
@@ -1101,7 +1118,7 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
                          "\"tests_not_run\":{},\"tests_built\":{},"
                          "\"failed_members\":[{}],\"unrunnable_members\":[{}],"
                          "\"not_run\":[{}],\"elapsed_ms\":{}}}}}",
-                         members->size(), totalPassed, totalFailed, totalNotRun,
+                         members.size(), totalPassed, totalFailed, totalNotRun,
                          totalBuilt,
                          join(failed), join(unrunnable), join(notRun), wsElapsed);
             std::fflush(stdout);
@@ -1134,15 +1151,15 @@ export int cmd_test(const mcpplibs::cmdline::ParsedArgs& parsed,
         if (totalBuilt)
             notRunCounts += std::format("; {} built, not run", totalBuilt);
         if (failed.empty() && notRun.empty() && unrunnable.empty())
-            mcpp::ui::status("workspace result",
+            mcpp::ui::result("workspace result",
                 std::format("ok. {} member(s); {} passed; 0 failed{}; finished in {:.2f}s",
-                            members->size(), totalPassed, notRunCounts,
+                            members.size(), totalPassed, notRunCounts,
                             static_cast<double>(wsElapsed) / 1000.0));
         else
             mcpp::ui::error(std::format(
                 "workspace test: {}/{} member(s) failed; {} passed; {} failed{}; "
                 "finished in {:.2f}s",
-                failed.size(), members->size(), totalPassed, totalFailed, notRunCounts,
+                failed.size(), members.size(), totalPassed, totalFailed, notRunCounts,
                 static_cast<double>(wsElapsed) / 1000.0));
         if (!failed.empty())
             mcpp::ui::plain(std::format("    failed members: {}", join_names(failed)));

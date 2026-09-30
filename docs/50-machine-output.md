@@ -137,6 +137,38 @@ the answer, and the exit code says the answer is a rejection. §1 still holds �
 parse stdout, do not branch on the code — but a client that treats any non-zero
 exit as "no output" will discard a document it was given.
 
+### Standard output carries the result, standard error the narration
+
+Every command writes to two streams, and the division is the same for all of
+them. Releases up to 2026.9.30.2 wrote the narration to standard output, so a
+consumer that read it there reads standard error now.
+
+| stream | carries |
+|---|---|
+| standard output | the command's **result**: what a program prints under `mcpp run`; a document (an envelope, `mcpp emit`, `mcpp run --list-runners`, `--version`, `--help`); a listing (`mcpp toolchain list`, `mcpp cache list`, `mcpp search`, `mcpp test --list`); and the report of `mcpp test`: each test's verdict, the output of a test that failed, the `test result` line, and the `workspace result` line of a workspace run |
+| standard error | the **narration**: the status lines (`Resolving`, `Compiling`, `Finished`, `Running`, `Packing`, `Packed`, `Downloading`, `Updating` and the others that begin a line with a verb), the progress bars and the status row of a terminal, the blank line that follows `Running`, `warning:`, `error:`, `note:` and `tip:` lines, the compilers' diagnostics, and what `--verbose` adds |
+
+The test for a line is what it is for. A line that says what the command is
+doing or has done is narration. A line that is what the command was asked to
+produce is a result; Cargo prints libtest's report on standard output for the
+same reason, and so does `mcpp test`.
+
+- **A pipe receives the result alone.** `mcpp run -q 2>/dev/null` writes
+  exactly the program's standard output, and `mcpp build >/dev/null` still
+  shows the steps. On a terminal both streams reach the screen, and the status
+  row is drawn on standard error, so `mcpp build 2>/dev/null` shows no row.
+- **`--quiet` suppresses the narration**, including the blank line after
+  `Running`, and leaves warnings, errors and diagnostics.
+- **The machine-readable modes** (`--format json`, `--message-format json`)
+  keep standard output for their document, as before. What they narrate on
+  standard error is unchanged: `mcpp test --message-format json` narrates
+  nothing, and `mcpp pack --message-format json` and `mcpp emit
+  build-database` narrate there while they plan and build.
+- **Both streams on one pipe keep the order of the writes.** `mcpp build 2>&1
+  | tee log` records the steps, and is the spelling for a script that used to
+  write `mcpp build | tee log` (a CI log, which captures both streams, is
+  unaffected).
+
 ## 4. Effects — what a command does before it prints
 
 An IDE with an untrusted-workspace gate has to decide **before** running.
@@ -204,14 +236,20 @@ same thing — one answer, two shapes.
 
 ## 6. Exit status
 
-`mcpp run` REPORTS THE PROGRAM'S OWN EXIT STATUS. Three bands divide the space,
+`mcpp run` REPORTS THE PROGRAM'S OWN EXIT STATUS. Four bands divide the space,
 and only the first belongs to the program:
 
 | range | meaning |
 |---|---|
-| `0`–`124` | the program ran; this is its own status, passed through unchanged |
+| `0`–`124` | the program ran; this is its own status, passed through unchanged. The exception is `101`, below |
+| `101` | `mcpp run` could not build the program: its planning or its build failed, and nothing was started. This is the status Cargo gives a failed `cargo run` build |
 | `125`–`127` | the spawn was attempted and refused — `127` not found, `126` found but not executable, `125` anything else; `126` also answers `mcpp run --format <f>` for a distributable that is a directory and meets no runner, refused before the spawn with the same meaning (2026.9.14.2+) |
-| `2` | mcpp refused before attempting anything: a usage, configuration or resolution error |
+| `2` | mcpp refused the request before building anything, or after building it and before starting anything: a usage error, `--format` with `--no-runner`, a program or a runner that the project does not declare |
+
+Until 2026.9.30.2 a failed build exited `1` and a failed planning `2`, so that
+a compile error and a program that returns `1` could not be told apart by a
+script. A failed build is now `101`; `mcpp build`, `mcpp test` and `mcpp pack`
+keep their statuses.
 
 Until 2026.9.4.3 every non-zero status was folded to `1`, so that `2` could mean
 "could not start" as distinct from "ran and failed". The distinction was worth
@@ -221,13 +259,17 @@ well — so the command this project tells people to type could not be branched 
 
 The middle band is the one `env`, `timeout` and `nice` already use and that
 shells document, so `126` and `127` arrive with their usual meanings rather than
-as numbers this project allocated.
+as numbers this project allocated. `101` is Cargo's, for the same reason.
 
-A PROGRAM MAY ITSELF EXIT `125`–`127`, AND mcpp DOES NOT TRY TO DISAMBIGUATE BY
-NUMBER. What separates the two is that a launcher failure always writes a reason
-to stderr and a program's own status never does. A client that must be certain
-should read stderr, or use `--format json` where the status is a field rather
-than a channel.
+A PROGRAM MAY ITSELF EXIT `101` OR `125`–`127`, AND mcpp DOES NOT TRY TO
+DISAMBIGUATE BY NUMBER. What separates the two is that a launcher or build
+failure always writes a reason to stderr and a program's own status never does.
+A client that must be certain should read stderr, or use `--format json` where
+the status is a field rather than a channel.
+
+With a runner (`--runner`, `[target.<triple>].runner`) the status that passes
+through is the runner's, and a runner that itself returns `101` reads as a
+failed build. This is accepted, as it is in Cargo.
 
 `mcpp test` is unchanged and remains `0` or `1`: it aggregates many programs, so
 there is no single status to pass through. Per-test codes are in the JSON
@@ -539,10 +581,19 @@ to stderr, including what the build programs and tools the pack starts print.
 | field | |
 |---|---|
 | `artifacts` | one record per produced artifact: `path` (absolute), `type` (`file` or `directory`), `format` (the `--format` value, `tar` when omitted) and `targets` (the canonical triple of each leg that went into it). A dispatched format reports the terminal outputs of the actions the request introduced; a several-`--target` Android pack reports one artifact whose `targets` lists every leg |
-| `stage` | the tree the artifact was made from: `dir`, `manifest` (the stage manifest below) and `closure` (`walked` or `not-walked`); `null` for a library package and when no tree was staged |
+| `stage` | the tree the artifact was made from: `dir`, `manifest` (the stage manifest below) and `closure` (`walked` or `not-walked`); `null` for a library package, when no tree was staged, and for a pack of several members |
+| `stages` *(2026.10.1.1+)* | present only for a pack of several members (`--workspace`, or `-p` repeated): one record per member in `[workspace] members` order, with `member` (the qualified package name) and the `dir`, `manifest` and `closure` of `stage` |
+
+For a pack of several members `artifacts` lists every member's artifacts, in the
+same member order, and each record gains `member`, the qualified package name of
+the member it belongs to. A pack of one member has neither `stages` nor
+`member`: the envelope is the one it always was.
 
 A failure omits `data`, exits with the command's exit status and carries the
-diagnostic code `MCPP_PACK_FAILED`; the reason is on stderr. The per-run
+diagnostic code `MCPP_PACK_FAILED`; the reason is on stderr. A pack of several
+members that failed for some of them carries one `MCPP_PACK_FAILED` diagnostic
+more for each such member, naming it, and omits `data` as well: the members that
+were packed are on disk and named on stderr. The per-run
 `effects` are `read-project`, `write-project` and `write-global-cache`, with
 `exec-build-script` when a build program ran. `--protocol-version` declares
 `init-mcpp-home`, `read-project`, `write-project`, `network`,
@@ -556,9 +607,11 @@ mcpp test [pattern] [--workspace] --message-format json
 
 This stream predates the envelope of §2 and is not wrapped in it: it is NDJSON,
 one record per test as each finishes, then one summary record per member. A
-`--workspace` run ends with one `workspace_summary` record. The §7 guarantees
-apply to it — fields are added and never removed, and a field's meaning never
-changes — and the fields below are the contract as of 2026.9.2.1.
+`--workspace` run ends with one `workspace_summary` record. A test over several
+members adds one `group_build` record per group, before the group's first test
+record. The §7 guarantees apply to it — fields are added and never removed, and
+a field's meaning never changes — and the fields below are the contract as of
+2026.9.2.1, with the additions each row dates.
 
 Per test:
 
@@ -569,7 +622,8 @@ Per test:
 | `status` | `pass`, `compile_fail`, `run_fail`, `not_run`, or `built` |
 | `exit_code` | the test's exit status; `0` for `not_run` and `built` |
 | `signal` | the signal number when the status encodes one, else `null` |
-| `duration_ms` | build+run wall time of this test |
+| `duration_ms` | the wall time of the step that decided the status: the run for a test that ran, the build for a `compile_fail` |
+| `build_ms` | the build time of this test's own binary in this invocation, the sum of its link edge and its main unit's compile edge in `.ninja_log`; `0` when neither was rebuilt *(2026.10.1.1+)* |
 | `timed_out` | `true` when `--timeout` killed it (`run_fail`) |
 | `compile_output`, `run_output` | captured diagnostics |
 | `reason` | `not_run` only: why, in one sentence; `""` otherwise |
@@ -583,6 +637,37 @@ Summary record, `{"summary": {...}}`:
 | `not_run_reason` | the reason shared by all of them, or `""` |
 | `built` | tests built under `--no-run`, which were not to be executed |
 | `elapsed_ms`, `build_ms`, `run_ms` | wall time, split |
+| `build_group` | *(2026.10.1.1+)* present when the member was planned with others: the `group` of the `group_build` record whose build its tests waited for |
+
+`build_ms` is the wall time this member's tests waited for their build. For a
+member planned alone that is its own build. For a member planned with others it
+is the build of its whole group, the same number for every member of the
+group, and a consumer that sums `build_ms` over members deduplicates by
+`build_group`; a consumer that does not sum it is unaffected. `elapsed_ms` is
+the wall clock for the whole member, planning and the group's build included.
+
+### The group record *(2026.10.1.1+)*
+
+`mcpp test` over several members plans the members of one configuration
+together and builds them once, so the build's time belongs to the group and is
+stated once. One record per group precedes the group's first test record:
+
+```json
+{"group_build":{"group":0,"members":["libs/a","libs/b"],"build_ms":8210}}
+```
+
+| field | |
+|---|---|
+| `group` | the group's number, from 0, in the order the groups were built |
+| `members` | the members planned in it, as `[workspace] members` spells them |
+| `build_ms` | the wall time of the group's build: its packages and every test binary |
+
+A member whose package does not build in a group reports
+`{"error":"package","member":"…","compile_output":"…"}`, and the members of the
+group whose packages build still run. A test of one member, named with `-p` or
+by the command's directory, has neither the record nor `build_group`; a
+whole-workspace selection (`--workspace`, or a virtual root without `-p`)
+reports in the per-group form even when it holds one member.
 
 **`built` and `not_run` are different answers and are counted apart.** Both
 describe a test that was compiled and not executed, and that is where the

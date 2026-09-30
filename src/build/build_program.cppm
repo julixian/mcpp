@@ -14,6 +14,8 @@ export module mcpp.build.build_program;
 
 import std;
 import mcpp.diag;   // structured diagnostics of build programs (#734 E11)
+import mcpp.home;      // cache_root — the global home of the engine's compiled module (#748)
+import mcpp.log;       // the compile of a build program is timestamped in the verbose log
 import mcpp.manifest;
 import mcpp.platform;
 import mcpp.pm.mangle;        // imported_module_names -- what build.mcpp asks for
@@ -24,7 +26,8 @@ import mcpp.toolchain.fingerprint;   // hash_file / hash_string (FNV-1a, 16 hex)
 import mcpp.build.directives;        // the directive definition table (own module: see its header)
 import mcpp.build.progress;          // the program's line (build progress design 2026-09-29)
 import mcpp.build.refusal;           // the machine-readable identity of a refusal
-import mcpp.build.hostprogram;       // bundled `mcpp` module compile (own module: see its header)
+import mcpp.build.hostprogram;       // the bundled `mcpp` module's text (own module: see its header)
+import mcpp.build.host_module_compile; // the bundled module and the host modules, compiled once per key (#748)
 import mcpp.build.resources;         // compile_utf8_manifest — the build program speaks UTF-8 (#693)
 import mcpp.toolchain.hostflags;     // the shared host-compile flag producer
 import mcpp.toolchain.linkmodel;     // shared C-library / clang-cfg-bypass model
@@ -367,8 +370,39 @@ struct BuildProgramEnv {
         // platform rather than leaving the rule true only where the compiler
         // happens to help.
         bool                  importable = true;
+        // WHERE THE COMPILED MODULE MAY BE KEPT (#748, B1). An entry from an
+        // index package whose sources are in the immutable store goes to the
+        // global cache, where every project of the machine reuses it; everything
+        // else (a path or git dependency, a workspace member) is kept under the
+        // workspace's `target/`, because its sources can change without its name
+        // and version changing. The rule is the dependency cache's own
+        // (plan.cpp), and a host module is compiled alone, so the local taint it
+        // asks about is its own package's.
+        //
+        // The provider's identity is part of the entry's key either way: the
+        // index, name and version for an index package, and the manifest's own
+        // name and version otherwise.
+        std::string           providerIndex;
+        std::string           providerName;
+        std::string           providerVersion;
+        bool                  immutableSource = false;
+        // The provider's package root. For a module whose sources can change in
+        // place, the tree below it is part of the entry's key: an edit to a header
+        // the interface includes is an edit to what was compiled.
+        std::filesystem::path providerRoot;
     };
     std::vector<HostModuleRef> hostModules;
+    // WHERE THE MODULES THIS PROGRAM IMPORTS ARE COMPILED TO (#748, B1).
+    //
+    // `moduleCacheRoot` is the global cache root, or empty when the build's cache
+    // mode (`--cache local` or `off`) asks for nothing to be written there.
+    // `moduleStore` is `<workspace>/target/.build-mcpp/host-modules`, which the
+    // programs of one workspace share, so that a host module several members
+    // import is compiled once for all of them. Empty means the program's own
+    // artifacts directory, which is what a program that is not part of a
+    // workspace had before.
+    std::filesystem::path moduleCacheRoot;
+    std::filesystem::path moduleStore;
 };
 
 // The env-var name `hostprogram::xpkg_dir` reads back. One spelling of the
@@ -425,13 +459,61 @@ bool mentions_missing_mcpp_api(std::string_view compilerOutput);
 std::vector<std::pair<std::string, std::string>>
 install_hook_env(const BuildProgramEnv& env);
 
-std::expected<void, std::string> run_build_program(
+// THE COMPILE OF A PROGRAM, MADE AHEAD OF ITS RUN (#748, B2).
+//
+// A workspace's programs run in an order: a member's program reads the directives
+// of the programs of the members it depends on. Their compiles have none. This is
+// what the compile leaves behind, so that `step9_member_build_programs` can
+// compile every program that needs it at the same time, and then run the programs
+// in the order they always ran in, each taking its compile from here.
+//
+// NOTHING IS REPORTED OR APPLIED BY THE COMPILE. A compile that failed leaves its
+// message here, and the program's turn reports it, so the failure that reaches
+// the user is the first in the order the programs run in, whichever compile
+// finished first. The warnings and the refusal the compile produced are kept for
+// the same reason: they are said, and recorded, by the thread that runs the
+// programs, in that order.
+struct PrecompiledProgram {
+    // A compile was attempted. False when the program's result was still valid
+    // when it was asked (nothing to compile), or when a check that comes before
+    // the compile refused it (which the program's turn refuses again, in order).
+    bool                      compiled = false;
+    // What the compile was made for: the program's text, the host compiler, the
+    // host modules' text. The program's turn uses the compile only when its own
+    // computation of this agrees, so a compile made for something that changed in
+    // the meantime is made again rather than trusted.
+    std::string               stamp;
+    std::filesystem::path     bin;
+    std::chrono::milliseconds compile{0};
+    // The compile's own failure, in the words a serial build gives it.
+    std::string               error;
+    std::optional<mcpp::build::refusal::Code> refusal;
+    std::vector<std::string>  warnings;
+};
+
+// Everything `run_build_program` does before it runs the program, and stops there:
+// the checks, the cache, and, for a program that needs it, the compile. Safe to
+// call from several threads at once for different programs. A program that
+// compiles shows as compiling; nothing else is shown.
+PrecompiledProgram precompile_build_program(
     mcpp::manifest::Manifest& m,
     const std::filesystem::path& root,
     const std::filesystem::path& hostCompiler,
     const mcpp::toolchain::Toolchain& tc,
     const mcpp::manifest::CppStandardConfig& cppStandard,
     const BuildProgramEnv& env);
+
+// `precompiled`, when given, is what `precompile_build_program` made for this
+// program. The program is compiled here only when it is absent or made for
+// something else.
+std::expected<void, std::string> run_build_program(
+    mcpp::manifest::Manifest& m,
+    const std::filesystem::path& root,
+    const std::filesystem::path& hostCompiler,
+    const mcpp::toolchain::Toolchain& tc,
+    const mcpp::manifest::CppStandardConfig& cppStandard,
+    const BuildProgramEnv& env,
+    const PrecompiledProgram* precompiled = nullptr);
 
 // Has any recorded build-program input changed since its build.mcpp cache was
 // written: a glob's path SET (#359), a declared file's CONTENT, or a declared
@@ -609,8 +691,11 @@ std::string sanitize_feature_env(std::string f) {
 }
 
 // The injected contract values, as (NAME, value) pairs for the child process.
+// `warn` is false in the concurrent compile phase (#748, B2): the values are
+// computed again at the program's turn, which states each warning once.
 std::vector<std::pair<std::string, std::string>>
-contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv& env) {
+contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv& env,
+             bool warn = true) {
     std::vector<std::pair<std::string, std::string>> e;
     auto hostT = mcpp::toolchain::triple::host_triple().str();
     // The toolchain and target names an install hook also receives, from the
@@ -729,7 +814,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
         if (inserted) {
             e.emplace_back(var, dir.string());
         } else if (it->second != dir.string()) {
-            mcpp::ui::warning(std::format(
+            if (warn) mcpp::ui::warning(std::format(
                 "build.mcpp: dependency name collides on {} (kept '{}', ignored "
                 "'{}') — rename one dependency to disambiguate", var,
                 it->second, dir.string()));
@@ -746,7 +831,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
         if (inserted) {
             e.emplace_back(var, form);
         } else if (it->second != form) {
-            mcpp::ui::warning(std::format(
+            if (warn) mcpp::ui::warning(std::format(
                 "build.mcpp: dependency name collides on {} (kept '{}', ignored "
                 "'{}') — rename one dependency to disambiguate", var,
                 it->second, form));
@@ -790,7 +875,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
         if (inserted) {
             e.emplace_back(var, path);
         } else if (it->second != path) {
-            mcpp::ui::warning(std::format(
+            if (warn) mcpp::ui::warning(std::format(
                 "build.mcpp: tool name collides on {} (kept '{}', ignored '{}')",
                 var, it->second, path));
         }
@@ -996,13 +1081,22 @@ install_hook_env(const BuildProgramEnv& env) {
     };
 }
 
-std::expected<void, std::string> run_build_program(
+// WHICH PART OF A PROGRAM'S LIFE ONE CALL RUNS. `Whole` is the program as it has
+// always been run: check, compile if the cache is stale, run, apply. `Compile`
+// stops at the end of the compile and leaves its outcome in `*made`; it reports,
+// records and applies nothing. `Run` is `Whole` with a compile taken from `*made`.
+enum class ProgramMode { Whole, Compile, Run };
+
+std::expected<void, std::string> run_build_program_impl(
+    ProgramMode mode,
     mcpp::manifest::Manifest& m,
     const fs::path& root,
     const fs::path& hostCompiler,
     const mcpp::toolchain::Toolchain& tc,
     const mcpp::manifest::CppStandardConfig& cppStandard,
-    const BuildProgramEnv& env) {
+    const BuildProgramEnv& env,
+    const PrecompiledProgram* given,
+    PrecompiledProgram* made) {
 
     fs::path src = root / "build.mcpp";
     std::error_code ec;
@@ -1048,7 +1142,7 @@ std::expected<void, std::string> run_build_program(
 
     fs::path bdir = build_dir(root, env);
     fs::path outDir = bdir / "out";
-    auto childEnv = contract_env(root, outDir, env);
+    auto childEnv = contract_env(root, outDir, env, mode != ProgramMode::Compile);
     std::string ctxHash = contract_hash(childEnv);
     // THE GRAPH DOCUMENT'S CONTENT, NOT ITS PATH. The path is the same on
     // every run; what the document says is what the program's answer depends
@@ -1253,6 +1347,9 @@ std::expected<void, std::string> run_build_program(
     // directives, no run.
     CacheRecord cache = read_cache(bdir);
     if (cache_fresh(root, bdir, cache, programHash, compilerHash, ctxHash)) {
+        // Nothing to compile. Applying, advising and reporting the cached result
+        // belong to the program's turn, which does them in order.
+        if (mode == ProgramMode::Compile) return {};
         if (auto terr = dirs::target_directive_error(m, cache.directives); !terr.empty())
             return std::unexpected(terr);
         // #622 A4. Checked on the cache-hit path too, so a `deploy` a fresh
@@ -1284,6 +1381,9 @@ std::expected<void, std::string> run_build_program(
         const std::string& who;
         bool requested;
         ProgressClock::time_point compileStart{}, runStart{};
+        // The compile was made elsewhere, by the thread that compiled it: its
+        // duration is stated, and is not read off this thread's clock.
+        std::optional<std::chrono::milliseconds> compileDuration;
         bool ran = false;
         bool reported = false;
         ~ProgramReport() { report(); }
@@ -1293,7 +1393,8 @@ std::expected<void, std::string> run_build_program(
             using namespace std::chrono;
             const auto now = ProgressClock::now();
             const auto zero = ProgressClock::time_point{};
-            const auto compile = compileStart == zero ? milliseconds{0}
+            const auto compile = compileDuration ? *compileDuration
+                : compileStart == zero ? milliseconds{0}
                 : duration_cast<milliseconds>((runStart == zero ? now : runStart) - compileStart);
             const auto run = runStart == zero ? milliseconds{0}
                 : duration_cast<milliseconds>(now - runStart);
@@ -1301,9 +1402,12 @@ std::expected<void, std::string> run_build_program(
                 who, requested,
                 ran ? mcpp::build::progress::ProgramOutcome::Ran
                     : mcpp::build::progress::ProgramOutcome::Failed,
-                compile, run);
+                compile, run, /*compiledAside=*/compileDuration.has_value());
         }
     } programReport{who, env.requested};
+    // The compile phase says nothing: what it made is reported, or refused, when
+    // the program's turn comes.
+    if (mode == ProgramMode::Compile) programReport.reported = true;
 
     fs::create_directories(outDir, ec);   // creates bdir too
     // #230: on Windows the capture_exec shell is cmd.exe, which can only launch
@@ -1315,38 +1419,9 @@ std::expected<void, std::string> run_build_program(
     fs::path bin = bdir / (mcpp::platform::is_windows
                                ? "build.mcpp.exe" : "build.mcpp.bin");
 
-    // ── Compile build.mcpp with the host toolchain ──────────────────────────
-    // Spelled by the dialect layer, not concatenated here: the canonical of
-    // `standard = "c++fly"` / `"c++latest"` is not a valid -std= spelling, so
-    // the old `"-std=" + canonical` produced `-std=c++fly` and the host compile
-    // died on an unknown dialect. cppfly::std_flag resolves those against the
-    // toolchain that will actually run the compile — the host one, here.
-    std::string std_flag = mcpp::toolchain::cppfly::std_flag(
-        tc, cppStandard.canonical.empty() ? std::string_view("c++23")
-                                          : std::string_view(cppStandard.canonical),
-        cppStandard.level);
-    // One resolution of the deployment target, used by every compile below
-    // and by the std module it asks stdmod to build — they must agree or
-    // clang rejects the BMI.
+    // The driver's dialect: what the compile is spelled in, and how the program's
+    // output is read (`accept_output`). Used on both sides of the compile.
     //
-    // LEGITIMATELY HOST-KEYED, unlike the main build's readers (#685). `tc`
-    // here is always the HOST toolchain (see this function's own doc above
-    // `run_build_program` / `host_base_flags`'s header) -- build.mcpp is
-    // compiled AND run on the machine doing the build, so "the target" this
-    // one compile is for IS the host, and `tc.targetTriple` already names
-    // it. Asking `tc`'s own resolved target keeps this correct without
-    // reading a compile-time `__APPLE__`/`is_macos` constant, which would
-    // silently disagree with `tc` the day build.mcpp gains a host toolchain
-    // resolved for something other than the machine mcpp itself runs on.
-    const bool buildProgramTargetIsMacos = [&] {
-        auto bpTt = mcpp::toolchain::triple::parse(tc.targetTriple);
-        return bpTt && bpTt->os == "macos";
-    }();
-    const std::string macosDeploymentTarget =
-        mcpp::platform::macos::deployment_target(
-            buildProgramTargetIsMacos, m.buildConfig.macosDeploymentTarget);
-    auto base = host_base_flags(tc, macosDeploymentTarget);
-
     // The host compile has always been spelled in GNU driver syntax with no
     // dialect branch at all — `grep -i msvc` over this file used to hit only
     // comments. Under cl.exe every one of `-O0` / `-x c++` / `-static` / `-o`
@@ -1355,342 +1430,462 @@ std::expected<void, std::string> run_build_program(
     const auto& dial = mcpp::toolchain::dialect_for(tc);
     const bool msvcHost = dial.id == std::string_view("msvc");
 
-    // Only wire the bundled `mcpp` module when build.mcpp actually imports it —
-    // so the common `#include`-based program compiles exactly as before (no
-    // -fmodules, cwd = project root). When it does `import mcpp;`, compile the
-    // module, link its object, and run the build.mcpp compile from `bdir` so GCC
-    // finds gcm.cache/mcpp.gcm.
-    // `srcText` was read above the cache fast path, which the prerequisite
-    // check needs to run ahead of.
-    bool usesModule    = srcText.find("import mcpp") != std::string::npos;
-    bool usesStdCompat = imports_module(srcText, "std.compat");
-    bool usesStd       = usesStdCompat || imports_module(srcText, "std");
+    // THE COMPILE, AS ONE STEP. The preparation of what the program imports and
+    // the compile of the program itself are one piece of work with one duration,
+    // which is what `ran` reports; it used to report the compile of the program
+    // alone and leave the preparation (seven seconds a program, measured on
+    // #748's runner) to be counted in `plan`. It is a lambda so that it can be
+    // made ahead of the program's run, on another thread (`precompile_build_
+    // program`), and used by the run without being made again.
+    ProgressClock::time_point compileBegan{}, compileEnded{};
+    std::vector<std::string> compileWarnings;
+    std::optional<refusal::Code> compileRefusal;
+    auto compile_binary = [&]() -> std::expected<void, std::string> {
+        compileBegan = ProgressClock::now();
+        mcpp::build::progress::program_compiling(who, env.requested);
+        mcpp::log::verbose("buildmcpp-host", std::format("build.mcpp {}: compile start", who));
+        // ── Compile build.mcpp with the host toolchain ──────────────────────────
+        // Spelled by the dialect layer, not concatenated here: the canonical of
+        // `standard = "c++fly"` / `"c++latest"` is not a valid -std= spelling, so
+        // the old `"-std=" + canonical` produced `-std=c++fly` and the host compile
+        // died on an unknown dialect. cppfly::std_flag resolves those against the
+        // toolchain that will actually run the compile — the host one, here.
+        std::string std_flag = mcpp::toolchain::cppfly::std_flag(
+            tc, cppStandard.canonical.empty() ? std::string_view("c++23")
+                                              : std::string_view(cppStandard.canonical),
+            cppStandard.level);
+        // One resolution of the deployment target, used by every compile below
+        // and by the std module it asks stdmod to build — they must agree or
+        // clang rejects the BMI.
+        //
+        // LEGITIMATELY HOST-KEYED, unlike the main build's readers (#685). `tc`
+        // here is always the HOST toolchain (see this function's own doc above
+        // `run_build_program` / `host_base_flags`'s header) -- build.mcpp is
+        // compiled AND run on the machine doing the build, so "the target" this
+        // one compile is for IS the host, and `tc.targetTriple` already names
+        // it. Asking `tc`'s own resolved target keeps this correct without
+        // reading a compile-time `__APPLE__`/`is_macos` constant, which would
+        // silently disagree with `tc` the day build.mcpp gains a host toolchain
+        // resolved for something other than the machine mcpp itself runs on.
+        const bool buildProgramTargetIsMacos = [&] {
+            auto bpTt = mcpp::toolchain::triple::parse(tc.targetTriple);
+            return bpTt && bpTt->os == "macos";
+        }();
+        const std::string macosDeploymentTarget =
+            mcpp::platform::macos::deployment_target(
+                buildProgramTargetIsMacos, m.buildConfig.macosDeploymentTarget);
+        auto base = host_base_flags(tc, macosDeploymentTarget);
 
-    // A rule package's interface is compiled by this same function, so what IT
-    // imports decides what has to be built just as much as what build.mcpp
-    // imports. Scanning only build.mcpp made a rule that said `import std;`
-    // fail with `module 'std' not found` — the std module was never built,
-    // because the program that triggers the build did not mention it.
-    for (auto const& hm : env.hostModules) {
-        std::ifstream is(hm.interface);
-        if (!is) continue;  // a missing interface is diagnosed by build_host_module
-        std::ostringstream ss; ss << is.rdbuf();
-        const std::string t = ss.str();
-        if (t.find("import mcpp") != std::string::npos) usesModule = true;
-        if (imports_module(t, "std.compat")) usesStdCompat = true;
-        if (imports_module(t, "std"))        usesStd       = true;
-    }
+        // Only wire the bundled `mcpp` module when build.mcpp actually imports it —
+        // so the common `#include`-based program compiles exactly as before (no
+        // -fmodules, cwd = project root). When it does `import mcpp;`, compile the
+        // module, link its object, and run the build.mcpp compile from `bdir` so GCC
+        // finds gcm.cache/mcpp.gcm.
+        // `srcText` was read above the cache fast path, which the prerequisite
+        // check needs to run ahead of.
+        bool usesModule    = srcText.find("import mcpp") != std::string::npos;
+        bool usesStdCompat = imports_module(srcText, "std.compat");
+        bool usesStd       = usesStdCompat || imports_module(srcText, "std");
 
-    usesStd = usesStd || usesStdCompat;
-
-    // The toolchain's own environment (MSVC's INCLUDE / LIB / VSLANG, which
-    // detection synthesized from the located VC tools + Windows SDK). Needed
-    // by every compile below, the module precompile included.
-    std::vector<std::pair<std::string, std::string>> compileEnv;
-    for (auto const& ev : tc.envOverrides)
-        compileEnv.emplace_back(ev.key, ev.value);
-
-    // Named modules dispatch on the same BmiTraits/CommandDialect rows the
-    // main build uses, so there is no per-family gate here: cl.exe's
-    // .ifc + /reference works because the table already describes it, not
-    // because build.mcpp grew a second implementation of it.
-    std::vector<std::string> moduleFlags;
-    fs::path mcppModuleObject;
-    fs::path mcppCoreObject;     // `mcpp.core`, the same interface (#734, E8)
-    if (usesModule) {
-        auto mf = build_mcpp_module(bdir, hostCompiler, base, std_flag, tc,
-                                    compileEnv);
-        if (!mf) return std::unexpected(mf.error());
-        moduleFlags = std::move(mf->useFlags);
-        mcppModuleObject = std::move(mf->object);
-        mcppCoreObject   = std::move(mf->aliasObject);
-    }
-
-    // ── `import std;` in build.mcpp ─────────────────────────────────────────
-    //
-    // mcpp asks projects to `import std;` everywhere and then made their build
-    // script fall back to `#include` — the bundled `mcpp` module even says so
-    // in its own header comment. The std module the main build already uses is
-    // reusable verbatim: stdmod::ensure_built caches on
-    // (toolchain × standard × dialect), so for a native build this is a cache
-    // HIT on the very artifact the project's own TUs import. Only a cross
-    // build pays for a second one, which is unavoidable — see below.
-    //
-    // `tc` here is the HOST toolchain: prepare.cppm's
-    // host_tc_for_build_program() resolves the spec WITHOUT the --target axis
-    // and hands it in. That is load-bearing. build.mcpp is compiled AND run on
-    // the machine doing the build, so a std BMI built for the target would
-    // produce a helper that cannot execute — the same host≠target mistake the
-    // mingw-cross work had to fix in four separate places.
-    std::vector<std::string> stdFlags;
-    std::vector<std::string> stdObjects;
-    // GCC finds staged BMIs by cwd; Clang/MSVC get an explicit path flag.
-    bool stdStagedInBdir = false;
-    if (usesStd) {
-        if (!tc.hasImportStd) {
-            return std::unexpected(std::format(
-                "build.mcpp uses `import std;` but the host toolchain ({}) "
-                "ships no std module.\n"
-                "       Use #include in build.mcpp, or switch to a toolchain "
-                "that provides one.", tc.label()));
-        }
-        auto sm = mcpp::toolchain::ensure_built(
-            tc, cppStandard.canonical, std_flag, macosDeploymentTarget);
-        if (!sm) {
-            // The second branch of the same refusal, and it is named for the
-            // same reason: both `run_build_program` call sites in prepare.cppm
-            // return `std::unexpected` unconditionally, so this error always
-            // reaches the layer that reads the code. An unnamed one here would
-            // reproduce, for the host std module, exactly the gap the target
-            // std module had.
-            refusal::record(refusal::Code::StdModulePrecompile);
-            return std::unexpected(std::format(
-                "build.mcpp uses `import std;` but the std module could not be "
-                "built for the host toolchain: {}", sm.error().message));
+        // A rule package's interface is compiled by this same function, so what IT
+        // imports decides what has to be built just as much as what build.mcpp
+        // imports. Scanning only build.mcpp made a rule that said `import std;`
+        // fail with `module 'std' not found` — the std module was never built,
+        // because the program that triggers the build did not mention it.
+        for (auto const& hm : env.hostModules) {
+            std::ifstream is(hm.interface);
+            if (!is) continue;  // a missing interface is diagnosed by provide_host_module
+            std::ostringstream ss; ss << is.rdbuf();
+            const std::string t = ss.str();
+            if (t.find("import mcpp") != std::string::npos) usesModule = true;
+            if (imports_module(t, "std.compat")) usesStdCompat = true;
+            if (imports_module(t, "std"))        usesStd       = true;
         }
 
-        auto traits = mcpp::toolchain::bmi_traits(tc);
-        if (traits.stdBmiUsePrefix.empty()) {
-            // GCC: BMIs are found implicitly under <cwd>/gcm.cache, so stage
-            // the cached ones where the compile will look. Copy rather than
-            // symlink — this mirrors the main build's staging edge, and a
-            // stale copy is caught by ensure_built's own cache key.
-            std::error_code ec;
-            fs::path gcmDir = bdir / traits.bmiDir;
-            fs::create_directories(gcmDir, ec);
-            auto stage = [&](const fs::path& from, std::string_view name)
-                -> std::expected<void, std::string> {
-                if (from.empty() || !fs::exists(from)) return {};
-                fs::path to = gcmDir / std::format("{}{}", name, traits.bmiExt);
-                fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
-                if (ec) return std::unexpected(std::format(
-                    "staging {} for build.mcpp failed: {}", name, ec.message()));
-                return {};
-            };
-            if (auto r = stage(sm->bmiPath, "std"); !r)
-                return std::unexpected(r.error());
-            if (usesStdCompat) {
-                if (auto r = stage(sm->compatBmiPath, "std.compat"); !r)
-                    return std::unexpected(r.error());
+        usesStd = usesStd || usesStdCompat;
+
+        // The toolchain's own environment (MSVC's INCLUDE / LIB / VSLANG, which
+        // detection synthesized from the located VC tools + Windows SDK). Needed
+        // by every compile below, the module precompile included.
+        std::vector<std::pair<std::string, std::string>> compileEnv;
+        for (auto const& ev : tc.envOverrides)
+            compileEnv.emplace_back(ev.key, ev.value);
+
+        // Named modules dispatch on the same BmiTraits/CommandDialect rows the
+        // main build uses, so there is no per-family gate here: cl.exe's
+        // .ifc + /reference works because the table already describes it, not
+        // because build.mcpp grew a second implementation of it.
+        std::vector<std::string> moduleFlags;
+        fs::path mcppModuleObject;
+        fs::path mcppCoreObject;     // `mcpp.core`, the same interface (#734, E8)
+        // The BMIs a compile can see, in the order they were made: what GCC finds by
+        // name under `gcm.cache`, and what the other two families are told by flag.
+        // A host module is compiled with every one before it.
+        std::vector<mcpp::build::VisibleBmi> visibleBmis;
+        // Where what this program imports is kept: the engine's module globally when
+        // the cache mode allows it, and the workspace's store for everything that is
+        // the project's own (#748, B1).
+        mcpp::build::ModuleStores stores;
+        stores.cacheRoot      = env.moduleCacheRoot;
+        stores.workspaceStore = env.moduleStore.empty() ? bdir / "host-modules" : env.moduleStore;
+        if (usesModule) {
+            auto mf = mcpp::build::provide_mcpp_module(stores, bdir, hostCompiler, base,
+                                                       std_flag, tc, compileEnv);
+            if (!mf) return std::unexpected(mf.error());
+            moduleFlags = std::move(mf->useFlags);
+            mcppModuleObject = std::move(mf->object);
+            mcppCoreObject   = std::move(mf->aliasObject);
+            for (auto& b : mf->bmis) visibleBmis.push_back(std::move(b));
+        }
+
+        // ── `import std;` in build.mcpp ─────────────────────────────────────────
+        //
+        // mcpp asks projects to `import std;` everywhere and then made their build
+        // script fall back to `#include` — the bundled `mcpp` module even says so
+        // in its own header comment. The std module the main build already uses is
+        // reusable verbatim: stdmod::ensure_built caches on
+        // (toolchain × standard × dialect), so for a native build this is a cache
+        // HIT on the very artifact the project's own TUs import. Only a cross
+        // build pays for a second one, which is unavoidable — see below.
+        //
+        // `tc` here is the HOST toolchain: prepare.cppm's
+        // host_tc_for_build_program() resolves the spec WITHOUT the --target axis
+        // and hands it in. That is load-bearing. build.mcpp is compiled AND run on
+        // the machine doing the build, so a std BMI built for the target would
+        // produce a helper that cannot execute — the same host≠target mistake the
+        // mingw-cross work had to fix in four separate places.
+        std::vector<std::string> stdFlags;
+        std::vector<std::string> stdObjects;
+        // GCC finds staged BMIs by cwd; Clang/MSVC get an explicit path flag.
+        bool stdStagedInBdir = false;
+        if (usesStd) {
+            if (!tc.hasImportStd) {
+                return std::unexpected(std::format(
+                    "build.mcpp uses `import std;` but the host toolchain ({}) "
+                    "ships no std module.\n"
+                    "       Use #include in build.mcpp, or switch to a toolchain "
+                    "that provides one.", tc.label()));
             }
-            // -fmodules may already be present from the `mcpp` module path;
-            // GCC tolerates the repeat, but keep the argv honest.
-            if (!usesModule) stdFlags.push_back("-fmodules");
-            stdStagedInBdir = true;
-        } else {
-            // Through bmi_reference_tokens, not string concatenation: the
-            // traits spell these for the ninja STRING channel, where
-            // `-fmodule-file=std=<p>` (one word) and `/reference std=<p>`
-            // (two) are indistinguishable. Concatenating produced a single
-            // argv element with a space inside it, and cl answered
-            // "C2230: could not find module 'std'".
-            for (auto& t : mcpp::toolchain::bmi_reference_tokens(
-                     traits.stdBmiUsePrefix, sm->bmiPath))
-                stdFlags.push_back(t);
-            if (usesStdCompat && !sm->compatBmiPath.empty())
+            // One thread builds the std module, and the others find it: the first
+            // build in a fresh home would otherwise have every program's compile
+            // write the same cache directory.
+            std::optional<mcpp::toolchain::StdModule> smValue;
+            std::optional<std::string> smError;
+            {
+                static std::mutex stdModuleMutex;
+                std::lock_guard stdLock(stdModuleMutex);
+                auto built = mcpp::toolchain::ensure_built(
+                    tc, cppStandard.canonical, std_flag, macosDeploymentTarget);
+                if (built) smValue = std::move(*built);
+                else       smError = built.error().message;
+            }
+            if (!smValue) {
+                // The second branch of the same refusal, and it is named for the
+                // same reason: both `run_build_program` call sites in prepare.cppm
+                // return `std::unexpected` unconditionally, so this error always
+                // reaches the layer that reads the code. An unnamed one here would
+                // reproduce, for the host std module, exactly the gap the target
+                // std module had.
+                compileRefusal = refusal::Code::StdModulePrecompile;
+                return std::unexpected(std::format(
+                    "build.mcpp uses `import std;` but the std module could not be "
+                    "built for the host toolchain: {}", *smError));
+            }
+            auto sm = std::move(smValue);
+
+            auto traits = mcpp::toolchain::bmi_traits(tc);
+            if (traits.stdBmiUsePrefix.empty()) {
+                // GCC: BMIs are found implicitly under <cwd>/gcm.cache, so stage
+                // the cached ones where the compile will look. Copy rather than
+                // symlink — this mirrors the main build's staging edge, and a
+                // stale copy is caught by ensure_built's own cache key.
+                std::error_code ec;
+                fs::path gcmDir = bdir / traits.bmiDir;
+                fs::create_directories(gcmDir, ec);
+                auto stage = [&](const fs::path& from, std::string_view name)
+                    -> std::expected<void, std::string> {
+                    if (from.empty() || !fs::exists(from)) return {};
+                    fs::path to = gcmDir / std::format("{}{}", name, traits.bmiExt);
+                    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+                    if (ec) return std::unexpected(std::format(
+                        "staging {} for build.mcpp failed: {}", name, ec.message()));
+                    return {};
+                };
+                if (auto r = stage(sm->bmiPath, "std"); !r)
+                    return std::unexpected(r.error());
+                if (usesStdCompat) {
+                    if (auto r = stage(sm->compatBmiPath, "std.compat"); !r)
+                        return std::unexpected(r.error());
+                }
+                // -fmodules may already be present from the `mcpp` module path;
+                // GCC tolerates the repeat, but keep the argv honest.
+                if (!usesModule) stdFlags.push_back("-fmodules");
+                stdStagedInBdir = true;
+            } else {
+                // Through bmi_reference_tokens, not string concatenation: the
+                // traits spell these for the ninja STRING channel, where
+                // `-fmodule-file=std=<p>` (one word) and `/reference std=<p>`
+                // (two) are indistinguishable. Concatenating produced a single
+                // argv element with a space inside it, and cl answered
+                // "C2230: could not find module 'std'".
                 for (auto& t : mcpp::toolchain::bmi_reference_tokens(
-                         traits.stdCompatBmiUsePrefix, sm->compatBmiPath))
+                         traits.stdBmiUsePrefix, sm->bmiPath))
                     stdFlags.push_back(t);
+                if (usesStdCompat && !sm->compatBmiPath.empty())
+                    for (auto& t : mcpp::toolchain::bmi_reference_tokens(
+                             traits.stdCompatBmiUsePrefix, sm->compatBmiPath))
+                        stdFlags.push_back(t);
+            }
+            if (!sm->objectPath.empty() && fs::exists(sm->objectPath))
+                stdObjects.push_back(sm->objectPath.string());
+            if (usesStdCompat && !sm->compatObjectPath.empty()
+                && fs::exists(sm->compatObjectPath))
+                stdObjects.push_back(sm->compatObjectPath.string());
+            // The std cache's directory is named by its own identity hash, which is
+            // what a dependent entry's key records for the BMIs inside it.
+            {
+                const auto id8 = sm->cacheDir.filename().generic_u8string();
+                const std::string stdIdentity(reinterpret_cast<const char*>(id8.data()), id8.size());
+                visibleBmis.push_back({"std", sm->bmiPath, stdIdentity});
+                if (usesStdCompat && !sm->compatBmiPath.empty())
+                    visibleBmis.push_back({"std.compat", sm->compatBmiPath, stdIdentity});
+            }
         }
-        if (!sm->objectPath.empty() && fs::exists(sm->objectPath))
-            stdObjects.push_back(sm->objectPath.string());
-        if (usesStdCompat && !sm->compatObjectPath.empty()
-            && fs::exists(sm->compatObjectPath))
-            stdObjects.push_back(sm->compatObjectPath.string());
-    }
 
-    // #355 step 5: dependency-provided host modules (reusable build rules
-    // shipped as ordinary packages). Compiled HERE, with `base` and `std_flag`
-    // — the same flags the build.mcpp compile below gets — because a BMI is
-    // only usable by a compile that agrees with it. Doing this in a separate
-    // sub-build would leave that agreement to chance, and disagreement shows
-    // up as `module X CRC mismatch`, not as a clear error.
-    //
-    // AFTER the std block, and that ordering is load-bearing: a rule may
-    // `import std;` just as build.mcpp may, and it can only do so once the std
-    // BMI exists and `stdFlags` names it. Compiling rules first — which is what
-    // 2026.8.5.1 did — handed them an empty `stdFlags` and failed with
-    // `module 'std' not found`.
-    std::vector<fs::path> hostModuleObjects;
-    for (auto const& ref : env.hostModules) {
-        std::vector<std::string> use = moduleFlags;
-        use.insert(use.end(), stdFlags.begin(), stdFlags.end());
-        auto hm = build_host_module(bdir, hostCompiler, base, std_flag, tc,
-                                    compileEnv, ref.logical, ref.interface, use);
-        if (!hm) return std::unexpected(hm.error());
-        // APPENDED VERBATIM, and nothing is de-duplicated.
+        // #355 step 5: dependency-provided host modules (reusable build rules
+        // shipped as ordinary packages). Compiled HERE, with `base` and `std_flag`
+        // — the same flags the build.mcpp compile below gets — because a BMI is
+        // only usable by a compile that agrees with it. Doing this in a separate
+        // sub-build would leave that agreement to chance, and disagreement shows
+        // up as `module X CRC mismatch`, not as a clear error.
         //
-        // This filtered per TOKEN, and it was written for the one family whose
-        // marker is a single idempotent word: GCC's `-fmodules`, already
-        // present because the bundled `mcpp` module put it there. The other
-        // two families do not have that shape.
-        //
-        //   GCC     `-fmodules`                       1 token, idempotent
-        //   Clang   `-fmodule-file=<name>=<path>`     1 token, unique
-        //   MSVC    `/reference`, `<name>=<path>`     2 tokens, FIRST REPEATS
-        //
-        // So on `windows = "msvc@system"` the pair arrived, `/reference` was
-        // found already in the list, and only the pair's second half was
-        // appended. cl.exe received `<name>=<path>.ifc` with no switch in
-        // front of it and read it as a source file name:
-        //
-        //   c1xx: fatal error C1083: Cannot open source file:
-        //     'huxerui.rules.sources=...\huxerui.rules.sources.ifc'
-        //
-        // Clang was immune by construction -- one word, never equal to an
-        // existing element -- which is why the defect was specific to the one
-        // toolchain selection that reaches `import std;` at c++20 on Windows.
-        //
-        // The comment this replaces stated the whole value of the filter:
-        // "repeating it is harmless but noisy". It bought a tidier argv and
-        // paid with a broken command line. De-duplicating by logical module
-        // name, or by contiguous subsequence, would both be correct -- and
-        // would both be a new rule kept for the same cosmetic reason. The rule
-        // is gone instead.
-        for (auto& f : hm->useFlags)
-            moduleFlags.push_back(f);
-        hostModuleObjects.push_back(std::move(hm->object));
-    }
+        // AFTER the std block, and that ordering is load-bearing: a rule may
+        // `import std;` just as build.mcpp may, and it can only do so once the std
+        // BMI exists and `stdFlags` names it. Compiling rules first — which is what
+        // 2026.8.5.1 did — handed them an empty `stdFlags` and failed with
+        // `module 'std' not found`.
+        std::vector<fs::path> hostModuleObjects;
+        for (auto const& ref : env.hostModules) {
+            std::vector<std::string> use = moduleFlags;
+            use.insert(use.end(), stdFlags.begin(), stdFlags.end());
+            mcpp::build::HostModuleSource source;
+            source.logical         = ref.logical;
+            source.interface       = ref.interface;
+            source.index           = ref.providerIndex;
+            source.package         = ref.providerName;
+            source.version         = ref.providerVersion;
+            source.immutableSource = ref.immutableSource;
+            source.sourceRoot      = ref.providerRoot;
+            auto hm = mcpp::build::provide_host_module(stores, source, bdir, hostCompiler,
+                                                       base, std_flag, tc, compileEnv, use,
+                                                       visibleBmis);
+            if (!hm) return std::unexpected(hm.error());
+            for (auto& b : hm->bmis) visibleBmis.push_back(b);
+            // APPENDED VERBATIM, and nothing is de-duplicated.
+            //
+            // This filtered per TOKEN, and it was written for the one family whose
+            // marker is a single idempotent word: GCC's `-fmodules`, already
+            // present because the bundled `mcpp` module put it there. The other
+            // two families do not have that shape.
+            //
+            //   GCC     `-fmodules`                       1 token, idempotent
+            //   Clang   `-fmodule-file=<name>=<path>`     1 token, unique
+            //   MSVC    `/reference`, `<name>=<path>`     2 tokens, FIRST REPEATS
+            //
+            // So on `windows = "msvc@system"` the pair arrived, `/reference` was
+            // found already in the list, and only the pair's second half was
+            // appended. cl.exe received `<name>=<path>.ifc` with no switch in
+            // front of it and read it as a source file name:
+            //
+            //   c1xx: fatal error C1083: Cannot open source file:
+            //     'huxerui.rules.sources=...\huxerui.rules.sources.ifc'
+            //
+            // Clang was immune by construction -- one word, never equal to an
+            // existing element -- which is why the defect was specific to the one
+            // toolchain selection that reaches `import std;` at c++20 on Windows.
+            //
+            // The comment this replaces stated the whole value of the filter:
+            // "repeating it is harmless but noisy". It bought a tidier argv and
+            // paid with a broken command line. De-duplicating by logical module
+            // name, or by contiguous subsequence, would both be correct -- and
+            // would both be a new rule kept for the same cosmetic reason. The rule
+            // is gone instead.
+            for (auto& f : hm->useFlags)
+                moduleFlags.push_back(f);
+            hostModuleObjects.push_back(std::move(hm->object));
+        }
 
-    // `-x c++` is required: the `.mcpp` extension is unknown to the compiler, so
-    // without it the driver hands build.mcpp to the linker as a linker script.
-    std::vector<std::string> compileArgv = { hostCompiler.string() };
-    if (msvcHost) {
-        // /nologo /EHsc /utf-8 — cl.exe needs these to behave like the other
-        // two drivers do by default (quiet, exceptions on, UTF-8 sources).
-        for (auto f : dial.alwaysFlagsArgv) compileArgv.emplace_back(f);
-    }
-    compileArgv.push_back(std_flag);
-    // No optimization: this program runs once per build and its compile time
-    // is on the critical path. MSVC spells "off" /Od, not /O0.
-    compileArgv.push_back(msvcHost ? std::string("/Od")
-                                   : std::string(dial.optPrefix) + "0");
-    for (auto& bf : base)        compileArgv.push_back(bf);
-    for (auto& mf : moduleFlags) compileArgv.push_back(mf);
-    for (auto& sf : stdFlags)    compileArgv.push_back(sf);
-    // The `.mcpp` extension is unknown to every driver, so without this the
-    // file is handed to the linker as a linker script.
-    // Per-file where the driver has that form (cl's /Tp), positional
-    // otherwise. Object files follow on this same command line, and cl's
-    // global /TP would compile them as C++ source.
-    if (!dial.perFileCxxPrefix.empty()) {
-        compileArgv.push_back(std::string(dial.perFileCxxPrefix) + src.string());
-    } else {
-        for (auto f : dial.forceCxxLangArgv) compileArgv.emplace_back(f);
-        compileArgv.push_back(src.string());
-    }
-    if (usesModule || !stdObjects.empty() || !hostModuleObjects.empty()) {
-        // Link the module objects. GNU drivers need the input language reset
-        // first, or the .o that follows `-x c++` is handed to the frontend as
-        // C++ source; cl.exe has no `-x` at all and infers from the extension.
-        // This used to be unconditional and was only harmless while MSVC could
-        // not reach it — removing that gate made the dead branch live, and cl
-        // answered with `D9002: ignoring unknown option '-x'`.
-        if (!msvcHost) { compileArgv.push_back("-x"); compileArgv.push_back("none"); }
-        if (usesModule) compileArgv.push_back(mcppModuleObject.string());
-        if (usesModule && !mcppCoreObject.empty()) compileArgv.push_back(mcppCoreObject.string());
-        for (auto& hmo : hostModuleObjects) compileArgv.push_back(hmo.string());
-        for (auto& so : stdObjects) compileArgv.push_back(so);
-    }
-    // THE BUILD PROGRAM SPEAKS THE ENCODING mcpp SPEAKS (#693, D4).
-    //
-    // mcpp hands a build program its paths through the environment and reads
-    // its directives from stdout, and on Windows mcpp runs with a UTF-8 process
-    // code page. A build program without the same application manifest reads
-    // the environment through the machine's ANSI code page instead. Measured on
-    // a cp1252 runner: a narrow build.mcpp in `C:\w\caf<U+00E9>` printed its
-    // path in cp1252 bytes that mcpp could not decode, and in a directory
-    // outside the code page it received `??` in place of the name. So the
-    // program carries the manifest; where no resource compiler stands beside
-    // the compiler, it is built without one and the build says so.
-    if constexpr (mcpp::platform::is_windows) {
-        auto manifestRes = mcpp::build::resources::compile_utf8_manifest(
-            tc, dial.id, bdir, "build.mcpp.utf8");
-        if (manifestRes) {
-            if (!msvcHost) { compileArgv.push_back("-x"); compileArgv.push_back("none"); }
-            compileArgv.push_back(manifestRes->string());
+        // `-x c++` is required: the `.mcpp` extension is unknown to the compiler, so
+        // without it the driver hands build.mcpp to the linker as a linker script.
+        std::vector<std::string> compileArgv = { hostCompiler.string() };
+        if (msvcHost) {
+            // /nologo /EHsc /utf-8 — cl.exe needs these to behave like the other
+            // two drivers do by default (quiet, exceptions on, UTF-8 sources).
+            for (auto f : dial.alwaysFlagsArgv) compileArgv.emplace_back(f);
+        }
+        compileArgv.push_back(std_flag);
+        // No optimization: this program runs once per build and its compile time
+        // is on the critical path. MSVC spells "off" /Od, not /O0.
+        compileArgv.push_back(msvcHost ? std::string("/Od")
+                                       : std::string(dial.optPrefix) + "0");
+        for (auto& bf : base)        compileArgv.push_back(bf);
+        for (auto& mf : moduleFlags) compileArgv.push_back(mf);
+        for (auto& sf : stdFlags)    compileArgv.push_back(sf);
+        // The `.mcpp` extension is unknown to every driver, so without this the
+        // file is handed to the linker as a linker script.
+        // Per-file where the driver has that form (cl's /Tp), positional
+        // otherwise. Object files follow on this same command line, and cl's
+        // global /TP would compile them as C++ source.
+        if (!dial.perFileCxxPrefix.empty()) {
+            compileArgv.push_back(std::string(dial.perFileCxxPrefix) + src.string());
         } else {
-            mcpp::ui::warning(std::format(
-                "build.mcpp: built without the UTF-8 code page ({}); a path outside "
-                "this machine's ANSI code page will not reach it intact",
-                manifestRes.error()));
+            for (auto f : dial.forceCxxLangArgv) compileArgv.emplace_back(f);
+            compileArgv.push_back(src.string());
         }
-    }
-    // Self-contained helper link — see the staticHostHelper doctrine above.
-    // Deliberately NOT in `base`: that also feeds the bundled module's
-    // compile/precompile commands, where a link flag has no business (and for
-    // Clang would perturb the default PIC/PIE codegen of mcpp.o).
-    if (staticHostHelper) compileArgv.push_back(std::string(dial.staticRuntime));
-    // A DYNAMIC HELPER ON LINUX GETS `DT_RPATH`, NOT `DT_RUNPATH`.
-    //
-    // The driver's default is the new tag, and a runpath is consulted only for
-    // the helper's OWN needed libraries. A build program that opens a host
-    // library at run time -- a rule package reading a driver's version through
-    // the driver itself -- then fails one hop later, because that library's
-    // own dependencies (`libdl.so.2`, `libpthread.so.0`) are looked up without
-    // the helper's search path and the payload loader has no default that
-    // reaches them. Measured: `dlopen("<sentinel>/lib/libcuda.so.1")` from a
-    // build.mcpp answered `libdl.so.2: cannot open shared object file` while
-    // the very same directories sat in the helper's RUNPATH. The artifacts
-    // mcpp links carry DT_RPATH for this reason (loader_contract's Rpath tag);
-    // the helper now does too. Driver-only spelling: the helper is always
-    // linked through the compiler driver, never through the linker directly.
-    if (!staticHostHelper && !msvcHost
-        && !mcpp::platform::is_windows && !mcpp::platform::is_macos)
-        compileArgv.push_back("-Wl,--disable-new-dtags");
-    if (msvcHost) {
-        // /Fe: takes its value attached, not as a separate argv token.
-        compileArgv.push_back(std::string(dial.outputExePrefix) + bin.string());
+        if (usesModule || !stdObjects.empty() || !hostModuleObjects.empty()) {
+            // Link the module objects. GNU drivers need the input language reset
+            // first, or the .o that follows `-x c++` is handed to the frontend as
+            // C++ source; cl.exe has no `-x` at all and infers from the extension.
+            // This used to be unconditional and was only harmless while MSVC could
+            // not reach it — removing that gate made the dead branch live, and cl
+            // answered with `D9002: ignoring unknown option '-x'`.
+            if (!msvcHost) { compileArgv.push_back("-x"); compileArgv.push_back("none"); }
+            if (usesModule) compileArgv.push_back(mcppModuleObject.string());
+            if (usesModule && !mcppCoreObject.empty()) compileArgv.push_back(mcppCoreObject.string());
+            for (auto& hmo : hostModuleObjects) compileArgv.push_back(hmo.string());
+            for (auto& so : stdObjects) compileArgv.push_back(so);
+        }
+        // THE BUILD PROGRAM SPEAKS THE ENCODING mcpp SPEAKS (#693, D4).
+        //
+        // mcpp hands a build program its paths through the environment and reads
+        // its directives from stdout, and on Windows mcpp runs with a UTF-8 process
+        // code page. A build program without the same application manifest reads
+        // the environment through the machine's ANSI code page instead. Measured on
+        // a cp1252 runner: a narrow build.mcpp in `C:\w\caf<U+00E9>` printed its
+        // path in cp1252 bytes that mcpp could not decode, and in a directory
+        // outside the code page it received `??` in place of the name. So the
+        // program carries the manifest; where no resource compiler stands beside
+        // the compiler, it is built without one and the build says so.
+        if constexpr (mcpp::platform::is_windows) {
+            auto manifestRes = mcpp::build::resources::compile_utf8_manifest(
+                tc, dial.id, bdir, "build.mcpp.utf8");
+            if (manifestRes) {
+                if (!msvcHost) { compileArgv.push_back("-x"); compileArgv.push_back("none"); }
+                compileArgv.push_back(manifestRes->string());
+            } else {
+                compileWarnings.push_back(std::format(
+                    "build.mcpp: built without the UTF-8 code page ({}); a path outside "
+                    "this machine's ANSI code page will not reach it intact",
+                    manifestRes.error()));
+            }
+        }
+        // Self-contained helper link — see the staticHostHelper doctrine above.
+        // Deliberately NOT in `base`: that also feeds the bundled module's
+        // compile/precompile commands, where a link flag has no business (and for
+        // Clang would perturb the default PIC/PIE codegen of mcpp.o).
+        if (staticHostHelper) compileArgv.push_back(std::string(dial.staticRuntime));
+        // A DYNAMIC HELPER ON LINUX GETS `DT_RPATH`, NOT `DT_RUNPATH`.
+        //
+        // The driver's default is the new tag, and a runpath is consulted only for
+        // the helper's OWN needed libraries. A build program that opens a host
+        // library at run time -- a rule package reading a driver's version through
+        // the driver itself -- then fails one hop later, because that library's
+        // own dependencies (`libdl.so.2`, `libpthread.so.0`) are looked up without
+        // the helper's search path and the payload loader has no default that
+        // reaches them. Measured: `dlopen("<sentinel>/lib/libcuda.so.1")` from a
+        // build.mcpp answered `libdl.so.2: cannot open shared object file` while
+        // the very same directories sat in the helper's RUNPATH. The artifacts
+        // mcpp links carry DT_RPATH for this reason (loader_contract's Rpath tag);
+        // the helper now does too. Driver-only spelling: the helper is always
+        // linked through the compiler driver, never through the linker directly.
+        if (!staticHostHelper && !msvcHost
+            && !mcpp::platform::is_windows && !mcpp::platform::is_macos)
+            compileArgv.push_back("-Wl,--disable-new-dtags");
+        if (msvcHost) {
+            // /Fe: takes its value attached, not as a separate argv token.
+            compileArgv.push_back(std::string(dial.outputExePrefix) + bin.string());
+        } else {
+            compileArgv.push_back("-o"); compileArgv.push_back(bin.string());
+        }
+        // A `<name>=<path>` with no switch in front of it, checked before the
+        // command runs rather than diagnosed from cl.exe's answer to it. cl reports
+        // such a token as `C1083: Cannot open source file`, which names the module
+        // and the BMI and never names the missing flag -- so it reads as a broken
+        // build tree rather than as a broken command line. See
+        // mcpp::toolchain::orphaned_reference; this is the reader that makes the
+        // rule enforced rather than merely stated.
+        if (auto orphan = mcpp::toolchain::orphaned_reference(compileArgv)) {
+            return std::unexpected(std::format(
+                "build.mcpp: the module reference '{}' reached the compiler with no "
+                "switch in front of it.\n"
+                "       This is an mcpp defect, not a problem with the project: the "
+                "reference is\n"
+                "       assembled as a pair (`/reference <name>=<path>` on MSVC) and "
+                "only one half\n"
+                "       arrived. Please report it with the toolchain name and this "
+                "line.", *orphan));
+        }
+        // GCC resolves imported BMIs via gcm.cache/ relative to the compile cwd, so
+        // any compile that imports a module — `mcpp`, `std`, a build rule's host
+        // module, or any mix — has to run from bdir, where they were staged or
+        // compiled. One condition: a build.mcpp that imports only a rule needs
+        // exactly the same cwd as one that imports only mcpp (a rule-only program
+        // compiled in the project root and failed with "failed to read compiled
+        // module", e2e 807 under GCC). Otherwise the project root is fine.
+        const bool needsBmiCwd = usesModule || stdStagedInBdir || !env.hostModules.empty();
+        std::string compileCwd = needsBmiCwd ? bdir.string() : root.string();
+        auto cres = mcpp::platform::process::capture_exec(compileArgv, compileEnv,
+                                                         compileCwd);
+        mcpp::log::verbose("buildmcpp-host", std::format("build.mcpp {}: compile end", who));
+        if (cres.exit_code != 0) {
+            std::string msg = std::format("build.mcpp failed to compile (exit {}):\n{}",
+                                          cres.exit_code, cres.output);
+            if (mentions_missing_mcpp_api(cres.output)) {
+                msg += std::format(
+                    "\n       The `mcpp` build module this engine bundles does not have "
+                    "that name.\n"
+                    "       Either the package was written for a newer mcpp (try "
+                    "`mcpp self update`;\n"
+                    "       this is mcpp {}), or the name is misspelled — the compiler "
+                    "cannot tell\n"
+                    "       the two apart, because the module is generated by whichever "
+                    "mcpp is running.",
+                    mcpp::MCPP_VERSION);
+            }
+            return std::unexpected(std::move(msg));
+        }
+        return {};
+    };
+
+    // The compile is taken from the phase that made it ahead of this run, or made
+    // here. It is taken only when it was made for what this run computes: the
+    // program's text, the host compiler and the text of the host modules.
+    const std::string stamp = programHash + '|' + compilerHash;
+    if (mode == ProgramMode::Run && given && given->compiled && given->stamp == stamp) {
+        for (auto const& w : given->warnings) mcpp::ui::warning(w);
+        programReport.compileDuration = given->compile;
+        if (!given->error.empty()) {
+            if (given->refusal) mcpp::build::refusal::record(*given->refusal);
+            return std::unexpected(given->error);
+        }
     } else {
-        compileArgv.push_back("-o"); compileArgv.push_back(bin.string());
-    }
-    // A `<name>=<path>` with no switch in front of it, checked before the
-    // command runs rather than diagnosed from cl.exe's answer to it. cl reports
-    // such a token as `C1083: Cannot open source file`, which names the module
-    // and the BMI and never names the missing flag -- so it reads as a broken
-    // build tree rather than as a broken command line. See
-    // mcpp::toolchain::orphaned_reference; this is the reader that makes the
-    // rule enforced rather than merely stated.
-    if (auto orphan = mcpp::toolchain::orphaned_reference(compileArgv)) {
-        return std::unexpected(std::format(
-            "build.mcpp: the module reference '{}' reached the compiler with no "
-            "switch in front of it.\n"
-            "       This is an mcpp defect, not a problem with the project: the "
-            "reference is\n"
-            "       assembled as a pair (`/reference <name>=<path>` on MSVC) and "
-            "only one half\n"
-            "       arrived. Please report it with the toolchain name and this "
-            "line.", *orphan));
-    }
-    mcpp::build::progress::program_compiling(who, env.requested);
-    programReport.compileStart = ProgressClock::now();
-    // GCC resolves imported BMIs via gcm.cache/ relative to the compile cwd, so
-    // any compile that imports a module — `mcpp`, `std`, a build rule's host
-    // module, or any mix — has to run from bdir, where they were staged or
-    // compiled. One condition: a build.mcpp that imports only a rule needs
-    // exactly the same cwd as one that imports only mcpp (a rule-only program
-    // compiled in the project root and failed with "failed to read compiled
-    // module", e2e 807 under GCC). Otherwise the project root is fine.
-    const bool needsBmiCwd = usesModule || stdStagedInBdir || !env.hostModules.empty();
-    std::string compileCwd = needsBmiCwd ? bdir.string() : root.string();
-    auto cres = mcpp::platform::process::capture_exec(compileArgv, compileEnv,
-                                                     compileCwd);
-    if (cres.exit_code != 0) {
-        std::string msg = std::format("build.mcpp failed to compile (exit {}):\n{}",
-                                      cres.exit_code, cres.output);
-        if (mentions_missing_mcpp_api(cres.output)) {
-            msg += std::format(
-                "\n       The `mcpp` build module this engine bundles does not have "
-                "that name.\n"
-                "       Either the package was written for a newer mcpp (try "
-                "`mcpp self update`;\n"
-                "       this is mcpp {}), or the name is misspelled — the compiler "
-                "cannot tell\n"
-                "       the two apart, because the module is generated by whichever "
-                "mcpp is running.",
-                mcpp::MCPP_VERSION);
+        auto compiled = compile_binary();
+        compileEnded = ProgressClock::now();
+        if (mode == ProgramMode::Compile) {
+            made->compiled = true;
+            made->stamp    = stamp;
+            made->bin      = bin;
+            made->compile  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 compileEnded - compileBegan);
+            made->warnings = std::move(compileWarnings);
+            made->refusal  = compileRefusal;
+            if (!compiled) made->error = compiled.error();
+            return {};
         }
-        return std::unexpected(std::move(msg));
+        for (auto const& w : compileWarnings) mcpp::ui::warning(w);
+        if (compileRefusal) mcpp::build::refusal::record(*compileRefusal);
+        if (!compiled) return std::unexpected(compiled.error());
+        programReport.compileStart = compileBegan;
     }
 
     // ── Run it; capture stdout(+stderr) and parse directives ────────────────
@@ -1811,6 +2006,34 @@ std::expected<void, std::string> run_build_program(
     report_stated_diagnostics(m.package.name, d);
     write_cache(bdir, root, programHash, compilerHash, ctxHash, d);
     return {};
+}
+
+PrecompiledProgram precompile_build_program(
+    mcpp::manifest::Manifest& m,
+    const fs::path& root,
+    const fs::path& hostCompiler,
+    const mcpp::toolchain::Toolchain& tc,
+    const mcpp::manifest::CppStandardConfig& cppStandard,
+    const BuildProgramEnv& env) {
+    PrecompiledProgram made;
+    // A refusal that comes before the compile is not carried: the program's turn
+    // runs the same checks and refuses in its own order.
+    (void)run_build_program_impl(ProgramMode::Compile, m, root, hostCompiler, tc,
+                                 cppStandard, env, nullptr, &made);
+    return made;
+}
+
+std::expected<void, std::string> run_build_program(
+    mcpp::manifest::Manifest& m,
+    const fs::path& root,
+    const fs::path& hostCompiler,
+    const mcpp::toolchain::Toolchain& tc,
+    const mcpp::manifest::CppStandardConfig& cppStandard,
+    const BuildProgramEnv& env,
+    const PrecompiledProgram* precompiled) {
+    return run_build_program_impl(precompiled ? ProgramMode::Run : ProgramMode::Whole,
+                                  m, root, hostCompiler, tc, cppStandard, env,
+                                  precompiled, nullptr);
 }
 
 std::vector<DeclaredProgramInputs>

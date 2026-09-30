@@ -31,7 +31,7 @@ them. Confusing them costs a full rebuild.
 | Store | Scope | Growth trigger | Emptied by |
 |---|---|---|---|
 | `target/<triple>/<fingerprint>/` | one project | a configuration fingerprint changes and opens a new directory | `mcpp clean`, `mcpp clean --stale` |
-| the build cache (`mcpp cache dir`) | the whole machine | any project compiles a dependency or a `std` module, or builds a host tool | `mcpp cache gc`, `mcpp cache prune`, `mcpp cache clean` |
+| the build cache (`mcpp cache dir`) | the whole machine | any project compiles a dependency or a `std` module, or builds a host tool, or compiles the `mcpp` module its build program imports | `mcpp cache gc`, `mcpp cache prune`, `mcpp cache clean` |
 
 `mcpp clean` removes `target/` entirely, and the next build recompiles
 everything. `mcpp clean --stale` removes only the fingerprint directories that
@@ -218,10 +218,12 @@ Every acquisition is reported by one renderer (2026.9.28.1+):
 - the clone of a `git` dependency;
 - the sandbox's first-run tools.
 
-On a terminal each item is a bar drawn in place. When stdout is not a terminal,
-as in a CI log or a pipe, each item prints one line when it starts, with its
-size when known, and one line when it finishes, with its duration. That output
-carries no carriage return and no erase sequence. `--quiet` prints neither.
+On a terminal each item is a bar drawn in place. When standard error is not a
+terminal, as in a CI log or when it is redirected, each item prints one line
+when it starts, with its size when known, and one line when it finishes, with
+its duration. That output carries no carriage return and no erase sequence.
+`--quiet` prints neither. The bars are narration, and narration is written to
+standard error (see "Output streams" below).
 
 An index refresh is reported step by step when the xlings that mcpp drives
 emits progress events for it (xlings 2026.9.28.1+). With an older xlings it
@@ -296,8 +298,9 @@ On a terminal one status row is drawn below the output and updated in place:
   there.
 - Last comes the longest-running `check` or `prepare` action. ninja reports
   every other step only when it finishes.
-- The row is first drawn half a second into the command. Every change leaves
-  in one write that overwrites the row in place, so the row never flickers.
+- The row is drawn on standard error, and is first drawn half a second into the
+  command. Every change leaves in one write that overwrites the row in place,
+  so the row never flickers.
 
 `MCPP_PROGRESS` chooses the screen:
 
@@ -307,10 +310,10 @@ On a terminal one status row is drawn below the output and updated in place:
 - `off`: no live row, only the lines of a log.
 
 The screen needs a terminal that draws braille: a UTF-8 locale, or Windows
-Terminal. Elsewhere the row is plain. When the output is not a terminal (a CI
-log, a pipe), only final lines are written, and the status row is written
-when the output has been silent for a minute. `TERM=dumb` selects that form
-on a terminal too.
+Terminal. Elsewhere the row is plain. When standard error is not a terminal (a
+CI log, a redirection), only final lines are written, and the status row is
+written when the output has been silent for a minute. `TERM=dumb` selects that
+form on a terminal too.
 
 `--play-game` plays a game on the screen while the build runs. It is accepted
 by `build`, `run` and `test`, and `--play-game=NAME` names the game;
@@ -333,14 +336,74 @@ The game runs at its own speed; the counts beside it state the build. Keys
 are read without echo, and Ctrl-C still stops the build. The terminal's mode
 is restored when the build ends or is interrupted; a process killed outright
 cannot restore it, and `stty sane` does. The game needs standard input and
-standard output on a terminal, with mcpp in its foreground (not a background
-job); otherwise one line says why, and the build proceeds.
+standard error (where the screen is drawn) on a terminal, with mcpp in its
+foreground (not a background job); otherwise one line says why, and the build
+proceeds.
 
 `--verbose` names every package: `Fresh` for those with nothing to do, and
 `Compiled` with the steps and span of each that did work. It also states each
 build program's compile and run times, and prints every step as ninja reports
 it (`[f/t] <command>` and its output). `--quiet` prints none of this. Machine
 output (`--message-format json`) is unchanged.
+
+## Output streams
+
+Every command writes its **narration** to standard error and its **result** to
+standard output (mcpp 2026.9.30.2 and earlier wrote the narration to standard
+output). The narration is what says what the command is doing: the status lines
+that begin with a verb, the progress bars, the status row, `Finished`, and the
+blank line after `Running`. The result is what the command was asked to
+produce:
+
+- under `mcpp run`, what the program prints, and nothing else;
+- a document or a listing: `mcpp run --list-runners`, `mcpp toolchain list`,
+  `mcpp cache list`, `mcpp search`, `mcpp test --list`, `mcpp emit`;
+- for `mcpp test`, the report: each test's verdict, the output of a test that
+  failed, the `test result` line, and for `--workspace` the `workspace result`
+  line.
+
+```console
+$ mcpp run -q 2>/dev/null > out.txt        # out.txt holds the program's output, byte for byte
+$ mcpp build >/dev/null                    # the steps and Finished are still shown
+$ mcpp build 2>&1 | tee build.log          # record the steps: both streams on one pipe
+```
+
+- `mcpp build | tee build.log` no longer records the steps, which are on
+  standard error; write `mcpp build 2>&1 | tee build.log`. A CI log captures
+  both streams and is unaffected.
+- `--quiet` suppresses the narration. Warnings, errors and compiler
+  diagnostics are written to standard error as before, and `--quiet` leaves
+  them.
+- Both streams keep the order of the writes on one pipe, and on a terminal.
+- On a terminal the status row is drawn on standard error. `mcpp build | less`
+  (standard output a pipe) draws it; `mcpp build 2>log` (standard error a file)
+  does not.
+- Machine output (`--message-format json`, `--format json`) is unchanged:
+  standard output carries the document alone
+  ([50 — Machine-Readable Output](50-machine-output.md)).
+
+### The exit status of `mcpp run`
+
+`mcpp run` exits with the program's own status, passed through unchanged. A
+`run` whose planning or build failed did not start the program, and exits
+**101**, which is the status a failed `cargo run` build has:
+
+```console
+$ mcpp run            # a compile error
+error: build failed in app v0.1.0 (.)
+$ echo $?
+101
+$ mcpp run -- 1       # a program that returns 1
+$ echo $?
+1
+```
+
+A program that could not be started keeps the status of the refusal (`127`
+not found, `126` not executable, `125` otherwise), and `mcpp build`, `mcpp
+test` and `mcpp pack` keep their statuses. A program, or a runner
+(`--runner`, `[target.<triple>].runner`), that itself returns 101 reads as a
+failed build; [50 — Machine-Readable Output](50-machine-output.md) §6 gives the
+bands.
 
 ## Validating a descriptor before publishing
 

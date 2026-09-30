@@ -3,6 +3,15 @@
 // All user-visible status lines from CLI / fetcher / build go through
 // here. TTY auto-detect; MCPP_NO_COLOR / --no-color disables colors.
 //
+// TWO STREAMS, ONE RULE (output streams plan 2026-10-01, §6, R3). A line that
+// narrates what the command is doing -- a verb in the status column, a
+// progress bar, the live region, the status row -- goes to the NARRATION
+// stream, which is standard error; `narration_stream()` is the one place that
+// says so. A line that states the command's result -- what a program prints
+// under `run`, a document, a listing, a test's verdict -- stays on standard
+// output, where a pipe or a redirection receives it and progress does not.
+// Every function below names which of the two it writes to.
+//
 // ONE RENDERER, TWO MEDIA (build progress design 2026-09-29, §5, and its
 // revision 3, 2026-09-30, §9). Every line goes through `emit`. On a terminal
 // that can move the cursor, the rows that are still changing -- a download
@@ -16,7 +25,7 @@
 // when the log has been silent for a minute.
 
 module;
-#include <cstdio>      // fileno, stdout
+#include <cstdio>      // fileno, stdout, stderr
 
 export module mcpp.ui;
 
@@ -35,16 +44,28 @@ void disable_color();
 // Check if color is enabled.
 bool is_color_enabled();
 
-// Verb-style status ("Compiling foo v0.1.0" pattern).
+// The stream that narrates: standard error. The live region, the progress
+// bars, the status row and every line below that is not a result are written
+// to it, and the region's terminal test, colour and size follow it.
+mcpp::platform::terminal::Stream narration_stream();
+
+// Verb-style status ("Compiling foo v0.1.0" pattern), on the narration stream.
 //   verb        verb word, padded right-aligned in 12-char column
 //   message     metadata after the verb
 void status(std::string_view verb, std::string_view message);
 
-// Cyan verb (Updating, Downloading, Cleaned).
+// A verb-style line that states the command's RESULT rather than a step of its
+// work, in the layout of `status`, on standard output: the `test result` and
+// `workspace result` lines of `mcpp test`, which Cargo's libtest also prints
+// on standard output. The caller says which of the two a line is; the stream
+// is never inferred from the verb's spelling.
+void result(std::string_view verb, std::string_view message);
+
+// Cyan verb (Updating, Downloading, Cleaned), on the narration stream.
 void info(std::string_view verb, std::string_view message);
 
-// Bold green Finished line, preceded by a blank line when the command wrote a
-// line before it (design §4.5).
+// Bold green Finished line, on the narration stream, preceded by a blank line
+// when the command narrated a line before it (design §4.5).
 // `descriptor` annotates the profile's actual effect (e.g. "optimized",
 // "unoptimized + debuginfo"). Empty = print the profile name alone; callers
 // that never resolved the profile knobs must not invent one. `detail` follows
@@ -105,14 +126,17 @@ struct Diagnostic {
 };
 void diagnostic(const Diagnostic& d);
 
-// Plain output (no verb), respecting -q flag.
+// Plain output (no verb), respecting -q flag: a line of a command's RESULT, on
+// standard output. `mcpp test` prints each test's verdict and the members'
+// summary lines through it.
 void plain(std::string_view message);
 
-// Flush stdout. Every stdout-writing function above already calls this, so
-// callers only need it when they wrote to stdout directly (std::println) and
-// want that line visible now rather than whenever the libc buffer happens to
-// fill. main() also sets stdout line-buffered, which covers the POSIX
-// platforms; this is what makes the guarantee hold on Windows too, where
+// Flush both standard streams. Every writing function above already flushes
+// what it wrote, so callers only need it when they wrote directly
+// (std::println) and want that line visible now rather than whenever the libc
+// buffer happens to fill, and before a child process that writes to the same
+// terminal starts. main() also sets stdout line-buffered, which covers the
+// POSIX platforms; this is what makes the guarantee hold on Windows too, where
 // MSVCRT treats _IOLBF as _IOFBF. Progress-driven output must be visible while
 // the process is still running: a build that is killed mid-flight is exactly
 // when its last lines matter most.
@@ -212,7 +236,9 @@ public:
     SuspendRegion& operator=(const SuspendRegion&) = delete;
 };
 
-// One final line to stdout, through the region; suppressed by --quiet.
+// One final line of narration, through the region; suppressed by --quiet. A
+// line of a command's result is `plain`. An empty `text` is the blank line
+// that separates a step from what follows it.
 void line(std::string_view text);
 
 // The bytes of one frame: from the first row of a region of `previousRows`
@@ -236,10 +262,10 @@ std::vector<std::string> region_rows(const std::vector<std::string>& bars,
 // --- progress bar (single-line, \r-rewritten) ---
 //
 // ONE RENDERER, TWO OUTPUT MODES. On a terminal the bar is a line of the
-// region, redrawn in place. When stdout is not a terminal (a CI log, a pipe, a
-// file) it prints one line when the item finishes, with its duration: no `\r`,
-// no erase sequence, no repaint per frame. The mode follows stdout;
-// `set_live_progress` overrides it for tests.
+// region, redrawn in place. When the narration stream is not a terminal (a CI
+// log, a pipe, a file) it prints one line when the item finishes, with its
+// duration: no `\r`, no erase sequence, no repaint per frame. The mode follows
+// the narration stream; `set_live_progress` overrides it for tests.
 void set_live_progress(bool live);
 bool live_progress();
 
@@ -330,7 +356,7 @@ private:
     std::unordered_set<std::string> finished_;
 };
 
-// --- quiet flag (suppresses status / info / finished) ---
+// --- quiet flag (suppresses status / info / finished / line: the narration) ---
 void set_quiet(bool q);
 bool is_quiet();
 
@@ -363,10 +389,13 @@ namespace {
 
 namespace term = mcpp::platform::terminal;
 
-bool g_color  = false;
+// Colour is decided per stream, by what that stream is: a line for a pipe must
+// not carry escape sequences because the OTHER stream is a terminal.
+// Indexed by `term::Stream`.
+bool g_color[2] = {false, false};
 bool g_quiet  = false;
 bool g_inited = false;
-// -1: follow stdout; 0 / 1: set by set_live_progress.
+// -1: follow the narration stream; 0 / 1: set by set_live_progress.
 int  g_liveOverride = -1;
 // East Asian ambiguous characters count two columns (terminal::ambiguous_wide).
 bool g_ambiguousWide = false;
@@ -382,16 +411,29 @@ constexpr std::string_view kYellow     = "\033[33m";
 constexpr std::string_view kRed        = "\033[31m";
 constexpr std::string_view kBrightRed  = "\033[91m";
 
-bool detect_color() {
+// The stream narration is written to (output streams plan 2026-10-01, R3):
+// standard error, so that standard output carries a command's result alone.
+// This is the one place that says so; changing it moves the region, the bars,
+// the status row, the colour decision and the size the region is fitted to.
+constexpr term::Stream kNarration = term::Stream::Err;
+// The stream a command's result is written to.
+constexpr term::Stream kResult = term::Stream::Out;
+
+bool& color_flag(term::Stream s) { return g_color[s == term::Stream::Out ? 0 : 1]; }
+bool colored(term::Stream s) { return color_flag(s); }
+// The colour of what the region and the narration lines draw.
+bool narration_colored() { return colored(kNarration); }
+
+bool detect_color(term::Stream s) {
     if (auto* e = std::getenv("MCPP_NO_COLOR"); e && *e == '1') return false;
     if (auto* e = std::getenv("NO_COLOR");      e && *e)        return false;
     // On Windows this also turns the console's escape processing on, without
     // which the colour sequences would be printed as text.
-    return term::can_move_cursor(term::Stream::Out);
+    return term::can_move_cursor(s);
 }
 
 std::string with_color(std::string_view code, std::string_view text) {
-    if (!g_color) return std::string(text);
+    if (!narration_colored()) return std::string(text);
     std::string out;
     out.reserve(code.size() + text.size() + kReset.size());
     out.append(code).append(text).append(kReset);
@@ -407,10 +449,17 @@ std::string verb_padded(std::string_view verb) {
 }
 
 std::string verb_line(std::string_view colour, std::string_view verb,
-                      std::string_view message) {
+                      std::string_view message, bool color) {
     auto v = verb_padded(verb);
-    if (g_color) return std::format("{}{}{}{} {}", kBold, colour, v, kReset, message);
+    if (color) return std::format("{}{}{}{} {}", kBold, colour, v, kReset, message);
     return std::format("{} {}", v, message);
+}
+
+// A verb line for the narration stream, which is where every verb line but
+// those `result` writes is written.
+std::string verb_line(std::string_view colour, std::string_view verb,
+                      std::string_view message) {
+    return verb_line(colour, verb, message, narration_colored());
 }
 
 // The configuration groups of one workspace command build on threads
@@ -433,7 +482,7 @@ struct Region {
     std::vector<std::pair<const void*, std::string>> bars;
     std::size_t drawnRows = 0;  // rows of the region on the screen now
     std::vector<std::string> lastRows;   // the rows drawn last
-    bool anythingAbove = false; // this command wrote a line to stdout
+    bool anythingAbove = false; // this command narrated a line
     std::chrono::steady_clock::time_point lastDraw{};
     std::chrono::steady_clock::time_point lastLine{};
     std::chrono::milliseconds heartbeat{60'000};
@@ -462,12 +511,12 @@ std::chrono::steady_clock::time_point& start_point() {
 }
 
 // Whether the bars draw on a terminal: the region's decision while it is
-// open, stdout's otherwise.
+// open, the narration stream's otherwise.
 bool bars_live() {
     auto& r = region();
     if (r.open) return r.live;
     if (g_liveOverride >= 0) return g_liveOverride == 1;
-    return term::can_move_cursor(term::Stream::Out);
+    return term::can_move_cursor(kNarration);
 }
 
 std::string erase_bytes(std::size_t rows) {
@@ -479,7 +528,7 @@ std::string erase_bytes(std::size_t rows) {
 }
 
 std::size_t max_live_lines() {
-    const auto rows = term::rows();
+    const auto rows = term::rows(kNarration);
     return std::min<std::size_t>(10, rows > 3 ? rows - 3 : 1);
 }
 
@@ -510,7 +559,7 @@ std::vector<std::string> current_rows_locked() {
     std::vector<std::string> bars;
     for (auto const& [who, text] : r.bars) bars.push_back(text);
     auto rows = region_rows(bars, frame, max_live_lines());
-    const auto width = term::cols() > 1 ? term::cols() - 1 : 1;
+    const auto width = term::cols(kNarration) > 1 ? term::cols(kNarration) - 1 : 1;
     for (auto& row : rows) row = fit(row, width);
     return rows;
 }
@@ -529,44 +578,51 @@ void redraw_locked() {
     if (!may_draw_locked()) return;
     auto rows = current_rows_locked();
     if (rows.size() == r.drawnRows && rows == r.lastRows) return;
-    term::write_frame(term::Stream::Out, frame_bytes(r.drawnRows, {}, rows));
+    term::write_frame(kNarration, frame_bytes(r.drawnRows, {}, rows));
     drawn_locked(std::move(rows));
 }
 
 void erase_locked() {
     auto& r = region();
     if (r.drawnRows == 0) return;
-    term::write_frame(term::Stream::Out, erase_bytes(r.drawnRows));
+    term::write_frame(kNarration, erase_bytes(r.drawnRows));
     r.drawnRows = 0;
     r.lastRows.clear();
 }
 
 // Writes `text` (whole lines) above the region; line_mutex() held. With the
 // region on a terminal, the lines and the region's new rows leave in one
-// write. A line for standard error travels in that write when standard error
-// is the same terminal; otherwise it goes to standard error alone, which is
-// not the screen the region is on.
-void emit_locked(term::Stream s, std::string_view text) {
+// write. A line for the other stream travels in that write when both streams
+// reach the same terminal; otherwise it goes to its own stream alone, which is
+// not the screen the region is on. `narrates` marks a line of the narration
+// (as opposed to a warning, an error or a result), which is what `Finished`'s
+// blank line answers to.
+void emit_locked(term::Stream s, std::string_view text, bool narrates = false) {
     auto& r = region();
-    if (s == term::Stream::Out && !text.empty()) r.anythingAbove = true;
+    if (narrates && !text.empty()) r.anythingAbove = true;
     r.lastLine = std::chrono::steady_clock::now();
     const bool framed = may_draw_locked()
-        && (s == term::Stream::Out || term::same_terminal());
+        && (s == kNarration || term::same_terminal());
     if (!framed) {
+        // What was written to standard output before, by a caller that did not
+        // come through here, arrives before this line whichever stream it is
+        // for: on a terminal that both streams reach, the two are one column of
+        // text. Standard error is unbuffered.
+        std::fflush(stdout);
         term::write(s, text);
         std::fflush(s == term::Stream::Out ? stdout : stderr);
         return;
     }
     auto rows = current_rows_locked();
-    term::write_frame(term::Stream::Out, frame_bytes(r.drawnRows, text, rows));
+    term::write_frame(kNarration, frame_bytes(r.drawnRows, text, rows));
     drawn_locked(std::move(rows));
 }
 
-void emit(term::Stream s, std::string_view text);
+void emit(term::Stream s, std::string_view text, bool narrates = false);
 
 // The terminal side of mcpp.log's verbose records: through the one writer.
 void verbose_record(const mcpp::log::Record& record) {
-    emit(term::Stream::Err, mcpp::log::verbose_line(record, g_color));
+    emit(term::Stream::Err, mcpp::log::verbose_line(record, colored(term::Stream::Err)));
 }
 
 std::atomic<long long> g_frameIntervalMs{100};
@@ -607,31 +663,41 @@ void tick(std::stop_token stop) {
         if (g_quiet || !r.source || now - r.lastLine < r.heartbeat) continue;
         auto frame = r.source();
         if (frame.status.empty()) { r.lastLine = now; continue; }
-        emit_locked(term::Stream::Out, frame.status + "\n");
+        emit_locked(kNarration, frame.status + "\n", /*narrates=*/true);
     }
 }
 
 } // namespace
 
 namespace {
-void emit(term::Stream s, std::string_view text) {
+void emit(term::Stream s, std::string_view text, bool narrates) {
     std::lock_guard line(line_mutex());
-    emit_locked(s, text);
+    emit_locked(s, text, narrates);
+}
+// A line of the narration: the stream is the narration stream's.
+void narrate(std::string_view text) {
+    emit(kNarration, text, /*narrates=*/true);
 }
 } // namespace
 
+term::Stream narration_stream() { return kNarration; }
+
 void init() {
     if (g_inited) return;
-    g_color  = detect_color();
-    g_ambiguousWide = term::ambiguous_wide();
+    color_flag(term::Stream::Out) = detect_color(term::Stream::Out);
+    color_flag(term::Stream::Err) = detect_color(term::Stream::Err);
+    g_ambiguousWide = term::ambiguous_wide(kNarration);
     g_inited = true;
     mcpp::log::set_terminal_sink(&verbose_record);
 }
 
 void set_ambiguous_wide(bool wide) { g_ambiguousWide = wide; }
 
-void disable_color() { g_color = false; }
-bool is_color_enabled() { return g_color; }
+void disable_color() {
+    color_flag(term::Stream::Out) = false;
+    color_flag(term::Stream::Err) = false;
+}
+bool is_color_enabled() { return narration_colored(); }
 
 void set_quiet(bool q) { g_quiet = q; }
 
@@ -639,11 +705,14 @@ void set_live_progress(bool live) { g_liveOverride = live ? 1 : 0; }
 
 bool live_progress() {
     if (g_liveOverride >= 0) return g_liveOverride == 1;
-    return term::can_move_cursor(term::Stream::Out);
+    return term::can_move_cursor(kNarration);
 }
 bool is_quiet()        { return g_quiet; }
 
-void flush() { std::fflush(stdout); }
+void flush() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+}
 
 void set_line_buffered() {
 #if defined(_WIN32)
@@ -667,13 +736,19 @@ void set_line_buffered() {
 void status(std::string_view verb, std::string_view message) {
     if (g_quiet) return;
     init();
-    emit(term::Stream::Out, verb_line(kBrightGreen, verb, message) + "\n");
+    narrate(verb_line(kBrightGreen, verb, message) + "\n");
+}
+
+void result(std::string_view verb, std::string_view message) {
+    if (g_quiet) return;
+    init();
+    emit(kResult, verb_line(kBrightGreen, verb, message, colored(kResult)) + "\n");
 }
 
 void info(std::string_view verb, std::string_view message) {
     if (g_quiet) return;
     init();
-    emit(term::Stream::Out, verb_line(kBrightCyan, verb, message) + "\n");
+    narrate(verb_line(kBrightCyan, verb, message) + "\n");
 }
 
 void finished(std::string_view profile, std::chrono::milliseconds elapsed,
@@ -691,28 +766,29 @@ void finished(std::string_view profile, std::chrono::milliseconds elapsed,
     if (!detail.empty()) msg += std::format(" · {}", detail);
     std::lock_guard line(line_mutex());
     // The summary is separated from the steps above it by one blank line
-    // (design §4.5); a command that wrote nothing before it writes none.
+    // (design §4.5); a command that narrated nothing before it writes none.
     const std::string head = region().anythingAbove ? "\n" : "";
-    emit_locked(term::Stream::Out, head + verb_line(kBrightGreen, "Finished", msg) + "\n");
+    emit_locked(kNarration, head + verb_line(kBrightGreen, "Finished", msg) + "\n",
+                /*narrates=*/true);
 }
 
 void warning(std::string_view message) {
     init();
-    emit(term::Stream::Err, g_color
+    emit(term::Stream::Err, colored(term::Stream::Err)
         ? std::format("{}{}warning:{} {}\n", kBold, kYellow, kReset, message)
         : std::format("warning: {}\n", message));
 }
 
 void error(std::string_view message) {
     init();
-    emit(term::Stream::Err, g_color
+    emit(term::Stream::Err, colored(term::Stream::Err)
         ? std::format("{}{}error:{} {}\n", kBold, kBrightRed, kReset, message)
         : std::format("error: {}\n", message));
 }
 
 void note(std::string_view message) {
     init();
-    emit(term::Stream::Err, g_color
+    emit(term::Stream::Err, colored(term::Stream::Err)
         ? std::format("{}{}note:{} {}\n", kBold, kCyan, kReset, message)
         : std::format("note: {}\n", message));
 }
@@ -747,7 +823,7 @@ void print_closing_notices() {
     if (g_quiet) return;
     init();
     for (auto const& n : notices) {
-        emit(term::Stream::Err, g_color
+        emit(term::Stream::Err, colored(term::Stream::Err)
             ? std::format("{}{}tip:{} {}\n", kBold, kCyan, kReset, n.message)
             : std::format("tip: {}\n", n.message));
     }
@@ -755,23 +831,24 @@ void print_closing_notices() {
 
 void plain(std::string_view message) {
     if (g_quiet) return;
-    emit(term::Stream::Out, std::string(message) + "\n");
+    emit(kResult, std::string(message) + "\n");
 }
 
 void line(std::string_view text) {
     if (g_quiet) return;
-    emit(term::Stream::Out, std::string(text) + "\n");
+    narrate(std::string(text) + "\n");
 }
 
 void diagnostic(const Diagnostic& d) {
     init();
+    const bool color = colored(term::Stream::Err);
     auto bold_red = [&](std::string_view s) {
-        return g_color ? std::format("{}{}{}{}", kBold, kBrightRed, s, kReset)
-                       : std::string(s);
+        return color ? std::format("{}{}{}{}", kBold, kBrightRed, s, kReset)
+                     : std::string(s);
     };
     auto blue = [&](std::string_view s) {
-        return g_color ? std::format("{}{}{}{}", kBold, kBrightCyan, s, kReset)
-                       : std::string(s);
+        return color ? std::format("{}{}{}{}", kBold, kBrightCyan, s, kReset)
+                     : std::string(s);
     };
     std::string out;
     std::string head = "error";
@@ -940,7 +1017,7 @@ std::string step_line(std::string_view verb, std::string_view subject,
                             : tone == Tone::Muted ? kDim
                             : tone == Tone::Bad   ? kRed
                                                   : std::string_view{};
-    if (g_color && !colour.empty()) s += std::format("{}{}{}", colour, state, kReset);
+    if (narration_colored() && !colour.empty()) s += std::format("{}{}{}", colour, state, kReset);
     else s += state;
     return s;
 }
@@ -948,15 +1025,15 @@ std::string step_line(std::string_view verb, std::string_view subject,
 std::string status_line(std::string_view phase, std::string_view rest) {
     init();
     const auto verb = std::format("{:>12}", phase);
-    std::string s = g_color ? std::format("{}{}{}{}", kBold, kBrightCyan, verb, kReset)
-                            : verb;
+    std::string s = narration_colored()
+        ? std::format("{}{}{}{}", kBold, kBrightCyan, verb, kReset) : verb;
     if (!rest.empty()) s += std::format(" {}", rest);
     return s;
 }
 
 std::string hue(std::string_view text, Hue h) {
     init();
-    if (!g_color || h == Hue::Plain || text.empty()) return std::string(text);
+    if (!narration_colored() || h == Hue::Plain || text.empty()) return std::string(text);
     std::string_view code = h == Hue::Cyan    ? "\033[36m"
                           : h == Hue::Magenta ? "\033[95m"
                           : h == Hue::Blue    ? "\033[94m"
@@ -1068,6 +1145,7 @@ void set_heartbeat(std::chrono::milliseconds interval) {
 
 SuspendRegion::SuspendRegion() {
     std::fflush(stdout);
+    std::fflush(stderr);
     std::lock_guard line(line_mutex());
     erase_locked();
     ++region().suspended;
@@ -1106,16 +1184,16 @@ std::string fmt_bytes(std::size_t b) {
     return std::format("{:.2f} GB", static_cast<double>(b) / (1024.0*1024.0*1024.0));
 }
 
-// Best-effort terminal width. Tries TIOCGWINSZ first; on failure (e.g.,
-// stdout is a pipe) honours $COLUMNS so users can clamp the width
-// manually for testing or when running under CI loggers that don't
-// propagate winsize. Falls back to 80 cols.
+// Best-effort width of the terminal narration is drawn on. Tries TIOCGWINSZ
+// first; on failure (e.g., standard error is a pipe) honours $COLUMNS so users
+// can clamp the width manually for testing or when running under CI loggers
+// that don't propagate winsize. Falls back to 80 cols.
 //
 // 80 is the right safe default for a "fixed-shape" status line — we'd
 // rather collapse the bar than wrap into a second row that `\r\033[2K`
 // can't clean up later.
 std::size_t terminal_cols() {
-    return term::cols();
+    return term::cols(kNarration);
 }
 
 // Truncate a "visible" string (no ANSI codes inside) to `max` chars, replacing

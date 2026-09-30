@@ -1187,10 +1187,14 @@ step6_host_module_registration(PrepareState& state) {
                 }
 
                 std::vector<prov::HostModule> ordered;
+                // The package each entry of `ordered` came from, for where its
+                // compiled module may be kept (#748, B1).
+                std::vector<std::size_t> orderedProvider;
                 for (auto p : *topo) {
                     for (auto& hm : units(p)) {
                         hm.importable = isDirect.contains(p);
                         ordered.push_back(std::move(hm));
+                        orderedProvider.push_back(p);
                     }
                 }
 
@@ -1202,7 +1206,8 @@ step6_host_module_registration(PrepareState& state) {
 
                 if (auto clash = prov::host_module_collision(ordered))
                     return std::unexpected(*clash);
-                for (auto const& hm : ordered) {
+                for (std::size_t k = 0; k < ordered.size(); ++k) {
+                    auto const& hm = ordered[k];
                     // Warned once per (package, module), not once per consumer:
                     // a rule re-exported down a chain is visible to every
                     // package on it, and repeating one naming remark N times
@@ -1212,8 +1217,31 @@ step6_host_module_registration(PrepareState& state) {
                         if (prefixWarned.insert(hm.package + "\x1e" + hm.module).second)
                             mcpp::diag::warning("build/rule-namespace", *w);
                     }
-                    state.hostModulesByConsumer[c].push_back(
-                        {hm.module, hm.interface, hm.importable});
+                    mcpp::build::BuildProgramEnv::HostModuleRef ref{
+                        hm.module, hm.interface, hm.importable};
+                    // Where the compiled module may be kept (#748, B1): in the
+                    // global cache only when the provider is an index package
+                    // whose sources are in the immutable store, the rule the
+                    // dependency cache applies to a package (plan.cpp). The
+                    // module is compiled alone, so nothing it was built against
+                    // can be local: the provider's own location decides.
+                    {
+                        const auto pi = orderedProvider[k];
+                        const auto& provider = state.packages[pi];
+                        const auto* ident = pi >= 1 && pi - 1 < state.dep_cache_identities.size()
+                            ? &state.dep_cache_identities[pi - 1] : nullptr;
+                        ref.providerName = identity(pi);
+                        ref.providerVersion = provider.manifest.package.version;
+                        ref.providerRoot = provider.root;
+                        if (ident && ident->sourceKind == "version"
+                            && mcpp::build::path_is_under_any(provider.root, state.storeRoots)) {
+                            ref.immutableSource = true;
+                            ref.providerIndex   = ident->indexName;
+                            ref.providerName    = ident->packageName;
+                            if (!ident->version.empty()) ref.providerVersion = ident->version;
+                        }
+                    }
+                    state.hostModulesByConsumer[c].push_back(std::move(ref));
                 }
             }
 
@@ -1883,10 +1911,7 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             // generating a declaration for this package must match how this
             // package is compiled.
             fill_package_build_env(bpEnv, pkg.manifest);
-            bpEnv.packFormat   = state.overrides.pack_format;
-            bpEnv.packStageDir = state.overrides.pack_stage_dir;
-            bpEnv.packStrip           = state.overrides.pack_strip;
-            bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
+            state.fillPackEnv(bpEnv, i);
             bpEnv.requested       = pkg.selectedMember;
             bpEnv.languageModules = pkg.manifest.language.modules;
             bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;
@@ -1896,6 +1921,11 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             bpEnv.artifactsDir = state.workRoot / "target" / ".build-mcpp" / "deps"
                 / (dirSafe(pkg.manifest.package.name) + "@" + pkg.manifest.package.version);
             bpEnv.genBase      = bpEnv.artifactsDir / "out";
+            // What the program imports is kept once for the workspace, and in the
+            // global cache where it comes from the engine or the index (#748).
+            bpEnv.moduleStore  = state.workRoot / "target" / ".build-mcpp" / "host-modules";
+            if (state.cacheMode == CacheMode::Global)
+                bpEnv.moduleCacheRoot = mcpp::home::cache_root();
             // mcpp#241: this package's resolved dependencies as
             // MCPP_DEP_<NAME>_DIR, from the authoritative edge graph (no
             // name-guessing); covers feature-activated deps too

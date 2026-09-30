@@ -387,8 +387,8 @@ int run(int argc, char** argv) {
                 .help("Target no accelerator, ignoring [build] accel"))
             .option(cl::Option("static").help(
                 "Force static linking (-static). On Linux, prefer pairing with --target <arch>-linux-musl"))
-            .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Build only the named workspace member (namespace.name or package name, then directory)"))
+            .option(cl::Option("package").short_name('p').takes_value().multiple().value_name("NAME")
+                .help("Build the named workspace member (namespace.name or package name, then directory); repeat to build several"))
             .option(cl::Option("profile").takes_value().value_name("NAME")
                 .help("Build profile: dev (default) | release | dist | <[profile.*] name>"))
             .option(cl::Option("release").help("Shorthand for --profile release"))
@@ -401,6 +401,8 @@ int run(int argc, char** argv) {
                 .help("Treat manifest schema warnings (unknown feature/platform) as errors"))
             .option(cl::Option("workspace")
                 .help("Build all workspace members"))
+            .option(cl::Option("exclude").takes_value().multiple().value_name("NAME")
+                .help("With --workspace (or at a virtual workspace root), leave the named member out; repeatable, refused with -p"))
             .option(cl::Option("play-game")
                 .help("Play a game in the status row while it builds: --play-game=snake|stack|runner, or one at random"))
             .action(wrap_rc(cmd_build)))
@@ -433,8 +435,8 @@ int run(int argc, char** argv) {
             // `run` accepted, and scripts written against it must keep working.
             .option(cl::Option("target-triple").takes_value().value_name("TRIPLE")
                 .help("Alias for --target"))
-            .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Run only the named workspace member (namespace.name or package name, then directory; single-member, no --workspace fan-out)"))
+            .option(cl::Option("package").short_name('p').takes_value().multiple().value_name("NAME")
+                .help("Run only the named workspace member (namespace.name or package name, then directory; one member: a second -p is refused)"))
             // DECLARED ON THE THREE COMMANDS THAT BUILD BEFORE THEY ACT, AS ON
             // `build`. The value has always reached them: the pre-parse loop
             // above publishes it as MCPP_TOOLCHAIN for every command, and
@@ -526,7 +528,7 @@ int run(int argc, char** argv) {
             .option(cl::Option("build-timeout").takes_value().value_name("SECS")
                 .help("Kill a compile/link drive still running after SECS seconds (default 0 = no limit; POSIX only)"))
             .option(cl::Option("workspace-timeout").takes_value().value_name("SECS")
-                .help("Stop the --workspace fan-out after SECS seconds and report what did run (default 0 = no limit)"))
+                .help("Start no further member's tests after SECS seconds since the command began, and report what did not run (default 0 = no limit); the build is bounded by --build-timeout"))
             .option(cl::Option("profile").takes_value().value_name("NAME")
                 .help("Build profile for the test build: dev (default) | release | dist | <[profile.*] name>"))
             .option(cl::Option("features").takes_value().value_name("LIST")
@@ -535,8 +537,8 @@ int run(int argc, char** argv) {
                 .help("Pin capability providers (e.g. blas=openblas,lapack=mkl)"))
             .option(cl::Option("strict")
                 .help("Treat manifest schema warnings (unknown feature/platform) as errors"))
-            .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Run tests only for the named workspace member (namespace.name or package name, then directory)"))
+            .option(cl::Option("package").short_name('p').takes_value().multiple().value_name("NAME")
+                .help("Run the tests of the named workspace member (namespace.name or package name, then directory); repeat to test several"))
             .option(cl::Option("toolchain").takes_value().value_name("SPEC")
                 .help("Build the tests with this toolchain for one invocation, e.g. llvm@22.1.8"))
             .option(cl::Option("cache").takes_value().value_name("MODE")
@@ -545,6 +547,8 @@ int run(int argc, char** argv) {
                 .help("Deprecated alias for --cache=off (also clears the build dir)"))
             .option(cl::Option("workspace")
                 .help("Run tests for all workspace members"))
+            .option(cl::Option("exclude").takes_value().multiple().value_name("NAME")
+                .help("With --workspace (or at a virtual workspace root), leave the named member out; repeatable, refused with -p"))
             .option(cl::Option("play-game")
                 .help("Play a game in the status row while it builds: --play-game=snake|stack|runner, or one at random"))
             .action(wrap_rc([&passthrough](const cl::ParsedArgs& p) {
@@ -637,7 +641,7 @@ int run(int argc, char** argv) {
                 .help("tar (default; .zip for a Windows target) | dir | any "
                       "format the resolved graph provides (e.g. appimage, msi)"))
             .option(cl::Option("output").short_name('o').takes_value()
-                .help("Override output path"))
+                .help("Override output path; with several members, the directory each archive or tree is written below"))
             // Packaging builds RELEASE by default — the artifact leaves this
             // machine. `[build] default-profile` still wins when it is set;
             // this only replaces the "dev" fallback every other command uses.
@@ -657,8 +661,12 @@ int run(int argc, char** argv) {
                 .help("Output format: human (default) | json (one mcpp.pack envelope on stdout; narration on stderr)"))
             .option(cl::Option("no-strip")
                 .help("Ship the artifacts as built (default: strip debug info)"))
-            .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Pack the named workspace member (namespace.name or package name, then directory), as if run in its directory"))
+            .option(cl::Option("package").short_name('p').takes_value().multiple().value_name("NAME")
+                .help("Pack the named workspace member (namespace.name or package name, then directory), as if run in its directory; repeat to pack several, planned and built once"))
+            .option(cl::Option("workspace")
+                .help("Pack every workspace member that has a program target, planned and built once"))
+            .option(cl::Option("exclude").takes_value().multiple().value_name("NAME")
+                .help("With --workspace, leave the named member out; repeatable, refused with -p"))
             .option(cl::Option("debug-symbols").takes_value().value_name("DIR")
                 .help("Write the separated *.debug files here (default: discard)"))
             .action(wrap_rc(cmd_pack)))
@@ -704,8 +712,8 @@ int run(int argc, char** argv) {
                 .option(cl::Option("no-accel")
                     .help("Describe the variant built for no accelerator"))
                 .option(cl::Option("static").help("Describe the build with --static"))
-                .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                    .help("Describe only the named workspace member (namespace.name or package name, then directory)"))
+                .option(cl::Option("package").short_name('p').takes_value().multiple().value_name("NAME")
+                    .help("Describe the named workspace member (namespace.name or package name, then directory); repeat to describe several"))
                 .option(cl::Option("profile").takes_value().value_name("NAME")
                     .help("Build profile: dev (default) | release | dist | <[profile.*] name>"))
                 .option(cl::Option("release").help("Shorthand for --profile release"))
@@ -717,7 +725,9 @@ int run(int argc, char** argv) {
                 .option(cl::Option("strict")
                     .help("Treat manifest schema warnings (unknown feature/platform) as errors"))
                 .option(cl::Option("workspace")
-                    .help("Describe all workspace members in one document")))
+                    .help("Describe all workspace members in one document"))
+                .option(cl::Option("exclude").takes_value().multiple().value_name("NAME")
+                    .help("With --workspace (or at a virtual workspace root), leave the named member out; repeatable, refused with -p")))
             .action(wrap_rc([&dispatch_sub](const cl::ParsedArgs& p) {
                 return dispatch_sub("emit", p, {{"xpkg", cmd_emit_xpkg},
                                                 {"sbom", mcpp::cli::cmd_sbom},

@@ -328,13 +328,15 @@ namespace {
 // bootstrap status lines line up under the cyan "Downloading …" lines
 // produced via the BootstrapProgressCallback. We can't import mcpp.ui
 // from here (cyclic dep), so this is a tiny duplicate of that helper —
-// no color, no fanciness.
+// no color, no fanciness. It writes to standard error, which is the stream
+// mcpp.ui narrates on: a status line is never a command's result, and a
+// pipe that reads the result must not receive it.
 void print_status(std::string_view verb, std::string_view msg) {
     constexpr std::size_t W = 12;
     if (verb.size() >= W) {
-        std::println("{} {}", verb, msg);
+        std::println(stderr, "{} {}", verb, msg);
     } else {
-        std::println("{}{} {}", std::string(W - verb.size(), ' '), verb, msg);
+        std::println(stderr, "{}{} {}", std::string(W - verb.size(), ' '), verb, msg);
     }
 }
 
@@ -954,8 +956,8 @@ bool ensure_project_index_dir(
             repo.artifact = spec.artifact;
             repo.source   = spec.source;
         } else if (!spec.artifact.empty()) {
-            std::println("warning: [indices].{}: artifact source ignored "
-                         "(rev/tag/branch/path pins force git)", name);
+            std::println(stderr, "warning: [indices].{}: artifact source ignored "
+                                 "(rev/tag/branch/path pins force git)", name);
         }
         customRepos.push_back(std::move(repo));
     }

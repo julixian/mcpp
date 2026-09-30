@@ -76,6 +76,27 @@ mcpp test -- --verbose    # everything after `--` goes to each test binary
 `--timeout <secs>` 杀掉仍在运行的测试（默认 300；`0` 关闭），`--build-timeout <secs>`
 限制编译耗时。挂起的测试以它自己的名字被报为失败，而不是报成一个停止的任务。
 
+报告是命令的结果，写到标准输出：每个测试的结论、失败测试的输出、`test result` 行，
+以及 `--workspace` 时的 `workspace result` 行。构建的各步骤（`Compiling`、`Running`）
+属于叙述，写到标准错误，因此 `mcpp test > report.txt` 收集报告，
+`mcpp test 2>&1 | tee test.log` 两者都收集
+（见 [09 —— 按场景选命令](09-commands-by-scenario.md#输出流)）。
+
+### 在工作空间中
+
+```bash
+mcpp test -p core -p http              # the tests of two members
+mcpp test --workspace --exclude legacy # every member's but legacy's
+```
+
+`-p` 可以重复，`--exclude` 把成员从 `--workspace` 或虚拟根的全体选择中去掉；两者都按
+[07 —— 工作空间](07-workspace.md#53--p---package-选项)所述解析。对多个成员的测试把它们放在
+一起规划、只构建一次：同一配置的成员是一张构建图，因此它们共用的包只编译一次，它的构建
+程序只运行一次。然后每个成员的测试按 `[workspace] members` 的顺序运行，各自使用该成员
+自己的运行时目录。命令在某个成员失败后继续，无论失败的是测试、它的包的构建还是它的规划，
+逐成员汇报，只要有一个失败就以非零退出。发现按成员隔离，因此两个成员可以各有一个
+`tests/main.cpp`。
+
 ## 取到产物取不到的包的测试
 
 ```toml
@@ -153,6 +174,7 @@ mcpp test --message-format json
 - manifest 加载不了时，`mcpp test --list` 列出的是 `tests/**/*.cpp`，而不是它读不到的
   `[test] discover` 集合。
 - `--build-timeout` 只在 POSIX 上有效。
-- `--workspace-timeout` 限制 `--workspace` 扇出的耗时，并报告哪些成员跑完了；它不把
-  超时归因到某一个成员。
+- `--workspace-timeout` 限制 `--workspace` 扇出的运行，并报告哪些成员跑完了；它不把
+  超时归因到某一个成员。它在每个成员的测试开始前检查，因此不能打断成员共用的那次构建，
+  那次构建由 `--build-timeout` 限制。
 </content>

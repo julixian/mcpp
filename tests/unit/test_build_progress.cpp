@@ -344,7 +344,7 @@ TEST(ProgressModel, APackageIsNamedOnceWhenItsFirstStepFinishes) {
     rec.steps = 4;
     Build b(tmp.path);
     b.set_record(rec);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     b.pass_begin();
     const auto log = tmp.path / ".ninja_log";
     append(log, "# ninja log v6\n1\t10\t0\tobj/dep.o\taa\n");
@@ -355,7 +355,7 @@ TEST(ProgressModel, APackageIsNamedOnceWhenItsFirstStepFinishes) {
     b.status({4, 4, 50, 0, {}});
     b.pass_end();
     b.finish(true);
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     // The dependency first, as its first step finished first; each once; the
     // standard library module is the toolchain's and is not named.
     const auto dep = out.find("Compiling compat.dep v1.0.0");
@@ -379,13 +379,13 @@ TEST(ProgressModel, APackageTheCacheServesIsNamedCachedWithItsUnits) {
     rec.step  = {{"obj/a.o", 0}, {"obj/b.o", 1}};
     Build b(tmp.path);
     b.set_record(rec);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     b.pass_begin();
     append(tmp.path / ".ninja_log", "# ninja log v6\n1\t2\t0\tobj/a.o\taa\n1\t2\t0\tobj/b.o\tbb\n");
     b.status({2, 2, 2, 0, {}});
     b.pass_end();
     b.finish(true);
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     EXPECT_NE(out.find("Cached compat.ftxui v6.1.9 (73 units)"), std::string::npos) << out;
     EXPECT_EQ(count(out, "compat.ftxui"), 1u) << out;
 }
@@ -405,7 +405,7 @@ TEST(ProgressModel, OnlyTheMainPassIsCountedAsBuilding) {
     rec.steps = 1;
     Build b(tmp.path);
     b.set_record(rec);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     b.pass_begin(mcpp::build::progress::PassKind::Placement);
     b.status({503, 503, 1, 0, {}});
     const auto placing = mcpp::build::progress::status_row();
@@ -419,7 +419,7 @@ TEST(ProgressModel, OnlyTheMainPassIsCountedAsBuilding) {
     const auto building = mcpp::build::progress::status_row();
     b.pass_end();
     b.finish(true);
-    testing::internal::GetCapturedStdout();
+    testing::internal::GetCapturedStderr();
     EXPECT_EQ(placing.find("503"), std::string::npos) << placing;
     EXPECT_NE(scanning.find("Scanning"), std::string::npos) << scanning;
     EXPECT_NE(scanning.find("200/460"), std::string::npos) << scanning;
@@ -437,7 +437,7 @@ TEST(ProgressModel, AFailureNamesItsPackageOnce) {
     rec.step  = {{"obj/a.o", 0}, {"obj/l.o", 1}};
     Build b(tmp.path);
     b.set_record(rec);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     b.pass_begin();
     // A failed step is not in ninja's log: the package is named from the
     // FAILED line.
@@ -445,7 +445,7 @@ TEST(ProgressModel, AFailureNamesItsPackageOnce) {
     const auto second = b.failed("obj/a.o ");
     b.pass_end();
     b.finish(false);
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(*first, "lib v0.1.0 (lib)");
     EXPECT_FALSE(second.has_value());
@@ -463,7 +463,7 @@ TEST(ProgressModel, AStepWhoseEntriesAreReadInTwoPiecesCountsOnce) {
     rec.step  = {{"obj/lib.m.o", 0}, {"pcm.cache/lib.pcm", 0}, {"bin/lib.a", 1}};
     Build b(tmp.path);
     b.set_record(rec);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     b.pass_begin();
     const auto log = tmp.path / ".ninja_log";
     append(log, "# ninja log v6\n1\t10\t0\tobj/lib.m.o\taa\n");
@@ -472,6 +472,6 @@ TEST(ProgressModel, AStepWhoseEntriesAreReadInTwoPiecesCountsOnce) {
     b.status({1, 2, 10, {}, {}});
     b.pass_end();
     b.finish(true);
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     EXPECT_EQ(count(out, "Compiling lib"), 1u) << out;
 }

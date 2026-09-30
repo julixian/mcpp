@@ -6,7 +6,9 @@ import mcpp.fetcher.progress;
 import mcpp.platform.process;
 
 // W11: one renderer for every acquisition, with a terminal mode (redrawn in
-// place) and a plain mode; either prints one line per item (#734).
+// place) and a plain mode; either prints one line per item (#734). The renderer
+// narrates, and narration is on standard error (output streams plan
+// 2026-10-01, R3), which is what these tests capture.
 
 TEST(GitProgress, ParsesThePhaseAndThePercentage) {
     auto r = mcpp::fetcher::parse_git_progress(
@@ -28,7 +30,7 @@ TEST(GitProgress, ParsesThePhaseAndThePercentage) {
 TEST(ProgressBarPlain, OneCompletionLineWithoutRepaints) {
     mcpp::ui::disable_color();
     mcpp::ui::set_live_progress(false);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     {
         mcpp::ui::ProgressBar bar("Fetching", "example");
         bar.update_bytes(10, 100, 0.1);
@@ -36,7 +38,7 @@ TEST(ProgressBarPlain, OneCompletionLineWithoutRepaints) {
         bar.update_bytes(100, 100, 1.0);
         bar.finish();
     }
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     EXPECT_EQ(out.find('\r'), std::string::npos) << out;
     EXPECT_EQ(out.find('\x1b'), std::string::npos) << out;
     // #734: one line per item, stating the size and the time.
@@ -47,13 +49,13 @@ TEST(ProgressBarPlain, OneCompletionLineWithoutRepaints) {
 TEST(ProgressBarPlain, AFailedItemIsNotReportedDone) {
     mcpp::ui::disable_color();
     mcpp::ui::set_live_progress(false);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     {
         mcpp::ui::ProgressBar bar("Installing", "xim:example");
         bar.update_indeterminate(0, 0.2);
         bar.finish_failed("xim:example");
     }
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     EXPECT_NE(out.find("did not complete"), std::string::npos) << out;
     EXPECT_EQ(out.find(" done"), std::string::npos) << out;
 }
@@ -61,14 +63,14 @@ TEST(ProgressBarPlain, AFailedItemIsNotReportedDone) {
 TEST(DownloadProgressPlain, AnInterruptedDownloadIsNotReportedDone) {
     mcpp::ui::disable_color();
     mcpp::ui::set_live_progress(false);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     {
         mcpp::ui::DownloadProgress dl;
         const mcpp::ui::DownloadFile f{"xim-index.tar.gz", 10, 100, true, false};
         dl.update(std::span{&f, 1}, 0.2);
         dl.finish_failed();
     }
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     EXPECT_NE(out.find("xim-index.tar.gz did not complete"), std::string::npos) << out;
     EXPECT_EQ(out.find(" done"), std::string::npos) << out;
 }
@@ -76,13 +78,13 @@ TEST(DownloadProgressPlain, AnInterruptedDownloadIsNotReportedDone) {
 TEST(ProgressBarLive, RedrawsInPlace) {
     mcpp::ui::disable_color();
     mcpp::ui::set_live_progress(true);
-    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
     {
         mcpp::ui::ProgressBar bar("Fetching", "example");
         bar.update(100);
         bar.finish();
     }
-    auto out = testing::internal::GetCapturedStdout();
+    auto out = testing::internal::GetCapturedStderr();
     mcpp::ui::set_live_progress(false);
     EXPECT_NE(out.find('\r'), std::string::npos) << out;
 }

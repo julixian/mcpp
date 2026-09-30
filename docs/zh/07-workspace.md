@@ -308,17 +308,20 @@ warning: dependency `render` declares standard = "c++26", and this graph is
 ```bash
 mcpp build                  # virtual workspace → builds ALL members; rooted → the root package
 mcpp build -p server        # build a specific member and its dependencies
+mcpp build -p server -p cli # build several members, in one plan
 mcpp build --workspace      # build every member explicitly
+mcpp build --workspace --exclude legacy   # every member but legacy
 mcpp test                   # virtual workspace → tests ALL members; rooted → the root package
 mcpp test  -p core          # test a single member
+mcpp test  -p core -p http  # test several members: one plan, one build, one report per member
 mcpp test  --workspace      # test every member (one report per member; continues past failures)
 ```
 
 在**虚拟**工作空间根（只有 `[workspace]`、没有 `[package]`）下，裸 `mcpp build` /
 `mcpp test` 作用于**全体**成员；在**带根包**的工作空间（`[package]` +
 `[workspace]`）下，两者作用于根包；`--workspace` 作用于根包与全体成员。
-`mcpp test --workspace` 独立构建并运行每个成员的 `tests/**/*.cpp`——发现按成员
-隔离，因此两个成员各有一个 `tests/main.cpp` 也不冲突。
+对多个成员的 `mcpp test` 把它们放在一起规划、只构建一次（§5.4），然后运行每个成员的
+`tests/**/*.cpp`——发现按成员隔离，因此两个成员各有一个 `tests/main.cpp` 也不冲突。
 
 ### 5.2 从成员子目录构建
 
@@ -333,8 +336,8 @@ mcpp 从当前目录向上搜索；若发现某个 `mcpp.toml` 含 `[workspace]`
 
 ### 5.3 `-p, --package` 选项
 
-`-p` 可用于 `build`、`test`、`run` 等命令，指定目标成员。选项名说的是**包**，
-参数值按下述顺序解析：
+`-p` 可用于 `build`、`test`、`run`、`mcpp emit build-database` 等命令，指定目标成员。
+选项名说的是**包**，参数值按下述顺序解析：
 
 1. 成员的限定名 `<namespace>.<name>`（只有声明了 namespace 的成员才有这个拼法）；
 2. 否则，成员裸的 `package.name`——如果两个以上成员共享它，拒绝并点名每一个匹配；
@@ -350,29 +353,63 @@ mcpp run -p server -- --port 8080
 参数值若既是某个成员的包名，又是另一个成员的目录，选中包名所命名的那个成员，并给
 出警告点名另一个成员——选项名的是包，包名的精确匹配压过恰好同名的目录。
 
-`--workspace`（用于 `build` 与 `test`）是扇出形式：作用于**每个**成员。
-`mcpp test --workspace` 逐成员分别汇报，遇失败继续，只要有任一成员失败就非零
-退出——很适合作为"一个测试众多库的工作空间"单条、无需 shell 的 CI 步骤。
+#### 多个成员（mcpp 2026.10.1.1+）
+
+`-p` 可以在 `build`、`test` 与 `mcpp emit build-database` 上重复。每个值指定一个成员，
+按上述顺序解析，命令作用于所有这些成员。选择是一个**集合**，无论 `-p` 怎么排列，都按
+`[workspace] members` 的顺序保存；同一个成员被两种拼法各指定一次，只选中一次。
+
+```bash
+mcpp build -p server -p cli         # the same members as -p cli -p server
+mcpp test  -p core -p http
+```
+
+指定不到任何成员的值会在规划任何内容之前被拒绝，拒绝信息列出各成员。`-p` 与 `--workspace` 同时出现也会被拒绝：两者陈述了两种选择，任何一方都不会被默认取代另一方。`mcpp run` 执行
+一个程序，所以只作用于一个成员：第二个 `-p` 被拒绝，并点名所有被指定的成员，绝不会被
+理解为"取最后一个"。
+
+#### 排除成员：`--exclude`
+
+```bash
+mcpp build --workspace --exclude legacy      # every member but legacy
+mcpp test  --exclude legacy --exclude bench  # at a virtual root: every member but two
+```
+
+`--exclude <name>` 可以在 `build`、`test` 与 `mcpp emit build-database` 上重复。它的值按
+与 `-p` 相同的方式解析，从"选中每个成员"的选择中去掉成员：`--workspace`，或不带 `-p` 的
+虚拟根。下列情形在规划任何内容之前被拒绝：与 `-p` 同时出现；两种形式都不适用时（在成员
+目录中，或在带根包的根下且没有 `--workspace`）；名字不匹配任何成员；以及它去掉了所有成员。
+
+`--workspace`（用于 `build`、`test` 与 `mcpp emit build-database`）是扇出形式：作用于
+**每个**成员。`mcpp test --workspace` 逐成员分别汇报，遇失败继续，只要有任一成员失败就
+非零退出——很适合作为"一个测试众多库的工作空间"单条、无需 shell 的 CI 步骤。成员无论因
+什么失败都只让自己失败：一个测试、它的包的构建，或者它的规划（无法规划的成员被排除在外，
+其余成员重新放在一起规划）。
 
 #### 扇出的汇报
 
 ```
+   Workspace building 97 members: libs/core, libs/http, ...
+   Workspace built members libs/core, libs/http, ... in 120.40s; slowest: obj/libs/jsc/tests/jsc.o 88.0s
    Workspace testing member 'libs/core' (3/97)
 test_paths ... ok (0.31s)
- test result ok. 7 passed; 0 failed; finished in 9.50s (build 8.90s + run 0.60s)
-   Workspace member 'libs/core' (3/97) ok — 7 passed in 9.50s
+ test result ok. 7 passed; 0 failed; finished in 121.10s (build 120.40s + run 0.60s)
+   Workspace member 'libs/core' (3/97) ok — 7 passed, run 0.60s
 ...
  workspace result ok. 97 member(s); 412 passed; 0 failed; finished in 355.20s
-    slowest: libs/jsc 93.5s, libs/install 32.2s, libs/http 24.1s
+    slowest: libs/install 32.2s, libs/http 24.1s
 ```
 
-`M/N` 进度、逐测试耗时，以及按 **build** 与 **run** 拆开的成员耗时。拆开才是有用
-的部分：一个测试只要几毫秒、但链接要 90 秒的成员，在单个合并数字里与"测试套件本身
-很慢"长得一模一样，而这两种情形只有一种值得去查。
+`M/N` 进度与逐测试耗时。同一配置的成员只构建一次，因此构建只在组的那一行里报告一次：
+它的成员、它的墙钟时间，以及占用时间最多的那些边。这就是原先逐成员拆分所给出的信号：
+链接要 90 秒、而不是测试慢的成员，会被组的 `slowest:` 边点名。每个成员自己的那一行写
+出它的**运行**耗时，最后的 `slowest:` 一行按这个耗时给成员排名。
 
-`--message-format json` 以 NDJSON 承载同样的数据。每条 test 记录都带成员限定
-字段（`"member"`），流的末尾是一条 `workspace_summary` 记录，列出失败成员与未
-运行成员——一旦两个成员都有一个叫 `smoke` 的测试，裸测试名就不再能归因。
+`--message-format json` 以 NDJSON 承载同样的数据。每条 test 记录都带成员限定字段
+（`"member"`），`group_build` 记录在每个组的第一条测试记录之前说明该组的构建，每个成员的
+汇总指明它的组（`build_group`），流的末尾是一条 `workspace_summary` 记录，列出失败成员与
+未运行成员——一旦两个成员都有一个叫 `smoke` 的测试，裸测试名就不再能归因。各字段见
+[50 —— 机器可读输出](50-machine-output.md#mcpp-test---message-format-json--测试流)。
 
 #### 给扇出设期限
 
@@ -382,10 +419,16 @@ mcpp test --workspace --build-timeout 300 # per-ninja-drive deadline (default 0 
 mcpp test --workspace --workspace-timeout 1800   # whole fan-out (default 0 = no limit)
 ```
 
-扇出是串行的，所以一个没有上界的成员会拖住排在它后面的每一个成员。三个期限都是
-**汇报而非中止**：测试超时只判该测试失败，扇出继续；构建超时只判该成员失败；
+各成员的运行是串行的，所以一个没有上界的成员会拖住排在它后面的每一个成员。三个期限都是
+**汇报而非中止**：测试超时只判该测试失败，扇出继续；构建超时判等待这次构建的成员失败；
 `--workspace-timeout` 停止扇出并列出未运行的成员，而不是把进程留给 CI 去 kill——
 那样会把进程本该说出的话一并丢掉。
+
+`--workspace-timeout` 限制的是运行，从命令开始时计时：它在每个成员的测试开始前检查，到那
+时还没有开始的成员被列为未运行（2026.10.1.1+）。一个组的成员在同一步中构建，期限无法打断
+这一步，因此仅构建就超过期限的工作空间会把这次构建做完（由 `--build-timeout` 限制），然后
+不再启动任何成员。2026.10.1.1 之前每个成员依次构建、依次运行，期限可以在两次构建之间停止
+扇出。
 
 ### 5.4 每个配置一张构建图（mcpp 2026.9.29.1+）
 
@@ -397,7 +440,8 @@ mcpp test --workspace --workspace-timeout 1800   # whole fan-out (default 0 = no
   在各自的图中构建，这些图同时进行，共享命令的并行任务数。成员写下的相对路径（例如它自己的
   `[indices]` 路径）按该成员的目录解析。
 - **选择。** `--workspace`，以及虚拟工作空间根下不带 `-p` 的命令，选中全体成员；`-p X` 与在
-  X 的目录中执行的命令规划 X 及其所依赖的一切。两者共用构建目录，因此先执行
+  X 的目录中执行的命令规划 X 及其所依赖的一切；`-p X -p Y` 把两者放在一起规划，作为一个
+  选择（§5.3）。这些选择共用构建目录，因此先执行
   `mcpp build --workspace` 再执行 `mcpp build -p X` 不编译任何内容；只有当某个包在两条命令中
   启用的 feature 不同时，它才会被重新编译。
 - **编译参数。** 成员的 `cflags`、`cxxflags`、`ldflags` 与 defines 作用于该成员自己的命令。
@@ -413,7 +457,15 @@ mcpp test --workspace --workspace-timeout 1800   # whole fan-out (default 0 = no
 - **资源。** 成员的 `[resources]` 与 `windows_code_page` 按该成员的目录与 include 目录编译，
   只嵌入该成员自己的程序与共享库（2026.9.29.2+）。
 - **构建程序。** 成员的构建程序按依赖在前的顺序运行；只要程序的输入不变，无论命令选中哪些
-  成员，程序的结果都被复用（2026.9.29.5+）。
+  成员，程序的结果都被复用（2026.9.29.5+）。它们的编译同时进行，数量以作业数为上限，只有运行
+  遵循这个顺序，因此计划与串行构建写出的相同；多个程序 import 的同一个 host 模块只为它们
+  编译一次（2026.10.1.1+；见 [30 — 构建程序](30-build-mcpp.md)）。
+- **测试。** 对多个成员的 `mcpp test` 按 `build` 的方式规划：每个配置一次，包含各成员的
+  测试，因此成员共用的包只编译一次，它的构建程序只运行一次，它的 feature 是选择所请求的
+  并集（2026.10.1.1+）。该配置的包与测试二进制只构建一次；然后每个成员的测试按成员顺序
+  运行，使用该成员自己的运行时目录，而不是其他成员的。在 `mcpp build --workspace` 之后运行
+  的测试不会编译构建已经编译过的任何内容，除非某个 dev-dependency 改变了包的 feature。
+  对一个成员的 `mcpp test` 是该成员的一次规划，一如既往。
 - **编译数据库。** `mcpp build --configure-only` 与 `mcpp emit build-database` 按构建的方式
   规划，每个配置一次规划并包含各成员的测试，因此成员共用的包在每个配置中只描述一次。规划了
   多个配置的命令只写一次根目录的 `compile_commands.json`，内容为各配置数据库的并集
@@ -468,7 +520,8 @@ myproject/
 - 工作空间根的 `compile_commands.json` 覆盖所有已构建或已配置的成员。
 - 工作空间根的 `mcpp.lock` 记录全体成员的解析结果。`mcpp build --workspace` 写入完整记录；
   `mcpp build -p X` 更新 X 所在图中的条目。
-- 成员的构建程序写入 `<member>/target/.build-mcpp/`。
+- 成员的构建程序写入 `<member>/target/.build-mcpp/`。各程序 import 的 host 模块编译进
+  workspace 自己的 `target/.build-mcpp/host-modules/`，为全体程序只编一次。
 - 早期版本的 mcpp 在成员自己的 `target/` 下留下的构建目录不再被读取；`mcpp clean --stale`
   会删除它们。
 

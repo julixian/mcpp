@@ -125,6 +125,22 @@ $ echo $?
 答案是一次拒绝。§1 依然成立 —— 解析 stdout，不要按退出码分支 —— 但一个把任何
 非零退出都当成「没有输出」的客户端，会丢掉它已经拿到手的文档。
 
+### 标准输出携带结果，标准错误携带叙述
+
+每条命令都写两个流，划分方式对所有命令相同。2026.9.30.2 及更早的版本把叙述写到标准输出，所以原先在那里读取叙述的使用方，现在应当读标准错误。
+
+| 流 | 携带的内容 |
+|---|---|
+| 标准输出 | 命令的**结果**：`mcpp run` 下程序打印的内容；文档（信封、`mcpp emit`、`mcpp run --list-runners`、`--version`、`--help`）；列表（`mcpp toolchain list`、`mcpp cache list`、`mcpp search`、`mcpp test --list`）；以及 `mcpp test` 的报告：每个测试的结论、失败测试的输出、`test result` 行，以及工作区运行的 `workspace result` 行 |
+| 标准错误 | **叙述**：状态行（`Resolving`、`Compiling`、`Finished`、`Running`、`Packing`、`Packed`、`Downloading`、`Updating` 及其他以动词开头的行）、终端上的进度条与状态行、`Running` 之后的空行、`warning:`、`error:`、`note:`、`tip:` 行、编译器诊断，以及 `--verbose` 增加的内容 |
+
+判断一行属于哪个流，依据它的用途。说明命令正在做什么或已经做了什么的行是叙述；命令被要求产生的东西是结果。Cargo 把 libtest 的报告写到标准输出，`mcpp test` 同理。
+
+- **管道只收到结果。** `mcpp run -q 2>/dev/null` 写出的恰好是程序的标准输出；`mcpp build >/dev/null` 仍然显示各步骤。在终端上两个流都到达屏幕，状态行画在标准错误上，所以 `mcpp build 2>/dev/null` 不显示状态行。
+- **`--quiet` 抑制叙述**，包括 `Running` 之后的空行，保留警告、错误和诊断。
+- **机器可读模式**（`--format json`、`--message-format json`）仍把标准输出留给自己的文档。它们在标准错误上叙述什么没有变化：`mcpp test --message-format json` 不叙述；`mcpp pack --message-format json` 与 `mcpp emit build-database` 在规划与构建期间在标准错误上叙述。
+- **两个流在同一条管道上保持写入顺序。** `mcpp build 2>&1 | tee log` 记录各步骤，这是原先写 `mcpp build | tee log` 的脚本应改成的写法（同时捕获两个流的 CI 日志不受影响）。
+
 ## 4. effects —— 命令在打印结果之前执行的动作
 
 一个带有 untrusted-workspace 门禁的 IDE，必须在**运行之前**就做出决定。等
@@ -188,14 +204,19 @@ mcpp cache list --json            ->  {"root": …, "entries": [ … ]}
 
 ## 6. 退出状态
 
-`mcpp run` 报告的是程序自身的退出状态。整个取值空间分三段，只有第一段属于
+`mcpp run` 报告的是程序自身的退出状态。整个取值空间分四段，只有第一段属于
 程序：
 
 | 区间 | 含义 |
 |---|---|
-| `0`–`124` | 程序运行过了；这是它自己的状态，原样透传 |
+| `0`–`124` | 程序运行过了；这是它自己的状态，原样透传。例外是 `101`，见下一行 |
+| `101` | `mcpp run` 无法构建程序：规划或构建失败，没有启动任何东西。这是 `cargo run` 构建失败时 Cargo 给出的状态 |
 | `125`–`127` | 尝试过启动但被拒绝 —— `127` 是找不到，`126` 是找到了但不可执行，`125` 是其他原因；对 `mcpp run --format <f>` 而言，一个是目录、且没有任何 runner 能到达的分发物同样得到 `126`，它在启动之前就被拒绝，含义相同（2026.9.14.2+） |
-| `2` | mcpp 在尝试启动任何东西之前就拒绝了：用法、配置或解析错误 |
+| `2` | mcpp 在构建任何东西之前拒绝了请求，或在构建之后、启动任何东西之前拒绝了请求：用法错误、`--format` 与 `--no-runner` 同用、项目没有声明的程序或 runner |
+
+在 2026.9.30.2 之前，构建失败退出 `1`，规划失败退出 `2`，脚本因此无法区分
+一次编译错误和一个返回 `1` 的程序。现在构建失败是 `101`；`mcpp build`、
+`mcpp test`、`mcpp pack` 保持各自的状态。
 
 在 2026.9.4.3 之前，所有非零状态都被折叠成 `1`，目的是让 `2` 能表示「起不来」
 以区别于「跑了但失败」。这个区分值得保留，但代价不值得：`main` 返回 `3` 的
@@ -204,12 +225,15 @@ mcpp cache list --json            ->  {"root": …, "entries": [ … ]}
 
 中间那一段，是 `env`、`timeout`、`nice` 早已在用、并且被 shell 文档化的取
 值，因此 `126` 与 `127` 到达时带着它们惯常的含义，而不是本项目自行分配的
-编号。
+编号。`101` 同理，它是 Cargo 的取值。
 
-**程序自身也可以以 `125`–`127` 退出，mcpp 不试图靠数字去区分两者。** 区分它
-们的是：启动失败一定会向 stderr 写出原因，而程序自身的退出状态从不这样做。
-需要确定结果的客户端应当读 stderr，或者使用 `--format json` —— 那里退出
-状态是一个字段，不是一条通道。
+**程序自身也可以以 `101` 或 `125`–`127` 退出，mcpp 不试图靠数字去区分两者。**
+区分它们的是：构建或启动失败一定会向 stderr 写出原因，而程序自身的退出状态从
+不这样做。需要确定结果的客户端应当读 stderr，或者使用 `--format json` —— 那里
+退出状态是一个字段，不是一条通道。
+
+使用 runner（`--runner`、`[target.<triple>].runner`）时，透传的是 runner 的状态；
+自己返回 `101` 的 runner 读起来与构建失败相同。这一点被接受，Cargo 也是如此。
 
 `mcpp test` 保持不变，仍然是 `0` 或 `1`：它聚合了多个程序的结果，没有单一的
 状态可以透传。每个测试各自的退出码在 JSON 流的 `exit_code` 字段里（见
@@ -496,10 +520,17 @@ mcpp pack [target] [--format <f>] [--target <triple>...] --message-format json
 | 字段 | |
 |---|---|
 | `artifacts` | 每个产出的产物一条记录：`path`（绝对路径）、`type`（`file` 或 `directory`）、`format`（`--format` 的取值，省略时为 `tar`），以及 `targets`（进入该产物的每条腿的规范三元组）。被分派的格式报告本次请求引入的那些 action 的终端输出；一个多 `--target` 的 Android 打包报告一个产物，其 `targets` 列出每一条腿 |
-| `stage` | 该产物所来自的那棵树：`dir`、`manifest`（即下文的暂存清单）与 `closure`（`walked` 或 `not-walked`）；库包，以及没有暂存任何树的情形，此字段为 `null` |
+| `stage` | 该产物所来自的那棵树：`dir`、`manifest`（即下文的暂存清单）与 `closure`（`walked` 或 `not-walked`）；库包、没有暂存任何树的情形，以及对多个成员的打包，此字段为 `null` |
+| `stages` *（2026.10.1.1+）* | 只在对多个成员的打包（`--workspace`，或重复的 `-p`）中出现：每个成员一条记录，按 `[workspace] members` 的顺序，带 `member`（限定的包名），以及与 `stage` 相同的 `dir`、`manifest`、`closure` |
+
+对多个成员的打包，`artifacts` 按同样的成员顺序列出每个成员的产物，每条记录多出
+`member`，即它所属成员的限定包名。对一个成员的打包既没有 `stages` 也没有 `member`：
+信封与以往完全一样。
 
 失败时省略 `data`，以命令自身的退出码退出，并携带诊断码
-`MCPP_PACK_FAILED`；原因写在 stderr 上。每次运行的 `effects` 是
+`MCPP_PACK_FAILED`；原因写在 stderr 上。对多个成员的打包若有成员失败，则对每个这样的成员
+再多带一条点名它的 `MCPP_PACK_FAILED` 诊断，同样省略 `data`：已经打包的成员在磁盘上，
+并在 stderr 上点名。每次运行的 `effects` 是
 `read-project`、`write-project` 与 `write-global-cache`，若运行了某个构建
 程序则再加上 `exec-build-script`。`--protocol-version` 为 `pack` 声明
 `init-mcpp-home`、`read-project`、`write-project`、`network`、
@@ -513,8 +544,9 @@ mcpp test [pattern] [--workspace] --message-format json
 
 这条流早于 §2 的信封，也不被它包裹：它是 NDJSON，每个测试结束时一条记录，随后
 每个成员一条汇总记录。`--workspace` 运行以一条 `workspace_summary` 记录
-结束。§7 的保证对它同样成立 —— 字段只增不减，字段含义永不改变 —— 下表是
-2026.9.2.1 时点的契约。
+结束。对多个成员的测试会在每个组的第一条测试记录之前增加一条 `group_build` 记录。
+§7 的保证对它同样成立 —— 字段只增不减，字段含义永不改变 —— 下表是
+2026.9.2.1 时点的契约，各行注明其后的新增。
 
 每个测试：
 
@@ -525,7 +557,8 @@ mcpp test [pattern] [--workspace] --message-format json
 | `status` | `pass`、`compile_fail`、`run_fail`、`not_run` 或 `built` |
 | `exit_code` | 该测试的退出状态；`not_run` 与 `built` 时为 `0` |
 | `signal` | 状态编码了信号时为信号编号，否则为 `null` |
-| `duration_ms` | 该测试构建加运行的墙钟时间 |
+| `duration_ms` | 决定该测试状态的那一步的墙钟时间：运行过的测试是运行，`compile_fail` 是构建 |
+| `build_ms` | 本次调用中该测试自身二进制的构建耗时，即它的链接边与主单元编译边在 `.ninja_log` 里的耗时之和；两者都未重新构建时为 `0` *（2026.10.1.1+）* |
 | `timed_out` | 被 `--timeout` 杀掉时为 `true`（`run_fail`） |
 | `compile_output`、`run_output` | 捕获到的诊断输出 |
 | `reason` | 仅 `not_run` 时：一句话说明原因；其余情况为 `""` |
@@ -539,6 +572,32 @@ mcpp test [pattern] [--workspace] --message-format json
 | `not_run_reason` | 它们共同的原因，或 `""` |
 | `built` | 在 `--no-run` 下构建、本就不打算执行的测试数 |
 | `elapsed_ms`、`build_ms`、`run_ms` | 墙钟时间，分段给出 |
+| `build_group` | *（2026.10.1.1+）* 成员与其他成员一起规划时出现：它的测试所等待的那次构建所属的 `group_build` 记录的 `group` |
+
+`build_ms` 是该成员的测试等待它们的构建所用的墙钟时间。单独规划的成员，它就是自己
+的构建；与其他成员一起规划的成员，它是整个组的构建时间，同一组的每个成员数字相同，
+对 `build_ms` 按成员求和的消费方按 `build_group` 去重；不求和的消费方不受影响。
+`elapsed_ms` 是整个成员的墙钟时间，包含规划与组的构建。
+
+### 组记录*（2026.10.1.1+）*
+
+对多个成员的 `mcpp test` 把同一配置的成员放在一起规划、只构建一次，因此构建的时间
+属于组，只说一次。每个组一条记录，位于该组第一条测试记录之前：
+
+```json
+{"group_build":{"group":0,"members":["libs/a","libs/b"],"build_ms":8210}}
+```
+
+| 字段 | |
+|---|---|
+| `group` | 组的编号，从 0 起，按构建顺序 |
+| `members` | 该组规划的成员，按 `[workspace] members` 的写法 |
+| `build_ms` | 该组构建的墙钟时间：它的包与每个测试二进制 |
+
+组内某个成员的包构建失败时，报告
+`{"error":"package","member":"…","compile_output":"…"}`，该组中包能构建的成员照常
+运行。用 `-p` 或命令所在目录指定的单个成员的测试，既没有这条记录，也没有 `build_group`；
+全体选择（`--workspace`，或虚拟根下不带 `-p`）即使只含一个成员，也按分组形式报告。
 
 **`built` 与 `not_run` 是两个不同的答案，分开计数。** 两者描述的都是一个
 编译过、没有执行的测试，相似之处到此为止：`not_run` 意味着 mcpp 试过而做不

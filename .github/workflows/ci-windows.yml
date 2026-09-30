@@ -394,7 +394,9 @@ jobs:
           # the global default in `toolchain list` / doctor output.
           TMP=$(mktemp -d); cd "$TMP"
 
-          out=$("$MCPP_SELF" toolchain default msvc); echo "$out"
+          # Both streams: `Detected` and `Default set to` are narration, on
+          # standard error since 2026.10.1.1.
+          out=$("$MCPP_SELF" toolchain default msvc 2>&1); echo "$out"
           grep -q "Detected"     <<<"$out"
           grep -q "msvc@system"  <<<"$out"
 

@@ -326,18 +326,22 @@ a descriptor generator rather than by the person reading the message.
 ```bash
 mcpp build                  # virtual workspace → builds ALL members; rooted → the root package
 mcpp build -p server        # build a specific member and its dependencies
+mcpp build -p server -p cli # build several members, in one plan
 mcpp build --workspace      # build every member explicitly
+mcpp build --workspace --exclude legacy   # every member but legacy
 mcpp test                   # virtual workspace → tests ALL members; rooted → the root package
 mcpp test  -p core          # test a single member
+mcpp test  -p core -p http  # test several members: one plan, one build, one report per member
 mcpp test  --workspace      # test every member (one report per member; continues past failures)
 ```
 
 At a **virtual** workspace root (only `[workspace]`, no `[package]`), bare
 `mcpp build` / `mcpp test` act on **all** members. At a **rooted** workspace
 (`[package]` + `[workspace]`), they act on the root package; `--workspace`
-acts on the root package and every member. `mcpp test --workspace` builds + runs each member's
-`tests/**/*.cpp` independently — discovery is scoped per member, so two members may
-each have a `tests/main.cpp` without colliding.
+acts on the root package and every member. `mcpp test` over several members
+plans them together and builds once (§5.4), then runs each member's
+`tests/**/*.cpp` — discovery is scoped per member, so two members may each have
+a `tests/main.cpp` without colliding.
 
 ### 5.2 Building from a Member Subdirectory
 
@@ -350,9 +354,9 @@ mcpp searches upward from the current directory; if it finds an `mcpp.toml` cont
 
 ### 5.3 The `-p, --package` Option
 
-`-p` works with `build`, `test`, `run`, and other commands to select the target
-member. Its value is resolved in one order, because the option names a
-*package*:
+`-p` works with `build`, `test`, `run`, `mcpp emit build-database` and other
+commands to select the target member. Its value is resolved in one order,
+because the option names a *package*:
 
 1. a member's qualified name, `<namespace>.<name>` (only meaningful for a
    member that declares a namespace);
@@ -372,32 +376,76 @@ selects the member named by the package, with a warning naming the other one —
 the option promises a package, so an exact package-name match outranks a
 directory that merely happens to share the spelling.
 
-`--workspace` (on `build` and `test`) is the fan-out form: it acts on **every**
-member. `mcpp test --workspace` reports each member separately and continues past a
-failing member, exiting non-zero if any member failed — ideal as a single,
-shell-free CI step for a workspace that tests many libraries.
+#### Several members (mcpp 2026.10.1.1+)
+
+`-p` may be repeated on `build`, `test` and `mcpp emit build-database`. Each
+value names one member, resolved by the order above, and the command acts on
+all of them. The selection is a **set**, kept in `[workspace] members` order
+whatever order `-p` was written in; a member named twice, by two spellings, is
+selected once.
+
+```bash
+mcpp build -p server -p cli         # the same members as -p cli -p server
+mcpp test  -p core -p http
+```
+
+A value that names no member is refused before anything is planned, and the
+refusal lists the members. `-p` together with `--workspace` is refused as
+well: the two state two selections, and neither is taken over the other.
+`mcpp run` executes one program, so it acts on one
+member: a second `-p` is refused, naming every member asked for, and is never
+read as "the last one".
+
+#### Leaving members out: `--exclude`
+
+```bash
+mcpp build --workspace --exclude legacy      # every member but legacy
+mcpp test  --exclude legacy --exclude bench  # at a virtual root: every member but two
+```
+
+`--exclude <name>` may be repeated on `build`, `test` and `mcpp emit
+build-database`. Its value is resolved like `-p`, and it removes members from
+a selection of every member: `--workspace`, or a virtual root without `-p`.
+It is refused, before anything is planned, together with `-p`, where neither
+form applies (inside a member, or at a rooted root without `--workspace`), for
+a name that matches no member, and when it leaves no member.
+
+`--workspace` (on `build`, `test` and `mcpp emit build-database`) is the fan-out
+form: it acts on **every** member. `mcpp test --workspace` reports each member
+separately and continues past a failing member, exiting non-zero if any member
+failed — ideal as a single, shell-free CI step for a workspace that tests many
+libraries. A member fails alone whatever failed in it: a test, its package's
+build, or its plan (a member that cannot be planned is planned without, and the
+others are planned together again).
 
 #### The fan-out report
 
 ```
+   Workspace building 97 members: libs/core, libs/http, ...
+   Workspace built members libs/core, libs/http, ... in 120.40s; slowest: obj/libs/jsc/tests/jsc.o 88.0s
    Workspace testing member 'libs/core' (3/97)
 test_paths ... ok (0.31s)
- test result ok. 7 passed; 0 failed; finished in 9.50s (build 8.90s + run 0.60s)
-   Workspace member 'libs/core' (3/97) ok — 7 passed in 9.50s
+ test result ok. 7 passed; 0 failed; finished in 121.10s (build 120.40s + run 0.60s)
+   Workspace member 'libs/core' (3/97) ok — 7 passed, run 0.60s
 ...
  workspace result ok. 97 member(s); 412 passed; 0 failed; finished in 355.20s
-    slowest: libs/jsc 93.5s, libs/install 32.2s, libs/http 24.1s
+    slowest: libs/install 32.2s, libs/http 24.1s
 ```
 
-`M/N` progress, per-test durations, and a per-member time split into **build** vs
-**run**. The split is the useful part: a member whose tests take milliseconds but
-whose link takes 90 seconds looks identical to a slow test suite in a single merged
-number, and only one of those is worth investigating.
+`M/N` progress and per-test durations. The members of one configuration are
+built once, so the build is reported once, in the group's line: its members, its
+wall time, and the edges that took the most of it. That is the signal the
+per-member split used to give: a member whose link takes 90 seconds, and not its
+tests, is named by the group's `slowest:` edges. Each member's own line states
+the time of its **run**, and the final `slowest:` line ranks members by it.
 
 `--message-format json` carries the same data as NDJSON. Every test record is
-member-qualified (`"member"`), and the stream ends with a `workspace_summary`
-record naming the failed and not-run members — a bare test name is ambiguous the
-moment two members both have a `smoke`.
+member-qualified (`"member"`), a `group_build` record states each group's build
+before its first test record, each member's summary names its group
+(`build_group`), and the stream ends with a `workspace_summary` record naming
+the failed and not-run members — a bare test name is ambiguous the moment two
+members both have a `smoke`. The fields are in
+[50 — Machine-Readable Output](50-machine-output.md#mcpp-test---message-format-json--the-test-stream).
 
 #### Bounding the fan-out
 
@@ -407,11 +455,20 @@ mcpp test --workspace --build-timeout 300 # per-ninja-drive deadline (default 0 
 mcpp test --workspace --workspace-timeout 1800   # whole fan-out (default 0 = no limit)
 ```
 
-The fan-out is serial, so an unbounded member stalls every member after it. All
-three deadlines report rather than abort: a timed-out test fails that test and the
-fan-out continues; a timed-out build fails that member; `--workspace-timeout` stops
-the fan-out and lists what did not run instead of leaving the CI job to kill the
-process (which discards everything it had to say).
+The members' runs are serial, so an unbounded member stalls every member after
+it. All three deadlines report rather than abort: a timed-out test fails that
+test and the fan-out continues; a timed-out build fails the members that waited
+for it; `--workspace-timeout` stops the fan-out and lists what did not run
+instead of leaving the CI job to kill the process (which discards everything it
+had to say).
+
+`--workspace-timeout` bounds the runs, and it is measured from the start of the
+command: it is checked before each member's tests start, and a member not
+started by then is listed as not run (2026.10.1.1+). The members of a group are
+built in one step, which the deadline cannot interrupt, so a workspace whose
+build alone exceeds it runs to the end of that build, bounded by
+`--build-timeout`, and then starts no member. Before 2026.10.1.1 each member was
+built and run in turn, and the deadline could stop the fan-out between builds.
 
 ### 5.4 One graph per configuration (mcpp 2026.9.29.1+)
 
@@ -428,7 +485,8 @@ member that several members use is compiled once.
   directory.
 - **Selection.** `--workspace`, and a virtual root without `-p`, select every
   member. `-p X`, and a command run in X's directory, plan X and what X
-  reaches. The two share the build directory, so `mcpp build --workspace`
+  reaches; `-p X -p Y` plans both together, as one selection (§5.3). The
+  selections share the build directory, so `mcpp build --workspace`
   followed by `mcpp build -p X` compiles nothing, and a package is compiled
   again only when its active features differ between the two commands.
 - **Flags.** A member's `cflags`, `cxxflags`, `ldflags` and defines apply to
@@ -454,7 +512,20 @@ member that several members use is compiled once.
   into that member's programs and shared libraries only (2026.9.29.2+).
 - **Build programs.** The members' build programs run dependencies first, and
   a program's result is reused by every command whose inputs to it are
-  unchanged, whichever members the command selects (2026.9.29.5+).
+  unchanged, whichever members the command selects (2026.9.29.5+). Their
+  compiles run at the same time, up to the job count, and only their runs
+  follow that order, so the plan is the one a serial build writes; a host
+  module that several programs import is compiled once for all of them
+  (2026.10.1.1+; see [30 — Build programs](30-build-mcpp.md)).
+- **Tests.** `mcpp test` over several members plans as `build` does: once per
+  configuration, with each member's tests, so a package the members share is
+  compiled once, its build program runs once, and its features are the union
+  the selection asks for (2026.10.1.1+). The configuration's packages and test
+  binaries are built once; then each member's tests run, in member order, with
+  that member's runtime directories and no other member's. A test run after
+  `mcpp build --workspace` compiles nothing the build compiled, unless a
+  dev-dependency changes a package's features. `mcpp test` of one member is one
+  plan of that member, as it always was.
 - **Compile database.** `mcpp build --configure-only` and `mcpp emit
   build-database` plan as the build does, one plan per configuration with each
   member's tests, so a package the members share is described once per
@@ -519,7 +590,9 @@ myproject/
 - `mcpp.lock` at the workspace root records the resolution of every member.
   `mcpp build --workspace` writes the whole record; `mcpp build -p X` updates
   the entries of X's graph.
-- A member's build program writes to `<member>/target/.build-mcpp/`.
+- A member's build program writes to `<member>/target/.build-mcpp/`. The host
+  modules the programs import are compiled into the workspace's own
+  `target/.build-mcpp/host-modules/`, once for all of them.
 - Build directories a member held under its own `target/` with an earlier mcpp
   are not read; `mcpp clean --stale` removes them.
 

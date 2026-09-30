@@ -86,7 +86,7 @@ export int emit_xpkg_to(std::string version, const std::filesystem::path& output
         std::ofstream os(output);
         if (!os) { std::println(stderr, "error: cannot write '{}'", output.string()); return 1; }
         os << lua;
-        std::println("Wrote {}", output.string());
+        mcpp::ui::line(std::format("Wrote {}", output.string()));
     }
     return 0;
 }
@@ -211,30 +211,31 @@ export int publish_package(bool dry_run, bool allow_dirty) {
         std::println("--- end ---");
     }
 
-    // 5. Print step-by-step PR instructions.
+    // 5. Print step-by-step PR instructions: guidance about what to do next,
+    // which is narration. The document a `--dry-run` prints above is the result.
     char first = pkg.name.empty() ? '?' : pkg.name[0];
-    std::println("");
-    std::println("Next steps to publish to mcpp-index:");
-    std::println("");
-    std::println("  1. Tag this commit and push:");
-    std::println("       git tag -a v{0} -m \"v{0}\"", pkg.version);
-    std::println("       git push --tags");
-    std::println("");
-    std::println("  2. Upload the tarball to your repo's GitHub Release:");
-    std::println("       URL: {}/releases/new?tag=v{}", pkg.repo, pkg.version);
-    std::println("       Attach: {}", tarball.string());
-    std::println("");
-    std::println("  3. Open a PR to mcpp-index:");
-    std::println("       Fork:  https://github.com/mcpplibs/mcpp-index");
-    std::println("       Add:   pkgs/{}/{}.lua", first, pkg.name);
-    std::println("       (file content is in {})", xpkgPath.string());
-    std::println("");
+    mcpp::ui::line("");
+    mcpp::ui::line("Next steps to publish to mcpp-index:");
+    mcpp::ui::line("");
+    mcpp::ui::line("  1. Tag this commit and push:");
+    mcpp::ui::line(std::format("       git tag -a v{0} -m \"v{0}\"", pkg.version));
+    mcpp::ui::line("       git push --tags");
+    mcpp::ui::line("");
+    mcpp::ui::line("  2. Upload the tarball to your repo's GitHub Release:");
+    mcpp::ui::line(std::format("       URL: {}/releases/new?tag=v{}", pkg.repo, pkg.version));
+    mcpp::ui::line(std::format("       Attach: {}", tarball.string()));
+    mcpp::ui::line("");
+    mcpp::ui::line("  3. Open a PR to mcpp-index:");
+    mcpp::ui::line("       Fork:  https://github.com/mcpplibs/mcpp-index");
+    mcpp::ui::line(std::format("       Add:   pkgs/{}/{}.lua", first, pkg.name));
+    mcpp::ui::line(std::format("       (file content is in {})", xpkgPath.string()));
+    mcpp::ui::line("");
     // TODO(post-v0.0.3): if `gh` CLI is on PATH and authenticated, offer
     //   `mcpp publish --auto` to:
     //     - gh release create v<v> <tarball>
     //     - fork mcpp-index, add pkg lua, gh pr create
     //   See docs/11-publishing-a-library.md.
-    std::println("Tip: future versions of mcpp may automate steps 2-3 via the gh CLI.");
+    mcpp::ui::line("Tip: future versions of mcpp may automate steps 2-3 via the gh CLI.");
     return 0;
 }
 

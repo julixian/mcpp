@@ -90,6 +90,23 @@ int launcher_status(int spawnErrno) {
     }
 }
 
+// THE STATUS OF A `run` WHOSE PLANNING OR BUILD FAILED (output streams plan
+// 2026-10-01, D7, R2).
+//
+// It used to be the build's own status, 1 or 2, and a program that returns 1
+// reads the same: a script that runs `mcpp run -q` could not tell a compile
+// error from a program that failed. 101 is the status Cargo gives a failed
+// `cargo run` build, and an established convention. It is also rare among the
+// statuses programs return themselves, which is what makes it tell the two
+// apart; it does not collide with the launcher's band above. Only `run` uses
+// it: `build`, `test` and `pack` keep their statuses, and so does a program's
+// own, which passes through unchanged.
+//
+// With a runner (`--runner`, `[target.<triple>].runner`) the status that passes
+// through is the runner's, and a runner that itself returns 101 reads as a
+// failed build. That is accepted, as in Cargo, and documented.
+constexpr int kRunBuildFailed = 101;
+
 // ─── P0: build cache for fast-path rebuilds ─────────────────────────
 
 constexpr std::string_view kBuildCacheFile = "target/.build_cache";
@@ -669,9 +686,13 @@ compute_subos_env(const mcpp::build::BuildPlan& plan) {
 // tell an engine that states "nothing" from one that predates the variable.
 constexpr std::string_view kRuntimeFilesEnv = "MCPP_RUNTIME_FILES";
 
+// `owner`, for a plan of several workspace members, is the member whose
+// artifact this is: the shared libraries another member's targets link are not
+// this artifact's files.
 std::vector<std::pair<std::string, std::filesystem::path>>
 runtime_files_for(const mcpp::build::BuildContext& ctx,
-                  const std::filesystem::path& artifact) {
+                  const std::filesystem::path& artifact,
+                  std::string_view owner = {}) {
     std::vector<std::pair<std::string, std::filesystem::path>> out;
     const auto artifactDir = artifact.parent_path().lexically_normal();
     const auto artifactNorm = artifact.lexically_normal();
@@ -689,6 +710,7 @@ runtime_files_for(const mcpp::build::BuildContext& ctx,
     for (auto const& d : mcpp::build::compute_flags(ctx.plan).runtimeDeploy) add(d.dest);
     for (auto const& lu : ctx.plan.linkUnits) {
         if (lu.kind != mcpp::build::LinkUnit::SharedLibrary) continue;
+        if (!owner.empty() && !lu.memberOf.empty() && lu.memberOf != owner) continue;
         add(lu.output);
         for (auto const& alias : lu.runtimeAliases) add(alias);
     }
@@ -1374,8 +1396,10 @@ std::optional<int> run_ninja_fast(const std::string& ninjaProgram,
         }
         return 1;
     }
+    // Verbose ninja output is narration, so it goes to the narration stream,
+    // whether or not `--quiet` is also given (verbose output survives it).
     if (verbose && !reporting && !out.empty())
-        std::fputs(out.c_str(), stdout);
+        mcpp::ui::block(out);
     // What the edges that ran had to say on success: the same reader the full
     // path calls (mcpp.build.advice), because this path skips `prepare` and a
     // report attached to one path only appears or not depending on whether
@@ -1826,6 +1850,20 @@ export std::optional<int> try_fast_workspace_build(
     return 0;
 }
 
+// THE BLANK LINE AFTER THE `Running` LINE BELONGS TO THAT LINE. It separates
+// mcpp's narration from the program's output on a terminal, so it is narration
+// as well: written to the stream the `Running` line was written to (standard
+// error) and, like it, not under `--quiet`. It used to be a bare `println` to
+// standard output, so `mcpp run -q` wrote one empty line in front of the
+// program's own output, and `mcpp run -q > file` began with it (measured with
+// 2026.9.30.2, `od -c`). Both streams are flushed after it, so that nothing
+// mcpp wrote is still buffered when the program starts writing to the same
+// terminal.
+void run_separator() {
+    mcpp::ui::line("");
+    mcpp::ui::flush();
+}
+
 // mcpp#225 (E2): `mcpp run`'s fast path. Mirrors try_fast_build's
 // fingerprint/freshness gate against the SAME cache entry `mcpp build`
 // wrote (targetTriple == "" — a HOST build; see the precondition below), then
@@ -1972,7 +2010,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, /*verbose=*/false,
                              match->runtimeEnvKey, match->runtimeEnvValue);
     if (!rc) return fast_path_declined("run", "ninja reported a stale graph");
-    if (*rc != 0) return rc;
+    if (*rc != 0) return kRunBuildFailed;
     if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(
             *validatedBefore))
         return fast_path_declined("run", "ninja relinked an artifact, whose closure the full path validates"); // never execute an artifact not validated for this binding
@@ -1982,8 +2020,7 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     mcpp::build::progress::close();   // the program owns the terminal
     mcpp::ui::status("Running",
         std::format("`{}`", mcpp::ui::shorten_path(exe, pathCtx)));
-    std::println("");
-    std::fflush(stdout);
+    run_separator();
     std::vector<std::string> argv;
     argv.push_back(exe.string());
     for (auto& a : passthrough) argv.push_back(a);
@@ -2180,8 +2217,7 @@ int run_artifact_via_runner(mcpp::build::BuildContext& ctx,
         mcpp::ui::status("Running",
             std::format("`{}`", mcpp::ui::shorten_path(exe, pathCtx)));
     }
-    std::println("");
-    std::fflush(stdout);
+    run_separator();
 
     std::vector<std::pair<std::string, std::string>> childEnv;
     auto [runEnvKey, runEnvValue] = compute_run_env(ctx.plan);
@@ -2336,7 +2372,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
         popts.features     = features;
         auto outcome = mcpp::pack::build_and_pack(
             std::move(popts), /*modeFromUser=*/false, targetName.value_or(std::string{}));
-        if (outcome.rc != 0) return outcome.rc;
+        if (outcome.rc != 0) return kRunBuildFailed;
         if (outcome.artifacts.empty()) {
             // Not reached today: `build_and_pack` returns rc=0 only after
             // confirming at least one reported artifact exists on disk. Kept
@@ -2363,10 +2399,9 @@ export int build_run_target(const std::optional<std::string>& targetName,
         ov2.will_run       = true;
         auto ctx2 = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false,
                                   /*extraTargets=*/{}, ov2);
-        if (!ctx2) { mcpp::ui::error(std::format("{}", ctx2.error())); return 2; }
-        if (auto rc = run_build_plan(*ctx2, /*verbose=*/false, no_cache, target_triple);
-            rc != 0)
-            return rc;
+        if (!ctx2) { mcpp::ui::error(std::format("{}", ctx2.error())); return kRunBuildFailed; }
+        if (run_build_plan(*ctx2, /*verbose=*/false, no_cache, target_triple) != 0)
+            return kRunBuildFailed;
         // ONE DISTRIBUTABLE, OR A SENTENCE. The pack pipeline reports the
         // terminal artifacts of the request (outputs no other introduced
         // action consumes); a format that ends in two files has no single
@@ -2418,7 +2453,7 @@ export int build_run_target(const std::optional<std::string>& targetName,
     ov.will_run       = true;
     auto ctx = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/false,
                              /*extraTargets=*/{}, ov);
-    if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); return 2; }
+    if (!ctx) { mcpp::ui::error(std::format("{}", ctx.error())); return kRunBuildFailed; }
     // `target_triple` IS PASSED, AND OMITTING IT WROTE A CROSS BUILD INTO
     // THE HOST'S CACHE SLOT.
     //
@@ -2437,9 +2472,8 @@ export int build_run_target(const std::optional<std::string>& targetName,
     // The comment on `try_fast_run` records the same defect reached through the
     // MANIFEST's default target, and guards that door alone. This is the other
     // door: the flag. Measured on 2026.8.24.3, from a clean `target/`.
-    if (auto rc = run_build_plan(*ctx, /*verbose=*/false, no_cache, target_triple);
-        rc != 0)
-        return rc;
+    if (run_build_plan(*ctx, /*verbose=*/false, no_cache, target_triple) != 0)
+        return kRunBuildFailed;
     // The program run is the selected member's (workspace design 2026-09-29
     // §15), with its closure's runtime.
     focus_on_member(*ctx);
@@ -2552,10 +2586,42 @@ export struct TestRunSummary {
     // `notRun` so the workspace total cannot add a stated build-only result to
     // a run that mcpp could not perform.
     int         built   = 0;
-    long long buildMs   = 0;   // Phase A + bulk pass + per-test drives
+    // The wall time this member's tests waited for their build. Phase A + bulk
+    // pass + per-test drives for a member planned alone; for a member planned
+    // with others, the build of its whole group (`buildGroup`), plus its own
+    // per-test drives.
+    long long buildMs   = 0;
     long long runMs     = 0;   // the test binaries' own execution
     long long elapsedMs = 0;   // wall clock for the whole member
     bool      packageError = false;   // Phase A failed: no test ever ran
+    // The configuration group whose one build this member's tests waited for,
+    // when `mcpp test` planned several members together; -1 for a member
+    // planned and built alone. Members of one group report the same
+    // `buildMs`, so a consumer that sums it over members deduplicates by this
+    // number.
+    int       buildGroup = -1;
+};
+
+// One selected member of a `mcpp test` over several members, as the command
+// layer found it: the path `[workspace] members` spells, and what discovery
+// read from the member's own directory (two members may each have a
+// `tests/main.cpp`).
+export struct WorkspaceTestMember {
+    std::string                         path;
+    std::vector<mcpp::manifest::Target> targets;
+    // Discovery failed: the member fails alone, with this message, and the
+    // others are planned without it.
+    std::string                         error;
+    // The line a member with no tests reports, naming where discovery looked.
+    std::string                         noTests;
+};
+
+// What the command layer reports around each member's run. `begin` is asked
+// before a member's tests start, and a member it answers false for is not run
+// (`--workspace-timeout`); `end` receives the member's exit status and summary.
+export struct WorkspaceTestHooks {
+    std::function<bool(std::size_t, const std::string&)>                  begin;
+    std::function<void(std::size_t, const std::string&, int, const TestRunSummary&)> end;
 };
 
 // Minimal JSON string escaping for the --message-format json records. Same
@@ -2580,127 +2646,136 @@ static std::string test_json_escape(std::string_view s) {
     return out;
 }
 
-// `mcpp test` driver: discover tests/**/*.cpp, synthesize targets, build
-// with dev-deps, run each test binary, summarize.
-export int run_tests(std::span<const std::string> passthrough,
-                     BuildOverrides overrides = {},
-                     TestOptions testOpts = {},
-                     TestRunSummary* summaryOut = nullptr) {
-    const bool json = (testOpts.format == TestMessageFormat::Json);
-    // The member this call is scoped to (empty outside a workspace). Threaded
-    // into every JSON record so a `--workspace` stream can be attributed: a
-    // bare test name is ambiguous the moment two members both have a `smoke`.
-    const std::string memberName = overrides.package_filter;
-    TestRunSummary summary;
-    struct SummaryWriter {
-        TestRunSummary* out; const TestRunSummary* src;
-        ~SummaryWriter() { if (out) *out = *src; }
-    } summaryWriter{summaryOut, &summary};
-    // Wall clock for the WHOLE member, started before Phase A. The old `t0`
-    // sat after Phase A and the bulk pass, so `finished in` reported only the
-    // per-test loop: measured on one member, 6.53s printed against 93.5s
-    // actual — a 14x understatement, and worst exactly on the build-heavy
-    // members where the number matters.
-    auto tMember = std::chrono::steady_clock::now();
-    auto member_ms = [&tMember] {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - tMember).count();
-    };
-    // JSON mode: stdout carries NDJSON only. All ui::status/info lines print
-    // to stdout, so silence them wholesale; errors already go to stderr.
-    if (json) mcpp::ui::set_quiet(true);
-    // The report covers the planning and the package's own build (Phase A);
-    // it is closed before the tests' own lines.
-    mcpp::build::progress::open(mcpp::log::is_verbose());
+// A test's result, as the records and the summary read it.
+struct TestResult {
+    std::string name;
+    // `NotRun` (#544): built, and not executed — the host cannot load the
+    // artifact, or the declared runner could not be found or started.
+    // Reporting that as `RunFail (exit 127)` states that the test ran and
+    // returned 127, which is false and indistinguishable from a missing
+    // program; reporting it as a pass would be read as one.
+    // `Built` (`--no-run`): compiled and linked, and deliberately not
+    // executed. Distinct from `NotRun`, which means mcpp tried and could
+    // not --- the difference is whether anything was left unanswered.
+    enum class St { Pass, CompileFail, RunFail, NotRun, Built } status;
+    int         exitCode = 0;
+    std::string compileOutput;
+    std::string runOutput;
+    // The wall time of the step that decided the status: the run for a test
+    // that ran, the build for a `compile_fail`. The meaning `duration_ms` has
+    // always had; the test binary's own build time is `buildMs`.
+    long long   durationMs = 0;
+    bool        timedOut = false;  // killed by --timeout
+    std::string reason;            // NotRun only: why, in one sentence
+    // The build time of this test's own binary in this invocation: the sum of
+    // its link edge and its main unit's compile edge in `.ninja_log`, 0 when
+    // neither was rebuilt (`build_ms`, 2026.10.1.1+).
+    long long   buildMs = 0;
+};
 
-    auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
-    if (!root) {
-        mcpp::ui::error("no mcpp.toml found in current directory or any parent");
-        return 2;
-    }
+// Streaming NDJSON: one record per test, emitted as it finishes — a
+// consumer (e.g. the d2x provider) sees progress live, and a crash
+// mid-run still leaves the completed records on stdout.
+static void emit_test_json(const std::string& memberName, const TestResult& r) {
+    const char* st = r.status == TestResult::St::Pass ? "pass"
+                   : r.status == TestResult::St::CompileFail ? "compile_fail"
+                   : r.status == TestResult::St::NotRun ? "not_run"
+                   : r.status == TestResult::St::Built ? "built"
+                                                        : "run_fail";
+    std::string signal = (r.exitCode > 128 && r.exitCode < 128 + 65)
+        ? std::to_string(r.exitCode - 128) : "null";
+    std::println("{{\"member\":\"{}\",\"test\":\"{}\",\"status\":\"{}\","
+                 "\"exit_code\":{},\"signal\":{},"
+                 "\"duration_ms\":{},\"timed_out\":{},"
+                 "\"compile_output\":\"{}\",\"run_output\":\"{}\","
+                 "\"reason\":\"{}\",\"build_ms\":{}}}",
+                 test_json_escape(memberName),
+                 test_json_escape(r.name), st, r.exitCode, signal, r.durationMs,
+                 r.timedOut ? "true" : "false",
+                 test_json_escape(r.compileOutput), test_json_escape(r.runOutput),
+                 test_json_escape(r.reason), r.buildMs);
+    std::fflush(stdout);
+}
 
-    auto discovered = mcpp::build::discover_test_targets(
-        *root, overrides.package_filter);
-    if (!discovered) {
-        mcpp::ui::error(discovered.error());
-        return 2;
-    }
-    auto testRoot = discovered->packageRoot;
-    auto testTargets = std::move(discovered->targets);
-    if (testTargets.empty()) {
-        // Names where it looked when the manifest chose the place, so that a
-        // glob that matches nothing is not read as a project without tests.
-        if (discovered->discoverDeclared) {
-            std::string globs;
-            for (auto const& g : discovered->discover)
-                globs += std::format("{}\"{}\"", globs.empty() ? "" : ", ", g);
-            std::println("no tests found ([test] discover = [{}])", globs);
-        } else {
-            std::println("no tests found in tests/");
+// An edge ninja recorded in `.ninja_log`: what it made, and how long it took.
+struct NinjaEdge {
+    std::string output;
+    long long   ms = 0;
+};
+
+// The edges ninja appended to `log` after byte `from`: the ones the drives
+// since that point ran. The log accumulates across invocations, so an edge
+// that was not rebuilt has an old entry that says how long it took once; the
+// offset taken before the first drive is what tells this run's edges from
+// those. A log that ninja rewrote (recompaction) is shorter than the offset
+// and reads as no edges, which is an absent measurement and not a zero.
+//
+// Format (ninja log v5): `start_ms TAB end_ms TAB mtime TAB output TAB hash`.
+static std::vector<NinjaEdge> ninja_edges_since(const std::filesystem::path& log,
+                                                std::uintmax_t from) {
+    std::vector<NinjaEdge> edges;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(log, ec);
+    if (ec || size <= from) return edges;
+    std::ifstream is(log, std::ios::binary);
+    if (!is) return edges;
+    is.seekg(static_cast<std::streamoff>(from));
+    std::string line;
+    while (std::getline(is, line)) {
+        std::array<std::string_view, 5> f{};
+        std::size_t n = 0, b = 0;
+        std::string_view v = line;
+        while (n < f.size()) {
+            const auto t = v.find('\t', b);
+            f[n++] = v.substr(b, t == std::string_view::npos ? std::string_view::npos : t - b);
+            if (t == std::string_view::npos) break;
+            b = t + 1;
         }
-        return 0;
+        if (n < 4) continue;
+        long long start = 0, end = 0;
+        auto [p1, e1] = std::from_chars(f[0].data(), f[0].data() + f[0].size(), start);
+        auto [p2, e2] = std::from_chars(f[1].data(), f[1].data() + f[1].size(), end);
+        if (e1 != std::errc{} || e2 != std::errc{} || end < start) continue;
+        edges.push_back({std::string(f[3]), end - start});
     }
-    // --list: enumerate (filtered) tests and stop — no toolchain resolution,
-    // no build. Names/paths come straight from discovery, so this also works
-    // on tests that do not currently compile.
-    if (testOpts.list) {
-        std::size_t total = 0;
-        for (auto& t : testTargets) {
-            if (!testOpts.filter.empty()
-                && t.name.find(testOpts.filter) == std::string::npos) continue;
-            ++total;
-            auto abs = std::filesystem::absolute(testRoot / t.main)
-                           .lexically_normal().generic_string();
-            if (json)
-                std::println("{{\"member\":\"{}\",\"test\":\"{}\",\"main\":\"{}\"}}",
-                             test_json_escape(memberName),
-                             test_json_escape(t.name), test_json_escape(abs));
-            else
-                std::println("{}", t.name);
-        }
-        if (json) {
-            std::println("{{\"summary\":{{\"total\":{}}}}}", total);
-            std::fflush(stdout);
-        }
-        return 0;
-    }
+    return edges;
+}
 
-    // 3. prepare_build with dev-deps enabled + synthetic targets.
-    // A test binary is executed, so the run tier applies here exactly as it
-    // does to `mcpp run` — `[xlings.workspace]` has no separate `test` tier
-    // because there is no separate need.
-    overrides.will_run = true;
-    auto ctx = prepare_build(/*print_fp=*/false,
-                             /*includeDevDeps=*/true,
-                             std::move(testTargets),
-                             std::move(overrides));
-    if (!ctx) { mcpp::ui::error(ctx.error()); return 2; }
+// A planned test build, and what the tests run against it need: the plan, the
+// backend that drives it, how long planning and the build took, and how the
+// test binaries are executed. One per configuration group of a `mcpp test`
+// over several members; `run_tests` holds one for its one member.
+struct TestBuild {
+    std::optional<BuildContext>              ctx;
+    std::unique_ptr<Backend>                 backend;
+    long long                                prepareMs = 0;
+    // Phase A, the bulk pass, and any attribution drive.
+    long long                                buildMs = 0;
+    bool                                     bulkBuiltEverything = false;
+    std::filesystem::path                    ninjaLog;
+    std::uintmax_t                           logFrom = 0;
 
-    // Filter guard. The filter selects at the build/run stage ONLY — the plan
-    // above always contains every test, so build.ninja and
-    // compile_commands.json stay complete (clangd depends on the latter; a
-    // filtered run must not clobber it down to one entry).
-    auto filter_match = [&](const mcpp::build::LinkUnit& lu) {
-        return lu.kind == mcpp::build::LinkUnit::TestBinary
-            && (testOpts.filter.empty()
-                || lu.targetName.find(testOpts.filter) != std::string::npos);
-    };
-    if (!testOpts.filter.empty()) {
-        bool any = false;
-        for (auto& lu : ctx->plan.linkUnits)
-            if (filter_match(lu)) { any = true; break; }
-        if (!any) {
-            if (json)
-                std::println("{{\"error\":\"no-tests-matched\",\"filter\":\"{}\"}}",
-                             test_json_escape(testOpts.filter));
-            mcpp::ui::error(std::format("no tests match '{}'", testOpts.filter));
-            return 2;
-        }
-    }
+    // How the test binaries are executed, resolved once for the build
+    // (#544): every test of one build shares a target.
+    RunnerChoice                             runnerChoice;
+    std::vector<std::string>                 runnerTmpl;
+    // Non-empty ⇒ no test is spawned; every one is reported NotRun with it.
+    std::string                              invocationNotRunReason;
+    // Non-zero: there is nothing to execute the tests with, and this is the
+    // exit status every member of the build returns.
+    int                                      runnerFatal = 0;
+    // Set by the first worker whose spawn the kernel refused; every worker
+    // checks it before spawning. Workers already past the check may be
+    // refused the same way — harmless, a refused spawn has no side effects —
+    // and each such result is NotRun, not RunFail. The reason is printed once.
+    std::atomic<bool>                        hostCannotRun{false};
+    std::string                              hostCannotRunReason;
+};
 
-    // 4. "Compiling test_X (test)" lines for the test binaries.
+// The "Compiling <package>" lines the tests' own lines follow.
+static void test_announce(const BuildContext& ctx) {
     std::map<std::string, std::size_t> cachedUnits;
-    for (auto& dep : ctx->cachedDeps) cachedUnits[dep.name] = dep.units;
+    for (auto& dep : ctx.cachedDeps) cachedUnits[dep.name] = dep.units;
     auto announce = [&](const std::string& name,
                         const mcpp::manifest::DependencySpec& spec,
                         std::string_view suffix) {
@@ -2716,184 +2791,247 @@ export int run_tests(std::span<const std::string> passthrough,
         }
     };
     std::set<std::string> announced;
-    announced.insert(ctx->manifest.package.name);
-    mcpp::ui::status("Compiling",
-        std::format("{} v{} (.)",
-                    ctx->manifest.package.name, ctx->manifest.package.version));
-    for (auto& [name, spec] : ctx->manifest.dependencies) {
-        if (announced.contains(name)) continue;
-        announced.insert(name);
-        announce(name, spec, "");
-    }
-    for (auto& [name, spec] : ctx->manifest.devDependencies) {
-        if (announced.contains(name)) continue;
-        announced.insert(name);
-        announce(name, spec, " (dev)");
-    }
-    // List test binaries.
-    // (Per-test "Compiling" lines print in Phase B, interleaved with each
-    // test's own result — announcing them all up front separated the three
-    // pieces of one test's story across the whole output.)
-
-    // 5. Two-phase build. Phase A: package-level artifacts (everything that
-    //    is not a test binary — libs, deps). A failure here is the PACKAGE's
-    //    fault, not any single test's: report it as a build error, never as
-    //    N red tests. Phase B (below): each test is built as its own ninja
-    //    goal, so a compile failure is attributed to exactly that test and
-    //    the rest still build and run.
-    struct TestResult {
-        std::string name;
-        // `NotRun` (#544): built, and not executed — the host cannot load the
-        // artifact, or the declared runner could not be found or started.
-        // Reporting that as `RunFail (exit 127)` states that the test ran and
-        // returned 127, which is false and indistinguishable from a missing
-        // program; reporting it as a pass would be read as one.
-        // `Built` (`--no-run`): compiled and linked, and deliberately not
-        // executed. Distinct from `NotRun`, which means mcpp tried and could
-        // not --- the difference is whether anything was left unanswered.
-        enum class St { Pass, CompileFail, RunFail, NotRun, Built } status;
-        int         exitCode = 0;
-        std::string compileOutput;
-        std::string runOutput;
-        long long   durationMs = 0;    // build+run wall time for THIS test
-        bool        timedOut = false;  // killed by --timeout
-        std::string reason;            // NotRun only: why, in one sentence
+    auto announce_package = [&](const mcpp::manifest::Manifest& m, std::string_view where) {
+        announced.insert(m.package.name);
+        mcpp::ui::status("Compiling",
+            std::format("{} v{} ({})", m.package.name, m.package.version, where));
     };
-    std::vector<TestResult> results;
-
-    // Streaming NDJSON: one record per test, emitted as it finishes — a
-    // consumer (e.g. the d2x provider) sees progress live, and a crash
-    // mid-run still leaves the completed records on stdout.
-    auto emit_json = [&](const TestResult& r) {
-        if (!json) return;
-        const char* st = r.status == TestResult::St::Pass ? "pass"
-                       : r.status == TestResult::St::CompileFail ? "compile_fail"
-                       : r.status == TestResult::St::NotRun ? "not_run"
-                       : r.status == TestResult::St::Built ? "built"
-                                                            : "run_fail";
-        std::string signal = (r.exitCode > 128 && r.exitCode < 128 + 65)
-            ? std::to_string(r.exitCode - 128) : "null";
-        std::println("{{\"member\":\"{}\",\"test\":\"{}\",\"status\":\"{}\","
-                     "\"exit_code\":{},\"signal\":{},"
-                     "\"duration_ms\":{},\"timed_out\":{},"
-                     "\"compile_output\":\"{}\",\"run_output\":\"{}\","
-                     "\"reason\":\"{}\"}}",
-                     test_json_escape(memberName),
-                     test_json_escape(r.name), st, r.exitCode, signal, r.durationMs,
-                     r.timedOut ? "true" : "false",
-                     test_json_escape(r.compileOutput), test_json_escape(r.runOutput),
-                     test_json_escape(r.reason));
-        std::fflush(stdout);
+    auto announce_dependencies = [&](const mcpp::manifest::Manifest& m) {
+        for (auto& [name, spec] : m.dependencies) {
+            if (announced.contains(name)) continue;
+            announced.insert(name);
+            announce(name, spec, "");
+        }
+        for (auto& [name, spec] : m.devDependencies) {
+            if (announced.contains(name)) continue;
+            announced.insert(name);
+            announce(name, spec, " (dev)");
+        }
     };
+    // A plan of several members has a virtual root, which declares only its
+    // members: the packages are the members, named as their directories.
+    if (ctx.manifest.package.virtualRoot && !ctx.workspaceMembers.empty()) {
+        for (auto const& wm : ctx.workspaceMembers) announce_package(wm.manifest, wm.memberPath);
+        for (auto const& wm : ctx.workspaceMembers) announce_dependencies(wm.manifest);
+        return;
+    }
+    announce_package(ctx.manifest, ".");
+    announce_dependencies(ctx.manifest);
+}
 
-    auto backend = mcpp::build::make_ninja_backend();
-
-    // Phase A goal set: every shared prerequisite — all package/dep compile
-    // units EXCEPT the tests' own main TUs, plus any non-test link outputs.
-    // In test mode the lib link unit is skipped entirely (plan.cppm), so the
-    // package's module objects are the only place shared breakage can show
-    // up; building them here is what keeps a broken src/ module a PACKAGE
-    // error instead of N identical per-test compile failures.
+// Phase A goal set: every shared prerequisite — all package/dep compile
+// units EXCEPT the tests' own main TUs, plus any non-test link outputs.
+// In test mode the lib link unit is skipped entirely (plan.cppm), so the
+// package's module objects are the only place shared breakage can show
+// up; building them here is what keeps a broken src/ module a PACKAGE
+// error instead of N identical per-test compile failures.
+static std::vector<std::string> test_package_goals(const BuildContext& ctx) {
     std::set<std::filesystem::path> testMains;
-    for (auto& lu : ctx->plan.linkUnits)
+    for (auto& lu : ctx.plan.linkUnits)
         if (lu.kind == mcpp::build::LinkUnit::TestBinary && lu.entryMain)
             testMains.insert(*lu.entryMain);
-    std::vector<std::string> pkgTargets;
-    for (auto& cu : ctx->plan.compileUnits)
+    std::vector<std::string> goals;
+    for (auto& cu : ctx.plan.compileUnits)
         if (!testMains.contains(cu.source))
-            pkgTargets.push_back(cu.object.generic_string());
-    for (auto& lu : ctx->plan.linkUnits)
+            goals.push_back(cu.object.generic_string());
+    for (auto& lu : ctx.plan.linkUnits)
         if (lu.kind != mcpp::build::LinkUnit::TestBinary)
-            pkgTargets.push_back(lu.output.generic_string());
-    mcpp::build::progress::programs_done();
-    if (!pkgTargets.empty()) {
-        mcpp::build::BuildOptions aOpts;
-        aOpts.ninjaTargets = pkgTargets;
-        aOpts.buildTimeoutSecs = static_cast<unsigned>(testOpts.buildTimeoutSecs);
-        // Phase A is the package's own build, and is reported as `mcpp build`
-        // reports one (build progress design 2026-09-29); the tests' own
-        // builds and runs below keep their per-test lines.
-        std::optional<mcpp::build::progress::Build> phaseReport;
-        if (!json && !mcpp::ui::is_quiet()) {
-            phaseReport.emplace(ctx->outputDir);
-            aOpts.progress = &*phaseReport;
-        }
-        auto tPhaseA = std::chrono::steady_clock::now();
-        auto a = backend->build(ctx->plan, aOpts);
-        summary.buildMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - tPhaseA).count();
-        if (!a) {
-            summary.packageError = true;
-            summary.elapsedMs = member_ms();
-            std::fflush(stdout);
-            if (json)
-                std::println("{{\"error\":\"package\",\"compile_output\":\"{}\"}}",
-                             test_json_escape(a.error().diagnosticOutput));
-            // Surface the compiler/linker stderr (parity with run_build_plan) —
-            // otherwise `mcpp test` failures show only "build failed" with no
-            // diagnostic, which is undebuggable (notably on CI). A failed step
-            // was reported when it failed.
-            if (!a.error().reported) mcpp::ui::error(a.error().message);
-            mcpp::ui::block(a.error().diagnosticOutput);
-            return 1;
-        }
+            goals.push_back(lu.output.generic_string());
+    return goals;
+}
 
-        // M3.2: populate BMI cache for deps that did NOT hit cache — deps
-        // are package-level artifacts, so this belongs right after Phase A.
-        for (auto& task : ctx->depsToPopulate) {
-            auto pr = mcpp::bmi_cache::populate_from(task.key, ctx->outputDir, task.artifacts);
-            if (!pr) {
-                mcpp::ui::warning(std::format(
-                    "bmi cache populate failed for {}@{}: {}",
-                    task.key.packageName, task.key.version, pr.error()));
-            }
-        }
-
-        // No "Finished test" line here: Phase A only built the shared
-        // prerequisites. Printing a success banner right before per-test
-        // failures read as a contradiction; the final summary carries timing.
+// The part of Phase A that one member's tests need: the objects of the
+// member's closure, which are the ones its test binaries link other than the
+// tests' own main TUs. A member whose package does not build is found by
+// building these alone, so that a group's other members still run.
+static std::vector<std::string> member_package_goals(const BuildContext& ctx,
+                                                    std::string_view owner) {
+    std::set<std::filesystem::path> testMains;
+    for (auto& lu : ctx.plan.linkUnits)
+        if (lu.kind == mcpp::build::LinkUnit::TestBinary && lu.entryMain)
+            testMains.insert(*lu.entryMain);
+    std::set<std::filesystem::path> mainObjects;
+    for (auto& cu : ctx.plan.compileUnits)
+        if (testMains.contains(cu.source)) mainObjects.insert(cu.object);
+    std::set<std::filesystem::path> seen;
+    std::vector<std::string> goals;
+    for (auto& lu : ctx.plan.linkUnits) {
+        if (lu.kind != mcpp::build::LinkUnit::TestBinary || lu.memberOf != owner) continue;
+        for (auto& o : lu.objects)
+            if (!mainObjects.contains(o) && seen.insert(o).second)
+                goals.push_back(o.generic_string());
     }
-    // The tests' own lines follow, as they always have.
-    mcpp::build::progress::close();
+    return goals;
+}
 
-    // 6. Phase B. First a single keep-going bulk build over every selected
-    //    test goal — ninja parallelizes across tests and a failing test does
-    //    not stop the rest (-k 0). The result is deliberately ignored: the
-    //    per-test loop below re-drives each goal so a failure is attributed to
-    //    exactly one test.
-    //
-    //    ...but ONLY when this bulk build failed. A re-drive was assumed to be
-    //    a near no-op, and it is not: a drive re-emits build.ninja, rewrites
-    //    compile_commands.json, spawns ninja and re-validates the runtime
-    //    closure. Measured on the 83-test suite AFTER the rule E fix, that is
-    //    still ~39ms x 83 = 3.2s of a 5.3s hot run — spent re-asking a question
-    //    the bulk build just answered for every test at once.
-    //
-    //    `-k 0` means the bulk exit code is 0 IFF every selected goal built, so
-    //    it carries exactly the information the loop was re-deriving. When it
-    //    is non-zero the loop runs as before and each failure still names its
-    //    own test.
-    bool bulkBuiltEverything = false;
-    {
-        mcpp::build::BuildOptions bulk;
-        bulk.keepGoing = true;
-        bulk.buildTimeoutSecs = static_cast<unsigned>(testOpts.buildTimeoutSecs);
-        for (auto& lu : ctx->plan.linkUnits)
-            if (filter_match(lu))
-                bulk.ninjaTargets.push_back(lu.output.generic_string());
-        if (!bulk.ninjaTargets.empty()) {
-            auto tBulk = std::chrono::steady_clock::now();
-            bulkBuiltEverything = backend->build(ctx->plan, bulk).has_value();
-            summary.buildMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - tBulk).count();
+// Phase A, run against `tb` (see the note at its two callers): everything
+// every test shares, built once. Nullopt when it built; else the failure,
+// which the caller reports. Its wall time is added to the build's.
+static std::optional<BuildError> test_phase_a(TestBuild& tb, const TestOptions& testOpts,
+                                              bool json) {
+    auto* ctx = &*tb.ctx;
+    auto& backend = tb.backend;
+    auto pkgTargets = test_package_goals(*ctx);
+    if (pkgTargets.empty()) return std::nullopt;
+    mcpp::build::BuildOptions aOpts;
+    aOpts.ninjaTargets = pkgTargets;
+    aOpts.buildTimeoutSecs = static_cast<unsigned>(testOpts.buildTimeoutSecs);
+    // Phase A is the package's own build, and is reported as `mcpp build`
+    // reports one (build progress design 2026-09-29); the tests' own
+    // builds and runs below keep their per-test lines.
+    std::optional<mcpp::build::progress::Build> phaseReport;
+    if (!json && !mcpp::ui::is_quiet()) {
+        phaseReport.emplace(ctx->outputDir);
+        aOpts.progress = &*phaseReport;
+    }
+    auto tPhaseA = std::chrono::steady_clock::now();
+    auto a = backend->build(ctx->plan, aOpts);
+    tb.buildMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tPhaseA).count();
+    if (!a) return std::move(a.error());
+
+    // M3.2: populate BMI cache for deps that did NOT hit cache — deps
+    // are package-level artifacts, so this belongs right after Phase A.
+    for (auto& task : ctx->depsToPopulate) {
+        auto pr = mcpp::bmi_cache::populate_from(task.key, ctx->outputDir, task.artifacts);
+        if (!pr) {
+            mcpp::ui::warning(std::format(
+                "bmi cache populate failed for {}@{}: {}",
+                task.key.packageName, task.key.version, pr.error()));
         }
     }
 
-    //    Then build + run each test in sequence; collect results.
+    // No "Finished test" line here: Phase A only built the shared
+    // prerequisites. Printing a success banner right before per-test
+    // failures read as a contradiction; the final summary carries timing.
+    return std::nullopt;
+}
 
+// 6. Phase B. First a single keep-going bulk build over every selected
+//    test goal — ninja parallelizes across tests and a failing test does
+//    not stop the rest (-k 0). The result is deliberately ignored: the
+//    per-test loop below re-drives each goal so a failure is attributed to
+//    exactly one test.
+//
+//    ...but ONLY when this bulk build failed. A re-drive was assumed to be
+//    a near no-op, and it is not: a drive re-emits build.ninja, rewrites
+//    compile_commands.json, spawns ninja and re-validates the runtime
+//    closure. Measured on the 83-test suite AFTER the rule E fix, that is
+//    still ~39ms x 83 = 3.2s of a 5.3s hot run — spent re-asking a question
+//    the bulk build just answered for every test at once.
+//
+//    `-k 0` means the bulk exit code is 0 IFF every selected goal built, so
+//    it carries exactly the information the loop was re-deriving. When it
+//    is non-zero the loop runs as before and each failure still names its
+//    own test.
+// `keep` says which test binaries are goals.
+template <class Keep>
+static void test_bulk(TestBuild& tb, const TestOptions& testOpts, Keep&& keep) {
+    auto* ctx = &*tb.ctx;
+    auto& backend = tb.backend;
+    mcpp::build::BuildOptions bulk;
+    bulk.keepGoing = true;
+    bulk.buildTimeoutSecs = static_cast<unsigned>(testOpts.buildTimeoutSecs);
+    for (auto& lu : ctx->plan.linkUnits)
+        if (keep(lu))
+            bulk.ninjaTargets.push_back(lu.output.generic_string());
+    if (!bulk.ninjaTargets.empty()) {
+        auto tBulk = std::chrono::steady_clock::now();
+        tb.bulkBuiltEverything = backend->build(ctx->plan, bulk).has_value();
+        tb.buildMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - tBulk).count();
+    }
+}
+
+// How the test binaries are executed — the SAME runner `mcpp run` uses,
+// resolved ONCE per build (#544). One read point, two callers; and
+// one lookup, because every test of a build shares a target, so
+// "the runner's program is not there" is a fact about the build and
+// is reported once rather than once per test.
+//
+// Nothing else about the test model changes, and that is a measured
+// result rather than a simplification: semihosting propagates the
+// firmware's `main` return value to the emulator's exit code
+// (`return 7` → qemu exits 7, verified), so "exit code is the verdict"
+// holds under a runner exactly as it does on the host.
+static void test_resolve_runner(TestBuild& tb, const TestOptions& testOpts, bool json) {
+    auto* ctx = &*tb.ctx;
+    tb.runnerChoice = choose_runner(*ctx, testOpts.noRunner);
+    auto& runnerChoice = tb.runnerChoice;
+    if (runnerChoice.ignored && !json)
+        mcpp::ui::info("note", std::format(
+            "--no-runner: ignoring the runner declared for {}", runnerChoice.tripleKey));
+    if (runnerChoice.fromManifest && !json)
+        mcpp::ui::info("note", std::format(
+            "[target.{}].runner overrides the runner a dependency supplied",
+            runnerChoice.tripleKey));
+    if (runnerChoice.freestanding && runnerChoice.tmpl.empty()) {
+        std::println(stderr, "error: {}",
+            mcpp::freestanding::no_runner_message(runnerChoice.tripleKey));
+        tb.runnerFatal = 2;
+        return;
+    }
+    tb.runnerTmpl = runnerChoice.tmpl;
+    auto& runnerTmpl = tb.runnerTmpl;
+    if (!runnerTmpl.empty()) {
+        const char* pathEnv = std::getenv("PATH");
+        auto found = mcpp::build::runner_lookup::locate(
+            runnerTmpl.front(), ctx->xlingsDepBinDirs, pathEnv ? pathEnv : "");
+        if (found.program) runnerTmpl.front() = found.program->string();
+        else tb.invocationNotRunReason = mcpp::build::runner_lookup::not_found_message(
+            runnerChoice.tripleKey, runnerTmpl.front(), found.searched);
+    }
+}
+
+// One member's tests, against a build that exists: the per-test builds that
+// the bulk pass did not answer, then the runs, then the member's summary.
+// `owner` is the member's package name in the plan, which picks its test
+// binaries out of a plan that holds several members' (empty: every test
+// binary of the plan). `carriedMs` is the time the member has already spent
+// on planning and building, which `elapsed_ms` counts; `summary.buildMs`
+// arrives holding the build's wall time.
+static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
+                           std::span<const std::string> passthrough, bool json,
+                           const std::string& memberName, const std::string& owner,
+                           long long carriedMs, TestRunSummary& summary) {
+    auto* ctx = &*tb.ctx;
+    auto& backend = tb.backend;
+    const auto tLoop = std::chrono::steady_clock::now();
+    if (tb.runnerFatal) return tb.runnerFatal;
+    const auto& runnerChoice = tb.runnerChoice;
+    auto& runnerTmpl = tb.runnerTmpl;
+    auto& invocationNotRunReason = tb.invocationNotRunReason;
+    auto& hostCannotRun = tb.hostCannotRun;
+    auto& hostCannotRunReason = tb.hostCannotRunReason;
+    const bool bulkBuiltEverything = tb.bulkBuiltEverything;
+
+    // Filter guard. The filter selects at the build/run stage ONLY — the plan
+    // always contains every test, so build.ninja and compile_commands.json
+    // stay complete (clangd depends on the latter; a filtered run must not
+    // clobber it down to one entry).
+    auto filter_match = [&](const mcpp::build::LinkUnit& lu) {
+        return lu.kind == mcpp::build::LinkUnit::TestBinary
+            && (owner.empty() || lu.memberOf == owner)
+            && (testOpts.filter.empty()
+                || lu.targetName.find(testOpts.filter) != std::string::npos);
+    };
+    std::vector<TestResult> results;
+    auto emit_json = [&](const TestResult& r) {
+        if (!json) return;
+        emit_test_json(memberName, r);
+    };
+
+    // The runtime of THIS member: in a plan of several members, the plan's own
+    // directories are the union over every member, and a member's tests are
+    // told about its closure's alone.
     auto runtimeEnvKey = mcpp::platform::env::runtime_library_path_key();
-    auto runtimeEnvValue = mcpp::platform::env::prepend_path_list(
-        runtimeEnvKey, ctx->plan.runtimeLibraryDirs);
+    std::string runtimeEnvValue;
+    bool hasRuntimeDirs = false;
+    with_member(*ctx, owner, [&] {
+        runtimeEnvValue = mcpp::platform::env::prepend_path_list(
+            runtimeEnvKey, ctx->plan.runtimeLibraryDirs);
+        hasRuntimeDirs = !ctx->plan.runtimeLibraryDirs.empty();
+    });
     // Read once for the whole run rather than per test: it is one file, and
     // every test in a run belongs to the same subos.
     const auto subosEnv = compute_subos_env(ctx->plan);
@@ -2905,7 +3043,7 @@ export int run_tests(std::span<const std::string> passthrough,
     // here with a dyld error that names neither the cause nor the platform —
     // so say it out loud rather than leaving the difference silent.
     if constexpr (mcpp::platform::is_macos) {
-        if (runtimeEnvKey.empty() && !ctx->plan.runtimeLibraryDirs.empty()) {
+        if (runtimeEnvKey.empty() && hasRuntimeDirs) {
             mcpp::diag::warning("test/runtime-path",
                 "macOS does not inject a runtime library path for test binaries "
                 "(DYLD_LIBRARY_PATH is deliberately not set); dependencies must be "
@@ -2945,6 +3083,7 @@ export int run_tests(std::span<const std::string> passthrough,
         std::string name;
         std::vector<std::string> argv;
         std::vector<std::pair<std::string, std::string>> env;
+        long long buildMs = 0;   // this test's own edges in .ninja_log
     };
     std::vector<Runnable> runnable;
 
@@ -2955,47 +3094,6 @@ export int run_tests(std::span<const std::string> passthrough,
     // the terminal interleaves them line by line, which does not just look
     // untidy — it makes a failing assertion unattributable, and the whole
     // reason the per-test loop exists is attribution.
-    // How the test binaries are executed — the SAME runner `mcpp run` uses,
-    // resolved ONCE per invocation (#544). One read point, two callers; and
-    // one lookup, because every test of an invocation shares a target, so
-    // "the runner's program is not there" is a fact about the invocation and
-    // is reported once rather than once per test.
-    //
-    // Nothing else about the test model changes, and that is a measured
-    // result rather than a simplification: semihosting propagates the
-    // firmware's `main` return value to the emulator's exit code
-    // (`return 7` → qemu exits 7, verified), so "exit code is the verdict"
-    // holds under a runner exactly as it does on the host.
-    const auto runnerChoice = choose_runner(*ctx, testOpts.noRunner);
-    if (runnerChoice.ignored && !json)
-        mcpp::ui::info("note", std::format(
-            "--no-runner: ignoring the runner declared for {}", runnerChoice.tripleKey));
-    if (runnerChoice.fromManifest && !json)
-        mcpp::ui::info("note", std::format(
-            "[target.{}].runner overrides the runner a dependency supplied",
-            runnerChoice.tripleKey));
-    if (runnerChoice.freestanding && runnerChoice.tmpl.empty()) {
-        std::println(stderr, "error: {}",
-            mcpp::freestanding::no_runner_message(runnerChoice.tripleKey));
-        return 2;
-    }
-    std::vector<std::string> runnerTmpl = runnerChoice.tmpl;
-    // Non-empty ⇒ no test is spawned; every one is reported NotRun with it.
-    std::string invocationNotRunReason;
-    if (!runnerTmpl.empty()) {
-        const char* pathEnv = std::getenv("PATH");
-        auto found = mcpp::build::runner_lookup::locate(
-            runnerTmpl.front(), ctx->xlingsDepBinDirs, pathEnv ? pathEnv : "");
-        if (found.program) runnerTmpl.front() = found.program->string();
-        else invocationNotRunReason = mcpp::build::runner_lookup::not_found_message(
-            runnerChoice.tripleKey, runnerTmpl.front(), found.searched);
-    }
-    // Set by the first worker whose spawn the kernel refused; every worker
-    // checks it before spawning. Workers already past the check may be
-    // refused the same way — harmless, a refused spawn has no side effects —
-    // and each such result is NotRun, not RunFail. The reason is printed once.
-    std::atomic<bool> hostCannotRun{false};
-    std::string       hostCannotRunReason;
 
     auto run_tests_now = [&](std::vector<Runnable>& list) {
         if (list.empty()) return;
@@ -3105,7 +3203,7 @@ export int run_tests(std::span<const std::string> passthrough,
                     }
                     if (!json) mcpp::ui::plain(std::format("{} ... not run", r.name));
                     results.push_back({r.name, TestResult::St::NotRun, 0, {}, {}, ms, false,
-                                       reason});
+                                       reason, r.buildMs});
                     std::fflush(stdout);
                     emit_json(results.back());
                     continue;
@@ -3114,18 +3212,18 @@ export int run_tests(std::span<const std::string> passthrough,
                     if (!json) mcpp::ui::plain(std::format(
                         "{} ... FAIL (timeout after {}s)", r.name, testOpts.timeoutSecs));
                     results.push_back({r.name, TestResult::St::RunFail, exitCode, {},
-                                       runOutput, ms, true});
+                                       runOutput, ms, true, {}, r.buildMs});
                 } else if (exitCode == 0) {
                     if (!json) mcpp::ui::plain(std::format(
                         "{} ... ok ({:.2f}s)", r.name, static_cast<double>(ms) / 1000.0));
                     results.push_back({r.name, TestResult::St::Pass, 0, {},
-                                       runOutput, ms});
+                                       runOutput, ms, false, {}, r.buildMs});
                 } else {
                     if (!json) mcpp::ui::plain(std::format(
                         "{} ... FAIL (exit {}, {:.2f}s)", r.name, exitCode,
                         static_cast<double>(ms) / 1000.0));
                     results.push_back({r.name, TestResult::St::RunFail, exitCode, {},
-                                       runOutput, ms});
+                                       runOutput, ms, false, {}, r.buildMs});
                 }
                 // The captured output belongs directly under its own line, or
                 // it is attributable to nothing.
@@ -3152,6 +3250,19 @@ export int run_tests(std::span<const std::string> passthrough,
         summary.runMs += std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - tRunPhase).count();
     };
+
+    // The build part of a test's duration is that test binary's own edges, its
+    // main TU and its link, among the ones ninja logged for this build. Read
+    // once when the bulk pass built every test; after each drive otherwise,
+    // since a drive logs its own.
+    std::map<std::string, long long> edgeMs;
+    auto read_edges = [&] {
+        edgeMs.clear();
+        for (auto& e : ninja_edges_since(tb.ninjaLog, tb.logFrom)) edgeMs[e.output] += e.ms;
+    };
+    read_edges();
+    std::map<std::filesystem::path, std::filesystem::path> objectOf;
+    for (auto& cu : ctx->plan.compileUnits) objectOf[cu.source] = cu.object;
 
     for (auto& lu : ctx->plan.linkUnits) {
         if (!filter_match(lu)) continue;
@@ -3200,6 +3311,11 @@ export int run_tests(std::span<const std::string> passthrough,
         }
 
         auto exe = ctx->outputDir / lu.output;
+        if (!bulkBuiltEverything) read_edges();
+        long long buildMsOfTest = edgeMs[lu.output.generic_string()];
+        if (lu.entryMain)
+            if (auto o = objectOf.find(*lu.entryMain); o != objectOf.end())
+                buildMsOfTest += edgeMs[o->second.generic_string()];
 
         // Through the runner resolved once above, or bare. The runner's
         // program was located already; only the artifact changes per test.
@@ -3219,8 +3335,9 @@ export int run_tests(std::span<const std::string> passthrough,
         // `mcpp run` hands them over (see `runtime_files_for`). Written here,
         // in the single-threaded pass, one list per test program.
         if (!runnerTmpl.empty()) {
-            if (auto listed = write_runtime_files_list(*ctx, exe,
-                                                       runtime_files_for(*ctx, exe)))
+            std::vector<std::pair<std::string, std::filesystem::path>> carried;
+            with_member(*ctx, owner, [&] { carried = runtime_files_for(*ctx, exe, owner); });
+            if (auto listed = write_runtime_files_list(*ctx, exe, carried))
                 childEnv.emplace_back(std::string(kRuntimeFilesEnv), listed->string());
             else if (invocationNotRunReason.empty())
                 invocationNotRunReason = listed.error();
@@ -3242,9 +3359,9 @@ export int run_tests(std::span<const std::string> passthrough,
             }
         }
 
-        runnable.push_back({lu.targetName, std::move(argv), std::move(childEnv)});
+        runnable.push_back({lu.targetName, std::move(argv), std::move(childEnv),
+                            buildMsOfTest});
     }
-
     // Pass 2: run them. Concurrently unless there is exactly one — see
     // `runJobs` for why the single-test case is deliberately different.
     //
@@ -3255,11 +3372,12 @@ export int run_tests(std::span<const std::string> passthrough,
     if (testOpts.noRun) {
         for (auto& r : runnable)
             results.push_back({r.name, TestResult::St::Built, 0, {}, {}, 0,
-                               false, {}});
+                               false, {}, r.buildMs});
     } else {
         run_tests_now(runnable);
     }
-    summary.elapsedMs = member_ms();
+    summary.elapsedMs = carriedMs + std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - tLoop).count();
 
     // 7. Summary.
     int passed = 0;
@@ -3300,13 +3418,18 @@ export int run_tests(std::span<const std::string> passthrough,
     const int rc = failed ? 1 : (notRun ? 2 : 0);
 
     if (json) {
+        // `build_group` names the configuration group whose one build this
+        // member's tests waited for, when it was planned with others; its
+        // `build_ms` is then the group's (docs/50 §8).
+        const auto group = summary.buildGroup >= 0
+            ? std::format(",\"build_group\":{}", summary.buildGroup) : std::string{};
         std::println("{{\"summary\":{{\"member\":\"{}\",\"passed\":{},\"failed\":{},"
                      "\"not_run\":{},\"not_run_reason\":\"{}\","
                      "\"built\":{},"
-                     "\"elapsed_ms\":{},\"build_ms\":{},\"run_ms\":{}}}}}",
+                     "\"elapsed_ms\":{},\"build_ms\":{},\"run_ms\":{}{}}}}}",
                      test_json_escape(memberName), passed, failed,
                      notRun, test_json_escape(notRunReason), built,
-                     summary.elapsedMs, summary.buildMs, summary.runMs);
+                     summary.elapsedMs, summary.buildMs, summary.runMs, group);
         std::fflush(stdout);
         return rc;
     }
@@ -3323,7 +3446,7 @@ export int run_tests(std::span<const std::string> passthrough,
 
     std::println("");
     if (rc == 0) {
-        mcpp::ui::status("test result",
+        mcpp::ui::result("test result",
             std::format("ok. {}; finished in {}", counts, timing));
         return 0;
     }
@@ -3340,6 +3463,466 @@ export int run_tests(std::span<const std::string> passthrough,
     return rc;
 }
 
+// `mcpp test` driver: discover tests/**/*.cpp, synthesize targets, build
+// with dev-deps, run each test binary, summarize.
+export int run_tests(std::span<const std::string> passthrough,
+                     BuildOverrides overrides = {},
+                     TestOptions testOpts = {},
+                     TestRunSummary* summaryOut = nullptr) {
+    const bool json = (testOpts.format == TestMessageFormat::Json);
+    // The member this call is scoped to (empty outside a workspace). Threaded
+    // into every JSON record so a `--workspace` stream can be attributed: a
+    // bare test name is ambiguous the moment two members both have a `smoke`.
+    const std::string memberName = overrides.package_filter;
+    TestRunSummary summary;
+    struct SummaryWriter {
+        TestRunSummary* out; const TestRunSummary* src;
+        ~SummaryWriter() { if (out) *out = *src; }
+    } summaryWriter{summaryOut, &summary};
+    // Wall clock for the WHOLE member, started before Phase A. The old `t0`
+    // sat after Phase A and the bulk pass, so `finished in` reported only the
+    // per-test loop: measured on one member, 6.53s printed against 93.5s
+    // actual — a 14x understatement, and worst exactly on the build-heavy
+    // members where the number matters.
+    auto tMember = std::chrono::steady_clock::now();
+    auto member_ms = [&tMember] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - tMember).count();
+    };
+    // JSON mode: stdout carries NDJSON only. All ui::status/info lines print
+    // to stdout, so silence them wholesale; errors already go to stderr.
+    if (json) mcpp::ui::set_quiet(true);
+    // The report covers the planning and the package's own build (Phase A);
+    // it is closed before the tests' own lines.
+    mcpp::build::progress::open(mcpp::log::is_verbose());
+
+    auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
+    if (!root) {
+        mcpp::ui::error("no mcpp.toml found in current directory or any parent");
+        return 2;
+    }
+
+    auto discovered = mcpp::build::discover_test_targets(
+        *root, overrides.package_filter);
+    if (!discovered) {
+        mcpp::ui::error(discovered.error());
+        return 2;
+    }
+    auto testRoot = discovered->packageRoot;
+    auto testTargets = std::move(discovered->targets);
+    if (testTargets.empty()) {
+        // Names where it looked when the manifest chose the place, so that a
+        // glob that matches nothing is not read as a project without tests.
+        if (discovered->discoverDeclared) {
+            std::string globs;
+            for (auto const& g : discovered->discover)
+                globs += std::format("{}\"{}\"", globs.empty() ? "" : ", ", g);
+            std::println("no tests found ([test] discover = [{}])", globs);
+        } else {
+            std::println("no tests found in tests/");
+        }
+        return 0;
+    }
+    // --list: enumerate (filtered) tests and stop — no toolchain resolution,
+    // no build. Names/paths come straight from discovery, so this also works
+    // on tests that do not currently compile.
+    if (testOpts.list) {
+        std::size_t total = 0;
+        for (auto& t : testTargets) {
+            if (!testOpts.filter.empty()
+                && t.name.find(testOpts.filter) == std::string::npos) continue;
+            ++total;
+            auto abs = std::filesystem::absolute(testRoot / t.main)
+                           .lexically_normal().generic_string();
+            if (json)
+                std::println("{{\"member\":\"{}\",\"test\":\"{}\",\"main\":\"{}\"}}",
+                             test_json_escape(memberName),
+                             test_json_escape(t.name), test_json_escape(abs));
+            else
+                std::println("{}", t.name);
+        }
+        if (json) {
+            std::println("{{\"summary\":{{\"total\":{}}}}}", total);
+            std::fflush(stdout);
+        }
+        return 0;
+    }
+    // 3. prepare_build with dev-deps enabled + synthetic targets.
+    // A test binary is executed, so the run tier applies here exactly as it
+    // does to `mcpp run` — `[xlings.workspace]` has no separate `test` tier
+    // because there is no separate need.
+    overrides.will_run = true;
+    auto prepared = prepare_build(/*print_fp=*/false,
+                                  /*includeDevDeps=*/true,
+                                  std::move(testTargets),
+                                  std::move(overrides));
+    if (!prepared) { mcpp::ui::error(prepared.error()); return 2; }
+    TestBuild tb;
+    tb.ctx.emplace(std::move(*prepared));
+    tb.backend = mcpp::build::make_ninja_backend();
+    tb.ninjaLog = tb.ctx->outputDir / ".ninja_log";
+    {
+        std::error_code ec;
+        tb.logFrom = std::filesystem::file_size(tb.ninjaLog, ec);
+        if (ec) tb.logFrom = 0;
+    }
+    auto* ctx = &*tb.ctx;
+
+    // Filter guard. The filter selects at the build/run stage ONLY — the plan
+    // above always contains every test, so build.ninja and
+    // compile_commands.json stay complete (clangd depends on the latter; a
+    // filtered run must not clobber it down to one entry).
+    auto filter_match = [&](const mcpp::build::LinkUnit& lu) {
+        return lu.kind == mcpp::build::LinkUnit::TestBinary
+            && (testOpts.filter.empty()
+                || lu.targetName.find(testOpts.filter) != std::string::npos);
+    };
+    if (!testOpts.filter.empty()) {
+        bool any = false;
+        for (auto& lu : ctx->plan.linkUnits)
+            if (filter_match(lu)) { any = true; break; }
+        if (!any) {
+            if (json)
+                std::println("{{\"error\":\"no-tests-matched\",\"filter\":\"{}\"}}",
+                             test_json_escape(testOpts.filter));
+            mcpp::ui::error(std::format("no tests match '{}'", testOpts.filter));
+            return 2;
+        }
+    }
+
+    // 4. "Compiling test_X (test)" lines for the test binaries.
+    test_announce(*ctx);
+    // List test binaries.
+    // (Per-test "Compiling" lines print in Phase B, interleaved with each
+    // test's own result — announcing them all up front separated the three
+    // pieces of one test's story across the whole output.)
+
+    // 5. Two-phase build. Phase A: package-level artifacts (everything that
+    //    is not a test binary — libs, deps). A failure here is the PACKAGE's
+    //    fault, not any single test's: report it as a build error, never as
+    //    N red tests. Phase B (below): each test is built as its own ninja
+    //    goal, so a compile failure is attributed to exactly that test and
+    //    the rest still build and run.
+    mcpp::build::progress::programs_done();
+    if (auto a = test_phase_a(tb, testOpts, json)) {
+        summary.packageError = true;
+        summary.buildMs = tb.buildMs;
+        summary.elapsedMs = member_ms();
+        std::fflush(stdout);
+        if (json)
+            std::println("{{\"error\":\"package\",\"compile_output\":\"{}\"}}",
+                         test_json_escape(a->diagnosticOutput));
+        // Surface the compiler/linker stderr (parity with run_build_plan) —
+        // otherwise `mcpp test` failures show only "build failed" with no
+        // diagnostic, which is undebuggable (notably on CI). A failed step
+        // was reported when it failed.
+        if (!a->reported) mcpp::ui::error(a->message);
+        mcpp::ui::block(a->diagnosticOutput);
+        return 1;
+    }
+    // The tests' own lines follow, as they always have.
+    mcpp::build::progress::close();
+
+    test_bulk(tb, testOpts, filter_match);
+    test_resolve_runner(tb, testOpts, json);
+    summary.buildMs = tb.buildMs;
+    return test_run_member(tb, testOpts, passthrough, json, memberName, /*owner=*/"",
+                           member_ms(), summary);
+}
+
+// `mcpp test` over several members: the members are planned once per
+// configuration group, each group's Phase A and test goals are built once, and
+// then each member's tests run in member order, continuing past a failing
+// member (member-selection design 2026-09-30, S4 and D1).
+//
+// `groups` holds the selected members by configuration, as `mcpp build` groups
+// them, and `members` the same members in `[workspace] members` order with
+// what discovery found in each. A member with no tests, or whose discovery
+// failed, is not planned, as it never was: it reports its own result when its
+// turn comes. A group that fails to plan is planned again member by member,
+// so a member that fails to plan fails alone, and the members that plan are
+// planned together again without it.
+export void run_workspace_tests(std::span<const std::string> passthrough,
+                                const BuildOverrides& base,
+                                const TestOptions& testOpts,
+                                const std::filesystem::path& wsRoot,
+                                const std::vector<std::vector<std::string>>& groups,
+                                std::vector<WorkspaceTestMember> members,
+                                const WorkspaceTestHooks& hooks) {
+    const bool json = (testOpts.format == TestMessageFormat::Json);
+    if (json) mcpp::ui::set_quiet(true);
+    // The report covers the planning and the packages' own builds (Phase A);
+    // it is closed before the tests' own lines.
+    mcpp::build::progress::open(mcpp::log::is_verbose());
+
+    // What each member has to say when its turn comes, decided before any
+    // build: a member whose tests cannot be planned says why, and one with
+    // nothing to run says so.
+    struct Slot {
+        int         session = -1;     // the build that holds the member's tests
+        std::string owner;            // the member's package name in that plan
+        std::string error;            // it failed before its tests could run
+        std::string note;             // it has no tests
+        bool        noMatch = false;  // no test matches the filter
+        bool        packageFailed = false;
+        std::string packageOutput;    // the diagnostics of its package's build
+        // Whether `packageOutput` was already printed, as the group's Phase A
+        // failure; a member's own failure that differs from it is printed at
+        // the member's turn, so a second broken member is not reported bare.
+        bool        packageOutputShown = false;
+    };
+    std::vector<Slot> slots(members.size());
+    std::map<std::string, std::size_t> indexOf;
+    std::vector<bool> planned(members.size(), false);
+    for (std::size_t i = 0; i < members.size(); ++i) {
+        indexOf[members[i].path] = i;
+        if (!members[i].error.empty()) { slots[i].error = members[i].error; continue; }
+        if (members[i].targets.empty()) { slots[i].note = members[i].noTests; continue; }
+        if (!testOpts.filter.empty()
+            && std::ranges::none_of(members[i].targets, [&](auto const& t) {
+                   return t.name.find(testOpts.filter) != std::string::npos; })) {
+            slots[i].noMatch = true;
+            continue;
+        }
+        planned[i] = true;
+    }
+
+    std::vector<std::unique_ptr<TestBuild>> sessions;
+    std::vector<std::vector<std::size_t>>   sessionMembers;
+
+    // One plan of the given members, with each member's tests.
+    auto plan_session = [&](const std::vector<std::size_t>& who)
+            -> std::expected<std::unique_ptr<TestBuild>, std::string> {
+        BuildOverrides mo = base;
+        mo.package_filter.clear();
+        mo.project_root = wsRoot;
+        mo.will_run = true;
+        mo.workspace_members.clear();
+        mo.workspace_request.clear();
+        mo.member_targets.clear();
+        for (auto i : who) {
+            mo.workspace_members.push_back(members[i].path);
+            mo.member_targets[members[i].path] = members[i].targets;
+        }
+        for (auto const& m : members) mo.workspace_request.push_back(m.path);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto prepared = prepare_build(/*print_fp=*/false, /*includeDevDeps=*/true,
+                                      /*extraTargets=*/{}, std::move(mo));
+        if (!prepared) return std::unexpected(prepared.error());
+        auto tb = std::make_unique<TestBuild>();
+        tb->prepareMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        tb->ctx.emplace(std::move(*prepared));
+        tb->backend = mcpp::build::make_ninja_backend();
+        tb->ninjaLog = tb->ctx->outputDir / ".ninja_log";
+        std::error_code ec;
+        tb->logFrom = std::filesystem::file_size(tb->ninjaLog, ec);
+        if (ec) tb->logFrom = 0;
+        return tb;
+    };
+    auto attach = [&](std::unique_ptr<TestBuild> tb, const std::vector<std::size_t>& who) {
+        mcpp::build::progress::programs_done();
+        const int id = static_cast<int>(sessions.size());
+        for (auto i : who) {
+            slots[i].session = id;
+            for (auto const& wm : tb->ctx->workspaceMembers)
+                if (wm.memberPath == members[i].path) slots[i].owner = wm.name;
+            // An empty owner selects every test binary of the plan, which is
+            // another member's as well: a member the plan does not name runs
+            // nothing.
+            if (slots[i].owner.empty()) {
+                slots[i].error = std::format(
+                    "member '{}' is not among the members its plan holds", members[i].path);
+                slots[i].session = -1;
+            }
+        }
+        sessionMembers.push_back(who);
+        sessions.push_back(std::move(tb));
+    };
+
+    for (auto const& g : groups) {
+        std::vector<std::size_t> who;
+        for (auto const& mp : g)
+            if (auto it = indexOf.find(mp); it != indexOf.end() && planned[it->second])
+                who.push_back(it->second);
+        if (who.empty()) continue;
+        auto tb = plan_session(who);
+        if (tb) { attach(std::move(*tb), who); continue; }
+        if (who.size() == 1) { slots[who.front()].error = tb.error(); continue; }
+        // The group did not plan, and the message does not say which member is
+        // to blame. Each member is planned alone to find out: the ones that
+        // plan are planned together again without the others, and the ones
+        // that do not are reported with their own reason.
+        std::vector<std::size_t> survivors;
+        std::vector<std::unique_ptr<TestBuild>> alone;
+        for (auto i : who) {
+            auto one = plan_session({i});
+            if (one) { survivors.push_back(i); alone.push_back(std::move(*one)); }
+            else slots[i].error = one.error();
+        }
+        if (survivors.size() > 1) {
+            if (auto together = plan_session(survivors)) {
+                attach(std::move(*together), survivors);
+                continue;
+            }
+        }
+        for (std::size_t k = 0; k < survivors.size(); ++k)
+            attach(std::move(alone[k]), {survivors[k]});
+    }
+    // The groups' compile databases are published once, as the union, below:
+    // a group's own build must not publish the root's as if it were the only
+    // one (`mcpp build` does the same).
+    if (sessions.size() > 1)
+        for (auto& s : sessions) s->ctx->plan.publishRootCompileDb = false;
+
+    // Build every group: Phase A once, then one keep-going pass over the test
+    // goals of the members whose package built.
+    for (std::size_t s = 0; s < sessions.size(); ++s) {
+        auto& tb = *sessions[s];
+        const auto& who = sessionMembers[s];
+        test_announce(*tb.ctx);
+        if (auto a = test_phase_a(tb, testOpts, json)) {
+            // A failure of the package level is the package's fault, never N
+            // red tests. A group's Phase A stops at its first failure, and the
+            // failure says nothing of which member it belongs to: each
+            // member's own part of it is built alone, so that a member whose
+            // package builds still runs, and the one whose package does not is
+            // reported as failed, alone.
+            if (!json) {
+                if (!a->reported) mcpp::ui::error(a->message);
+                mcpp::ui::block(a->diagnosticOutput);
+            }
+            if (who.size() > 1) {
+                for (auto i : who) {
+                    if (slots[i].session < 0) continue;
+                    const auto goals = member_package_goals(*tb.ctx, slots[i].owner);
+                    if (goals.empty()) continue;
+                    mcpp::build::BuildOptions own;
+                    own.ninjaTargets = goals;
+                    own.buildTimeoutSecs = static_cast<unsigned>(testOpts.buildTimeoutSecs);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    auto r = tb.backend->build(tb.ctx->plan, own);
+                    tb.buildMs += std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    if (!r) {
+                        slots[i].packageFailed = true;
+                        slots[i].packageOutput = r.error().diagnosticOutput;
+                        slots[i].packageOutputShown =
+                            r.error().diagnosticOutput == a->diagnosticOutput;
+                    }
+                }
+            }
+            // Nothing pointed at a member (a failure outside every member's
+            // own objects), or the group is one member: they fail together.
+            if (std::ranges::none_of(who, [&](auto i) { return slots[i].packageFailed; }))
+                for (auto i : who) {
+                    slots[i].packageFailed = true;
+                    slots[i].packageOutput = a->diagnosticOutput;
+                    slots[i].packageOutputShown = true;
+                }
+        }
+        // The test goals of the members that can run.
+        std::set<std::string> runnable;
+        for (auto i : who)
+            if (!slots[i].packageFailed && slots[i].session >= 0)
+                runnable.insert(slots[i].owner);
+        test_bulk(tb, testOpts, [&](const mcpp::build::LinkUnit& lu) {
+            return lu.kind == mcpp::build::LinkUnit::TestBinary
+                && runnable.contains(lu.memberOf)
+                && (testOpts.filter.empty()
+                    || lu.targetName.find(testOpts.filter) != std::string::npos);
+        });
+        if (!runnable.empty()) test_resolve_runner(tb, testOpts, json);
+    }
+    // The tests' own lines follow, as they always have.
+    mcpp::build::progress::close();
+
+    if (sessions.size() > 1) {
+        std::vector<std::filesystem::path> dirs;
+        for (auto& s : sessions) dirs.push_back(s->ctx->outputDir);
+        publish_workspace_compile_commands(wsRoot, dirs);
+    }
+
+    // One record or line per group, before its first member's tests: the
+    // members it built and the wall time of the build (member-selection design
+    // D6). The time is the group's and not any member's, so it is stated once;
+    // each member's summary names the group it waited for.
+    for (std::size_t s = 0; s < sessions.size(); ++s) {
+        auto& tb = *sessions[s];
+        const auto& who = sessionMembers[s];
+        if (json) {
+            std::string list;
+            for (auto i : who) {
+                if (!list.empty()) list += ',';
+                list += std::format("\"{}\"", test_json_escape(members[i].path));
+            }
+            std::println("{{\"group_build\":{{\"group\":{},\"members\":[{}],\"build_ms\":{}}}}}",
+                         s, list, tb.buildMs);
+            std::fflush(stdout);
+            continue;
+        }
+        std::string names;
+        for (auto i : who) names += (names.empty() ? "" : ", ") + members[i].path;
+        // The edges that took the build its time, for the question the per
+        // member split used to answer: which member's link, and not its tests,
+        // is slow.
+        auto edges = ninja_edges_since(tb.ninjaLog, tb.logFrom);
+        std::ranges::sort(edges, [](auto const& a, auto const& b) { return a.ms > b.ms; });
+        std::string slowest;
+        for (std::size_t k = 0; k < edges.size() && k < 3; ++k) {
+            if (edges[k].ms < 1000) break;
+            slowest += std::format("{}{} {:.1f}s", slowest.empty() ? "" : ", ",
+                                   edges[k].output, static_cast<double>(edges[k].ms) / 1000.0);
+        }
+        mcpp::ui::status("Workspace", std::format(
+            "{}built {} {} in {:.2f}s{}",
+            sessions.size() > 1 ? std::format("group {}/{} ", s + 1, sessions.size())
+                                : std::string{},
+            who.size() == 1 ? "member" : "members", names,
+            static_cast<double>(tb.buildMs) / 1000.0,
+            slowest.empty() ? std::string{} : std::format("; slowest: {}", slowest)));
+    }
+
+    for (std::size_t i = 0; i < members.size(); ++i) {
+        auto& m = members[i];
+        auto& slot = slots[i];
+        if (hooks.begin && !hooks.begin(i, m.path)) continue;
+        TestRunSummary sum;
+        int rc = 0;
+        if (!slot.error.empty()) {
+            mcpp::ui::error(slot.error);
+            rc = 2;
+        } else if (slot.noMatch) {
+            if (json)
+                std::println("{{\"error\":\"no-tests-matched\",\"filter\":\"{}\"}}",
+                             test_json_escape(testOpts.filter));
+            mcpp::ui::error(std::format("no tests match '{}'", testOpts.filter));
+            rc = 2;
+        } else if (!slot.note.empty()) {
+            if (!json) std::println("{}", slot.note);
+        } else if (slot.session >= 0) {
+            auto& tb = *sessions[static_cast<std::size_t>(slot.session)];
+            sum.buildGroup = slot.session;
+            sum.buildMs = tb.buildMs;
+            if (slot.packageFailed) {
+                sum.packageError = true;
+                sum.elapsedMs = tb.prepareMs + tb.buildMs;
+                if (json)
+                    std::println("{{\"error\":\"package\",\"member\":\"{}\",\"compile_output\":\"{}\"}}",
+                                 test_json_escape(m.path), test_json_escape(slot.packageOutput));
+                mcpp::ui::error(std::format(
+                    "member '{}': its package did not build, so its tests did not run", m.path));
+                if (!json && !slot.packageOutputShown) mcpp::ui::block(slot.packageOutput);
+                rc = 1;
+            } else {
+                rc = test_run_member(tb, testOpts, passthrough, json, m.path, slot.owner,
+                                     tb.prepareMs + tb.buildMs, sum);
+            }
+        }
+        if (hooks.end) hooks.end(i, m.path, rc, sum);
+    }
+}
+
 // `mcpp clean` driver.
 export int clean_project(bool wipe_bmi) {
     auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
@@ -3350,14 +3933,14 @@ export int clean_project(bool wipe_bmi) {
         std::println(stderr, "error: cannot remove target/: {}", ec.message());
         return 1;
     }
-    std::println("Cleaned: {}", (*root / "target").string());
+    mcpp::ui::line(std::format("Cleaned: {}", (*root / "target").string()));
 
     if (wipe_bmi) {
         auto cache = mcpp::toolchain::default_cache_root();
         std::filesystem::remove_all(cache, ec);
-        std::println("Cleaned build cache: {}", cache.string());
-        std::println("  (`mcpp cache clean --legacy` also removes the unused "
-                     "pre-v1 cache, if any)");
+        mcpp::ui::line(std::format("Cleaned build cache: {}", cache.string()));
+        mcpp::ui::line("  (`mcpp cache clean --legacy` also removes the unused "
+                       "pre-v1 cache, if any)");
     }
     return 0;
 }

@@ -82,6 +82,36 @@ struct DeadlineRun {
     int  spawn_error = 0;
 };
 
+// ─── Starting a child is safe for concurrent callers ─────────────────────
+//
+// `CreateProcess` with `bInheritHandles = TRUE` hands a child EVERY inheritable
+// handle of its parent, and a capture pipe's write end has to be inheritable for
+// its own child. A child started by thread B while thread A holds that write end
+// keeps it open for as long as it lives, and A's reader then waits for end of
+// file until B's unrelated child exits. (`SetHandleInformation` cannot close the
+// window: a handle is inheritable from its creation to the moment the parent
+// closes it, and the start of the child lies between the two.)
+//
+// So the starts that can run at the same time as another, the ones below and
+// the `_popen` calls of mcpp.platform.process, hold one process-wide section
+// from the creation of the pipe to the parent's close of its write end. The
+// alternative, `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, would restrict what OUR
+// launchers pass and leave `_popen` and any third party passing everything; the
+// section is one rule for all of them.
+//
+// On another platform the class exists and does nothing.
+class LaunchSection {
+public:
+    LaunchSection();
+    ~LaunchSection();
+    // Leaves the section before the destructor does.
+    void release();
+    LaunchSection(const LaunchSection&) = delete;
+    LaunchSection& operator=(const LaunchSection&) = delete;
+private:
+    bool held_ = false;
+};
+
 // Receives stdout+stderr as it arrives. Called on the calling thread only.
 //
 // A NULL sink means "do not capture": the child inherits the caller's stdio and
@@ -169,6 +199,10 @@ void background_stop(unsigned long long job, unsigned long long process,
 // A REGISTRY AND NOT ONE SLOT, for the reason the POSIX peer gives: a spanning
 // `[hooks]` command and the build's own ninja are guarded at the same time, and
 // a single slot lets the second registration disarm the first.
+//
+// SAFE FOR CONCURRENT CALLERS, as the POSIX peer is: claiming and releasing a
+// slot is serialized by a mutex and the console handler takes no lock. The
+// capacity is 256.
 void guard_job_on_signal(unsigned long long job);
 void unguard_job(unsigned long long job);
 void clear_job_guard();
@@ -238,6 +272,9 @@ std::string environment_block(const char* const* envEntries,
     return block;
 }
 
+// The one section every child start shares (see LaunchSection).
+std::mutex g_launchMutex;
+
 struct Handle {
     HANDLE h = nullptr;
     Handle() = default;
@@ -251,6 +288,19 @@ struct Handle {
 };
 
 } // namespace
+
+LaunchSection::LaunchSection() {
+    g_launchMutex.lock();
+    held_ = true;
+}
+
+LaunchSection::~LaunchSection() { release(); }
+
+void LaunchSection::release() {
+    if (!held_) return;
+    held_ = false;
+    g_launchMutex.unlock();
+}
 
 DeadlineRun capture_with_deadline(const char*        commandLine,
                                   const char* const* envEntries,
@@ -273,6 +323,9 @@ DeadlineRun capture_with_deadline(const char*        commandLine,
     sa.nLength        = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
+    // From the creation of the pipe to the parent's close of its write end: no
+    // other child may be started while this pipe is inheritable.
+    LaunchSection launch;
     Handle readEnd, writeEnd;
     if (capture) {
         if (!::CreatePipe(&readEnd.h, &writeEnd.h, &sa, 0)) return out;
@@ -350,6 +403,7 @@ DeadlineRun capture_with_deadline(const char*        commandLine,
     // The parent must drop its copy of the write end or the pipe never reaches
     // EOF, even after every child has exited.
     writeEnd.reset();
+    launch.release();
 
     const auto started = std::chrono::steady_clock::now();
     const auto until = deadlineMs > 0
@@ -414,8 +468,11 @@ namespace {
 // Read by a console control handler, which runs on a thread of the OS's
 // choosing. Only the handle is shared, and closing a job handle is atomic from
 // the caller's point of view.
-constexpr int kMaxGuardedJobs = 8;
+constexpr int kMaxGuardedJobs = 256;
 volatile unsigned long long g_guardedJobs[kMaxGuardedJobs] = {};
+// Serializes the WRITERS of the registry and of the handler it installs; the
+// console handler never takes it.
+std::mutex g_guardMutex;
 
 BOOL WINAPI background_console_handler(DWORD) {
     // TerminateJobObject, not CloseHandle: this handler races `background_stop`
@@ -477,12 +534,19 @@ BackgroundChild spawn_background(const char* commandLine,
     // CREATE_NEW_PROCESS_GROUP is the peer of POSIX_SPAWN_SETPGROUP: the child
     // stops receiving the console's Ctrl-C, which is what makes the guard
     // below necessary and what stops a stray Ctrl-C from half-killing the tree.
-    const BOOL ok = ::CreateProcessA(
-        nullptr, cmdBuf.data(), nullptr, nullptr,
-        /*bInheritHandles=*/TRUE,
-        CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP
-            | (inheritStdio ? 0u : CREATE_NO_WINDOW),
-        nullptr, (cwd && *cwd) ? cwd : nullptr, &si, &pi);
+    BOOL ok = FALSE;
+    {
+        // This child inherits every inheritable handle, another thread's
+        // capture pipe included, unless it is started outside the window that
+        // pipe is open in (see LaunchSection).
+        LaunchSection launch;
+        ok = ::CreateProcessA(
+            nullptr, cmdBuf.data(), nullptr, nullptr,
+            /*bInheritHandles=*/TRUE,
+            CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP
+                | (inheritStdio ? 0u : CREATE_NO_WINDOW),
+            nullptr, (cwd && *cwd) ? cwd : nullptr, &si, &pi);
+    }
     if (!ok) {
         out.refused = ::GetLastError();
         if (job) ::CloseHandle(job);
@@ -555,19 +619,23 @@ void background_stop(unsigned long long job, unsigned long long process,
 
 void guard_job_on_signal(unsigned long long job) {
     if (!job) return;
-    for (int i = 0; i < kMaxGuardedJobs; ++i) {
-        if (g_guardedJobs[i] == 0) {
-            g_guardedJobs[i] = job;
-            ::SetConsoleCtrlHandler(background_console_handler, TRUE);
-            return;
+    {
+        std::lock_guard lock(g_guardMutex);
+        for (int i = 0; i < kMaxGuardedJobs; ++i) {
+            if (g_guardedJobs[i] == 0) {
+                g_guardedJobs[i] = job;
+                ::SetConsoleCtrlHandler(background_console_handler, TRUE);
+                return;
+            }
         }
     }
-    std::fputs("mcpp: internal: more than 8 concurrently guarded jobs; the "
+    std::fputs("mcpp: internal: more than 256 concurrently guarded jobs; the "
                "newest is NOT guarded and may outlive mcpp\n", stderr);
 }
 
 void unguard_job(unsigned long long job) {
     if (!job) return;
+    std::lock_guard lock(g_guardMutex);
     bool any = false;
     for (int i = 0; i < kMaxGuardedJobs; ++i) {
         if (g_guardedJobs[i] == job) g_guardedJobs[i] = 0;
@@ -577,6 +645,7 @@ void unguard_job(unsigned long long job) {
 }
 
 void clear_job_guard() {
+    std::lock_guard lock(g_guardMutex);
     for (int i = 0; i < kMaxGuardedJobs; ++i) g_guardedJobs[i] = 0;
     ::SetConsoleCtrlHandler(background_console_handler, FALSE);
 }
@@ -598,6 +667,10 @@ DeadlineRun capture_with_deadline(const char*, const char* const*, unsigned long
     // Not Windows: the POSIX launcher in mcpp.platform.process owns this.
     return {};
 }
+
+LaunchSection::LaunchSection() {}
+LaunchSection::~LaunchSection() {}
+void LaunchSection::release() {}
 
 BackgroundChild spawn_background(const char*, const char*, int) { return {}; }
 int  background_running(unsigned long long, int*) { return -1; }

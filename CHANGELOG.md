@@ -4,6 +4,98 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.1.1] - 2026-10-01
+
+This release implements the plan for member selection, build programs prepared
+once, a pack over several members, and the output streams
+(`.agents/docs/2026-09-30-member-selection-and-build-program-cost-plan.md`),
+and resolves mcpp#748, mcpp#749 and mcpp#750. Two changes are observable by
+scripts: narration moves to standard error, and a `mcpp run` whose build failed
+exits 101 (both under **Changed**).
+
+### Changed
+
+- **Narration is written to standard error, and a command's result to
+  standard output.** The narration is what says what a command is doing: the
+  status lines that begin with a verb (`Resolving`, `Compiling`, `Finished`,
+  `Running`, `Packed`, `Downloading` and the others), the progress bars, the
+  status row of a terminal, and the blank line after `Running`. The result is
+  what the command was asked to produce: the program's output under `mcpp run`,
+  a document or a listing, and for `mcpp test` each verdict, the `test result`
+  line and the `workspace result` line. Releases up to 2026.9.30.2 wrote the
+  narration to standard output. A script that read a status line from standard
+  output changes: `mcpp build | tee log` becomes `mcpp build 2>&1 | tee log`. A
+  CI log, which captures both streams, is unaffected. The live status row is
+  drawn on standard error, whether or not standard output is a terminal
+  (e2e 864 to 866).
+- **A `mcpp run` whose planning or build failed exits 101**, as `cargo run`
+  does. It exited 1 or 2, which a program that returns 1 also does. The
+  program's own status still passes through, a refused start keeps 125 to 127,
+  and `build`, `test` and `pack` keep their statuses. A program or runner that
+  itself returns 101 reads as a failed build (e2e 863).
+- **`mcpp test` over several members plans once per configuration.** The
+  members of one configuration are one plan with each member's tests, so a
+  package they share is compiled once with the union of their features and its
+  build program runs once; then each member's tests run in `[workspace]
+  members` order with that member's runtime directories, continuing past a
+  member that fails. The JSON stream adds a `group_build` record before a
+  group's first test and a `build_group` field in each member's summary, whose
+  `build_ms` is the group's build time; each test record adds `build_ms`, the
+  build time of its own binary. `--workspace-timeout` bounds the runs and
+  `--build-timeout` the build (e2e 854 to 856).
+- **A workspace's build programs share what they import and compile at the
+  same time (mcpp#748).** The bundled `mcpp` module and each host module are
+  compiled once per key: the host compiler, the standard and every flag of the
+  compile, the imported BMIs and the interface's content. The engine's module
+  and the host modules of index packages are kept in the global cache, where
+  `mcpp cache gc` collects them; a host module of a path or git dependency or
+  of a workspace member is kept under the workspace's
+  `target/.build-mcpp/host-modules/`. The members' programs are compiled
+  together, up to the job count, and run in the order they always ran, so the
+  plan is the one a serial build writes. On a fixture of #748's shape the whole
+  build takes 0.33 to 0.48 s instead of 0.89 to 1.22 s (e2e 857 to 861).
+
+### Added
+
+- **A repeated `-p` selects every member it names (mcpp#750).** `build`,
+  `test`, `pack` and `mcpp emit build-database` read one selection: a set of
+  members in `[workspace] members` order, whatever the order of the `-p`
+  values. A value that names no member is refused before planning, and the
+  refusal lists the members. `mcpp run` executes one program and refuses a
+  second `-p`, naming both; `--workspace` together with `-p` is refused
+  (e2e 852, 853).
+- **`--exclude <member>`** removes members from a whole-workspace selection
+  (`--workspace`, or a virtual root without `-p`), on `build`, `test`, `pack`
+  and `mcpp emit build-database`. It is refused with `-p`, for a name that
+  matches no member, and when it leaves no member (e2e 853).
+- **`mcpp pack` over several members (mcpp#749).** `--workspace`, a repeated
+  `-p` and `--exclude` pack several members with one plan per configuration and
+  one build; each member is staged in a tree of its own, its build program sees
+  its own `pack_stage_dir()`, and a dispatched format runs one second pass per
+  configuration. A positional target, several `--target` values, an `--output`
+  that is a file, a member no provider of the requested format acts for, and
+  two members that would write one destination are refused before anything is
+  compiled. A member whose distribution step fails is reported by name and the
+  others are packed; the members are reported in `[workspace] members` order,
+  and `${mcpp.target_file:<name>}` names the target of the member an action is
+  for. `mcpp pack -p <member>` keeps its meaning. The JSON envelope adds
+  `data.stages` and a `member` field per artifact when several members are
+  packed (e2e 867 to 870).
+
+### Fixed
+
+- **A repeated `-p` no longer keeps only its last value (mcpp#750).**
+  `mcpp test -p a -p b` tested `b` alone and exited 0.
+- **Starting a child process is safe for concurrent callers.** A pipe created
+  by one thread could be inherited by a child another thread started, and the
+  first thread's reader then waited for end of file until the unrelated child
+  exited. Pipes are created close-on-exec on Linux; on macOS and Windows the
+  creation of a pipe, the start of the child and the parent's close of the
+  write end form one critical section. The registry of children for signal
+  forwarding is serialised and holds 256 entries.
+- **`mcpp run -q` writes exactly the program's standard output.** It began
+  with an empty line (e2e 862).
+
 ## [2026.9.30.2] - 2026-09-30
 
 This release answers five reports on 2026.9.30.1 while building xlings
