@@ -2273,24 +2273,53 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     ctx.projectRoot= *state.root;
     ctx.outputDir  = target_dir(*state.tc, state.fp, state.workRoot);
 
-    if (auto r = step13_source_packages(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_runner_and_xlings(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_prebuilt_check(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_link_forms(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_make_plan(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_cxx_private_runtime(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_cxx_process_runtime(state, ctx); !r) return std::unexpected(r.error());
-    step13_graph_and_schedule(state, ctx);
-    if (auto r = step13_build_graph_actions(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_assembly_units(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_windows_resources(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_dependency_cache(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_lockfile(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_runtime_provider_overrides(state, ctx); !r) return std::unexpected(r.error());
-    if (auto r = step13_abi_enforcement(state, ctx); !r) return std::unexpected(r.error());
-    step13_resolution_json(state, ctx);
-    if (auto r = step13_empty_link_check(state, ctx); !r) return std::unexpected(r.error());
-    step13_report_packages(state, ctx);
+    // Each step states its duration under `build/stage`, as the phases do
+    // (build wall-time plan, W9), when the log file or --verbose would show it.
+    const bool timing = mcpp::log::is_verbose() || mcpp::log::is_enabled(mcpp::log::Level::info);
+    auto timed = [&](std::string_view step, auto&& run) {
+        if (!timing) return run();
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = run();
+        mcpp::log::verbose("build/stage", std::format("plan finish {}: {}ms", step,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count()));
+        return r;
+    };
+
+    if (auto r = timed("source packages", [&] { return step13_source_packages(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("runner and xlings", [&] { return step13_runner_and_xlings(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("prebuilt check", [&] { return step13_prebuilt_check(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("link forms", [&] { return step13_link_forms(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("make plan", [&] { return step13_make_plan(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("cxx private runtime", [&] { return step13_cxx_private_runtime(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("cxx process runtime", [&] { return step13_cxx_process_runtime(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    timed("graph and schedule", [&] { step13_graph_and_schedule(state, ctx); return 0; });
+    if (auto r = timed("build graph actions", [&] { return step13_build_graph_actions(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("assembly units", [&] { return step13_assembly_units(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("windows resources", [&] { return step13_windows_resources(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("dependency cache", [&] { return step13_dependency_cache(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("lockfile", [&] { return step13_lockfile(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("runtime provider overrides", [&] { return step13_runtime_provider_overrides(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    if (auto r = timed("abi enforcement", [&] { return step13_abi_enforcement(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    timed("resolution json", [&] { step13_resolution_json(state, ctx); return 0; });
+    if (auto r = timed("empty link check", [&] { return step13_empty_link_check(state, ctx); }); !r)
+        return std::unexpected(r.error());
+    timed("report packages", [&] { step13_report_packages(state, ctx); return 0; });
+
 
     ctx.planNotes = std::move(state.planNotes);
     return ctx;
