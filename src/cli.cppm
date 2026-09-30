@@ -641,7 +641,7 @@ int run(int argc, char** argv) {
                 .help("tar (default; .zip for a Windows target) | dir | any "
                       "format the resolved graph provides (e.g. appimage, msi)"))
             .option(cl::Option("output").short_name('o').takes_value()
-                .help("Override output path"))
+                .help("Override output path; with several members, the directory each archive or tree is written below"))
             // Packaging builds RELEASE by default — the artifact leaves this
             // machine. `[build] default-profile` still wins when it is set;
             // this only replaces the "dev" fallback every other command uses.
@@ -661,8 +661,12 @@ int run(int argc, char** argv) {
                 .help("Output format: human (default) | json (one mcpp.pack envelope on stdout; narration on stderr)"))
             .option(cl::Option("no-strip")
                 .help("Ship the artifacts as built (default: strip debug info)"))
-            .option(cl::Option("package").short_name('p').takes_value().value_name("NAME")
-                .help("Pack the named workspace member (namespace.name or package name, then directory), as if run in its directory"))
+            .option(cl::Option("package").short_name('p').takes_value().multiple().value_name("NAME")
+                .help("Pack the named workspace member (namespace.name or package name, then directory), as if run in its directory; repeat to pack several, planned and built once"))
+            .option(cl::Option("workspace")
+                .help("Pack every workspace member that has a program target, planned and built once"))
+            .option(cl::Option("exclude").takes_value().multiple().value_name("NAME")
+                .help("With --workspace, leave the named member out; repeatable, refused with -p"))
             .option(cl::Option("debug-symbols").takes_value().value_name("DIR")
                 .help("Write the separated *.debug files here (default: discard)"))
             .action(wrap_rc(cmd_pack)))

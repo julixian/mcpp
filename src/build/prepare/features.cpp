@@ -1911,10 +1911,7 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             // generating a declaration for this package must match how this
             // package is compiled.
             fill_package_build_env(bpEnv, pkg.manifest);
-            bpEnv.packFormat   = state.overrides.pack_format;
-            bpEnv.packStageDir = state.overrides.pack_stage_dir;
-            bpEnv.packStrip           = state.overrides.pack_strip;
-            bpEnv.packDebugSymbolsDir = state.overrides.pack_debug_symbols_dir;
+            state.fillPackEnv(bpEnv, i);
             bpEnv.requested       = pkg.selectedMember;
             bpEnv.languageModules = pkg.manifest.language.modules;
             bpEnv.ruleModules  = pkg.manifest.buildConfig.ruleModules;

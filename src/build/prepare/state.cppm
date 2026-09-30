@@ -317,6 +317,97 @@ struct PrepareState {
     // which a root receives; in a workspace plan every selected member does.
     std::vector<std::string> profileCflags, profileCxxflags;
     bool workspacePlan() const { return !selectedMemberPaths.empty(); }
+    // ── The packaging pass: which packed member a package acts for ──────────
+    //
+    // `mcpp pack` over several members plans them as one graph (member
+    // selection design 2026-09-30, K1), and a package of it may serve one
+    // member, several, or be a member itself. A program that provides a pack
+    // format submits an action against the staged tree of the member it packs,
+    // so each program must be told which member that is: its own when it is a
+    // selected member, the one selected member whose closure reaches it when
+    // exactly one does, and none when several do (`pack_owner`). The closures
+    // are read from the dependency edges recorded while the graph was walked,
+    // which is why this is asked for only after the graph is complete.
+    //
+    // Empty, and never asked for, when the plan holds fewer than two selected
+    // members: its one subject is what every package acts for.
+    std::map<std::string, std::vector<std::string>> packReach;
+    bool packReachComputed = false;
+    std::size_t selectedMemberCount() const {
+        std::size_t n = 0;
+        for (std::size_t i = 1; i < packages.size(); ++i)
+            if (packages[i].selectedMember) ++n;
+        return n;
+    }
+    void computePackReach() {
+        if (packReachComputed) return;
+        packReachComputed = true;
+        if (selectedMemberCount() < 2) return;
+        for (std::size_t m = 1; m < packages.size(); ++m) {
+            if (!packages[m].selectedMember) continue;
+            std::vector<bool> reached(packages.size(), false);
+            reached[m] = true;
+            for (bool grew = true; grew;) {
+                grew = false;
+                for (auto const& r : graphRequests)
+                    if (r.consumerPackageIndex < reached.size() && reached[r.consumerPackageIndex]
+                        && r.dependencyPackageIndex < reached.size()
+                        && !reached[r.dependencyPackageIndex]) {
+                        reached[r.dependencyPackageIndex] = true;
+                        grew = true;
+                    }
+            }
+            const auto member = mcpp::build::qualified_package_name(packages[m].manifest);
+            for (std::size_t i = 1; i < packages.size(); ++i)
+                if (reached[i])
+                    packReach[mcpp::build::qualified_package_name(packages[i].manifest)]
+                        .push_back(member);
+        }
+    }
+    // Why package `i` has no stage when several packed members reach it: such a
+    // package acts for none of them (`pack_owner`). Empty otherwise.
+    std::string packSharedWhy(std::size_t i) {
+        computePackReach();
+        if (i >= packages.size()) return {};
+        const auto name = mcpp::build::qualified_package_name(packages[i].manifest);
+        auto reach = packReach.find(name);
+        if (reach == packReach.end() || reach->second.size() < 2) return {};
+        std::string members;
+        for (auto const& m : reach->second) members += (members.empty() ? "'" : ", '") + m + "'";
+        return std::format("package '{}' is reached by the packed members {}", name, members);
+    }
+    // What the packaging pass tells the programs that act for package `i`, or
+    // null when there is none to tell: outside a packaging pass, for a package
+    // several packed members reach, and for a member that has no stage.
+    const BuildOverrides::PackStage* packStageOf(std::size_t i) {
+        auto& stages = overrides.pack_stages;
+        if (stages.empty()) return nullptr;
+        if (selectedMemberCount() < 2) return &stages.begin()->second;
+        computePackReach();
+        if (i >= packages.size()) return nullptr;
+        const auto name = mcpp::build::qualified_package_name(packages[i].manifest);
+        auto reach = packReach.find(name);
+        if (reach == packReach.end()) return nullptr;
+        auto stage = stages.find(pack_owner(name, reach->second));
+        return stage == stages.end() ? nullptr : &stage->second;
+    }
+    // The packaging pass's values of a build program's environment, for the
+    // program of package `i`. A package that acts for no packed member is told
+    // nothing, not even the format: its answer cannot depend on a request it
+    // has no member to serve, so its program is not run again for it, and one
+    // run serves every member that reaches it.
+    void fillPackEnv(mcpp::build::BuildProgramEnv& env, std::size_t i) {
+        if (overrides.pack_stages.empty()) {
+            env.packFormat = overrides.pack_format;
+            return;
+        }
+        if (const auto* stage = packStageOf(i)) {
+            env.packFormat          = overrides.pack_format;
+            env.packStageDir        = stage->dir;
+            env.packStrip           = stage->strip;
+            env.packDebugSymbolsDir = stage->debugSymbolsDir;
+        }
+    }
     // `--features` as the command gave it. A workspace plan hands the tokens to
     // its members and clears `overrides.features`; the request is still what
     // the build was asked for, and what its fast-path record names.

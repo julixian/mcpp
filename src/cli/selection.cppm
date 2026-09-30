@@ -17,6 +17,7 @@
 export module mcpp.cli.selection;
 
 import std;
+import mcpplibs.cmdline;
 import mcpp.manifest;
 import mcpp.project;
 
@@ -190,6 +191,39 @@ select_members(const MemberRequest& req,
     auto sel = select_members(*m, wsRoot, inside, req);
     if (!sel) return std::unexpected(sel.error());
     return std::optional<MemberSelection>{std::move(*sel)};
+}
+
+
+// The selectors of a command line, as `mcpp::cli::select_members` reads them
+// (member selection design 2026-09-30, S1): every command that acts on members
+// reads its `-p`, `--workspace` and `--exclude` the same way, so the members a
+// command plans are the ones the flags name whatever the command is.
+MemberRequest member_request(const mcpplibs::cmdline::ParsedArgs& parsed) {
+    MemberRequest req;
+    req.all = parsed.is_flag_set("workspace");
+    req.packages = parsed.option_or_empty("package").values;
+    req.excludes = parsed.option_or_empty("exclude").values;
+    return req;
+}
+
+// The workspace a fan-out acts on, and its members grouped by configuration
+// (workspace design 2026-09-29 §15): members whose root-position values are
+// equal are planned together, in one graph, in one build directory.
+std::expected<std::vector<std::vector<std::string>>, std::string>
+workspace_groups(const std::filesystem::path& wsRoot, const std::vector<std::string>& members) {
+    auto ws = mcpp::manifest::load(wsRoot / "mcpp.toml");
+    if (!ws) return std::unexpected(ws.error().format());
+    std::vector<std::vector<std::string>> groups;
+    std::map<std::string, std::size_t> byKey;
+    for (auto const& mp : members) {
+        auto mm = mcpp::project::load_member_manifest(*ws, wsRoot, mp);
+        if (!mm) return std::unexpected(mm.error());
+        const auto key = mcpp::project::root_position_key(*mm);
+        auto [it, fresh] = byKey.try_emplace(key, groups.size());
+        if (fresh) groups.emplace_back();
+        groups[it->second].push_back(mp);
+    }
+    return groups;
 }
 
 } // namespace mcpp::cli

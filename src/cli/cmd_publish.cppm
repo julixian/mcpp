@@ -12,6 +12,7 @@ import mcpp.build.advice;
 import mcpplibs.cmdline;
 import mcpp.build.prepare;   // profile_override_from_flags
 import mcpp.build.progress;  // the build's report (build progress design 2026-09-29)
+import mcpp.cli.selection;    // which members `pack` acts on, as `build` plans them
 import mcpp.log;
 import mcpp.libs.json;
 import mcpp.pack;
@@ -224,6 +225,14 @@ export int cmd_pack(const mcpplibs::cmdline::ParsedArgs& parsed) {
         env.data = nullptr;
         env.diagnostics.push_back({"MCPP_PACK_FAILED", mcpp::wire::Severity::Error,
             "mcpp pack did not produce a package; the reason is on standard error"});
+        // A pack of several members names each member that failed, which the
+        // code above cannot: the others may have been packed.
+        if (outcome.members.size() > 1)
+            for (auto const& m : outcome.members)
+                if (m.rc != 0)
+                    env.diagnostics.push_back({"MCPP_PACK_FAILED", mcpp::wire::Severity::Error,
+                        std::format("mcpp pack did not produce a package for member '{}'; "
+                                    "the reason is on standard error", m.name)});
         mcpp::wire::emit(env);
         return rc;
     }
@@ -242,9 +251,30 @@ export int cmd_pack(const mcpplibs::cmdline::ParsedArgs& parsed) {
     };
     nlohmann::json artifacts = nlohmann::json::array();
     nlohmann::json stage = nullptr;
+    nlohmann::json stages = nullptr;
     if (libraryRoute) {
         const auto fmt = parsed.value("format").value_or("tar");
         artifacts.push_back(artifact_json(library.artifact, fmt, library.targets));
+    } else if (outcome.members.size() > 1) {
+        // Several members (member selection design 2026-09-30, K1). Fields are
+        // added and none is redefined (docs/50 §7): every member's artifacts
+        // are listed, each naming its member, and `stage`, which names one
+        // tree, stays null while `stages` names one per member.
+        stages = nlohmann::json::array();
+        for (auto const& m : outcome.members) {
+            for (auto const& a : m.artifacts) {
+                auto j = artifact_json(a, m.format, m.targets);
+                j["member"] = m.name;
+                artifacts.push_back(std::move(j));
+            }
+            if (!m.stageDir.empty())
+                stages.push_back(nlohmann::json{
+                    {"member", m.name},
+                    {"dir", m.stageDir.lexically_normal().string()},
+                    {"manifest", m.stageManifest.lexically_normal().string()},
+                    {"closure", m.closure},
+                });
+        }
     } else {
         for (auto const& a : outcome.artifacts)
             artifacts.push_back(artifact_json(a, outcome.format, outcome.targets));
@@ -256,11 +286,121 @@ export int cmd_pack(const mcpplibs::cmdline::ParsedArgs& parsed) {
             };
     }
     env.data = nlohmann::json{{"artifacts", std::move(artifacts)}, {"stage", std::move(stage)}};
+    if (!stages.is_null()) env.data["stages"] = std::move(stages);
     mcpp::wire::emit(env);
     return 0;
 }
 
 namespace {
+
+// The members `mcpp pack` packs, from the selectors of its command line (member
+// selection design 2026-09-30, K1).
+//
+// A command without a selector acts on the package of its directory, as it
+// always has, and so does a selection of one member: `-p X` packs X as if the
+// command ran in X's directory, which is what the command does. Several members
+// are planned and built once, each in its own stage. For `pack`, "every member"
+// means every member with a program target to pack: `--workspace` skips a member
+// that has none, and `-p` names a member that has none in a refusal.
+struct PackMembers {
+    // Set when several members are packed; null for one, which is the package of
+    // the directory the command runs in, entered when `-p` named it.
+    std::optional<mcpp::pack::MemberPack> several;
+    int                                   rc = 0;   // non-zero: refused, and reported
+};
+
+PackMembers pack_members(const mcpplibs::cmdline::ParsedArgs& parsed) {
+    PackMembers out;
+    const auto request = mcpp::cli::member_request(parsed);
+    auto selection = mcpp::cli::select_members(request);
+    if (!selection) {
+        mcpp::ui::error(selection.error());
+        out.rc = 2;
+        return out;
+    }
+    if (!*selection) {
+        // Outside a workspace there is nothing for `-p` to name.
+        if (!request.packages.empty()) {
+            auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
+            if (!root) {
+                mcpp::ui::error("-p needs a workspace; no mcpp.toml was found here or above");
+            } else if (auto rm = mcpp::manifest::load(*root / "mcpp.toml"); !rm) {
+                mcpp::ui::error(rm.error().format());
+            } else {
+                mcpp::ui::error(std::format("-p {}: {} is not a workspace",
+                                            request.packages.front(), root->string()));
+            }
+            out.rc = 2;
+        }
+        return out;
+    }
+    const auto& sel = **selection;
+    const bool selected = request.all || !request.packages.empty() || !request.excludes.empty();
+    if (!selected) return out;
+
+    // The members with a program to pack.
+    auto ws = mcpp::manifest::load(sel.root / "mcpp.toml");
+    if (!ws) {
+        mcpp::ui::error(ws.error().format());
+        out.rc = 2;
+        return out;
+    }
+    std::vector<std::string> packable;
+    for (auto const& mp : sel.members) {
+        auto mm = mcpp::project::load_member_manifest(*ws, sel.root, mp);
+        if (!mm) {
+            mcpp::ui::error(mm.error());
+            out.rc = 2;
+            return out;
+        }
+        if (std::ranges::any_of(mm->targets, [](auto const& t) { return t.is_program(); })) {
+            packable.push_back(mp);
+            continue;
+        }
+        // One member named is packed as it always was, a library package
+        // included; with several, a member that has no program is skipped when
+        // the selection is every member, and refused by name when `-p` named it.
+        if (sel.members.size() == 1) packable.push_back(mp);
+        else if (sel.whole)
+            mcpp::ui::info("Skipping", std::format(
+                "{}: no program target to pack", mm->package.name));
+        else {
+            mcpp::ui::error(std::format(
+                "member '{}' has no program target to pack: `mcpp pack` over several members "
+                "packs programs.\n  Pack it alone with `-p {}`, or leave it out.",
+                mm->package.name, mp));
+            out.rc = 2;
+            return out;
+        }
+    }
+    if (packable.empty()) {
+        mcpp::ui::error("no workspace member has a program target to pack");
+        out.rc = 2;
+        return out;
+    }
+
+    if (packable.size() == 1) {
+        // One member: the package of its directory, as if the command ran there.
+        // A relative `--output` keeps meaning the directory the user typed it in
+        // (the caller resolves it before this changes the directory).
+        std::error_code ec;
+        std::filesystem::current_path(sel.root / packable.front(), ec);
+        if (ec) {
+            mcpp::ui::error(std::format("-p {}: cannot enter {}: {}", packable.front(),
+                                        (sel.root / packable.front()).string(), ec.message()));
+            out.rc = 2;
+        }
+        return out;
+    }
+    auto groups = mcpp::cli::workspace_groups(sel.root, packable);
+    if (!groups) {
+        mcpp::ui::error(groups.error());
+        out.rc = 2;
+        return out;
+    }
+    out.several = mcpp::pack::MemberPack{sel.root, std::move(*groups), {}};
+    return out;
+}
 
 int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
                   mcpp::pack::PackOutcome* report,
@@ -270,31 +410,14 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
     // other `-p` uses, and the pack then runs in its directory, so the result
     // is by construction the one `mcpp pack` in that directory produces. A
     // relative `--output` keeps meaning the directory the user typed it in.
+    std::optional<std::filesystem::path> typedOutput;
+    if (auto v = parsed.value("output")) typedOutput = std::filesystem::absolute(*v);
+    const auto startedIn = std::filesystem::current_path();
+    auto members = pack_members(parsed);
+    if (members.rc != 0) return members.rc;
     std::optional<std::filesystem::path> outputFromUser;
-    if (auto pkg = parsed.option_or_empty("package").value(); !pkg.empty()) {
-        auto root = mcpp::project::find_manifest_root(std::filesystem::current_path());
-        if (!root) {
-            mcpp::ui::error("-p needs a workspace; no mcpp.toml was found here or above");
-            return 2;
-        }
-        auto rm = mcpp::manifest::load(*root / "mcpp.toml");
-        if (!rm) { mcpp::ui::error(rm.error().format()); return 2; }
-        auto member = mcpp::project::resolve_member_dir(*rm, *root, pkg);
-        if (!member) { mcpp::ui::error(member.error()); return 2; }
-        if (member->empty()) {
-            mcpp::ui::error(std::format("-p {}: {} is not a workspace", pkg, root->string()));
-            return 2;
-        }
-        if (auto v = parsed.value("output"))
-            outputFromUser = std::filesystem::absolute(*v);
-        std::error_code ec;
-        std::filesystem::current_path(*member, ec);
-        if (ec) {
-            mcpp::ui::error(std::format("-p {}: cannot enter {}: {}", pkg,
-                                        member->string(), ec.message()));
-            return 2;
-        }
-    }
+    if (typedOutput && std::filesystem::current_path() != startedIn)
+        outputFromUser = typedOutput;
     // ─── Resolve mode ────────────────────────────────────────────────
     mcpp::pack::Options opts;
     bool modeFromUser = false;
@@ -356,6 +479,48 @@ int cmd_pack_body(const mcpplibs::cmdline::ParsedArgs& parsed,
     std::vector<std::string> triples;
     if (auto o = parsed.option("target")) triples = o->get().values;
     if (!triples.empty()) opts.targetTriple = triples.back();
+
+    // ─── Several members ─────────────────────────────────────────────
+    //
+    // Each is refused before anything is planned, let alone compiled: the
+    // command names one thing where several members are packed, and the
+    // members cannot share it.
+    if (members.several) {
+        if (const auto name = parsed.positional(0); !name.empty()) {
+            mcpp::ui::error(std::format(
+                "a target name cannot be given when several members are packed: '{}' names "
+                "a target of one package.\n"
+                "  use: -p <member> {}, or leave the name out to pack each member's program",
+                name, name));
+            return 2;
+        }
+        if (triples.size() > 1) {
+            mcpp::ui::error(
+                "--target may be given once when several members are packed: each member's "
+                "program is built for one target,\n"
+                "  and a pack for several targets stages one member's legs into one tree.\n"
+                "  use: pack that member alone with -p <member>");
+            return 2;
+        }
+        opts.output.clear();
+        if (typedOutput) {
+            std::error_code ec;
+            if (std::filesystem::exists(*typedOutput, ec)
+                && !std::filesystem::is_directory(*typedOutput, ec)) {
+                mcpp::ui::error(std::format(
+                    "--output names a file, '{}', and several members are packed.\n"
+                    "  Each member's archive or tree is written below the directory --output "
+                    "names, under the name\n"
+                    "  it has by default. use: --output <directory>", typedOutput->string()));
+                return 2;
+            }
+            members.several->outputDir = *typedOutput;
+        }
+        auto out = mcpp::pack::build_and_pack_members(std::move(opts), modeFromUser,
+                                                      *members.several);
+        if (report) *report = out;
+        return out.rc;
+    }
 
     // ─── Which target, and therefore which kind of package ───────────
     //

@@ -493,7 +493,32 @@ export struct BuildContext {
     // record is written, and matched, per selection and group (§15).
     std::string                     workspaceRequest;
     std::string                     workspaceGroup;
+    // Which packed member each package acts for, in a plan of several
+    // selected members (member selection design 2026-09-30, K1): for every
+    // package of the plan, the selected members whose dependency closure
+    // reaches it, in discovery order, a member reaching itself. Empty for a
+    // plan of one member or none, where the plan's one subject is what every
+    // package acts for. Read through `pack_owner`.
+    std::map<std::string, std::vector<std::string>> packReach;
+    // The packages that declared each pack format with
+    // `mcpp::provides_pack_format`, by format, as qualified package names.
+    // Collected on every pass, with `plan.providedPackFormats`, which it
+    // refines: the plan knows the set of formats and this knows who provides
+    // each.
+    std::map<std::string, std::vector<std::string>> packFormatProviders;
 };
+
+// The selected member a package acts for in a packaging pass: the package
+// itself when it is one of the members, the one member that reaches it when
+// exactly one does, and none (empty) when several do. `reach` is the package's
+// entry of `BuildContext::packReach`. Written once and read by prepare, which
+// hands each program the stage of the member it acts for, and by `mcpp pack`,
+// which attributes each action a program submitted to a member.
+export inline std::string pack_owner(std::string_view package,
+                                     const std::vector<std::string>& reach) {
+    if (std::ranges::find(reach, package) != reach.end()) return std::string(package);
+    return reach.size() == 1 ? reach.front() : std::string{};
+}
 
 // The ONE cache-mode resolver, for the same reason resolve_profile_name exists:
 // execute.cppm's fast paths deliberately skip prepare_build, so they need to
@@ -514,6 +539,50 @@ export struct BuildContext {
 // after the plan's graph is written; the plan's own fields are exchanged, not
 // lost. A context of any other shape is left as it is.
 export void focus_on_member(BuildContext& ctx);
+
+// Reads `fn` with the plan describing one workspace member (workspace design
+// 2026-09-29 §15): the member's link group is exchanged into the plan's own
+// fields for the call, so what a member's tests run against, or what its
+// package is made of -- its runtime directories, the files its runtime needs --
+// is its closure's, and no other member's; and the member's manifest and root
+// become the context's, so a reader that asks "the package being built" is
+// answered about the member. `owner` is the member's qualified package name.
+// Outside a workspace plan, for an empty `owner` and for a name the plan does
+// not hold, the plan is read as it is.
+//
+// Every exchange is undone before the call returns, also when `fn` throws: a
+// drive emits the plan and must see its own fields, and the next member is
+// read from the plan as the group left it. The exchange is of fields, not of
+// copies, so a member's view costs no more than a swap. This is
+// `focus_on_member` for a plan of several members, and scoped.
+export template <class F>
+void with_member(BuildContext& ctx, std::string_view owner, F&& fn) {
+    BuildPlan::LinkGroup* group = nullptr;
+    BuildContext::WorkspaceMember* member = nullptr;
+    if (!owner.empty()) {
+        for (auto& g : ctx.plan.linkGroups)
+            if (!g.linkOnly && g.member == owner) { group = &g; break; }
+        for (auto& m : ctx.workspaceMembers)
+            if (m.name == owner) { member = &m; break; }
+    }
+    if (!group && !member) { fn(); return; }
+    struct Exchange {
+        BuildContext& ctx;
+        BuildPlan::LinkGroup* group;
+        BuildContext::WorkspaceMember* member;
+        void flip() {
+            if (group) swap_link_group(ctx.plan, *group);
+            if (member) {
+                std::swap(ctx.manifest, member->manifest);
+                std::swap(ctx.projectRoot, member->root);
+            }
+        }
+        Exchange(BuildContext& c, BuildPlan::LinkGroup* g, BuildContext::WorkspaceMember* m)
+            : ctx(c), group(g), member(m) { flip(); }
+        ~Exchange() { flip(); }
+    } exchange{ctx, group, member};
+    fn();
+}
 
 export CacheMode resolve_cache_mode(const mcpp::manifest::Manifest& m,
                                     std::string_view override_mode);
@@ -676,32 +745,49 @@ export struct BuildOverrides {
     // and after staging, so the claiming member submits an action whose input
     // is a directory that by then exists.
     //
-    // NEITHER VALUE IS DERIVED HERE, AND THAT IS THE POINT. `pack_stage_dir` is
-    // a function of the package name, the version, the resolved triple and the
-    // mode, and the resolved triple is not known until a prepare has run.
-    // Computing it a second time before prepare -- from the host triple, say --
-    // is the shape where two derivations of one value agree on every machine
-    // the author has. Both are read out of what the first pass and `make_plan`
-    // already answered.
+    // NEITHER VALUE IS DERIVED HERE, AND THAT IS THE POINT. A member's stage
+    // directory is a function of the package name, the version, the resolved
+    // triple and the mode, and the resolved triple is not known until a
+    // prepare has run. Computing it a second time before prepare -- from the
+    // host triple, say -- is the shape where two derivations of one value agree
+    // on every machine the author has. Both are read out of what the first pass
+    // and `make_plan` already answered.
     std::string           pack_format;
-    std::filesystem::path pack_stage_dir;
-    // WHY THERE IS NO STAGED TREE, when there is none and a format was still
-    // requested. Empty otherwise.
-    //
-    // A dispatched format does not require the built-in bundling to have
-    // succeeded -- see the note in `mcpp.pack.pipeline`. When it did not, the
-    // reason travels here so `${mcpp.stage_dir}`'s refusal can name it instead
-    // of saying only that the placeholder is unavailable. A member author
-    // reading "this build is not packaging" for a build that plainly is would
-    // be sent looking in the wrong place.
-    std::string           pack_stage_reason;
-    // #649 E5: the strip decision and the debug-symbol directory that pass
-    // resolved, "1" or "0" and absolute, set only beside `pack_format`. A
-    // member that stages libraries of its own reads them through
-    // `mcpp::pack_strip()` and `mcpp::pack_debug_symbols_dir()`, so
-    // `--no-strip` reaches its files as it reaches the engine's.
-    std::string           pack_strip;
-    std::filesystem::path pack_debug_symbols_dir;
+    // What a packaging pass knows of one packed member: where its tree is
+    // staged, and what the staging resolved for the programs that act for it.
+    struct PackStage {
+        // The staged tree, absolute. Empty when staging was refused, which is
+        // what makes `${mcpp.stage_dir}` refuse with `reason` attached rather
+        // than expand to a directory that does not exist.
+        std::filesystem::path dir;
+        // WHY THERE IS NO STAGED TREE, when there is none and a format was
+        // still requested. Empty otherwise.
+        //
+        // A dispatched format does not require the built-in bundling to have
+        // succeeded -- see the note in `mcpp.pack.pipeline`. When it did not,
+        // the reason travels here so `${mcpp.stage_dir}`'s refusal can name it
+        // instead of saying only that the placeholder is unavailable. A member
+        // author reading "this build is not packaging" for a build that
+        // plainly is would be sent looking in the wrong place.
+        std::string           reason;
+        // #649 E5: the strip decision and the debug-symbol directory that
+        // member's staging resolved, "1" or "0" and absolute. A member that
+        // stages libraries of its own reads them through `mcpp::pack_strip()`
+        // and `mcpp::pack_debug_symbols_dir()`, so `--no-strip` reaches its
+        // files as it reaches the engine's.
+        std::string           strip;
+        std::filesystem::path debugSymbolsDir;
+    };
+    // The packed members' stages, by qualified package name. One entry is what a
+    // pack of one member sets, and then every program of the plan receives it,
+    // as the plan's only package being packed. With several entries (`mcpp
+    // pack` over several members, member selection design 2026-09-30, K1) a
+    // program receives the stage of the member it acts for: its own when it is
+    // a packed member, and otherwise the one packed member whose dependency
+    // closure reaches it. A package that several packed members reach acts for
+    // none of them, and receives no stage at all, which is what lets one run of
+    // its program serve every member.
+    std::map<std::string, PackStage> pack_stages;
 };
 
 // ── git dependency helpers ──────────────────────────────────────────────────

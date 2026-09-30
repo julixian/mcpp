@@ -148,6 +148,8 @@ mcpp pack --dev                        # the same, as `build` and `run` spell it
 mcpp pack --message-format json        # one mcpp.pack envelope on stdout (mcpp 2026.9.16.1+)
 mcpp pack --no-strip                   # ship the artifacts as built
 mcpp pack -p app --format release      # a workspace member, as if run in its directory
+mcpp pack --workspace --format release # every member with a program, planned and built once
+mcpp pack -p cli -p gui -o dist/       # two members, each archive below dist/
 mcpp pack --debug-symbols dbg/         # write the separated *.debug files under dbg/
 mcpp pack --format msi --features installer   # activate root-package features for the pack
 ```
@@ -168,12 +170,81 @@ relative `-o` keeps meaning the directory the command was typed in.
 take, with the same precedence: `--profile` wins over either, on all three
 commands.
 
+### Packing several members (mcpp 2026.10.1.1+)
+
+`-p` may be repeated, and `--workspace` and `--exclude` select members as they do
+for `mcpp build` ([07 — Workspaces](07-workspace.md), §5.3). The members are
+planned as one selection and built once, and each is then staged, and packed, in
+a tree of its own:
+
+```bash
+mcpp pack --workspace --format release          # every member with a program
+mcpp pack --workspace --exclude updater         # every such member but one
+mcpp pack -p cli -p gui --format release
+```
+
+Packing each member with its own `mcpp pack -p <member>` plans the graph, runs
+the build programs and starts the build again for every member, including the
+members they share. A pack over several members plans once for each
+configuration (the grouping `mcpp build` uses), builds once, and runs each build
+program once per pass: a package that several members reach, such as a shared
+library with a build program, is prepared and compiled once, and its program
+does not run again for the pack.
+
+What each member receives is what `mcpp pack -p <member>` gives it:
+
+- **The product.** A member's archive or tree is the one the member makes when
+  packed alone, below its own `target/dist/`. With `--output <dir>` it is written
+  below the directory, which is created when it is missing, under the name it has
+  by default.
+- **A staged tree of its own.** With a dispatched `--format`, the pack prepares
+  twice, as above, and the second pass tells each build program the staged tree
+  of the member it acts for. `mcpp::pack_stage_dir()` and `${mcpp.stage_dir}`
+  answer per member. A program acts for the member it belongs to; a package that
+  only one packed member reaches (a provider the member depends on) acts for that
+  member; a package that several packed members reach acts for none of them, and
+  is told neither the format nor a tree, so one run of its program serves them
+  all.
+- **Its own distributable.** An `artifact` action the request introduced belongs
+  to the member whose program, or whose provider, submitted it. Each member's
+  outputs are verified to exist and are reported as `Packed` for that member.
+
+`--workspace` packs a member only if it has a program target, and says which it
+skipped. A member named with `-p` that has none is refused. Members are packed in
+`[workspace] members` order, whatever order `-p` names them in. A member that
+fails, for instance one whose provider submitted nothing for the requested
+format, is reported by name and the others are packed; the exit status is
+non-zero if any member failed. One member, whether named with one `-p` or by the
+directory the command runs in, is packed exactly as before: `mcpp pack -p X`
+plans X's closure alone. `mcpp pack` with no selector at a virtual workspace
+root packs the first member that has a program, as it always did; `--workspace`
+packs them all.
+
+**Refused before anything is compiled**, naming what was refused:
+
+| Input | Reason |
+|---|---|
+| a positional target name | it names a target of one package |
+| more than one `--target` | a program is built for one target, and the several-target Android pack stages the legs of one member |
+| `--output` that exists as a file | each member's archive or tree is written below the directory |
+| a member named with `-p` that has no program target | there is nothing to pack for it |
+| with a dispatched `--format`, a member no provider acts for | the format is provided by a package the member does not reach, or by a package several members reach |
+| two members that would write one archive or tree | `--output` names one directory, and two packages of one name, version and target share an archive name |
+
+A package with a build program that provides a format for several members cannot
+serve them: a provider receives one staged tree. Provide the format from each
+member's own build program (a helper both call is enough), or pack the members
+one at a time.
+
 `--message-format json` (mcpp 2026.9.16.1+) prints one `mcpp.pack` envelope on
 stdout after the command finishes and sends every human line to stderr. Its
 `data.artifacts` holds each produced file or directory with its absolute path,
 its `type` (`file` or `directory`), the `--format` value and the triples of its
 legs; `data.stage` holds the staged tree, its manifest and whether the closure
-was walked ([50 — Machine Output](50-machine-output.md)). `--format` names the
+was walked ([50 — Machine Output](50-machine-output.md)). A pack of several
+members lists every member's artifacts, each naming its `member`, leaves
+`data.stage` null and names one tree per member in `data.stages`
+(2026.10.1.1+). `--format` names the
 package format on this command, so machine output is asked for the way
 `mcpp test` asks for it.
 

@@ -2772,25 +2772,6 @@ struct TestBuild {
     std::string                              hostCannotRunReason;
 };
 
-// Reads `fn` with the plan describing one workspace member (workspace design
-// 2026-09-29 §15): the member's link group is exchanged into the plan's own
-// fields for the call, so what a member's tests run against -- its runtime
-// directories, the files its runtime needs -- is the member's closure's, and
-// no other member's. Outside a workspace plan, and for an empty `owner`, the
-// plan is read as it is. The exchange is undone before the call returns: a
-// drive emits the plan, and must see its own fields.
-template <class F>
-static void as_member(BuildContext& ctx, std::string_view owner, F&& fn) {
-    BuildPlan::LinkGroup* group = nullptr;
-    if (!owner.empty())
-        for (auto& g : ctx.plan.linkGroups)
-            if (!g.linkOnly && g.member == owner) { group = &g; break; }
-    if (!group) { fn(); return; }
-    swap_link_group(ctx.plan, *group);
-    fn();
-    swap_link_group(ctx.plan, *group);
-}
-
 // The "Compiling <package>" lines the tests' own lines follow.
 static void test_announce(const BuildContext& ctx) {
     std::map<std::string, std::size_t> cachedUnits;
@@ -3046,7 +3027,7 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
     auto runtimeEnvKey = mcpp::platform::env::runtime_library_path_key();
     std::string runtimeEnvValue;
     bool hasRuntimeDirs = false;
-    as_member(*ctx, owner, [&] {
+    with_member(*ctx, owner, [&] {
         runtimeEnvValue = mcpp::platform::env::prepend_path_list(
             runtimeEnvKey, ctx->plan.runtimeLibraryDirs);
         hasRuntimeDirs = !ctx->plan.runtimeLibraryDirs.empty();
@@ -3355,7 +3336,7 @@ static int test_run_member(TestBuild& tb, const TestOptions& testOpts,
         // in the single-threaded pass, one list per test program.
         if (!runnerTmpl.empty()) {
             std::vector<std::pair<std::string, std::filesystem::path>> carried;
-            as_member(*ctx, owner, [&] { carried = runtime_files_for(*ctx, exe, owner); });
+            with_member(*ctx, owner, [&] { carried = runtime_files_for(*ctx, exe, owner); });
             if (auto listed = write_runtime_files_list(*ctx, exe, carried))
                 childEnv.emplace_back(std::string(kRuntimeFilesEnv), listed->string());
             else if (invocationNotRunReason.empty())

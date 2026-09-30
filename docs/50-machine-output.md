@@ -581,10 +581,19 @@ to stderr, including what the build programs and tools the pack starts print.
 | field | |
 |---|---|
 | `artifacts` | one record per produced artifact: `path` (absolute), `type` (`file` or `directory`), `format` (the `--format` value, `tar` when omitted) and `targets` (the canonical triple of each leg that went into it). A dispatched format reports the terminal outputs of the actions the request introduced; a several-`--target` Android pack reports one artifact whose `targets` lists every leg |
-| `stage` | the tree the artifact was made from: `dir`, `manifest` (the stage manifest below) and `closure` (`walked` or `not-walked`); `null` for a library package and when no tree was staged |
+| `stage` | the tree the artifact was made from: `dir`, `manifest` (the stage manifest below) and `closure` (`walked` or `not-walked`); `null` for a library package, when no tree was staged, and for a pack of several members |
+| `stages` *(2026.10.1.1+)* | present only for a pack of several members (`--workspace`, or `-p` repeated): one record per member in `[workspace] members` order, with `member` (the qualified package name) and the `dir`, `manifest` and `closure` of `stage` |
+
+For a pack of several members `artifacts` lists every member's artifacts, in the
+same member order, and each record gains `member`, the qualified package name of
+the member it belongs to. A pack of one member has neither `stages` nor
+`member`: the envelope is the one it always was.
 
 A failure omits `data`, exits with the command's exit status and carries the
-diagnostic code `MCPP_PACK_FAILED`; the reason is on stderr. The per-run
+diagnostic code `MCPP_PACK_FAILED`; the reason is on stderr. A pack of several
+members that failed for some of them carries one `MCPP_PACK_FAILED` diagnostic
+more for each such member, naming it, and omits `data` as well: the members that
+were packed are on disk and named on stderr. The per-run
 `effects` are `read-project`, `write-project` and `write-global-cache`, with
 `exec-build-script` when a build program ran. `--protocol-version` declares
 `init-mcpp-home`, `read-project`, `write-project`, `network`,

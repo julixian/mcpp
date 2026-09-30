@@ -136,6 +136,8 @@ mcpp pack --dev                        # the same, as `build` and `run` spell it
 mcpp pack --message-format json        # one mcpp.pack envelope on stdout (mcpp 2026.9.16.1+)
 mcpp pack --no-strip                   # ship the artifacts as built
 mcpp pack -p app --format release      # a workspace member, as if run in its directory
+mcpp pack --workspace --format release # every member with a program, planned and built once
+mcpp pack -p cli -p gui -o dist/       # two members, each archive below dist/
 mcpp pack --debug-symbols dbg/         # write the separated *.debug files under dbg/
 mcpp pack --format msi --features installer   # activate root-package features for the pack
 ```
@@ -154,11 +156,64 @@ feature：每一条 `--target` 腿，以及被分派格式的两遍构建。它�
 `--release` 与 `--dev`（mcpp 2026.9.16.1+）是 `build`、`run` 已接受的简写，
 优先级相同：三条命令上都是 `--profile` 优先于它们。
 
+### 打包多个成员（mcpp 2026.10.1.1+）
+
+`-p` 可以重复，`--workspace` 与 `--exclude` 选择成员的方式与 `mcpp build` 相同
+（[07 —— 工作区](07-workspace.md)，§5.3）。这些成员作为一个选择一起规划、只构建一次，
+然后每个成员在各自的暂存树中暂存并打包：
+
+```bash
+mcpp pack --workspace --format release          # 每个有程序的成员
+mcpp pack --workspace --exclude updater         # 除一个之外的每个这样的成员
+mcpp pack -p cli -p gui --format release
+```
+
+对每个成员分别运行 `mcpp pack -p <member>`，每次都会重新规划图、重新运行构建程序、
+重新启动构建，它们共用的成员也不例外。对多个成员的打包，每个配置（即 `mcpp build`
+使用的分组）规划一次、构建一次，每个构建程序每遍运行一次：被多个成员依赖的包，
+例如带构建程序的共享库，只准备并编译一次，它的程序在这次打包里不会再次运行。
+
+每个成员得到的，就是 `mcpp pack -p <member>` 给它的：
+
+- **产物。** 成员的归档或目录，就是它单独打包时得到的那一份，位于它自己的
+  `target/dist/` 之下。给出 `--output <dir>` 时，它写在该目录之下（目录不存在时会创建），使用默认的名字。
+- **自己的暂存树。** 使用被分派的 `--format` 时，打包如上所述准备两次，第二遍告诉每个
+  构建程序它所代表的成员的暂存树。`mcpp::pack_stage_dir()` 与 `${mcpp.stage_dir}`
+  按成员回答。一个程序代表它所属的成员；只有一个被打包成员依赖到的包（成员所依赖的
+  提供者）代表那个成员；被多个被打包成员依赖到的包不代表其中任何一个，它既不会被告知
+  格式，也不会被告知任何树，因此它的程序运行一次就够所有成员使用。
+- **自己的可分发物。** 本次请求引入的 `artifact` action，属于提交它的那个程序或提供者
+  所代表的成员。每个成员的输出都会核实存在，并以该成员的 `Packed` 报告。
+
+`--workspace` 只打包有程序 target 的成员，并说明跳过了哪些；用 `-p` 点名的成员若没有
+程序 target 则被拒绝。成员按 `[workspace] members` 的顺序打包，与 `-p` 的书写顺序无关。
+某个成员失败（例如它的提供者对所请求的格式什么也没有提交）时，按名字报告，其余成员
+照常打包；只要有一个成员失败，退出状态就非零。一个成员 —— 无论是用一个 `-p` 点名，还是
+由命令所在的目录决定 —— 与以前完全一样地打包：`mcpp pack -p X` 只规划 X 的闭包。在虚拟
+工作区根目录不带任何选择器的 `mcpp pack` 仍旧打包第一个有程序的成员；`--workspace` 则
+打包全部。
+
+**在任何东西被编译之前拒绝**，并点名被拒绝的对象：
+
+| 输入 | 原因 |
+|---|---|
+| 位置参数 target 名 | 它点名的是某一个包的 target |
+| 多于一个 `--target` | 一个程序只为一个 target 构建，而多 target 的 Android 打包暂存的是一个成员的各条腿 |
+| 已存在且是文件的 `--output` | 每个成员的归档或目录写在该目录之下 |
+| 用 `-p` 点名、却没有程序 target 的成员 | 它没有可打包的东西 |
+| 使用被分派的 `--format` 时，没有任何提供者代表它的成员 | 该格式由成员依赖不到的包提供，或由被多个成员依赖到的包提供 |
+| 两个会写同一个归档或目录的成员 | `--output` 只点名一个目录，而名字、版本与 target 相同的两个包共用同一个归档名 |
+
+一个为多个成员提供格式、带构建程序的包，无法同时服务它们：提供者只会得到一棵暂存树。
+请从每个成员自己的构建程序提供该格式（两者共用一个辅助函数即可），或者逐个打包成员。
+
 `--message-format json`（mcpp 2026.9.16.1+）在命令结束后于 stdout 上输出一个
 `mcpp.pack` 信封，所有给人看的行都改走 stderr。它的 `data.artifacts` 列出
 产出的每一个文件或目录，带绝对路径、`type`（`file` 或 `directory`）、
 `--format` 取值以及各条腿的三元组；`data.stage` 给出暂存树、它的 manifest，
-以及闭包是否已经走通（见 [50 —— 机器输出](50-machine-output.md)）。这条命令
+以及闭包是否已经走通（见 [50 —— 机器输出](50-machine-output.md)）。对多个成员的
+打包列出每个成员的产物，每一条点名它的 `member`，`data.stage` 为 null，并在
+`data.stages` 中为每个成员给出一棵树（2026.10.1.1+）。这条命令
 上的 `--format` 表示的是包格式，因此机器输出改用 `mcpp test` 请求它的那种
 方式。
 
