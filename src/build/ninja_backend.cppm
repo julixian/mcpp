@@ -3862,7 +3862,10 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     // because the only number reported is the total.
     auto tStage = t0;
     auto stage = [&](std::string_view what) {
-        if (!mcpp::log::is_verbose()) { tStage = std::chrono::steady_clock::now(); return; }
+        if (!mcpp::log::is_verbose() && !mcpp::log::is_enabled(mcpp::log::Level::info)) {
+            tStage = std::chrono::steady_clock::now();
+            return;
+        }
         auto now = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - tStage).count();
         tStage = now;

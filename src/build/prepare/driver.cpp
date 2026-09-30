@@ -21,6 +21,7 @@ import mcpp.build.build_program;
 import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.platform;
+import mcpp.log;
 
 namespace mcpp::build {
 
@@ -59,21 +60,48 @@ prepare_build(bool print_fingerprint,
         return std::unexpected(std::move(message));
     };
 
-    if (auto r = phase0_manifest_and_workspace(state); !r) return fail(r.error());
+    // WHERE PLANNING'S TIME GOES: each phase states its duration under
+    // `build/stage`, as the backend's own steps do, whenever the log file or
+    // --verbose would show it. Planning had no such record, and a planned
+    // edit of one source spent 3.05 s before ninja that could only be
+    // attributed from gaps between unrelated log lines (.agents/docs/
+    // 2026-09-30-build-wall-time-progress-count-and-hang-plan.md, W9).
+    auto timed = [&](std::string_view phase, auto&& run) {
+        if (!mcpp::log::is_verbose() && !mcpp::log::is_enabled(mcpp::log::Level::info))
+            return run();
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = run();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        mcpp::log::verbose("build/stage", std::format("plan {}: {}ms", phase, ms));
+        return r;
+    };
+
+    if (auto r = timed("manifest", [&] { return phase0_manifest_and_workspace(state); }); !r)
+        return fail(r.error());
     if (auto r = check_engine_floors(state, /*rootOnly=*/true); !r) return fail(r.error());
-    if (auto r = phase1_toolchain_spec_and_axes(state); !r) return fail(r.error());
-    if (auto r = phase2_define_toolchain_resolver(state); !r) return fail(r.error());
-    if (auto r = phase3_xlings_before_graph(state); !r) return fail(r.error());
-    if (auto r = phase4a_graph_load(state); !r) return fail(r.error());
-    if (auto r = phase4b_graph_worklist(state); !r) return fail(r.error());
+    if (auto r = timed("toolchain request", [&] { return phase1_toolchain_spec_and_axes(state); }); !r)
+        return fail(r.error());
+    if (auto r = timed("toolchain resolver", [&] { return phase2_define_toolchain_resolver(state); }); !r)
+        return fail(r.error());
+    if (auto r = timed("xlings", [&] { return phase3_xlings_before_graph(state); }); !r)
+        return fail(r.error());
+    if (auto r = timed("graph load", [&] { return phase4a_graph_load(state); }); !r)
+        return fail(r.error());
+    if (auto r = timed("graph", [&] { return phase4b_graph_worklist(state); }); !r)
+        return fail(r.error());
     if (auto r = check_engine_floors(state, /*rootOnly=*/false); !r) return fail(r.error());
-    if (auto r = phase5_toolchain_after_graph(state); !r) return fail(r.error());
-    if (auto r = phase6_features_and_host_tools(state); !r) return fail(r.error());
-    if (auto r = phase9_target_side(state); !r) return fail(r.error());
-    if (auto r = phase11_scan(state); !r) return fail(r.error());
+    if (auto r = timed("toolchain", [&] { return phase5_toolchain_after_graph(state); }); !r)
+        return fail(r.error());
+    if (auto r = timed("features and host tools", [&] { return phase6_features_and_host_tools(state); }); !r)
+        return fail(r.error());
+    if (auto r = timed("target side", [&] { return phase9_target_side(state); }); !r)
+        return fail(r.error());
+    if (auto r = timed("scan", [&] { return phase11_scan(state); }); !r)
+        return fail(r.error());
 
     g_notesOnFailure.clear();
-    return phase13_finish(state);
+    return timed("finish", [&] { return phase13_finish(state); });
 }
 
 
