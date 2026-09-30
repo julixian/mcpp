@@ -142,7 +142,10 @@ else skip "6 no ninja payload or vendored xlings to stand in"; fi
 
 # ── 7. planning states its phases ──────────────────────────────────────────
 cd "$W/s4" && touch src/main.cpp
-if MCPP_VERBOSE=1 "$MCPP" build > s7.log 2>&1 && grep -q 'build/stage: plan scan' s7.log; then
+LOGFILE="$HOME/.mcpp/log/mcpp.log"
+before=$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)
+if MCPP_LOG_LEVEL=info "$MCPP" build > s7.log 2>&1 \
+   && tail -c +$((before + 1)) "$LOGFILE" 2>/dev/null | grep -q 'build/stage: plan scan'; then
     pass "7 CHANGE: planning states its phases under build/stage"
 else fail "7 CHANGE: the planning phase timers" s7.log; fi
 

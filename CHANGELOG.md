@@ -61,8 +61,9 @@ of 10.5 s; a build with nothing to do is unchanged at 0.05 s.
   modification time, so a command that loads its configuration no longer runs
   `xlings --version` (0.35 s) when the binary has not changed.
 - **Planning states where its time goes.** Each phase of planning, and each
-  step of its last phase, logs its duration under `build/stage` whenever the
-  log file or `--verbose` would show it.
+  step of its last phase, logs its duration under `build/stage` in the log
+  file, which `--verbose` or `MCPP_LOG_LEVEL=info` enables. The backend's own
+  stage lines are recorded in the file under the same condition.
 
 ## [2026.9.30.1] - 2026-09-30
 

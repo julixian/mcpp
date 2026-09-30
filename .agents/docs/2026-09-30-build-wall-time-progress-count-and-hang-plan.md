@@ -897,8 +897,13 @@ stated as openxlings/xlings#638; W3 removes mcpp's dependence on it.
 ### 10.1 What was built
 
 - **W9.** Every phase of `prepare_build`, and every step of its last phase,
-  logs `plan <phase>: <ms>` under `build/stage` when the log is at info level
-  or `--verbose` is on; the backend's own stage lines follow the same gate.
+  logs `plan <phase>: <ms>` under `build/stage` in the log file, which
+  `--verbose` or `MCPP_LOG_LEVEL=info` enables; the backend's own stage lines
+  are also recorded in the file at info level. The planning lines went to the
+  terminal under `--verbose` at first, and e2e 198 failed on the Linux-to-
+  Windows leg: its check that a non-PE build says nothing about resources read
+  `plan finish windows resources: 0ms`. A record of thirty lines a build
+  belongs in the file, where no check of what a build says reads it.
 - **W1.** `landing()` answers nothing for a piece that would rest outside the
   screen, `spawn()` answers nothing when no candidate lands inside, and both
   fill loops end when a spawn fails or a locked piece adds no cell. The

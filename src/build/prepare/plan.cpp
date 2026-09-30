@@ -2273,14 +2273,14 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
     ctx.projectRoot= *state.root;
     ctx.outputDir  = target_dir(*state.tc, state.fp, state.workRoot);
 
-    // Each step states its duration under `build/stage`, as the phases do
-    // (build wall-time plan, W9), when the log file or --verbose would show it.
-    const bool timing = mcpp::log::is_verbose() || mcpp::log::is_enabled(mcpp::log::Level::info);
+    // Each step states its duration under `build/stage` in the log file, as
+    // the phases do (build wall-time plan, W9; see prepare_build).
+    const bool timing = mcpp::log::is_enabled(mcpp::log::Level::info);
     auto timed = [&](std::string_view step, auto&& run) {
         if (!timing) return run();
         const auto t0 = std::chrono::steady_clock::now();
         auto r = run();
-        mcpp::log::verbose("build/stage", std::format("plan finish {}: {}ms", step,
+        mcpp::log::info("build/stage", std::format("plan finish {}: {}ms", step,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count()));
         return r;

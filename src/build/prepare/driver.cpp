@@ -61,19 +61,21 @@ prepare_build(bool print_fingerprint,
     };
 
     // WHERE PLANNING'S TIME GOES: each phase states its duration under
-    // `build/stage`, as the backend's own steps do, whenever the log file or
-    // --verbose would show it. Planning had no such record, and a planned
-    // edit of one source spent 3.05 s before ninja that could only be
-    // attributed from gaps between unrelated log lines (.agents/docs/
-    // 2026-09-30-build-wall-time-progress-count-and-hang-plan.md, W9).
+    // `build/stage` in the log file, which --verbose or MCPP_LOG_LEVEL=info
+    // enables. Planning had no such record, and a planned edit of one source
+    // spent 3.05 s before ninja that could only be attributed from gaps
+    // between unrelated log lines (.agents/docs/
+    // 2026-09-30-build-wall-time-progress-count-and-hang-plan.md, W9). The
+    // file and not the terminal: thirty lines a build are a record to read
+    // afterwards, not output, and their words would reach every check that
+    // reads what a verbose build says.
     auto timed = [&](std::string_view phase, auto&& run) {
-        if (!mcpp::log::is_verbose() && !mcpp::log::is_enabled(mcpp::log::Level::info))
-            return run();
+        if (!mcpp::log::is_enabled(mcpp::log::Level::info)) return run();
         const auto t0 = std::chrono::steady_clock::now();
         auto r = run();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        mcpp::log::verbose("build/stage", std::format("plan {}: {}ms", phase, ms));
+        mcpp::log::info("build/stage", std::format("plan {}: {}ms", phase, ms));
         return r;
     };
 
