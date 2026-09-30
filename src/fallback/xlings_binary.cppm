@@ -56,8 +56,10 @@ struct XlingsSource {
 std::optional<XlingsSource> choose_xlings_source(std::optional<XlingsSource> override_,
                                                  std::optional<XlingsSource> released,
                                                  std::optional<XlingsSource> onPath);
-// The same choice over this process's sources.
-std::optional<XlingsSource> select_xlings_source(const std::filesystem::path& destBin = {});
+// The same choice over this process's sources. Their versions are read
+// through `versionMemo` (known_xlings_version).
+std::optional<XlingsSource> select_xlings_source(const std::filesystem::path& destBin = {},
+                                                 const std::filesystem::path& versionMemo = {});
 
 // The version `bin` answers, asked at most once per process. With `memoFile`,
 // the answer is also kept across processes, keyed by the binary's path, size
@@ -120,7 +122,7 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
         // re-acquired, which replaced 2026.8.2.1 with the system's 0.4.51 --
         // older still, and equally missing the feature the check exists to
         // restore. Look before leaping.
-        auto candidate = select_xlings_source(destBin);
+        auto candidate = select_xlings_source(destBin, versionMemo);
         if (!candidate || candidate->version.empty()
             || !version_is_older(have, candidate->version)) {
             // stderr, not stdout. This is a remark about the environment,
@@ -138,15 +140,21 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
             settled.insert(destBin);
             return destBin;
         }
+        // Beside the binary first and renamed over it, so a copy that fails
+        // (a full disk, a running binary) leaves the old one in place.
         std::error_code rec;
-        std::filesystem::copy_file(candidate->path, destBin,
+        auto staged = destBin;
+        staged += ".new";
+        std::filesystem::copy_file(candidate->path, staged,
             std::filesystem::copy_options::overwrite_existing, rec);
-        if (!rec) {
-            std::filesystem::permissions(destBin,
+        if (!rec)
+            std::filesystem::permissions(staged,
                 std::filesystem::perms::owner_exec
               | std::filesystem::perms::group_exec
               | std::filesystem::perms::others_exec,
               std::filesystem::perm_options::add, rec);
+        if (!rec) std::filesystem::rename(staged, destBin, rec);
+        if (!rec) {
             if (!quiet && !updated)
                 std::println(stderr,
                              "{:>12} vendored xlings {} -> {} from {} (pinned {})",
@@ -158,8 +166,11 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
             settled.insert(destBin);
             return destBin;
         }
-        // The copy failed; the chain below tries again from the start.
-        std::filesystem::remove(destBin, rec);
+        // The copy failed: the old binary stays, as it would with no source.
+        std::error_code sec;
+        std::filesystem::remove(staged, sec);
+        settled.insert(destBin);
+        return destBin;
     }
 
     std::error_code ec;
@@ -177,7 +188,7 @@ acquire_xlings_binary(const std::filesystem::path& destBin, bool quiet = false,
     // The first acquisition takes the source a replacement would take
     // (select_xlings_source): the override, otherwise the newer of the
     // released copy and the PATH copy.
-    if (auto src = select_xlings_source(destBin)) {
+    if (auto src = select_xlings_source(destBin, versionMemo)) {
         std::filesystem::copy_file(src->path, destBin,
             std::filesystem::copy_options::overwrite_existing, ec);
         if (!ec) {
@@ -290,22 +301,24 @@ std::optional<XlingsSource> choose_xlings_source(std::optional<XlingsSource> ove
     return released;
 }
 
-std::optional<XlingsSource> select_xlings_source(const std::filesystem::path& destBin) {
+std::optional<XlingsSource> select_xlings_source(const std::filesystem::path& destBin,
+                                                 const std::filesystem::path& versionMemo) {
     std::optional<XlingsSource> override_, released, onPath;
     std::error_code ec;
     if (const char* e = std::getenv("MCPP_VENDORED_XLINGS"); e && *e) {
         std::filesystem::path p{e};
         if (std::filesystem::exists(p, ec))
-            override_ = XlingsSource{p, vendored_xlings_version(p), "MCPP_VENDORED_XLINGS"};
+            override_ = XlingsSource{p, known_xlings_version(p, versionMemo), "MCPP_VENDORED_XLINGS"};
     }
     if (!override_) {
         if (auto r = released_xlings_source(destBin); !r.empty())
-            released = XlingsSource{r, vendored_xlings_version(r), "the release of this mcpp"};
+            released = XlingsSource{r, known_xlings_version(r, versionMemo),
+                                    "the release of this mcpp"};
         if (auto sys = mcpp::platform::fs::which(
                 std::string("xlings") + std::string(mcpp::platform::exe_suffix))) {
             const bool isDest = !destBin.empty() && std::filesystem::equivalent(*sys, destBin, ec);
             if (!isDest && std::filesystem::exists(*sys, ec))
-                onPath = XlingsSource{*sys, vendored_xlings_version(*sys), "PATH"};
+                onPath = XlingsSource{*sys, known_xlings_version(*sys, versionMemo), "PATH"};
         }
     }
     return choose_xlings_source(std::move(override_), std::move(released), std::move(onPath));

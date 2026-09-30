@@ -1433,3 +1433,19 @@ TEST(ModuleResolution, OneFileReachedTwiceIsNamedAsSuchWhateverItsSpelling) {
     EXPECT_NE(errors.find("one file is reached as two packages"), std::string::npos) << errors;
     std::filesystem::remove_all(dir);
 }
+
+// A kept walk matched by the literal tail of a glob: `**/` also matches no
+// directory, so `**/main.cpp` matches a `main.cpp` at the root as well as one
+// below it, as the per-pattern walk did.
+TEST(Scanner, ADoubleStarSlashTailMatchesAtTheRoot) {
+    auto dir = make_tempdir("mcpp-glob-tail");
+    write(dir / "main.cpp", "int main() {}\n");
+    write(dir / "sub" / "main.cpp", "int main() {}\n");
+    write(dir / "sub" / "other.cpp", "int x;\n");
+    auto files = expand_glob(dir, "**/main.cpp");
+    ASSERT_EQ(files.size(), 2u);
+    EXPECT_EQ(files[0], dir / "main.cpp");
+    EXPECT_EQ(files[1], dir / "sub" / "main.cpp");
+    std::filesystem::remove_all(dir);
+}
+

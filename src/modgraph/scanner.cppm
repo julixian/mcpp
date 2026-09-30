@@ -692,9 +692,14 @@ std::vector<std::filesystem::path> expand_glob_one(const std::filesystem::path& 
     if (!fs::exists(start, startEc)) return out;
 
     // Every match ends with the text after the glob's last `*`, which the
-    // matcher reads literally: a cheap test that turns most entries away.
+    // matcher reads literally: a cheap test that turns most entries away. A
+    // `**/` also matches no directory at all (`**/main.cpp` matches a root
+    // `main.cpp`), so the `/` after a `**` is not part of the tail.
     const auto star = glob.find_last_of('*');
-    const std::string_view tail = star == std::string_view::npos ? glob : glob.substr(star + 1);
+    std::string_view tail = star == std::string_view::npos ? glob : glob.substr(star + 1);
+    if (star != std::string_view::npos && star > 0 && glob[star - 1] == '*'
+        && tail.starts_with('/'))
+        tail.remove_prefix(1);
     auto listing = tree_listing(root, start);
     for (auto const& f : listing->files) {
         if (!f.relative) continue;

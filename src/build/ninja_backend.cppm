@@ -4338,16 +4338,25 @@ std::expected<BuildResult, BuildError> NinjaBackend::build(const BuildPlan& plan
     std::string out;
     int ninjaExit = 0;
     bool scanFailed = false;
-    if (goalArg.empty()
+    // Under `-k` the build goes on past a failure and states every one, so
+    // the scans run in the main pass there: a failed scan pass would end the
+    // build at its first failure, and running both would state a failed scan
+    // twice.
+    if (goalArg.empty() && !opts.keepGoing
         && manifest.find("\nbuild " + std::string(kScannedGoal) + " : phony") != std::string::npos) {
         const auto scanDeadline =
             std::chrono::milliseconds(static_cast<long long>(opts.buildTimeoutSecs) * 1000);
+        // The main pass's options, and its goal last.
         std::vector<std::string> scan{ninjaProgram};
         if (!opts.verbose && !opts.progress) scan.push_back("--quiet");
         scan.insert(scan.end(), {std::string("-C"), plan.outputDir.string()});
         if (opts.verbose) scan.push_back("-v");
-        scan.push_back(std::string(kScannedGoal));
+        if (const char* topics = std::getenv("MCPP_NINJA_DEBUG"); topics && *topics) {
+            scan.push_back("-d");
+            scan.push_back(topics);
+        }
         if (opts.parallelJobs) scan.push_back(std::format("-j{}", opts.parallelJobs));
+        scan.push_back(std::string(kScannedGoal));
         if (opts.progress) {
             auto run = run_ninja_reporting(scan, nenv, scanDeadline, *opts.progress, opts.verbose,
                                            command_prefixes(flags, plan),

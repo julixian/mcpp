@@ -3224,12 +3224,23 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                     if (collided.contains(name)) bound.emplace_back(name, path);
                 }
                 if (bound.empty()) continue;   // sees no collided name
-                // GCC's mapper answers only what it lists: the standard
-                // library modules are listed where GCC's own mapper puts them.
+                // GCC's mapper answers only what it lists. The standard
+                // library modules, and any name a unit of the package imports
+                // that no unit of the graph provides (a BMI placed by other
+                // means), are listed where GCC's own mapper puts them.
                 if (gcc) {
-                    entries.emplace_back("std", std::string(traits.bmiDir) + "/" + basename("std"));
-                    entries.emplace_back("std.compat",
-                                         std::string(traits.bmiDir) + "/" + basename("std.compat"));
+                    std::set<std::string, std::less<>> listed;
+                    for (auto const& [name, path] : entries) listed.insert(name);
+                    auto flat = [&](const std::string& name) {
+                        if (listed.insert(name).second)
+                            entries.emplace_back(name, std::string(traits.bmiDir) + "/" + basename(name));
+                    };
+                    flat("std");
+                    flat("std.compat");
+                    for (auto const& cu : plan.compileUnits)
+                        if (cu.packageName == pkg)
+                            for (auto const& imp : cu.imports)
+                                if (!graph.providersOf.contains(imp)) flat(imp);
                 }
                 std::sort(entries.begin(), entries.end());
                 ModuleScope scope;
@@ -3251,7 +3262,9 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                     const bool separate = !prefix.empty() && prefix.back() == ' ';
                     if (separate) prefix.remove_suffix(1);
                     for (auto const& [name, path] : bound) {
-                        const auto value = name + "=" + (outputDir / path).string();
+                        auto bmi = outputDir / std::filesystem::path(path);
+                        bmi.make_preferred();
+                        const auto value = name + "=" + bmi.string();
                         if (separate) {
                             flags.push_back(std::string(prefix));
                             flags.push_back(mcpp::manifest::flag_element(value));

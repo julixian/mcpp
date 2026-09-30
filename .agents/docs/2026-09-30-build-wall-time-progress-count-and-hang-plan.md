@@ -972,6 +972,23 @@ without a new staleness class.
 - Revert probes: the W1 property test, e2e 846 and e2e 847 each fail on
   2026.9.30.1.
 
+### 10.5 Review of the implementation
+
+An independent review of the pull request's diff found the following, each
+resolved as stated.
+
+| Finding | Resolution |
+|---|---|
+| W8: the literal-tail prefilter dropped a root-level match of `**/name`, since `**/` also matches no directory | The `/` after a `**` is not part of the tail; `Scanner.ADoubleStarSlashTailMatchesAtTheRoot` |
+| W2: the scan pass took neither `-k` nor `MCPP_NINJA_DEBUG`, and put `-j` after its goal | Under `-k` the scans run in the main pass; `-d` is passed; `-j` precedes the goal |
+| W3: the candidates' versions were asked without the memo on the path where the vendored binary is behind the pin | They are read through the memo |
+| W3: a failed copy during an upgrade removed the working binary | The copy is written beside the binary and renamed over it; a failure keeps the old one |
+| W10: the GCC map listed only names a unit provides | A name a unit of the package imports that no unit provides is listed at GCC's own path |
+| W10: the clang and MSVC paths mixed separators | Native separators |
+| W10: the GCC map's relative path in the compile database | Not a defect: the database's directory is the build directory (`compile_commands.cppm:484`) |
+| W2: the phase is one value for the whole command, so two configurations built at once show the phase of the pass that began last | Recorded; cosmetic |
+| W8: a file symlink whose target is deleted during planning stays listed | Recorded; the per-pattern walk had the same window between its walk and its use |
+
 ## 8. Appendix: readings
 
 - **Clean builds, wall time (s).**
