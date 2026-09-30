@@ -1155,41 +1155,10 @@ static std::expected<void, std::string> step13_build_graph_actions(PrepareState&
                 "there is anything to stage.\n"
                 "  use: role = \"artifact\"", ids));
         }
-        if (!unresolvedTargets.empty()) {
-            std::string bad, known;
-            for (auto const& n : unresolvedTargets) bad += (bad.empty() ? "" : ", ") + n;
-            for (auto const& lu : ctx.plan.linkUnits)
-                known += (known.empty() ? "" : ", ") + lu.targetName;
-            return std::unexpected(std::format(
-                "build.mcpp action references unknown target(s) via "
-                "${{mcpp.target_file:...}}: {}\n"
-                "  targets in this build: [{}]\n"
-                "  (a target gated by required_features is absent unless those "
-                "features are active)",
-                bad, known.empty() ? std::string("none") : known));
-        }
-
-        for (auto const& [n, in] : ambiguousTargets)
-            return std::unexpected(std::format(
-                "build.mcpp action references ${{mcpp.target_file:{}}}, a target of "
-                "each of the members {}, and its package acts for none of them.\n"
-                "  use: select one of the members, or give the targets distinct names",
-                n, std::format("{}", in)));
-
-        if (!unresolvedArtifacts.empty()) {
-            std::string bad, known;
-            for (auto const& n : unresolvedArtifacts) bad += (bad.empty() ? "" : ", ") + n;
-            for (auto const& lu : ctx.plan.linkUnits)
-                if (!lu.artifactOf.empty())
-                    known += (known.empty() ? "" : ", ") + lu.artifactOf + "/" + lu.targetName;
-            return std::unexpected(std::format(
-                "build.mcpp action references unknown artifact(s) via "
-                "${{mcpp.artifact:<package>/<target>}}: {}\n"
-                "  artifacts in this build: [{}]\n"
-                "  (an artifact exists when a dependency edge requests it with "
-                "`artifacts = [\"<target>\"]`)",
-                bad, known.empty() ? std::string("none") : known));
-        }
+        if (auto refused = mcpp::build::refuse_unresolved_references(
+                ctx.plan, unresolvedTargets, ambiguousTargets, unresolvedArtifacts);
+            !refused)
+            return std::unexpected(refused.error());
 
         // role = "object": the outputs are LINK inputs, so attach them to the
         // link units that should receive them.

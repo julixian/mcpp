@@ -699,6 +699,16 @@ struct TargetFileAnswer {
 TargetFileAnswer resolve_target_file(const BuildPlan& plan, std::string_view name,
                                      std::string_view actingMember);
 
+// The references an action's arguments made that the plan cannot answer, as
+// the refusal a user reads: names no link unit has (`unresolvedTargets`), names
+// several members define for a package that acts for none of them
+// (`ambiguousTargets`, from `resolve_target_file`), and `${mcpp.artifact:}`
+// references no requested artifact matches (`unresolvedArtifacts`).
+std::expected<void, std::string> refuse_unresolved_references(
+    const BuildPlan& plan, const std::set<std::string>& unresolvedTargets,
+    const std::map<std::string, std::vector<std::string>>& ambiguousTargets,
+    const std::set<std::string>& unresolvedArtifacts);
+
 // The objects a package contributes to an image that links it whole: its
 // module units, which link unconditionally, then its implementation units, in
 // plan order. A shared library that carries a private copy of a graph C++
@@ -3316,6 +3326,48 @@ TargetFileAnswer resolve_target_file(const BuildPlan& plan, std::string_view nam
     // have: to the one unit, or to the last of the units that share the name.
     if (members.size() > 1) answer.members.assign(members.begin(), members.end());
     return answer;
+}
+
+std::expected<void, std::string> refuse_unresolved_references(
+    const BuildPlan& plan, const std::set<std::string>& unresolvedTargets,
+    const std::map<std::string, std::vector<std::string>>& ambiguousTargets,
+    const std::set<std::string>& unresolvedArtifacts) {
+    if (!unresolvedTargets.empty()) {
+        std::string bad, known;
+        for (auto const& n : unresolvedTargets) bad += (bad.empty() ? "" : ", ") + n;
+        for (auto const& lu : plan.linkUnits)
+            known += (known.empty() ? "" : ", ") + lu.targetName;
+        return std::unexpected(std::format(
+            "build.mcpp action references unknown target(s) via "
+            "${{mcpp.target_file:...}}: {}\n"
+            "  targets in this build: [{}]\n"
+            "  (a target gated by required_features is absent unless those "
+            "features are active)",
+            bad, known.empty() ? std::string("none") : known));
+    }
+
+    for (auto const& [n, in] : ambiguousTargets)
+        return std::unexpected(std::format(
+            "build.mcpp action references ${{mcpp.target_file:{}}}, a target of "
+            "each of the members {}, and its package acts for none of them.\n"
+            "  use: select one of the members, or give the targets distinct names",
+            n, std::format("{}", in)));
+
+    if (!unresolvedArtifacts.empty()) {
+        std::string bad, known;
+        for (auto const& n : unresolvedArtifacts) bad += (bad.empty() ? "" : ", ") + n;
+        for (auto const& lu : plan.linkUnits)
+            if (!lu.artifactOf.empty())
+                known += (known.empty() ? "" : ", ") + lu.artifactOf + "/" + lu.targetName;
+        return std::unexpected(std::format(
+            "build.mcpp action references unknown artifact(s) via "
+            "${{mcpp.artifact:<package>/<target>}}: {}\n"
+            "  artifacts in this build: [{}]\n"
+            "  (an artifact exists when a dependency edge requests it with "
+            "`artifacts = [\"<target>\"]`)",
+            bad, known.empty() ? std::string("none") : known));
+    }
+    return {};
 }
 
 std::vector<std::filesystem::path>
