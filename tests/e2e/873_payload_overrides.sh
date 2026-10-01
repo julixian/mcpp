@@ -13,6 +13,9 @@ set -e
 
 MCPP="${MCPP:-mcpp}"
 work="$(mktemp -d)"
+# A path written INTO a manifest goes through host_path (see _host_path.sh).
+source "$(dirname "$0")/_host_path.sh"
+work_HOST="$(host_path "$work")"
 trap 'rm -rf "$work"' EXIT
 export NO_COLOR=1
 
@@ -48,7 +51,7 @@ name    = "app"
 version = "0.1.0"
 
 [build-dependencies.e2e]
-plug = { path = "$work/plug", features = ["tools-x"], host-module = true }
+plug = { path = "$work_HOST/plug", features = ["tools-x"], host-module = true }
 
 [targets.app]
 kind = "bin"
@@ -83,9 +86,9 @@ grep -q "mcpp-e2e-absent-tool" <<<"$out" || fail "the refusal does not name the 
 # The environment variable.
 out="$(MCPP_XLINGS_OVERRIDE_XIM_MCPP_E2E_ABSENT_TOOL="$work/opt/bin/absent-tool" probe build)"
 grep -q "Finished" <<<"$out" || fail "an env override still needed the payload"
-grep -q "Using xim:mcpp-e2e-absent-tool ← $work/opt/bin/absent-tool  \[custom · env MCPP_XLINGS_OVERRIDE_XIM_MCPP_E2E_ABSENT_TOOL\]" <<<"$out" \
+grep -q "Using xim:mcpp-e2e-absent-tool ← $work_HOST/opt/bin/absent-tool  \[custom · env MCPP_XLINGS_OVERRIDE_XIM_MCPP_E2E_ABSENT_TOOL\]" <<<"$out" \
     || fail "no Using line naming the env override"
-grep -q "dir=$work/opt source=override program=$work/opt/bin/absent-tool" <<<"$out" \
+grep -q "dir=$work_HOST/opt source=override program=$work_HOST/opt/bin/absent-tool" <<<"$out" \
     || fail "the build program did not receive the override (root, source, program)"
 grep -q "Finished .* · custom: xim:mcpp-e2e-absent-tool" <<<"$out" || fail "Finished does not summarise the source"
 

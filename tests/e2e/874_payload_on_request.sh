@@ -11,6 +11,9 @@ set -e
 
 MCPP="${MCPP:-mcpp}"
 work="$(mktemp -d)"
+# A path written INTO a manifest goes through host_path (see _host_path.sh).
+source "$(dirname "$0")/_host_path.sh"
+work_HOST="$(host_path "$work")"
 trap 'rm -rf "$work"' EXIT
 export NO_COLOR=1
 
@@ -44,7 +47,7 @@ name    = "app"
 version = "0.1.0"
 
 [build-dependencies.e2e]
-plug = { path = "$work/plug", features = ["tools-x"], host-module = true }
+plug = { path = "$work_HOST/plug", features = ["tools-x"], host-module = true }
 
 [targets.app]
 kind = "bin"
