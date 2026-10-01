@@ -330,3 +330,22 @@ TEST(Sources, PathSpecTakesTheFamilyFromTheDrivers) {
     EXPECT_FALSE(none.has_value());
     std::filesystem::remove_all(base);
 }
+
+// ── The engine floor read from a manifest that does not parse ───────────────
+
+TEST(Sources, StatedMcppFloorIsReadFromPackageOnly) {
+    using mcpp::manifest::stated_mcpp_floor;
+    EXPECT_EQ(stated_mcpp_floor("[package]\nname = \"p\"\nmcpp = \">=2026.10.1.3\"\n"),
+              "2026.10.1.3");
+    // A bare version is the same statement.
+    EXPECT_EQ(stated_mcpp_floor("[package]\nmcpp = \"2026.9.28.3\"\n"), "2026.9.28.3");
+    // Only `[package]`: a dependency named mcpp states a dependency, not a floor.
+    EXPECT_EQ(stated_mcpp_floor("[package]\nname = \"p\"\n\n[dependencies]\nmcpp = \"1.0\"\n"),
+              "");
+    // `[package.metadata]` is another table.
+    EXPECT_EQ(stated_mcpp_floor("[package.metadata]\nmcpp = \"9.9.9.9\"\n"), "");
+    // A key that merely starts with the name is not the key.
+    EXPECT_EQ(stated_mcpp_floor("[package]\nmcpp_home = \"/x\"\n"), "");
+    EXPECT_EQ(stated_mcpp_floor("[package]\n# mcpp = \"9.9.9.9\"\n"), "");
+    EXPECT_EQ(stated_mcpp_floor(""), "");
+}

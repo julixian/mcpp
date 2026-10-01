@@ -15,6 +15,7 @@ import mcpp.pm.index_spec;
 import mcpp.platform;
 import mcpp.platform.axis;   // the one macos/macosx spelling rule
 import mcpp.xpkg_version;    // the release grammar of `mcpp = ">=V"`
+import mcpp.version;         // MCPP_VERSION -- a refused key may be a newer one
 
 // ANONYMOUS NAMESPACE, AND THIS COST TWO WINDOWS JOBS TO LEARN.
 //
@@ -557,6 +558,14 @@ make_xlings_entry(std::string_view key, std::string_view value) {
 std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                                                     const std::filesystem::path& origin = "mcpp.toml",
                                                     LoadContext ctx = {});
+// THE ENGINE FLOOR A MANIFEST STATES, read from its text rather than from the
+// parsed document: a manifest that fails to parse still says which engine it was
+// written for, and that is exactly the case where the answer matters. Only
+// `mcpp` inside `[package]` counts. Empty when the file states none.
+//
+// Exported for the test that pins the shapes it reads.
+std::string stated_mcpp_floor(std::string_view text);
+
 std::expected<Manifest, ManifestError> load(const std::filesystem::path& path,
                                             LoadContext ctx = {});
 
@@ -4600,6 +4609,45 @@ void apply_defaults_and_infer(Manifest& m, const std::filesystem::path& root) {
 
 } // namespace
 
+std::string stated_mcpp_floor(std::string_view text) {
+    bool inPackage = false;
+    std::size_t at = 0;
+    while (at <= text.size()) {
+        const auto nl = text.find('\n', at);
+        std::string_view line = text.substr(at, nl == std::string_view::npos
+                                                   ? std::string_view::npos : nl - at);
+        at = nl == std::string_view::npos ? text.size() + 1 : nl + 1;
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+            line.remove_prefix(1);
+        if (line.starts_with('#')) continue;
+        if (line.starts_with('[')) {
+            // `[package]` only. A table that merely begins with it, such as
+            // `[package.metadata]`, states no floor.
+            inPackage = line.starts_with("[package]");
+            continue;
+        }
+        if (!inPackage || !line.starts_with("mcpp")) continue;
+        auto rest = line.substr(4);
+        while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t'))
+            rest.remove_prefix(1);
+        if (!rest.starts_with('=')) continue;      // `mcpp_something = ...`
+        rest.remove_prefix(1);
+        while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t'))
+            rest.remove_prefix(1);
+        if (rest.empty() || rest.front() != '"') continue;
+        rest.remove_prefix(1);
+        const auto end = rest.find('"');
+        if (end == std::string_view::npos) continue;
+        std::string_view value = rest.substr(0, end);
+        // The grammar of the key is `">=V"`, and a bare `"V"` is read the same
+        // way the parsed form reads it.
+        if (value.starts_with(">=")) value.remove_prefix(2);
+        while (!value.empty() && value.front() == ' ') value.remove_prefix(1);
+        return std::string(value);
+    }
+    return {};
+}
+
 std::expected<Manifest, ManifestError> load(const std::filesystem::path& path,
                                             LoadContext ctx) {
     std::ifstream is(path);
@@ -4610,8 +4658,29 @@ std::expected<Manifest, ManifestError> load(const std::filesystem::path& path,
     }
     std::stringstream ss;
     ss << is.rdbuf();
-    auto m = parse_string(ss.str(), path, ctx);
-    if (!m) return m;
+    const std::string text = ss.str();
+    auto m = parse_string(text, path, ctx);
+    if (!m) {
+        // A KEY THIS ENGINE DOES NOT KNOW MAY BE A KEY OF A NEWER ONE, and the
+        // package says which engine it was written for. Without this the reader
+        // of a new plugin collection on an old engine is told
+        // `unknown key 'provision' in a scoped entry` and nothing about the
+        // version -- measured with mcpp-plugins 0.19.0 on mcpp 2026.10.1.2,
+        // where the floor check never runs because it needs the document this
+        // very parse failed to produce.
+        const auto floor = stated_mcpp_floor(text);
+        const auto need = floor.empty() ? std::nullopt : mcpp::xpkg_version::parse(floor);
+        const auto have = mcpp::xpkg_version::parse(mcpp::MCPP_VERSION);
+        if (need && have && mcpp::xpkg_version::compare(*have, *need) < 0)
+            m.error().message += std::format(
+                "\n       This package requires mcpp >= {}, and this is mcpp {}, so the "
+                "key may be\n"
+                "       one a newer engine reads.\n"
+                "       hint: pin \"mcpp\": \"{}\" (or newer) in .xlings.json and run "
+                "`xlings install`, or\n       run `xlings install mcpp@{}`",
+                floor, mcpp::MCPP_VERSION, floor, floor);
+        return m;
+    }
 
     // M5.0: defaults + target inference (uses filesystem context relative to mcpp.toml).
     apply_defaults_and_infer(*m, path.parent_path());
