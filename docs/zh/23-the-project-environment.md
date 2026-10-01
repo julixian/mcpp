@@ -397,7 +397,7 @@ hardware = {}
 | | 位置 | 面向 |
 |---|---|---|
 | 1 | `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>` | CI 与发行版打包，无需改清单。`path:cmake` 在 PATH 上查找该名字 |
-| 2 | 根清单的 `[xlings.overrides]`，也可写在 `[target.'cfg(..)']` 下 | 工程自己的陈述 |
+| 2 | 根清单（构建工作区成员时为工作区清单）的 `[xlings.overrides]`，也可写在 `[target.'cfg(..)']` 下 | 工程自己的陈述 |
 | 3 | `~/.mcpp/config.toml` 的 `[xlings.overrides]` | 关于这台机器的事实 |
 
 条目里的 `version` 会与依赖图中每一条要求比较，低于其中任一条则拒绝并点出两侧。没写

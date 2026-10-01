@@ -450,7 +450,7 @@ Three places may state an override, highest first:
 | | place | purpose |
 |---|---|---|
 | 1 | `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>` | CI and distribution packaging, without editing the manifest. `path:cmake` looks the name up on PATH |
-| 2 | `[xlings.overrides]` in the root manifest, also under `[target.'cfg(..)']` | the project's own statement |
+| 2 | `[xlings.overrides]` in the root manifest -- or the workspace manifest, where a member is built -- also under `[target.'cfg(..)']` | the project's own statement |
 | 3 | `[xlings.overrides]` in `~/.mcpp/config.toml` | a fact about this machine |
 
 A `version` in the entry is checked against every requirement a package of the
