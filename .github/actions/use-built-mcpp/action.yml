@@ -1,0 +1,41 @@
+name: use-built-mcpp
+description: >
+  Put this commit's mcpp, built once per host by .github/workflows/build.yml,
+  in place of a build of the job's own (rule R1 of
+  .agents/docs/2026-10-02-pr-ci-acceleration-and-the-toolchain-specification-design.md).
+
+  Run it after bootstrap-mcpp or setup-macos-llvm, which restore the sandbox
+  and install the released bootstrap. It exports MCPP_BOOT (that bootstrap),
+  MCPP and MCPP_FRESH (this commit's binary, at an absolute path), and
+  MCPP_VENDORED_XLINGS, and sets the given mirror on xlings and on the binary.
+
+  The binary is the one the build job produced, not a repackaging of it, so
+  every consumer tests what a self-host build makes. On Linux that binary's
+  interpreter and runtime libraries live in payloads of the sandbox (glibc and
+  the GCC runtime of the toolchain mcpp.toml names). A restored sandbox holds
+  them; when it does not, the bootstrap installs that toolchain and the binary
+  is run again. A binary that still does not run fails this step.
+
+inputs:
+  host:
+    description: >
+      The host the artifact was built on: linux-x86_64, linux-aarch64,
+      macos-arm64 or windows-x86_64.
+    required: true
+  mirror:
+    description: The mirror xlings and mcpp use in this job.
+    required: false
+    default: GLOBAL
+
+runs:
+  using: composite
+  steps:
+    - name: Download this commit's mcpp (${{ inputs.host }})
+      uses: actions/download-artifact@v4
+      with:
+        name: mcpp-built-${{ inputs.host }}
+        path: ${{ runner.temp }}/mcpp-built
+
+    - name: Use this commit's mcpp
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/use.sh" "${{ inputs.host }}" "${{ inputs.mirror }}"

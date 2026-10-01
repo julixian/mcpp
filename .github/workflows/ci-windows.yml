@@ -3,55 +3,37 @@ name: ci-windows
 # Windows CI for mcpp — same flow as Linux (ci-linux.yml) and macOS (ci-macos.yml):
 #   xlings install mcpp → self-host build → smoke → package
 #
-# SHAPE: three INDEPENDENT jobs, no `needs:` between them; each restores the
-# shared cache lineage (.github/actions/bootstrap-mcpp) and pays one warm
-# `mcpp build` to get the PR's own binary. The e2e suite moved to
-# ci-windows-e2e.yml (sharded ×2) — it was 9.7 of this job's 20.4 min.
-#
-#   before: build → unit → xlings → stdin → e2e → toolchains → package  ≈ 20 min
-#   after:  max(build+unit+package, toolchains+integration)             ≈ 8 min
-#           in parallel with ci-windows-e2e (≈ 8 min)
+# SHAPE: called by ci.yml after the Windows build (build.yml). No job here
+# builds mcpp to obtain the commit's binary: each takes the one binary that
+# build produced (use-built-mcpp, rule R1 of the 2026-10-02 CI record) and names
+# it MCPP_SELF. A job builds mcpp only when the build is what it tests (the LLVM
+# rebuild of `toolchains`). The e2e suite is ci-windows-e2e.yml, called beside
+# this one.
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-windows-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 env:
   MCPP_HOME: C:\Users\runneradmin\.mcpp
 
 jobs:
   build-test:
-    name: build + test + package (windows x64, self-host)
+    name: test + package (windows x64, self-host)
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap-mcpp
 
-      - name: Build mcpp from source (self-host)
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: windows-x86_64
+
+      - name: Name this commit's mcpp MCPP_SELF
         shell: bash
         run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP" build
-          # Pick the NEWEST mcpp.exe, not an arbitrary one: `target/` is
-          # restored from cache and keeps a directory per build fingerprint,
-          # so after a version bump the freshly built binary sits alongside
-          # the previous release's. `find | head -1` returned whichever the
-          # directory walk hit first — which is how a 0.0.106 build ran the
-          # 0.0.105 binary and failed 01_help_and_version.
-          MCPP_SELF=$(find target -name "mcpp.exe" -path "*/bin/*" -printf "%T@ %p\n" \
-              | sort -rn | head -1 | cut -d" " -f2-)
-          test -n "$MCPP_SELF" || { echo "FAIL: no mcpp.exe"; exit 1; }
-          MCPP_SELF=$(cd "$(dirname "$MCPP_SELF")" && pwd)/$(basename "$MCPP_SELF")
-          "$MCPP_SELF" --version
-          echo "MCPP_SELF=$MCPP_SELF" >> "$GITHUB_ENV"
+          "$MCPP_FRESH" --version
+          echo "MCPP_SELF=$MCPP_FRESH" >> "$GITHUB_ENV"
 
       - name: Unit + integration tests via mcpp test
         shell: bash
@@ -72,15 +54,11 @@ jobs:
           VERSION=$(awk -F '"' '/^version[[:space:]]*=/{print $2; exit}' mcpp.toml)
           WRAPPER="mcpp-${VERSION}-windows-x86_64"
           ZIPNAME="${WRAPPER}.zip"
-          # Pick the NEWEST mcpp.exe, not an arbitrary one: `target/` is
-          # restored from cache and keeps a directory per build fingerprint,
-          # so after a version bump the freshly built binary sits alongside
-          # the previous release's. `find | head -1` returned whichever the
-          # directory walk hit first — which is how a 0.0.106 build ran the
-          # 0.0.105 binary and failed 01_help_and_version.
-          MCPP_BIN=$(find target -name "mcpp.exe" -path "*/bin/*" -printf "%T@ %p\n" \
-              | sort -rn | head -1 | cut -d" " -f2-)
-          test -n "$MCPP_BIN" || { echo "FAIL: no mcpp.exe in target/"; exit 1; }
+          # The binary of build.yml (use-built-mcpp), not one found under
+          # target/: nothing restores target/ any more, and this is the binary
+          # every other job of the commit tests.
+          MCPP_BIN="$MCPP_SELF"
+          test -f "$MCPP_BIN" || { echo "FAIL: no mcpp.exe at $MCPP_BIN"; exit 1; }
 
           STAGING=$(mktemp -d)
           mkdir -p "$STAGING/$WRAPPER/bin" "$STAGING/$WRAPPER/registry/bin"
@@ -239,22 +217,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap-mcpp
 
-      - name: Build mcpp from source (self-host)
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: windows-x86_64
+
+      - name: Name this commit's mcpp MCPP_SELF
         shell: bash
         run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP" build
-          # Pick the NEWEST mcpp.exe, not an arbitrary one: `target/` is
-          # restored from cache and keeps a directory per build fingerprint,
-          # so after a version bump the freshly built binary sits alongside
-          # the previous release's. `find | head -1` returned whichever the
-          # directory walk hit first — which is how a 0.0.106 build ran the
-          # 0.0.105 binary and failed 01_help_and_version.
-          MCPP_SELF=$(find target -name "mcpp.exe" -path "*/bin/*" -printf "%T@ %p\n" \
-              | sort -rn | head -1 | cut -d" " -f2-)
-          test -n "$MCPP_SELF" || { echo "FAIL: no mcpp.exe"; exit 1; }
-          MCPP_SELF=$(cd "$(dirname "$MCPP_SELF")" && pwd)/$(basename "$MCPP_SELF")
-          echo "MCPP_SELF=$MCPP_SELF" >> "$GITHUB_ENV"
+          "$MCPP_FRESH" --version
+          echo "MCPP_SELF=$MCPP_FRESH" >> "$GITHUB_ENV"
 
       # Integration: the mcpp built from THIS PR's source ($MCPP_SELF, the
       # self-hosted binary) builds & runs a real external C++ project — xlings
@@ -429,7 +400,6 @@ jobs:
         run: |
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
           MCPP="$MCPP_SELF" bash .github/tools/check_unicode_paths.sh
-
 
       # GRAPHICS ON THIS HOST, BUILD ONLY, AND THAT IS THE WHOLE CLAIM.
       #

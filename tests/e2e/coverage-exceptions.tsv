@@ -1,0 +1,4 @@
+# Tests that no hosted runner can run, read by .github/tools/check_e2e_coverage.py.
+# One `<test>\t<reason>` line each. A test that runs on some shard, or that a
+# workflow names, does not belong here, and the check fails if it is listed.
+658_a_program_runs_on_an_attached_android_device.sh	needs an Android device attached over adb; the android job of ci-linux-e2e.yml runs `mcpp test` on an emulator instead

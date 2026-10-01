@@ -1,13 +1,21 @@
 name: bootstrap-mcpp
 description: >
-  Restore the shared CI cache lineage (mcpp sandbox + xlings + target/) and
-  bootstrap a released mcpp via xlings. Exports MCPP and XLINGS_BIN.
+  Restore the shared CI cache lineage (mcpp sandbox and xlings) and bootstrap
+  a released mcpp via xlings. Exports MCPP and XLINGS_BIN.
 
-  Extracted so the split CI jobs (build / toolchain legs / e2e shards /
-  integration) share ONE definition instead of copy-pasting a 40-line
-  preamble per job. Every job that uses it lands on the same cache keys,
-  which is what makes splitting cheap: each job restores a warm sandbox
-  and only pays one incremental `mcpp build`.
+  The caches are RESTORED here and never saved. One job per host writes them,
+  the build job of .github/workflows/build.yml, and only on a push to main
+  (rule R3 of .agents/docs/2026-10-02-pr-ci-acceleration-and-the-toolchain-
+  specification-design.md). Before that rule every job that used this action
+  saved the same key on success: thirty-four to forty-two saves per pull
+  request against a 10 GB repository limit, parallel saves of one key racing
+  each other, and the main lineage evicted within forty minutes (measured
+  2026-10-01). The keys are outputs so that the one writer saves exactly what
+  was restored.
+
+  `target/` is no longer cached. A restored `target/` made no build
+  incremental: on an exact hit ninja still ran 830 of 830 edges, while the
+  caches themselves were up to 3.3 GB each.
 
 inputs:
   xlings-version:
@@ -26,10 +34,20 @@ inputs:
     # depended on the machine, which is why CI failed on `compat:lua` on
     # Windows and `mcpplibs.capi:lua` on Linux. Never pin below that.
     default: '2026.9.30.1'
-  cache-target:
-    description: also restore/save target/ (build artifacts + BMIs)
-    required: false
-    default: 'true'
+
+outputs:
+  sandbox-key:
+    description: the exact key of the mcpp sandbox cache
+    value: ${{ steps.sandbox.outputs.cache-primary-key }}
+  sandbox-hit:
+    description: "'true' when the sandbox was restored by its exact key"
+    value: ${{ steps.sandbox.outputs.cache-hit }}
+  xlings-key:
+    description: the exact key of the xlings cache
+    value: ${{ steps.xlings.outputs.cache-primary-key }}
+  xlings-hit:
+    description: "'true' when xlings was restored by its exact key"
+    value: ${{ steps.xlings.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -38,8 +56,9 @@ runs:
     # "-release-" caches. A bare "mcpp-sandbox-<os>-" restore prefix used to
     # match the release sandbox too, silently swapping in a differently
     # populated registry (issue #120).
-    - name: Cache mcpp sandbox
-      uses: actions/cache@v4
+    - name: Restore the mcpp sandbox
+      id: sandbox
+      uses: actions/cache/restore@v4
       with:
         path: ~/.mcpp
         # `runner.arch` IS PART OF EVERY KEY, AND WAS NOT.
@@ -70,8 +89,9 @@ runs:
         restore-keys: |
           mcpp-sandbox-${{ runner.os }}-${{ runner.arch }}-ci-xl${{ inputs.xlings-version }}-
 
-    - name: Cache xlings
-      uses: actions/cache@v4
+    - name: Restore xlings
+      id: xlings
+      uses: actions/cache/restore@v4
       with:
         path: ~/.xlings
         key: xlings-${{ runner.os }}-${{ runner.arch }}-v2-xl${{ inputs.xlings-version }}-${{ hashFiles('.xlings.json') }}
@@ -207,17 +227,3 @@ runs:
     # Precise key on src/ + manifest so a no-source-change run lands on a full
     # hit; layered restore-keys let partial hits keep BMI/dyndep state for a
     # proper incremental build.
-    - name: Cache target/ (build artifacts + BMIs)
-      if: inputs.cache-target == 'true'
-      uses: actions/cache@v4
-      with:
-        path: target
-        # `modules/**` belongs here as much as `src/**` does. mcpp's own
-        # source lives in both since the subsystem split, and a key that hashed
-        # only one of them would restore a target/ built from different sources
-        # and report success — the failure mode a cache key exists to prevent,
-        # arriving silently.
-        key: mcpp-target-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('src/**', 'modules/**', 'tests/**', 'mcpp.toml', 'mcpp.lock') }}
-        restore-keys: |
-          mcpp-target-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          mcpp-target-${{ runner.os }}-${{ runner.arch }}-

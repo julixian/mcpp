@@ -1,37 +1,33 @@
 name: ci-windows-e2e
 
-# The e2e suite on Windows, split out of ci-windows.yml (where it was 9.7 of
-# the job's 20.4 min) and sharded across two runners — same shape as
-# ci-linux-e2e.yml. Shares the cache lineage in .github/actions/bootstrap-mcpp,
-# so each shard restores a warm sandbox and pays one incremental `mcpp build`.
+# The e2e suite on Windows x64, called by ci.yml beside ci-windows.yml after
+# the Windows build. Three shards, assigned by measured duration
+# (tests/e2e/timings/windows.tsv, rule R4 of the 2026-10-02 CI record): about
+# fifteen tests of over thirty seconds took 58 to 64 percent of a round-robin
+# shard, and the two shards differed by 3.6 minutes on average. Each shard runs
+# the one binary build.yml produced (use-built-mcpp, rule R1) and writes the
+# per-test report the e2e-coverage job of ci.yml reads.
 #
-# Paired workflows: ci-windows.yml (build + unit + package, toolchains +
-# regressions), ci-linux-e2e.yml, ci-macos-e2e.yml.
+# Paired workflows: ci-windows.yml, ci-linux-e2e.yml, ci-macos-e2e.yml.
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   e2e:
-    name: e2e ${{ matrix.shard }}/2 (windows x64, self-host)
+    name: e2e ${{ matrix.shard }}/3 (windows x64, self-host)
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     env:
       MCPP_HOME: C:\Users\runneradmin\.mcpp
       # Round-robin slice of tests/e2e (see run_all.sh).
-      E2E_SHARD: ${{ matrix.shard }}/2
+      E2E_SHARD: ${{ matrix.shard }}/3
+      E2E_TIMINGS: tests/e2e/timings/windows.tsv
+      E2E_REPORT: ${{ github.workspace }}/e2e-report-windows-${{ matrix.shard }}.tsv
       # NOTE: do NOT force MCPP_VERBOSE here. The e2e suite includes tests that
       # assert mcpp's DEFAULT (quiet) output — e.g. 48_build_error_output and
       # 53_namespaced_cache_label — which forced verbose would break.
@@ -46,23 +42,15 @@ jobs:
           submodules: recursive
       - uses: ./.github/actions/bootstrap-mcpp
 
-      - name: Build mcpp from source (self-host)
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: windows-x86_64
+
+      - name: Name this commit's mcpp MCPP_SELF
         shell: bash
         run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP" build
-          # Pick the NEWEST mcpp.exe, not an arbitrary one: `target/` is
-          # restored from cache and keeps a directory per build fingerprint,
-          # so after a version bump the freshly built binary sits alongside
-          # the previous release's. `find | head -1` returned whichever the
-          # directory walk hit first — which is how a 0.0.106 build ran the
-          # 0.0.105 binary and failed 01_help_and_version.
-          MCPP_SELF=$(find target -name "mcpp.exe" -path "*/bin/*" -printf "%T@ %p\n" \
-              | sort -rn | head -1 | cut -d" " -f2-)
-          test -n "$MCPP_SELF" || { echo "FAIL: no mcpp.exe"; exit 1; }
-          MCPP_SELF=$(cd "$(dirname "$MCPP_SELF")" && pwd)/$(basename "$MCPP_SELF")
-          "$MCPP_SELF" --version
-          echo "MCPP_SELF=$MCPP_SELF" >> "$GITHUB_ENV"
+          "$MCPP_FRESH" --version
+          echo "MCPP_SELF=$MCPP_FRESH" >> "$GITHUB_ENV"
 
       # MinGW-w64 GCC (xim:mingw-gcc). Installed here so the `mingw` capability
       # is GRANTED rather than left to whatever the shared sandbox cache happens
@@ -101,7 +89,8 @@ jobs:
           # claim that an older client can still build against a package the PR
           # produces is only worth making if something checks it against a real
           # old binary. Captured before $MCPP is repointed at the fresh build.
-          export MCPP_BOOT="${MCPP:-$MCPP_BOOT}"
+          # MCPP_BOOT is the released bootstrap (use-built-mcpp), for e2e 252.
+          export MCPP_BOOT
           export MCPP="$MCPP_SELF"
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
           export MCPP_E2E_TOOLCHAIN_MIRROR=GLOBAL
@@ -112,6 +101,17 @@ jobs:
 
       # Measurement legs print READING lines (#646 F2 across PE images, #649 E10
       # the llvm row's recorded CRT); collected where a reader finds them.
+      # One file, no glob: the report the e2e-coverage job of ci.yml reads.
+      - name: Upload the shard's report
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-windows-${{ matrix.shard }}
+          path: e2e-report-windows-${{ matrix.shard }}.tsv
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Measurement readings
         if: always()
         shell: bash

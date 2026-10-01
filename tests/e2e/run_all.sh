@@ -65,19 +65,33 @@ case "$OS" in
         CAPS+=(elf unix-shell fresh-sandbox)
         command -v g++      &>/dev/null && CAPS+=(gcc)
         command -v patchelf &>/dev/null && CAPS+=(patchelf)
-        # musl-gcc: check both system PATH and xlings-managed locations
+        # musl-gcc: check both system PATH and xlings-managed locations.
+        #
+        # ANY RELEASE OF THE FAMILY, NOT ONE VERSION. This probe named
+        # 15.1.0, and the mingw-cross probe below named 16.1.0: a capability
+        # that names a release turns every test that declares it into a silent
+        # skip the day the default moves (SPEC-009, check C3).
         if command -v x86_64-linux-musl-g++ &>/dev/null \
-           || [[ -x "$HOME/.xlings/data/xpkgs/xim-x-musl-gcc/15.1.0/bin/x86_64-linux-musl-g++" ]] \
-           || [[ -x "${MCPP_HOME}/registry/data/xpkgs/xim-x-musl-gcc/15.1.0/bin/x86_64-linux-musl-g++" ]]; then
+           || ls "$HOME"/.xlings/data/xpkgs/xim-x-musl-gcc/*/bin/x86_64-linux-musl-g++ 2>/dev/null | head -1 | grep -q . \
+           || ls "${MCPP_HOME}"/registry/data/xpkgs/xim-x-musl-gcc/*/bin/x86_64-linux-musl-g++ 2>/dev/null | head -1 | grep -q .; then
             CAPS+=(musl)
         fi
         # mingw-cross: the Linux-hosted MinGW-w64 cross toolchain (xim
         # mingw-cross-gcc, GCC 16 MSVCRT). Must be the xim-managed GCC-16 build,
         # NOT the distro apt g++-mingw-w64 (GCC 13 — no `import std`). Probe the
         # xlings/mcpp payload location, mirroring the musl probe above.
-        if [[ -x "$HOME/.xlings/data/xpkgs/xim-x-mingw-cross-gcc/16.1.0/bin/x86_64-w64-mingw32-g++" ]] \
-           || [[ -x "${MCPP_HOME}/registry/data/xpkgs/xim-x-mingw-cross-gcc/16.1.0/bin/x86_64-w64-mingw32-g++" ]]; then
+        if ls "$HOME"/.xlings/data/xpkgs/xim-x-mingw-cross-gcc/*/bin/x86_64-w64-mingw32-g++ 2>/dev/null | head -1 | grep -q . \
+           || ls "${MCPP_HOME}"/registry/data/xpkgs/xim-x-mingw-cross-gcc/*/bin/x86_64-w64-mingw32-g++ 2>/dev/null | head -1 | grep -q .; then
             CAPS+=(mingw-cross)
+        fi
+        # llvm: an LLVM payload in the home mcpp uses. It was a legal token that
+        # no line granted, so the seven tests that need nothing else (134-137,
+        # 741, 875, 876) ran on no runner while their skip lines read like
+        # legitimate ones (finding F9 of the 2026-10-02 CI record). Granted on
+        # Linux only: the macOS runner wires its LLVM into the sandbox for the
+        # build, and the tests that declare `llvm` were written for an ELF host.
+        if ls "${MCPP_HOME}"/registry/data/xpkgs/xim-x-llvm/*/bin/clang++ 2>/dev/null | head -1 | grep -q .; then
+            CAPS+=(llvm)
         fi
         # mingw-host-headers: this Linux HOST's own mingw-w64 headers
         # (`apt install mingw-w64`, distro package). Distinct from both
@@ -395,9 +409,79 @@ if [[ -n "${E2E_SHARD:-}" ]]; then
         echo "FATAL: bad E2E_SHARD='$E2E_SHARD' (want <index>/<total>, 1-based)"
         exit 1
     fi
-    echo "Shard: ${SHARD_IDX}/${SHARD_TOTAL} (round-robin over the suite)"
 fi
 SHARD_POS=0
+
+# BY MEASURED DURATION WHEN A TIMING TABLE IS GIVEN (rule R4 of the 2026-10-02
+# CI record). Round-robin balances counts, not time: measured on 2026-10-01 the
+# two Windows shards differed by 3.6 minutes on average, and about fifteen tests
+# of over thirty seconds took 58-64 percent of a shard. E2E_TIMINGS names a
+# table of `<test>\t<milliseconds>` lines (tests/e2e/timings/<host>.tsv); the
+# tests are assigned longest first, each to the shard with the least time so
+# far, and a test the table does not know counts as the table's median. The
+# assignment depends only on the file list and the table, both in the
+# repository, so a shard's membership is reproducible from the commit, and it
+# changes which shard runs a test, never whether one does.
+SHARD_MEMBERS=""
+if (( SHARD_TOTAL > 1 )) && [[ -n "${E2E_TIMINGS:-}" ]]; then
+    if [[ ! -r "$E2E_TIMINGS" ]]; then
+        echo "FATAL: E2E_TIMINGS='$E2E_TIMINGS' is not readable"
+        exit 1
+    fi
+    SHARD_MEMBERS="$(
+        for t in "$HERE"/[0-9]*.sh; do basename "$t"; done \
+        | awk -v tf="$E2E_TIMINGS" '
+            BEGIN { FS = "\t"; n = 0
+                    while ((getline line < tf) > 0) {
+                        split(line, f, "\t"); if (f[2] ~ /^[0-9]+$/) { ms[f[1]] = f[2] + 0; v[++n] = f[2] + 0 } }
+                    # median of the known durations
+                    for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (v[j] < v[i]) { x = v[i]; v[i] = v[j]; v[j] = x }
+                    med = n ? v[int((n + 1) / 2)] : 1000 }
+            { w = ($0 in ms) ? ms[$0] : med; printf "%d\t%s\n", w, $0 }' \
+        | sort -t "$(printf '\t')" -k1,1nr -k2,2 \
+        | awk -v total="$SHARD_TOTAL" -v me="$SHARD_IDX" '
+            BEGIN { FS = "\t"; for (i = 1; i <= total; i++) load[i] = 0 }
+            { best = 1; for (i = 2; i <= total; i++) if (load[i] < load[best]) best = i
+              load[best] += $1; if (best == me) print $2 }')"
+    echo "Shard: ${SHARD_IDX}/${SHARD_TOTAL} (by measured duration, $E2E_TIMINGS)"
+elif (( SHARD_TOTAL > 1 )); then
+    echo "Shard: ${SHARD_IDX}/${SHARD_TOTAL} (round-robin over the suite)"
+fi
+in_shard() {
+    local name="$1"
+    if [[ -n "$SHARD_MEMBERS" ]]; then
+        grep -qxF "$name" <<<"$SHARD_MEMBERS"
+        return
+    fi
+    local mine=$(( (SHARD_POS % SHARD_TOTAL) + 1 ))
+    SHARD_POS=$(( SHARD_POS + 1 ))
+    (( mine == SHARD_IDX ))
+}
+
+# What each test of this run did, for the coverage check of ci.yml
+# (.github/tools/check_e2e_coverage.py): one `<status>\t<test>\t<ms>\t<detail>`
+# line per test of this shard, status pass, fail, timeout or skip.
+report() {
+    [[ -n "${E2E_REPORT:-}" ]] || return 0
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$E2E_REPORT"
+}
+if [[ -n "${E2E_REPORT:-}" ]]; then : > "$E2E_REPORT"; fi
+
+# E2E_LIST=1 prints the tests this invocation would run (after E2E_ONLY and the
+# shard, before the capability check) and exits, so a shard's membership can be
+# read without running it.
+if [[ "${E2E_LIST:-}" == "1" ]]; then
+    for test in "$HERE"/[0-9]*.sh; do
+        name="$(basename "$test")"
+        if [[ -n "${E2E_ONLY:-}" ]]; then
+            # shellcheck disable=SC2053 -- glob match is the point
+            [[ "$name" == $E2E_ONLY ]] || continue
+        fi
+        if (( SHARD_TOTAL > 1 )); then in_shard "$name" || continue; fi
+        echo "$name"
+    done
+    exit 0
+fi
 
 # Optional name filter: E2E_ONLY="<glob>" runs just the matching tests.
 # Used by the workflows that own ONE subject (see ci-windows-msvc-xlings.yml)
@@ -407,17 +491,16 @@ for test in "$HERE"/[0-9]*.sh; do
         # shellcheck disable=SC2053 — glob match is the point
         [[ "$(basename "$test")" == $E2E_ONLY ]] || continue
     fi
-    if (( SHARD_TOTAL > 1 )); then
-        _mine=$(( (SHARD_POS % SHARD_TOTAL) + 1 ))
-        SHARD_POS=$(( SHARD_POS + 1 ))
-        (( _mine == SHARD_IDX )) || continue
-    fi
     name="$(basename "$test")"
+    if (( SHARD_TOTAL > 1 )); then
+        in_shard "$name" || continue
+    fi
     echo
     missing_cap="$(check_requires "$test")"
     if [[ -n "$missing_cap" ]]; then
         echo "SKIP: $name (missing capability: $missing_cap)"
         ((SKIP++))
+        report skip "$name" 0 "missing capability: $missing_cap"
         continue
     fi
     echo "=== $name ==="
@@ -434,13 +517,16 @@ for test in "$HERE"/[0-9]*.sh; do
     if [[ $rc -eq 0 ]]; then
         echo "PASS: $name (${_dur})"
         ((PASS++))
+        report pass "$name" "$_dur_ms" ""
     elif [[ $rc -eq 124 ]]; then
+        report timeout "$name" "$_dur_ms" "exceeded ${E2E_TEST_TIMEOUT}s"
         # GNU timeout: 124 = killed after deadline (TERM); 137 = SIGKILL after grace.
         echo "TIMEOUT: $name (exceeded ${E2E_TEST_TIMEOUT}s — likely network / xlings stall)"
         ((FAIL++))
         FAILED_TESTS+=("$name (TIMEOUT)")
         TIMED_OUT_TESTS+=("$name")
     else
+        report fail "$name" "$_dur_ms" "exit $rc"
         echo "FAIL: $name (exit $rc, ${_dur})"
         ((FAIL++))
         FAILED_TESTS+=("$name (exit $rc)")

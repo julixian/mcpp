@@ -104,8 +104,6 @@ jobs:
           if ($left) { Write-Host "FAIL: VC tools still present after masking"; exit 1 }
 
       - uses: ./.github/actions/bootstrap-mcpp
-        with:
-          cache-target: 'false'
 
       - name: Install xim:qt-base 6.11.1 and remove its copy of the runtime
         shell: bash
