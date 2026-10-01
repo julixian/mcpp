@@ -975,14 +975,6 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         link_toolchain_flags +=
             mcpp::toolchain::ClangDriverModel::kLinkDriverFlags;
         }
-        // A LINKER STATED BY ROLE (mcpp#755, `tools = { ld = ... }`): clang's
-        // `--ld-path` names the program, after `-fuse-ld` has chosen the
-        // flavour, so the flags that follow still speak to the same linker.
-        if (auto* ld = plan.toolchain.tool_override("ld")) {
-            const auto opt = " --ld-path=" + escape_path(*ld);
-            link_toolchain_flags += opt;
-            link_toolchain_flags_c += opt;
-        }
         f.sysroot = link_toolchain_flags;
     } else if (lm.mode != mcpp::toolchain::CLibMode::None) {
         // GCC (or Clang without cfg): --sysroot from probe, or the payload
@@ -2400,6 +2392,27 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             }
         }
     }
+
+    // A LINKER STATED BY ROLE (mcpp#755, `tools = { ld = ... }`), AFTER EVERY
+    // SHAPE HAS BUILT ITS LINE.
+    //
+    // It was appended inside the Linux clang branch, the only one that consumes
+    // `link_toolchain_flags`: on macOS the stated linker entered the fingerprint
+    // -- the fast path declined when the wrapper changed -- and took no part in
+    // the link, with nothing said (measured in the toolchain lab on macos-15,
+    // where `build.ninja` held no `--ld-path`). The flag belongs to the driver,
+    // not to a platform, so it is added once here, for every shape.
+    //
+    // Clang only: `--ld-path` is clang's. GCC chooses its linker by name inside a
+    // `-B` directory, so a program named anything else could not be selected that
+    // way, and a silent `-B` would be the same defect in the other direction. A
+    // gcc toolchain that states `ld` is refused where the declaration is read.
+    if (plan.toolchain.compiler == mcpp::toolchain::CompilerId::Clang)
+        if (auto* ld = plan.toolchain.tool_override("ld")) {
+            const auto opt = " --ld-path=" + escape_path(*ld);
+            if (f.ld.find("--ld-path=") == std::string::npos)  f.ld  += opt;
+            if (f.ldC.find("--ld-path=") == std::string::npos) f.ldC += opt;
+        }
 
     return f;
 }

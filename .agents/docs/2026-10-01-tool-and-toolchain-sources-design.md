@@ -150,5 +150,11 @@ action 描述的是一次还不存在的构建;一个载荷请求也无法回答
   的预算是 128 KiB,而只有 Windows 上 `capture_exec` 所经的 shell 是 8191 字节。覆盖它的是
   mcpp-plugins 的 `all-rules-compile`(导入十五个宿主模块)与两个单测——每种 tokenize 语法
   一个,因为 clang 与 GCC 把反斜杠当转义,cl 与 clang-cl 不当。
+- `tools = { ld = ... }` 只对 clang 驱动成立(`--ld-path`);gcc 按 `-B` 目录里的名字 `ld`
+  选链接器,所以一个别名程序无法那样被选中,声明处直接拒绝而不是在链接时忽略。这条起初写成了
+  Linux clang 分支里的一行,于是 macOS 的 Apple 链接形状拿不到它——被陈述的链接器进了指纹
+  (改动 wrapper 会让快速路径失效),却不参与链接,而且什么都不说。现在它在所有形状之后追加
+  一次。覆盖它的是 toolchain-lab:e2e 875 在没有装 llvm 载荷的宿主上 SKIP,而 macOS CI 正是
+  这样的宿主。
 - 工具链描述数据化(核心读描述文件、不再硬编码 `to_xim_package`)不在本次范围;
   `[toolchain] { path }` 的字段已经与那份描述同形,所以它是后续的第三种载体,而不是改写。

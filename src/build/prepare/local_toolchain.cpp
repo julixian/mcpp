@@ -240,6 +240,20 @@ step2_use_local_toolchain(PrepareState& state, const mcpp::toolchain::ToolchainS
     for (auto const& [role, p] : lt.tools)
         if (!fs::exists(p, ec))
             return refuse(std::format("tools.{} names '{}', which does not exist", role, p));
+    // A STATED LINKER REACHES THE LINK THROUGH CLANG'S `--ld-path`, which gcc
+    // does not have: gcc selects a linker by the name `ld` inside a `-B`
+    // directory, so a program named anything else cannot be chosen that way.
+    // Refused here rather than ignored in the link: the alternative is a stated
+    // tool that enters the fingerprint and takes no part in the build, which is
+    // what this mechanism exists to prevent.
+    if (family == "gcc")
+        for (auto const& [role, p] : lt.tools)
+            if (role == "ld")
+                return refuse(std::format(
+                    "tools.ld names '{}', and this is a gcc toolchain: a linker is stated "
+                    "through clang's `--ld-path`, which gcc has no counterpart for. Either "
+                    "name an llvm toolchain, or place a program called `ld` in the tree "
+                    "gcc searches", p));
     if (!lt.sysroot.empty() && !fs::is_directory(lt.sysroot, ec))
         return refuse(std::format("sysroot '{}' is not a directory", lt.sysroot));
     state.explicit_compiler = driver;
