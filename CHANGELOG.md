@@ -33,8 +33,8 @@ unchanged.
   sysroot, family, launcher, tools }`, or `MCPP_TOOLCHAIN=path:<dir>`. mcpp
   probes the drivers in the tree, identifies them, drives them with its own
   link model, and writes nothing into the tree. The driver and each stated tool
-  enter the fingerprint by content, the fast paths decline when one changed,
-  and `mcpp.lock` records the toolchain as `local`.
+  enter the fingerprint by content, and a build records them beside its output,
+  so the fast paths decline once one of them changed.
 - **`[toolchain] bootstrap`** names the toolchain that compiles and runs build
   programs when it should not be the one building the project.
 - **`[toolchain] <key> = { configure = "build.mcpp" }`** hands the build

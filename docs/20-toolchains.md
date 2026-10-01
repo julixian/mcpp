@@ -409,9 +409,10 @@ mcpp's own file, and a tree mcpp does not own does not get one.
 
 **Identity.** The driver and each tool named by `tools` enter the build's
 fingerprint by path, size and modification time, so rebuilding the toolchain in
-place rebuilds what it produced. A build that used one records it in
-`mcpp.lock` as `local`: a machine without that toolchain is told so by name
-rather than building with another one.
+place rebuilds what it produced, and a build records them beside its output so
+the fast paths decline once one of them changed. A machine that does not have
+the tree is told so by name — the declaration is refused where it is read —
+rather than building with another toolchain.
 
 This is not the `system` compiler of the section above. `system` is whatever
 `PATH` happens to hold; this is a tree the project names, that mcpp identifies
