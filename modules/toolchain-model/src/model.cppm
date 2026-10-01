@@ -321,7 +321,21 @@ struct Toolchain {
     // Tools stated by role where the layout does not have them
     // (`tools = { ld = ... }`): `ld`, `ar`, `ranlib`, `nm`, `objcopy`,
     // `strip`, `as`. Read before any derivation from the driver's directory.
-    std::vector<std::pair<std::string, std::filesystem::path>> toolOverrides;
+    //
+    // A NAMED STRUCT, NOT `std::pair<std::string, std::filesystem::path>`, AND
+    // THAT IS NOT A STYLE CHOICE. Exporting that specialization from this
+    // module made clang 20.1.7 crash while generating code for
+    // `mcpp::pack::interface_set_digest` -- a function in another module that
+    // instantiates the same specialization and sorts by a pointer to its
+    // `first`. The failure named a file this change never touched, which is
+    // the signature of this hazard (`modules/manifest/src/types.cppm` records
+    // a GCC 16 case of the same shape). Measured on windows-2022, clang
+    // 20.1.7, 2026-10-01.
+    struct ToolOverride {
+        std::string           role;
+        std::filesystem::path program;
+    };
+    std::vector<ToolOverride> toolOverrides;
     // The driver-and-tool prefix of a cross toolchain (`aarch64-none-linux-gnu-`).
     std::string                         toolPrefix;
 
