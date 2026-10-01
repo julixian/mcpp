@@ -159,3 +159,4 @@
   - [SPEC-006 —— 工具链管理：身份、来源、选择与载荷契约](../specs/toolchain-management.md)
   - [SPEC-007 —— 构建插件：配置、施工与校验的分工，运行时与规划期的义务](../specs/build-plugins.md)
   - [SPEC-008 —— 库的接口：公开模块、发布闭包与两种形态的一致](../specs/library-interface.md)
+  - [SPEC-009 —— 工具链的支持与维护：版本线、默认值、来源、移动与退役](../specs/toolchain-maintenance.md)
