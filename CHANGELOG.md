@@ -58,6 +58,27 @@ unchanged.
   resolution recorded, in place of a sentence listing every way one can be
   chosen.
 
+### Fixed
+
+- **A build program's compile command goes through a response file when it
+  outgrows the channel it travels.** The command carries one
+  `-fmodule-file=<name>=<path>` per host module the program imports, with
+  absolute paths, and on Windows it reaches a shell that tolerates 8191 bytes: a
+  program importing fifteen modules reported only `The command line is too
+  long.`, naming neither the length nor the cause. The file is written in the
+  grammar its driver reads -- single quotes for clang and GCC, which treat a
+  backslash as an escape, Windows quoting for cl and clang-cl -- and stays beside
+  the program for a failed compile to show.
+- **A manifest key this engine does not know says which engine the package
+  needs.** A package written for a newer mcpp was refused with `unknown key
+  '<key>'` and nothing about the version, because the engine floor is checked on
+  the document that very parse failed to produce. The refusal now names the
+  floor, this engine and the upgrade, which is what a reader meets first after a
+  plugin collection raises it.
+- **`which()` resolves a name that is also a shell builtin.** `command -v true`
+  prints `true`, not a path, so a bare-name payload override of such a name was
+  refused as not found on a machine carrying `/usr/bin/true`.
+
 ## [2026.10.1.2] - 2026-10-01
 
 This release implements the design for a pack's build and a compile that does
