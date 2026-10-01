@@ -1,11 +1,11 @@
 ---
 subject: design
-status: active
+status: landed
 ---
 
 # A pack's build reported as a build, and a unit's compile independent of the member selection: triage and design (#753, #751)
 
-- Status: implemented as 2026.10.1.2 (pull request #754). Section 15 records
+- Status: landed as 2026.10.1.2 (pull request #754, released 2026-10-01). Section 15 records
   what was built, what was measured, and where the implementation departs
   from sections 3, 4 and 10.
   - Revision 1 was reviewed on 2026-10-01. D1 to D4 were accepted as
@@ -659,4 +659,34 @@ medium confidence and its two below were confirmed in the code and fixed
 (section 15.1). It found the per-unit maps, their keys, the dyndep and staging
 paths, the cache population, both argument-file writers, the job count and the
 token reclaim consistent with sections 3 and 4.
+
+### 15.4 Release
+
+- **mcpp.** #754 was merged as 23c9590b, whose tree is the reviewed head
+  71d09f0b, and tagged v2026.10.1.2 (release run 36818095279). Both canaries,
+  xlings and mcppls, built and tested with the new engine. The release job's
+  own pack, the measurement of #753, wrote the package lines,
+  `Building 251/414` to `411/414` and `Finished release [optimized] in 5m49s`
+  before `Packing`.
+- **Mirrors and index.** The four archives were uploaded to GitCode
+  (xlings-res/mcpp) from this host as each appeared, and their bytes match the
+  release's checksums. openxlings/xim-pkgindex#916 was merged after its four
+  hashes were compared with the release's sidecars block by block, and
+  `xlings install mcpp@2026.10.1.2` installs the release.
+- **mcpp-index.** mcpplibs/mcpp-index#497 moved `latest_mcpp` and the CI pin
+  to 2026.10.1.2 after the full sweep (run 36823747543): 28 jobs succeeded and
+  1 was skipped. The first attempt's two failed shards had stopped on an HTTP
+  500 downloading the archive, before any member ran. #496, the previous
+  release's pin, was merged first.
+- **GalTranslPP.** PR 3 moved to 2026.10.1.2 (run 36824209051): `mcpp run -p
+  GPPCLI` after `mcpp build --workspace` took 10 s (3m22s and 4m30s on
+  2026.9.30.2), the two release packs 83 s. The temporary verification branch
+  was deleted.
+- **Sandbox.** The script of section 15.2, run in an `xlings subos --sandbox`
+  with the CN mirror against the release installed from the index: every
+  section passed in at least one of five runs, and every failure was proot's
+  `Bad address` on ninja's own logs (xlings#635). The same script against
+  2026.10.1.1 in another subos fails sections 1, 2, 3, 5 and 6b on behaviour
+  and shows the same proot error.
+- **Issues.** #751 and #753 were closed with these readings.
 
