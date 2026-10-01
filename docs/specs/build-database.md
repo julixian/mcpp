@@ -242,6 +242,7 @@ mcpp 输出的 S1 文档满足 S1 等级 2,不输出 `ide.options`。等级 3 �
 | 1.1 | 2026-09-16 | R5.2 增加离线诊断码 `MCPP_OFFLINE_DOWNLOAD_REQUIRED`;R5.3 的 `network` 按观测列出;新增 R5.4(子进程不继承调用方描述符,xlings 子进程有期限并随 mcpp 结束)(#648)。 |
 | 1.2 | 2026-09-17 | R3.7 陈述 `arguments` 的每一项是编译器收到的参数,单元 flag 按 SPEC-004 §8 的词列出(#655)。 |
 | 1.3 | 2026-09-26 | R2.5:`emit` 下构建失败的宿主工具是警告。R3.7:`work-directory` 是输出目录,模块接口单元的 `arguments` 带语言 flag。R3.8:标准库单元的 `provides` 指向 std 缓存中的 BMI,工具链带 `build-id`。R4.1:compile-commands 文档包含标准库单元(S1-12-1)。R5.2:成员各自规划,构建程序失败的包不带其指令地被描述(#699,#702)。 |
+| 1.5 | 2026-10-01 | R2.5 的同一规则适用于载荷:构建程序请求了 `provision = "on-request"` 的载荷时,命令不安装,记 note `MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED`,点名程序与包(mcpp#755)。 |
 | 1.4 | 2026-09-26 | R2.5:命令不构建宿主工具;工具库中没有的工具被推迟,输出说明 `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED`,取代 1.3 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`(#707)。 |
 | 1.5 | 2026-09-28 | R3.7:规则声明的设备源不是编译单元,不进入 S1 与 `compile_commands.json`(#724)。新增 R3.12:集合的 `ide.generated` 列出规则生成的文件与目录,给出构建写入的路径与生成它的步骤,S1 0.3.0(#724,Sunrisepeak/mcpp-language-server#28)。R5.1:S1 版本为 0.3.0。R5.2:以构建程序的指令为前提的检查不对其构建程序已失败的包运行,失败路径保留已记录的说明(#724)。 |
 | 1.6 | 2026-09-29 | 工作区按配置规划,与 `mcpp build` 相同(R2.1、R3.3、R3.4、R5.2):成员共用的包在一个配置中只描述一次;集合名的前缀由 `<成员>/` 改为只在文档描述多个配置时出现的 `<配置>/`;一个配置的规划失败时逐成员规划。R3.5:被选成员的集合按其目标给出 `ide.kind`。R4.1:同一文件与输出一条条目。 |

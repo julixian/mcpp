@@ -22,7 +22,11 @@ rules declare the payloads they drive. After:
 Everything mcpp installs and does not compile: a compiler, a shader compiler, a
 device toolkit, an emulator, a probe driver, a prebuilt C library. A project
 names one in `[xlings.workspace]`, or a rule package names it in
-`[feature-xlings.<f>]`, and mcpp provisions it before the build runs.
+`[feature-xlings.<f>]`, and mcpp provisions it before the build runs — or, with
+`provision = "on-request"`, when a build program asks for it (docs/23). A
+project may also state that a payload comes from somewhere else on this machine
+(`[xlings.overrides]`), and then it is not installed at all; a recipe is
+unaffected either way.
 
 A payload lives in `xim-pkgindex` as one Lua file: a `package` table that
 describes it, and two functions that place and register it.

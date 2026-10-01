@@ -68,7 +68,7 @@ inline constexpr int kEnvelopeVersion = 1;
 // from what comes back.
 struct KindVersion { std::string_view kind; int version; };
 
-inline constexpr std::array<KindVersion, 7> kKinds{{
+inline constexpr std::array<KindVersion, 8> kKinds{{
     {"mcpp.env",             1},
     {"mcpp.xpkg",            1},
     {"mcpp.cache",           1},
@@ -77,6 +77,10 @@ inline constexpr std::array<KindVersion, 7> kKinds{{
     // the driver, the triple, the C-library model, and either `ok` or a refusal
     // whose `reason` is a token from mcpp.build.refusal.
     {"mcpp.why.toolchain",   1},
+    // `mcpp why sources|tool|payload --format json` (mcpp#755): the decision
+    // record of a prepare -- where the toolchain, each payload and each plugin
+    // tool came from, its class and origin -- filtered to the topic.
+    {"mcpp.why.sources",     1},
     // `mcpp toolchain list --format json`: which toolchains are installed and
     // which target rows this host serves, with their status.
     {"mcpp.toolchain.list",  1},

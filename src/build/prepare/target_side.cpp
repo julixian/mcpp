@@ -1723,9 +1723,12 @@ static std::expected<void, std::string> step9_root_build_program(PrepareState& s
         const auto namedBeforeRoot  = bcRoot.namedRunners;
         // The root's program is the requested package's.
         bpEnv.requested = !state.m->package.virtualRoot;
-        auto bp = mcpp::build::run_build_program(
-            *state.m, *state.root, host->first, host->second,
-            state.m->cppStandard, bpEnv);
+        auto bp = run_answering_requests(state, *state.m, bpEnv, 0,
+            state.m->package.name, [&] {
+                return mcpp::build::run_build_program(
+                    *state.m, *state.root, host->first, host->second,
+                    state.m->cppStandard, bpEnv);
+            });
         if (!bp && !state.overrides.plan_only) {
             return std::unexpected(bp.error());
         }
@@ -2132,9 +2135,12 @@ static std::expected<void, std::string> step9_member_build_programs(PrepareState
         const auto runnerN = bc.runner.size();
         auto namedBefore = bc.namedRunners;
         const bool exclusiveBefore = bc.runExclusive;
-        auto bp = mcpp::build::run_build_program(
-            pkg.manifest, pkg.root, host->first, host->second,
-            pkg.manifest.cppStandard, bpEnv, made.compiled ? &made : nullptr);
+        auto bp = run_answering_requests(state, pkg.manifest, bpEnv, i,
+            pkg.manifest.package.name, [&] {
+                return mcpp::build::run_build_program(
+                    pkg.manifest, pkg.root, host->first, host->second,
+                    pkg.manifest.cppStandard, bpEnv, made.compiled ? &made : nullptr);
+            });
         if (!bp) {
             if (!state.overrides.plan_only)
                 return std::unexpected(std::format(

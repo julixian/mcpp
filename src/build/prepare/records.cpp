@@ -558,8 +558,57 @@ void step13_resolution_json(PrepareState& state, BuildContext& ctx) {
                 {"root",    tcr.windowsSdkRoot.generic_string()},
             };
         }
+        // WHERE EACH SOURCE CAME FROM (mcpp#755): the decision record, one
+        // entry per subject, as `mcpp why` reads it. Added beside the other
+        // keys; no reader keys on `schema_version`.
+        {
+            nlohmann::json sources = nlohmann::json::array();
+            for (auto const& d : ctx.sources) {
+                nlohmann::json e = {
+                    {"subject", d.subject}, {"value", d.value},
+                    {"class", std::string(source_class_name(d.cls))},
+                    {"origin", {{"kind", d.originKind}, {"file", d.originFile},
+                                {"line", d.originLine}, {"key", d.originKey}}},
+                    {"decidedFor", d.decidedFor},
+                    {"considered", d.considered},
+                };
+                sources.push_back(std::move(e));
+            }
+            j["sources"] = std::move(sources);
+        }
         std::error_code ec;
         std::filesystem::create_directories(ctx.plan.outputDir, ec);
+        // The `Finished` line of a build that skips prepare reads the summary
+        // from here, beside the steps record the fast path already reads.
+        {
+            auto summary = sources_summary(ctx.sources);
+            auto sp = ctx.plan.outputDir / "sources.summary";
+            if (summary.empty()) std::filesystem::remove(sp, ec);
+            else if (std::ofstream so(sp); so) so << summary << "\n";
+            ec.clear();
+        }
+        // A toolchain named by path can change in place; the fast paths
+        // compare what is recorded here (mcpp#755).
+        {
+            auto stampPath = ctx.plan.outputDir / "local-toolchain.stamp";
+            if (ctx.tc.localRoot.empty()) {
+                std::filesystem::remove(stampPath, ec);
+            } else if (std::ofstream st(stampPath, std::ios::binary); st) {
+                auto put = [&](const std::filesystem::path& p) {
+                    std::error_code fe;
+                    const auto size = std::filesystem::file_size(p, fe);
+                    const auto time = std::filesystem::last_write_time(p, fe);
+                    // The same two spellings the fast path compares against.
+                    st << std::format("{}", static_cast<std::uint64_t>(size)) << '\t'
+                       << std::format("{}", static_cast<std::int64_t>(
+                              time.time_since_epoch().count())) << '\t'
+                       << p.string() << '\n';
+                };
+                put(ctx.tc.binaryPath);
+                for (auto const& [role, p] : ctx.tc.toolOverrides) put(p);
+            }
+            ec.clear();
+        }
         auto path = ctx.plan.outputDir / "resolution.json";
         auto tmp = path;
         tmp += ".tmp";

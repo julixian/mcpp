@@ -4,11 +4,11 @@
 |---|---|
 | 规范编号 | SPEC-006 |
 | 标题 | 工具链管理:身份、来源、选择与载荷契约 |
-| 状态 | 草案 v0.4 |
-| 最后修改 | 2026-09-28 |
+| 状态 | 草案 v0.5 |
+| 最后修改 | 2026-10-01 |
 | 对应实现 | 逐条标注;标为「已实现」的条款对应 mcpp >= 2026.9.24.1。标为「未实现」的条款计划与下一批 LLVM 工具链一同落地,届时按实测修订本规范 |
 | 相关设计文档 | `.agents/docs/2026-09-24-toolchain-selection-and-payload-trust-design.md`、`.agents/docs/2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md`、`.agents/docs/2026-09-28-ecosystem-design-and-optimisation-plan.md` |
-| 相关 issue | mcpp#685、mcpp#687、mcpp#718 |
+| 相关 issue | mcpp#685、mcpp#687、mcpp#718、mcpp#755 |
 | 使用文档 | [docs/20 - 工具链](../zh/20-toolchains.md)、[docs/32 - 编写载荷](../zh/32-authoring-a-payload.md)、[docs/91 - 工具链内部](../zh/91-toolchain-internals.md) |
 
 本规范定义 mcpp 对工具链的命名、选择和使用方式,以及一个工具链载荷在发布前必须满足的条件。
@@ -41,6 +41,29 @@
 
 只有 `msvc` 有系统来源,写作 `msvc@system`。其他族写 `@system`,**必须**在读取处被拒绝。
 不带族的 `system`(PATH 上的编译器)**必须**被拒绝,拒绝信息给出可用的写法。
+
+### 2.2.1 按路径命名 已实现
+
+工具链**可以**写成一个表,由路径命名本机已有的一份:
+`[toolchain] <键> = { path = "<目录>", prefix, sysroot, family, launcher, tools }`,
+或 `MCPP_TOOLCHAIN=path:<目录>`。`<目录>/bin` 中的驱动决定族(`<prefix>clang++` 为 llvm,
+`<prefix>g++` 为 gcc);其余属性由探测该驱动得到。
+
+这与 §2.2 拒绝 `system` 并不矛盾:`system` 是「`PATH` 上碰巧有什么就用什么」,而本条是
+一次被命名、被识别、被记录的选择,与 `msvc@system` 同形。实现**必须**:
+
+- 以与托管载荷相同的 link model、hermetic 检查与 `import std` 能力判定驱动它;
+- **禁止**写入该目录树(它不是 mcpp 管理的);
+- 把驱动与 `tools` 所列每个程序的身份(路径、大小、修改时间)纳入指纹与快速路径的判定,
+  因为这样的工具链可以原地改变;
+- 把它们记在该次构建的产物旁,使快速路径在其中之一改变后让行;
+- 在构建输出、`resolution.json` 与 `mcpp why toolchain` 中陈述其来源(§3.3)。
+
+`[toolchain] bootstrap = "<族>@<版本>"` 命名编译并运行构建程序的工具链;未写时按 §3 的
+规则决定。`[toolchain] <键> = { configure = "build.mcpp" }` 把构建工具链的选择交给根构建
+程序的工具链阶段(SPEC-007 R9.9)。
+
+**状态:已实现**(mcpp 2026.10.1.3,mcpp#755)。
 
 ### 2.3 生态包前缀 已实现
 
@@ -81,6 +104,12 @@ clang 以 MSVC ABI 为目标时,所选 toolset 与 SDK 以 `-Xmicrosoft-visualc-
 ### 3.3 结果可见 已实现
 
 凡由探测得到的选择,其来源、版本与 SDK **必须**打印在构建输出中,写入 `resolution.json`,并进入缓存键。
+
+不是生态缺省的来源(按路径命名的工具链、被覆盖的载荷、使用者指定的工具、宿主上找到的
+程序)**必须**各自以一行陈述,写出它是什么、从哪里来、以及陈述它的位置;`Finished` 行
+**必须**汇总它们;`resolution.json` 的 `sources` 记录每一条。全部来源都是生态缺省时,输出
+**必须**与没有本机制时相同。`--managed-only`(或 `MCPP_MANAGED_ONLY`)**必须**拒绝任何
+非缺省来源,并逐条点名(mcpp#755)。
 MSVC ABI 目标上:SDK 以 `ucrt@<版本>` 进入运行时身份;clang 行的 toolset 与 SDK 写入 `resolution.json` 的
 `msvc_toolset` 与 `windows_sdk`,toolset 目录与 SDK 版本进入缓存键,`stdlibVersion` 记为 toolset 的版本。
 
@@ -286,4 +315,5 @@ xim-pkgindex 的准入脚本 `verify-toolchain.sh` 对一个载荷归档做一�
 | v0.1 | 2026-09-24 | 初版草案:身份与写法、来源与选择(含 MSVC ABI 目标的 sysroot)、载荷契约、构建、验收、发布顺序 |
 | v0.2 | 2026-09-24 | 随 mcpp 2026.9.24.1 更新实现状态:§2.3、§2.4、§3.1 至 §3.6 已实现;§4.2、§6.4 部分实现;§2.2 更正:不带族的 `system` 被拒绝 |
 | v0.3 | 2026-09-28 | 随 mcpp 2026.9.28.1:新增 §3.7,MSVC ABI 的 CRT 模型是目标 ABI 的性质,cl 与 clang++ 同样收到,默认 `toolchain-coupled`(mcpp#718)。 |
+| v0.5 | 2026-10-01 | 随 mcpp 2026.10.1.3(mcpp#755):新增 §2.2.1,工具链可由路径命名,并说明 `bootstrap` 与 `configure = "build.mcpp"`;§3.3 增加非缺省来源的陈述、汇总、记录与 `--managed-only`。 |
 | v0.4 | 2026-09-28 | 随 mcpp 2026.9.28.2:新增 §3.7.1,程序旁的文件由一个解析器决定;MSVC C++ 运行时是一个带版本的集合;契约决定种类;声明的运行时文件与 toolset 的版本比较;读不出的版本不作决定;action 的 `PATH` 首位是 toolset 的运行时目录(2026-09-28 设计 WS1)。 |

@@ -84,6 +84,19 @@ std::string version_of(std::string_view address);
 // duplicate install it would be preventing.
 std::expected<Resolution, std::string> unify(std::span<const Claim> claims);
 
+// AN OVERRIDE IS CHECKED THE WAY A WINNER IS (mcpp#755). `[xlings.overrides]`
+// replaces where a package comes from, not what the declarations require of
+// it: a version the override states is compared with every requirement a
+// claim on `key` made, and a version that fails one is refused naming both
+// sides. An override that states no version cannot be compared, which is not
+// a refusal -- `requirements_for` lists what went unchecked, for the note.
+std::optional<std::string> override_violation(std::span<const Claim> claims,
+                                              std::string_view key,
+                                              std::string_view version,
+                                              std::string_view statedBy);
+std::vector<std::string> requirements_for(std::span<const Claim> claims,
+                                          std::string_view key);
+
 } // namespace mcpp::xlings::addrset
 
 // ── implementation ──────────────────────────────────────────────────────────
@@ -121,6 +134,38 @@ Verdict check(std::string_view chosen, std::string_view stated) {
 }
 
 } // namespace
+
+std::optional<std::string> override_violation(std::span<const Claim> claims,
+                                              std::string_view key,
+                                              std::string_view version,
+                                              std::string_view statedBy) {
+    if (version.empty()) return std::nullopt;
+    for (auto const& c : claims) {
+        if (package_key(c.address) != key) continue;
+        const auto stated = version_of(c.address);
+        if (check(version, stated) != Verdict::Violated) continue;
+        return std::format(
+            "`{}` is overridden by {} with version {}, and {} requires {}.\n"
+            "       An override replaces where the package comes from, not what the\n"
+            "       declarations require of it.\n"
+            "       fix: name a program satisfying {}, or state the version it has.",
+            key, statedBy, version, c.declaredBy, stated, stated);
+    }
+    return std::nullopt;
+}
+
+std::vector<std::string> requirements_for(std::span<const Claim> claims,
+                                          std::string_view key) {
+    std::vector<std::string> out;
+    for (auto const& c : claims) {
+        if (package_key(c.address) != key) continue;
+        const auto stated = version_of(c.address);
+        if (stated.empty() || !mcpp::version_req::is_constraint(stated)) continue;
+        auto line = std::format("{} by {}", stated, c.declaredBy);
+        if (std::ranges::find(out, line) == out.end()) out.push_back(std::move(line));
+    }
+    return out;
+}
 
 std::expected<Resolution, std::string> unify(std::span<const Claim> claims) {
     Resolution out;

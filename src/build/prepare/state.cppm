@@ -52,6 +52,7 @@ import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.config;
 import mcpp.xlings;
+import mcpp.xlings.address_set;   // mcpp#755: override checks reuse the unification's claims
 import mcpp.xlings.runtime_selection;
 import mcpp.runtime.binding;
 import mcpp.toolchain.post_install;
@@ -564,6 +565,44 @@ struct PrepareState {
     std::map<std::size_t, std::vector<mcpp::build::BuildProgramEnv::DormantFeature>>
         dormantFeaturesByConsumer;
     std::map<std::string, std::string> xlingsWinner;
+
+    // ── Sources (mcpp#755): see sources.cpp ─────────────────────────────────
+    // The decision record, one entry per subject, and the subjects whose
+    // `Using` line has been printed (each is printed once per prepare).
+    std::vector<SourceDecision> sources;
+    std::set<std::string> announcedSources;
+    // Where an overridden payload comes from, resolved once per package key:
+    // the environment variable, the project's `[xlings.overrides]`, then
+    // config.toml. A key with no override maps to nullopt.
+    struct PayloadOverride {
+        std::string root;      // the directory `xpkg_dir` answers
+        std::string program;   // the program, when the override named one
+        std::string version;   // the version it states, empty when none
+        SourceClass cls = SourceClass::Custom;
+        std::string originKind, originFile, originKey;
+        int         originLine = 0;
+    };
+    std::map<std::string, std::optional<PayloadOverride>> payloadOverrideCache;
+    // Package keys whose payload this build does not install: overridden, or
+    // declared `provision = "on-request"` and not asked for (yet). And the
+    // addresses so skipped, for the run-tier record in plan.cpp.
+    std::set<std::string> xlingsOverridden;
+    std::set<std::string> xlingsDeferred;
+    std::set<std::string> xlingsSkipped;
+    // Package keys a build program asked for, installed on request.
+    std::set<std::string> requestedPayloads;
+    // A toolchain named by path, or stated by the build program (mcpp#755):
+    // the description the resolver uses, and the decision it is reported as.
+    std::optional<mcpp::manifest::LocalToolchain> localToolchain;
+    SourceDecision localToolchainOrigin;
+    // `[toolchain] <key> = { configure = "build.mcpp" }` and this is the first
+    // pass: the toolchain resolved is the bootstrap, and the root build
+    // program runs its toolchain phase once host modules are registered.
+    bool toolchainConfigure = false;
+    // The toolchain that compiles and runs build programs, when it is not the
+    // build toolchain on a native build: `[toolchain] bootstrap`, or the
+    // toolchain that ran the toolchain phase. Empty otherwise.
+    std::string bootstrapSpec;
     std::vector<std::unique_ptr<mcpp::manifest::Manifest>> dep_manifests;
     std::vector<DepCacheIdentity> dep_cache_identities;
     std::map<std::string, GitLockIdentity> root_git_lock_identities;
@@ -814,5 +853,62 @@ provision_xlings_addresses(const mcpp::config::GlobalConfig& cfg,
                            const std::filesystem::path& legacyStampRoot,
                            std::string_view label);
 std::string with_index_cause(std::string msg);
+
+// ── Sources (mcpp#755), defined in sources.cpp ─────────────────────────────
+// Record (or replace) the decision for `d.subject`; a non-default source is
+// announced once with its `Using` line.
+void record_source(PrepareState& state, SourceDecision d);
+// The override for a package key, resolved and cached; nullptr when none.
+std::expected<const PrepareState::PayloadOverride*, std::string>
+payload_override(PrepareState& state, std::string_view key);
+// The winners of one unification that this build installs from the registry
+// now: overridden and deferred (`on-request`, not asked for) packages are left
+// out, recorded, and announced. `onRequest[i]` says whether claim `i` was
+// declared `provision = "on-request"`.
+std::expected<std::vector<std::string>, std::string>
+payloads_to_provision(PrepareState& state,
+                      const mcpp::xlings::addrset::Resolution& unified,
+                      std::span<const mcpp::xlings::addrset::Claim> claims,
+                      const std::vector<char>& onRequest);
+// A dependency that states `[xlings.overrides]` is refused: where a payload
+// comes from is the root's statement (mcpp#755).
+std::optional<std::string> dependency_override_refusal(const PrepareState& state);
+// `MCPP_XPKG_<NS>_<NAME>_{DIR,SOURCE,PROGRAM}` for what `owner` and the host
+// modules compiled into consumer `consumer`'s program declared.
+void fill_xpkg_env(PrepareState& state, mcpp::build::BuildProgramEnv& e,
+                   const mcpp::manifest::Manifest& owner, std::size_t consumer);
+// After a run of `who`'s build program into `m`: when it asked for payloads,
+// install them in one batch and refill `e`; true when the program must run
+// again. Under `plan_only` nothing is installed: a note is recorded and false
+// is returned.
+std::expected<bool, std::string>
+answer_payload_requests(PrepareState& state, mcpp::manifest::Manifest& m,
+                        mcpp::build::BuildProgramEnv& e, std::size_t consumer,
+                        std::string_view who);
+// Run a build program through `run`, answering its payload requests: when a
+// run asked for payloads, install them and run it again (at most three runs).
+std::expected<void, std::string>
+run_answering_requests(PrepareState& state, mcpp::manifest::Manifest& m,
+                       mcpp::build::BuildProgramEnv& e, std::size_t consumer,
+                       std::string_view who,
+                       const std::function<std::expected<void, std::string>()>& run);
+// The `mcpp:decision=` lines every program of this build stated, as decisions.
+void record_tool_decisions(PrepareState& state);
+// The toolchain's own decision, the plugins' tool decisions, `--managed-only`,
+// and `ctx.sources`: the last step of the record, before `resolution.json`.
+std::expected<void, std::string> step13_sources(PrepareState& state, BuildContext& ctx);
+// A toolchain named by path, and the toolchain phase (local_toolchain.cpp).
+std::expected<void, std::string> step1_local_toolchain(PrepareState& state);
+std::expected<void, std::string>
+step2_use_local_toolchain(PrepareState& state, const mcpp::toolchain::ToolchainSpec& spec);
+std::expected<void, std::string> step2_apply_local_toolchain(PrepareState& state);
+std::expected<void, std::string> step6_toolchain_phase(PrepareState& state);
+// The statement and bootstrap spec of a toolchain phase that asked prepare to
+// start again, taken once.
+std::optional<std::pair<std::vector<std::string>, std::string>> take_toolchain_restart();
+// `--managed-only`: a refusal naming every source that is not the ecosystem's.
+std::optional<std::string> managed_only_refusal(const PrepareState& state);
+// The `Finished`-line summary of the non-default sources, empty when none.
+std::string sources_summary(const std::vector<SourceDecision>& sources);
 
 } // namespace mcpp::build

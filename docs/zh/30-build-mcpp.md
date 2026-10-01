@@ -102,6 +102,9 @@ mcpp build      # compiles + runs build.mcpp, then builds the project
 | `mcpp:warning=<text>` *(2026.8.21.2+)* | 对用户说一句话并**继续**。唯一一条不改变编译行、链接行与源码集的指令。它**穿过构建缓存** —— 见下 |
 | `mcpp:fact=<name>=<version>` *(2026.9.5.2+)* | 陈述程序**测得的机器事实**(`cuda.driver=12.4`)。在编译任何东西之前与 floor 比较；见下 |
 | `mcpp:floor=<name> >= <version>` *(2026.9.5.2+)* | 陈述本包对该量的**下界**。不满足 ⇒ 构建被拒并给出两侧取值（`version-floor-unmet`）；没有人陈述事实的下界保持沉默 |
+| `mcpp:decision=<主体>\t<来源>\t<值>\t<文件>\t<行>\t<载荷>` *(协议 15)* | 陈述这个插件运行哪个工具、它从哪里来；它进入构建的来源记录，不改变构建做的任何事 |
+| `mcpp:xpkg-request=<ns>:<name>` *(协议 15)* | 请求一个声明了 `provision = "on-request"` 的载荷。一次调用中的全部请求合为一次安装，该程序随后再运行一次；发出请求的那次运行被丢弃，因此它不得配置别的东西 |
+| `mcpp:toolchain=<键>=<值>` *(协议 15)* | 陈述构建工具链，只在清单写了 `configure = "build.mcpp"` 的根程序的工具链阶段中。键就是 `[toolchain]` 表的那些（`spec`、`path`、`prefix`、`sysroot`、`family`、`launcher`、`tool.<role>`、`origin`） |
 | `mcpp:rerun-if-changed=<path>`     | 该文件变化时重跑 `build.mcpp` |
 | `mcpp:rerun-if-env-changed=<VAR>`  | 该环境变量变化时重跑 `build.mcpp` |
 
@@ -162,6 +165,11 @@ int main() {
 | `mcpp::link_script(p)` *(2026.8.19+)* | `mcpp:link-script=` |
 | `mcpp::runner(tok)` *(2026.8.19.2+)* | `mcpp:runner=` —— 见下 |
 | `mcpp::xpkg_dir(ns, name)` / `mcpp::xpkg_dir(name)` *(2026.8.19+)* | `[xlings.workspace]` 里声明的包的载荷目录 —— 本 manifest 声明的，或编进本构建程序的某个依赖声明的（2026.9.6.6+）；没声明或没安装时返回 `""`（见下） |
+| `mcpp::xpkg_source(ns, name)` / `mcpp::xpkg_program(ns, name)` *(协议 15)* | 该载荷从哪里来 —— `payload`、`override`、`pending` 或 `""` —— 以及一条覆盖点名的程序 |
+| `mcpp::xpkg_request(ns, name)` / `mcpp::xpkg_pending()` *(协议 15)* | 一个声明了 `provision = "on-request"` 的载荷的目录；尚未安装时请求它，此时 `xpkg_pending()` 为真，程序应当返回（见下） |
+| `mcpp::phase()` *(协议 15)* | 根程序陈述构建工具链时为 `"toolchain"`，其余为 `"build"` |
+| `mcpp::decision(subject, from, value, file, line, payload)` *(协议 15)* | `mcpp:decision=` —— 记录一个工具从哪里来。`mcpp.plugins.tool` 为每个成员陈述它 |
+| `mcpp::toolchain(key, value)` *(协议 15)* | `mcpp:toolchain=` —— 在工具链阶段陈述构建工具链。`mcpp.plugins.toolchain` 构造该陈述 |
 | `mcpp::warning(text)` *(2026.8.21.2+)* | `mcpp:warning=` —— 见下 |
 | `mcpp::action{…}.submit()` *(2026.8.5.1+)* | `mcpp:action=` —— **声明一个构建图节点**，而不是在这里把活干了（见下） |
 
@@ -383,6 +391,44 @@ store 内部结构 —— 与 `dep_dir` 存在的理由相同。
 起就参与供给 —— 在那里写下一个包，它就会被下载并安装 —— 但构建程序的环境只由
 `[xlings.workspace]` 填充，于是载荷明明在盘上，`xpkg_dir` 却返回 `""`。这时构建程序
 唯一说得出口的话是「请声明这个包」，而它指的那条声明作者早已写下。
+
+### 构建程序请求时才安装的载荷：`xpkg_request`（协议 15）
+
+一个插件只在部分构建中需要的载荷，声明为 `provision = "on-request"`（docs/23），并在这里
+请求：
+
+```cpp
+const char* dir = mcpp::xpkg_request("xim", "cmake");
+if (mcpp::xpkg_pending()) return 0;    // 引擎安装它，然后再次运行本程序
+```
+
+载荷已安装或已被覆盖时，`xpkg_request` 的回答与 `xpkg_dir` 相同。否则它向引擎请求该载荷
+并回答 `""`：该次调用中的全部请求合为一次安装，发出过请求的程序带着目录再运行一次。发出
+请求的那次运行会被**丢弃** —— 因此程序必须在不配置任何依赖该工具的东西的情况下返回，它
+打印的其余内容不会被应用。
+
+自带工具的程序从不调用它，这正是「工程自己点名 cmake 就不下载」的实现方式。
+
+在 `mcpp emit build-database` 下不安装任何东西：计划记一条
+`MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED` note，并描述其余部分。
+
+### 陈述构建工具链：工具链阶段（协议 15）
+
+清单写了 `[toolchain] default = { configure = "build.mcpp" }` 的根程序运行两次。第一次
+`mcpp::phase()` 为 `"toolchain"`，程序在那里陈述构建这个工程所用的工具链：
+
+```cpp
+if (std::string_view(mcpp::phase()) == "toolchain") {
+    mcpp::toolchain("path", "/opt/acme-llvm");
+    mcpp::toolchain("origin", "build.mcpp:7");   // 构建报告的那一行
+    return 0;
+}
+```
+
+该阶段在目标依赖图解析之前运行，因此工具链是它唯一可以陈述的东西：那里的一条 flag、一个
+源文件或一个 action 会被按名拒绝。`mcpp.plugins.toolchain`（mcpp:plugins，feature
+`plugins-toolchain`）构造该陈述，包括从厂商 SDK 的环境脚本构造。见
+[20 —— 工具链管理](20-toolchains.md)。
 
 ### 依赖产出的 host 工具（2026.8.5.1+）
 

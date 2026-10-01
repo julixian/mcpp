@@ -50,6 +50,8 @@ std::filesystem::path self_exe_path();
 // Find an executable by name in PATH.
 //   Windows: `where <name>`
 //   POSIX:   `command -v <name>`
+// A name that the shell answers with a bare word -- a builtin such as `true` --
+// is then looked for in PATH directly, so the program is found where one exists.
 std::optional<std::filesystem::path> which(std::string_view binary_name);
 
 // ── extended_length ───────────────────────────────────────────────────────
@@ -165,6 +167,37 @@ std::optional<std::filesystem::path> which(std::string_view binary_name) {
         out.pop_back();
     auto nl = out.find('\n');
     if (nl != std::string::npos) out.resize(nl);
+
+    // A NAME THAT IS ALSO A SHELL BUILTIN comes back as the bare word: `command
+    // -v true` prints `true`, not `/usr/bin/true`, because the shell answers
+    // with what it would run. The answer is still a name on PATH -- the program
+    // exists -- so PATH is walked here rather than the name reported as missing.
+    // Found while verifying a bare-name payload override (mcpp#755): the
+    // refusal said `'true' is not found on PATH` on a machine carrying
+    // /usr/bin/true, which is the kind of answer that sends a reader to the
+    // wrong place.
+    if (rc == 0 && !out.empty() && !std::filesystem::exists(out)
+        && std::filesystem::path(out).filename() == out) {
+        if (const char* path = std::getenv("PATH")) {
+#if defined(_WIN32)
+            constexpr char sep = ';';
+#else
+            constexpr char sep = ':';
+#endif
+            std::string_view rest(path);
+            while (!rest.empty()) {
+                const auto at = rest.find(sep);
+                const auto dir = rest.substr(0, at);
+                if (!dir.empty()) {
+                    std::error_code ec;
+                    const auto cand = std::filesystem::path(dir) / out;
+                    if (std::filesystem::is_regular_file(cand, ec)) return cand;
+                }
+                if (at == std::string_view::npos) break;
+                rest.remove_prefix(at + 1);
+            }
+        }
+    }
 
     if (rc != 0 || out.empty()) return std::nullopt;
     if (!std::filesystem::exists(out)) return std::nullopt;

@@ -64,6 +64,14 @@ void result(std::string_view verb, std::string_view message);
 // Cyan verb (Updating, Downloading, Cleaned), on the narration stream.
 void info(std::string_view verb, std::string_view message);
 
+// A SOURCE THAT IS NOT THE ECOSYSTEM'S DEFAULT (mcpp#755): `Using`, the thing
+// and where it came from, then its tag (`[custom · mcpp.toml:22]`) dimmed. A
+// cyan verb for a source a project or machine stated; yellow for one found on
+// the host with a version nobody stated. The tag carries the whole meaning,
+// so the line reads the same without colour.
+void source(std::string_view verb, std::string_view message, std::string_view tag,
+            bool host);
+
 // Bold green Finished line, on the narration stream, preceded by a blank line
 // when the command narrated a line before it (design §4.5).
 // `descriptor` annotates the profile's actual effect (e.g. "optimized",
@@ -749,6 +757,15 @@ void info(std::string_view verb, std::string_view message) {
     if (g_quiet) return;
     init();
     narrate(verb_line(kBrightCyan, verb, message) + "\n");
+}
+
+void source(std::string_view verb, std::string_view message, std::string_view tag,
+            bool host) {
+    if (g_quiet) return;
+    init();
+    const auto bracket = std::format("[{}]", tag);
+    narrate(verb_line(host ? kYellow : kBrightCyan, verb,
+                      std::format("{}  {}", message, with_color(kDim, bracket))) + "\n");
 }
 
 void finished(std::string_view profile, std::chrono::milliseconds elapsed,

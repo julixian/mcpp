@@ -369,6 +369,113 @@ A build that provably *cannot* run stays an error on either axis: a runtime
 closure that cannot be satisfied is refused, because the artifact will not
 start. See [binary distribution](12-binary-distribution.md).
 
+### `{ path = … }` — a toolchain this machine already has (2026.10.1.3+)
+
+A toolchain mcpp did not install — a self-built LLVM, a vendor cross toolchain,
+an extracted release package — is named by path:
+
+```toml
+[toolchain]
+default = { path = "/opt/llvm-trunk" }
+
+# A cross toolchain whose drivers and tools carry a prefix, with its own sysroot
+# and a tool the tree does not keep where the layout expects it:
+[toolchain.linux]
+path     = "/opt/acme-gcc"
+prefix   = "aarch64-none-linux-gnu-"
+sysroot  = "/opt/acme-sysroot"
+family   = "gcc"                                 # checked against the drivers
+launcher = "ccache"                              # prefixes every compile
+tools    = { ar = "/opt/acme-gcc/bin/gcc-ar" }   # cc, cxx, ar, ranlib, nm, objcopy, strip, as
+```
+
+Or for one build, without editing the manifest:
+
+```bash
+MCPP_TOOLCHAIN=path:/opt/llvm-trunk mcpp build
+```
+
+**The layout.** The drivers live in `<path>/bin`: `clang++` (llvm) or `g++`
+(gcc), under `prefix` when there is one. Their family is read from which of the
+two is present, and the version, the target triple, the standard library and
+whether `import std` is available are read from the driver itself. The tools
+beside them are found as `<prefix><tool>`, then `llvm-<tool>`, then `<tool>`;
+`tools` names any the tree does not have.
+
+`tools = { ld = … }` is read by a clang tree, where the linker reaches the link
+as `--ld-path`. A gcc tree that states `ld` is refused: gcc chooses its linker by
+the name `ld` inside a directory it is given with `-B`, so a program under any
+other name could not be selected, and a stated tool that took no part in the
+build is what this mechanism exists to prevent.
+
+**What mcpp does with it.** The same as with a payload it installed: its own
+link line, its own hermetic check, its own `import std` decision. It writes
+nothing into the tree — the generated `clang++.cfg` of a managed payload is
+mcpp's own file, and a tree mcpp does not own does not get one.
+
+**Identity.** The driver and each tool named by `tools` enter the build's
+fingerprint by path, size and modification time, so rebuilding the toolchain in
+place rebuilds what it produced, and a build records them beside its output so
+the fast paths decline once one of them changed. A machine that does not have
+the tree is told so by name — the declaration is refused where it is read —
+rather than building with another toolchain.
+
+This is not the `system` compiler of the section above. `system` is whatever
+`PATH` happens to hold; this is a tree the project names, that mcpp identifies
+and records, in the shape `msvc@system` has always had.
+
+### `bootstrap` — the toolchain that builds build programs (2026.10.1.3+)
+
+```toml
+[toolchain]
+default   = { path = "/opt/llvm-trunk" }
+bootstrap = "llvm@22.1.8"
+```
+
+Build programs (`build.mcpp`), host tools and host modules are compiled and run
+on the machine doing the build. `bootstrap` names the toolchain that does that
+when it should not be the one building the project — a toolchain under
+development, say, which has to be able to fail without stopping the program that
+chose it. With no `bootstrap` the behaviour is unchanged: a native build uses
+its own toolchain, and a cross build resolves a host one.
+
+### `{ configure = "build.mcpp" }` — the build program states the toolchain (2026.10.1.3+)
+
+A toolchain a manifest cannot express — parts from several places, a vendor
+SDK's environment script, a version picked by looking at the machine — is
+stated by the root build program:
+
+```toml
+[toolchain]
+default = { configure = "build.mcpp" }
+```
+
+```cpp
+import mcpp;
+import mcpp.plugins.toolchain;             // mcpp:plugins, feature plugins-toolchain
+namespace tc = mcpp::plugins::toolchain;
+
+int main() {
+    if (tc::configure([] {
+            auto d = tc::layout(tc::env("ACME_LLVM", "/opt/acme-llvm"));
+            tc::use(tc::with_launcher(d, "ccache"));
+        }))
+        return 0;
+    // the ordinary build phase
+}
+```
+
+The program runs twice. Its **toolchain phase** runs first, compiled with the
+bootstrap toolchain, before the dependency graph is resolved; `mcpp::phase()` is
+`"toolchain"` there, and the only thing it may state is the toolchain — a flag,
+a source or an action in that phase is refused, naming the directive. Its
+**build phase** then runs as any build program does, with the toolchain it
+stated.
+
+The keys are the ones a `[toolchain]` table takes (`spec` for a managed one,
+or `path`, `prefix`, `sysroot`, `family`, `launcher`, `tool.<role>`), so what a
+manifest can say and what a program can say are one vocabulary.
+
 ### `msvc@system` — the machine's own Visual Studio
 
 mcpp locates and identifies an installed Visual Studio / Build Tools; it never
@@ -713,6 +820,53 @@ mcpp build --target aarch64-ios        # resolves llvm@22.1.8 + the iPhoneOS SDK
 mcpp build --target aarch64-ios-sim    # resolves llvm@22.1.8 + the Simulator SDK
 ```
 
+## The source of each tool (2026.10.1.3+)
+
+A build uses a toolchain, the payloads its plugins declare, and the tools those
+plugins run. Each of them has one source, and a build whose sources are all the
+ecosystem's prints exactly what it printed before this existed.
+
+| class | meaning |
+|---|---|
+| `managed` | the ecosystem's default: nothing was written |
+| `pinned` | a managed payload or toolchain at a version a manifest or the machine default chose |
+| `custom` | a path stated in `mcpp.toml`, an environment variable, or `config.toml` |
+| `program` | decided by a build program |
+| `host` | found on `PATH`, with its version stated by nobody |
+
+Anything but the first two gets a line of its own, naming what it is, where it
+came from, and the statement that chose it:
+
+```
+   Resolving toolchain
+   Bootstrap llvm@22.1.8 → @mcpp/registry/data/xpkgs/xim-x-llvm/22.1.8/bin/clang++
+       Using toolchain clang 23.0.0git ← /opt/acme-llvm   [program · build.mcpp:9]
+      Target x86_64-unknown-linux-gnu
+       Using xim:cmake ← /usr/bin/cmake                   [custom · mcpp.toml:22]
+   Compiling app v0.1.0 (.)
+    Finished dev [unoptimized + debuginfo] in 2.51s · custom: xim:cmake; program: toolchain
+```
+
+The tag carries the whole statement, so the line reads the same without colour.
+A tool a plugin took from an overridden payload is the same statement as that
+override, and is reported once.
+
+`mcpp why sources` lists every source with what was consulted for it;
+`mcpp why tool <name>` and `mcpp why payload <ns:name>` narrow it to one.
+`--format json` answers the same as `mcpp.why.sources`, and every build writes
+the record into `target/<triple>/<fingerprint>/resolution.json`.
+
+### `--managed-only` — refuse anything but the ecosystem's
+
+```bash
+mcpp build --managed-only          # or MCPP_MANAGED_ONLY=1
+```
+
+A build whose toolchain, payload or plugin tool came from anywhere else is
+refused, naming each one and where it was stated. It is what a release build or
+a reproducibility audit asks for; the fast paths decline under it, because the
+sources are decided by the resolution it skips.
+
 ## The host surface mcpp keeps, and the reason for each
 
 The rule this engine is arranged around: **a build is reproducible only if the
@@ -989,6 +1143,9 @@ mcpp's runtime behavior can be adjusted with the following environment variables
 | `MCPP_OFFLINE=1` | Never touch the network; equivalent to global `--offline` |
 | `MCPP_NO_COLOR=1` / `NO_COLOR=1` | Disable colored output |
 | `MCPP_LOG_LEVEL=debug\|info\|warn\|error\|off` | Log level |
+| `MCPP_TOOLCHAIN=path:<dir>` | Build with the toolchain in that directory, for this build |
+| `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>` | Where that payload comes from (`path:<name>` looks it up on PATH) |
+| `MCPP_MANAGED_ONLY=1` | Refuse a build whose sources are not the ecosystem's |
 
 When `MCPP_HOME` is not set explicitly, mcpp locates the sandbox automatically based on the parent directory of the binary (after a release tarball is extracted to `~/.mcpp/`, `~/.mcpp/` is the home), so the release build runs without any environment variable configuration.
 

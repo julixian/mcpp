@@ -93,11 +93,16 @@ static void step4a_define_split_and_identity_closures(PrepareState& state) {
                                           : pkg.namespace_ + ":" + pkg.name;
         };
         std::vector<addrset::Claim> claims;
+        // Whether each claim was declared `provision = "on-request"`, by the
+        // manifest that made it (mcpp#755).
+        std::vector<char> onRequest;
         for (auto const& spec : applicable_xlings_addresses(
                  *state.runtimeOwnerManifest, state.activeFeaturesByPackage.empty()
                      ? std::vector<std::string>{} : state.activeFeaturesByPackage[0],
-                 state.toolPurpose, /*isRoot=*/true))
+                 state.toolPurpose, /*isRoot=*/true)) {
             claims.push_back({spec, "this project", 0});
+            onRequest.push_back(state.runtimeOwnerManifest->xlings.on_request(spec));
+        }
         // THE BUCKET IS DECIDED BY WHERE THE WINNING CLAIM SITS IN THIS LIST,
         // not by its distance. The root's own pass provisions exactly the
         // addresses collected above; anything else has to reach the graph pass
@@ -110,15 +115,25 @@ static void step4a_define_split_and_identity_closures(PrepareState& state) {
                 ? state.activeFeaturesByPackage[i] : std::vector<std::string>{};
             for (auto const& spec : applicable_xlings_addresses(
                      man, feats, state.toolPurpose, /*isRoot=*/i == 0
-                         || state.packages[i].selectedMember))
+                         || state.packages[i].selectedMember)) {
                 claims.push_back({spec, describe(i), i == 0 ? 0 : 1});
+                onRequest.push_back(man.xlings.on_request(spec));
+            }
         }
         auto unified = addrset::unify(claims);
         if (!unified) return std::unexpected(unified.error());
+        for (auto const& w : unified->winners)
+            state.xlingsWinner[addrset::package_key(w.address)] = w.address;
+        // WHAT THE REGISTRY INSTALLS, which is not every winner (mcpp#755): an
+        // overridden package comes from where its override says, and one every
+        // declaration states `provision = "on-request"` waits for a build
+        // program to ask. Both are recorded as decisions there.
+        auto install = payloads_to_provision(state, *unified, claims, onRequest);
+        if (!install) return std::unexpected(install.error());
         std::vector<std::string> rootSpecs, fromGraph;
         for (auto const& w : unified->winners) {
+            if (std::ranges::find(*install, w.address) == install->end()) continue;
             (w.claim < rootClaims ? rootSpecs : fromGraph).push_back(w.address);
-            state.xlingsWinner[addrset::package_key(w.address)] = w.address;
         }
         // REPORTED, NOT INFERRED. An override that is only visible as "two
         // versions were declared and one directory exists" is a fact the reader

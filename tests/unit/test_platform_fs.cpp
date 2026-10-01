@@ -103,3 +103,27 @@ TEST(PlatformFs, WindowsExtendedLengthLeavesPrefixedAndRelativePathsAlone) {
     EXPECT_EQ(windows_extended_length_spelling("obj/a.ddi"), "obj/a.ddi");
     EXPECT_EQ(windows_extended_length_spelling(""), "");
 }
+
+// A NAME THE SHELL ANSWERS FOR ITSELF still resolves to the program on PATH.
+// `command -v true` prints `true`, because a shell runs its own builtin, and
+// the path is then found by walking PATH (mcpp#755: a bare-name payload
+// override of such a name was refused as "not found on PATH" on a machine
+// carrying /usr/bin/true).
+TEST(PlatformFs, WhichResolvesANameThatIsAlsoAShellBuiltin) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "`where` reports programs only; the shell answers nothing";
+#else
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file("/usr/bin/true", ec)
+        && !std::filesystem::is_regular_file("/bin/true", ec))
+        GTEST_SKIP() << "this host has no `true` program to find";
+    const auto found = mcpp::platform::fs::which("true");
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->filename(), "true");
+    EXPECT_TRUE(std::filesystem::is_regular_file(*found, ec)) << found->string();
+#endif
+}
+
+TEST(PlatformFs, WhichStillAnswersNothingForANameNoHostHas) {
+    EXPECT_FALSE(mcpp::platform::fs::which("mcpp-no-such-program-7c25d9f6").has_value());
+}

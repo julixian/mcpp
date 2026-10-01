@@ -340,6 +340,20 @@ host module 是这条规则的例外，它的声明在它被编入的**每一个
 "xim:android-build-tools" = ""
 ```
 
+**一个工具从哪里来，只有一个顺序**（2026.10.1.3+）。一个规则的工具按每个成员共用的顺序
+解析：构建程序自己的选项、该成员历来读取的变量、引擎的覆盖（`[xlings.overrides]`）、然后
+是声明的载荷。构建程序点名了工具时，该载荷**不得**因此被安装，所以规则只在最后一步请求
+载荷 —— 而只有部分构建需要的载荷声明为 `provision = "on-request"`，并以
+`mcpp::xpkg_request` 请求（docs/23、docs/30）。
+
+`mcpp.plugins.tool`（mcpp:plugins，在 `plugins-core` 中）实现这个顺序，包括那一份列出所有
+点名方式的拒绝文案，并以 `mcpp::decision` 记录答案，因此构建会报告来源，
+`mcpp why tool <name>` 也能回答。自己解析工具的规则，欠的是同一个顺序与同一份记录。
+
+规则**禁止**在无人指定时搜索 `PATH`：在那里找到的工具可以经由构建程序自己的选择
+（`mcpp::plugins::tool::on_path()`）或一条覆盖到达，而自行回落到它的规则必须说出它用了
+哪一个程序、以及如何陈述它（SPEC-007 R6.2）。
+
 **构建不许碰网络，而被包起来的工具可能会碰。** 在 `appimagetool` 1.9.1 上
 实测：除非用 `--runtime-file` 指定一份本地副本，它每次被调用都会从一个
 GitHub release 下载它的 type-2 runtime 存根。包装这类工具的成员必须从

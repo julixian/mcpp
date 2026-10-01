@@ -1201,8 +1201,100 @@ export int why_toolchain_json(std::string_view target, std::string_view tcSpec) 
     return 0;
 }
 
-export int why_report(const std::string& topic, const std::string& features) {
+// WHERE EACH SOURCE CAME FROM (mcpp#755): the decision record of a prepare,
+// filtered to a topic. `sources` lists every subject; `tool <name>` the plugin
+// tools whose name or module contains `<name>`; `payload <addr>` the payloads
+// whose identity contains `<addr>`. Read from the record itself, so it is what
+// the build reported and `resolution.json` holds.
+namespace {
+bool source_matches(const mcpp::build::SourceDecision& d, std::string_view topic,
+                    std::string_view subject) {
+    if (topic == "tool"    && !d.subject.starts_with("tool:"))    return false;
+    if (topic == "payload" && !d.subject.starts_with("payload:")) return false;
+    return subject.empty() || d.subject.contains(subject);
+}
+
+nlohmann::json source_json(const mcpp::build::SourceDecision& d) {
+    return {
+        {"subject", d.subject}, {"value", d.value},
+        {"class", std::string(mcpp::build::source_class_name(d.cls))},
+        {"origin", {{"kind", d.originKind}, {"file", d.originFile},
+                    {"line", d.originLine}, {"key", d.originKey}}},
+        {"decidedFor", d.decidedFor}, {"considered", d.considered},
+    };
+}
+
+void print_sources(const std::vector<mcpp::build::SourceDecision>& sources,
+                   std::string_view topic, std::string_view subject,
+                   const std::filesystem::path& root) {
+    std::println("sources:");
+    bool any = false;
+    for (auto const& d : sources) {
+        if (!source_matches(d, topic, subject)) continue;
+        any = true;
+        std::println("  {}  {}", d.subject, d.value);
+        std::println("      {}{}", mcpp::build::source_tag(d, root),
+                     d.decidedFor.empty() ? std::string{} : "  for " + d.decidedFor);
+        for (auto const& c : d.considered) std::println("      considered: {}", c);
+    }
+    if (!any) std::println("  (none{})", subject.empty() ? "" : std::format(" matching '{}'", subject));
+}
+} // namespace
+
+export int why_sources_json(std::string_view topic, std::string_view subject,
+                            const std::string& features) {
+    const bool wasQuiet = mcpp::ui::is_quiet();
+    mcpp::ui::set_quiet(true);
+    struct QuietGuard {
+        bool prev;
+        ~QuietGuard() { mcpp::ui::set_quiet(prev); }
+    } quietGuard{wasQuiet};
+    (void)mcpp::build::refusal::take();
+    mcpp::build::BuildOverrides ov;
+    ov.features = features;
+    auto ctx = mcpp::build::prepare_build(/*print_fingerprint=*/false,
+                                          /*includeDevDeps=*/false, {}, ov);
+    nlohmann::json data;
+    std::vector<mcpp::wire::Diagnostic> diags;
+    data["topic"] = std::string(topic);
+    data["subject"] = std::string(subject);
+    if (!ctx) {
+        const auto code = mcpp::build::refusal::take();
+        data["status"] = "refused";
+        data["reason"] = std::string(mcpp::build::refusal::name(code));
+        data["sources"] = nlohmann::json::array();
+        diags.push_back({.code = std::format("prepare.{}", mcpp::build::refusal::name(code)),
+                         .severity = mcpp::wire::Severity::Error,
+                         .message = ctx.error()});
+    } else {
+        data["status"] = "ok";
+        data["reason"] = "none";
+        nlohmann::json list = nlohmann::json::array();
+        for (auto const& d : ctx->sources)
+            if (source_matches(d, topic, subject)) list.push_back(source_json(d));
+        data["sources"] = std::move(list);
+    }
+    mcpp::wire::emit({
+        .kind        = "mcpp.why.sources",
+        .effects     = { mcpp::wire::Effect::ReadProject },
+        .data        = data,
+        .diagnostics = diags,
+    });
+    return 0;
+}
+
+export int why_report(const std::string& topic, const std::string& features,
+                      const std::string& subject = {}) {
     const bool all = topic.empty() || topic == "all";
+    static constexpr std::string_view kTopics[] = {
+        "all", "toolchain", "runtime", "deps", "runners", "sources", "tool", "payload",
+    };
+    if (!topic.empty() && std::ranges::find(kTopics, std::string_view(topic)) == std::end(kTopics)) {
+        std::println(stderr, "error: '{}' is not a topic of `mcpp why`; the topics are "
+                     "toolchain, runtime, deps, runners, sources, tool <name> and "
+                     "payload <ns:name>", topic);
+        return 2;
+    }
 
     // The dedicated runtime view is a pure interpreter of the build's stored
     // facts: no dependency resolution, xlings invocation, hardware query, or
@@ -1224,7 +1316,17 @@ export int why_report(const std::string& topic, const std::string& features) {
         std::println("toolchain: {}", tc.label());
         std::println("  abi(libc)={}  cxxstdlib={}  arch={}  os={}  triple={}",
                      prof.libc, prof.cxxStdlib, prof.arch, prof.os, tc.targetTriple);
-        std::println("  reason: [toolchain] in mcpp.toml if set, else platform-native default");
+        // The reason the decision record states (mcpp#755), not a sentence
+        // describing every way a toolchain can be chosen.
+        if (auto it = std::ranges::find_if(ctx->sources,
+                [](const mcpp::build::SourceDecision& d) {
+                    return d.subject == "toolchain.build"; });
+            it != ctx->sources.end())
+            std::println("  source: {}", mcpp::build::source_tag(*it, ctx->projectRoot));
+        if (!ctx->compilerChoice.origin.empty())
+            std::println("  reason: {}{}", ctx->compilerChoice.origin,
+                         ctx->compilerChoice.requiredBy.empty() ? std::string{}
+                             : " (" + ctx->compilerChoice.requiredBy + ")");
         if (!ctx->manifest.package.platforms.empty()) {
             std::string ps;
             for (auto& p : ctx->manifest.package.platforms) {
@@ -1245,6 +1347,9 @@ export int why_report(const std::string& topic, const std::string& features) {
             std::println("  declared accelerators: {}  (CI matrix hint)", as);
         }
     }
+    if (all || topic == "sources" || topic == "tool" || topic == "payload")
+        print_sources(ctx->sources, all ? std::string_view("sources") : std::string_view(topic),
+                      subject, ctx->projectRoot);
     if (all) (void)print_stored_runtime_resolution();
     // WHERE A NAMED RUNNER BECOMES DISCOVERABLE.
     //

@@ -129,6 +129,19 @@ struct GlobalConfig {
     // target = triple are orthogonal axes). Empty means host.
     std::string                     defaultTarget;
 
+    // From config.toml [xlings.overrides] (mcpp#755): where a declared xlings
+    // payload comes from on THIS MACHINE. The same entries a root manifest's
+    // `[xlings.overrides]` writes, below it in precedence: the environment
+    // variable, then the project, then this file. Keyed by package identity,
+    // `<ns>:<name>` with the namespace defaulted to `xim`.
+    struct PayloadOverride {
+        std::string kind = "path";   // "path" | "program" | "root"
+        std::string value;
+        std::string version;
+        int         line = 0;
+    };
+    std::map<std::string, PayloadOverride> payloadOverrides;
+
     // Resolved xlings home (registryDir unless overridden)
     std::filesystem::path xlingsHome() const {
         return xlingsHomeOverride.empty() ? registryDir : xlingsHomeOverride;
@@ -301,6 +314,13 @@ std::expected<GlobalConfig, ConfigError> load_or_init(
 
 // Pretty-print resolved config for `mcpp env` command.
 void print_env(const GlobalConfig& cfg);
+
+// `[xlings.overrides]` of a parsed config.toml, keyed by package identity
+// (`<ns>:<name>`, the namespace defaulted to `xim`): where a declared xlings
+// payload comes from on this machine (mcpp#755). A pure function of the
+// document, so a test reads it without a home to bootstrap.
+std::expected<std::map<std::string, GlobalConfig::PayloadOverride>, std::string>
+parse_payload_overrides(const mcpp::libs::toml::Document& doc);
 
 // Normalize legacy index naming in a loaded config (exported for tests):
 // org migration mcpp-community/mcpp-index -> mcpplibs/mcpp-index, index name
@@ -639,6 +659,43 @@ void canonicalize_legacy_index_names(GlobalConfig& cfg) {
     cfg.indexRepos = std::move(normalized);
 }
 
+std::expected<std::map<std::string, GlobalConfig::PayloadOverride>, std::string>
+parse_payload_overrides(const mcpp::libs::toml::Document& doc) {
+    std::map<std::string, GlobalConfig::PayloadOverride> out;
+    auto* ot = doc.get_table("xlings.overrides");
+    if (!ot) return out;
+    for (auto const& [key, val] : *ot) {
+        GlobalConfig::PayloadOverride o;
+        o.line = static_cast<int>(val.position.line);
+        if (val.is_string()) {
+            o.value = val.as_string();
+        } else if (val.is_table()) {
+            for (auto const& [k, v] : val.as_table()) {
+                if ((k != "program" && k != "root" && k != "version") || !v.is_string())
+                    return std::unexpected(std::format(
+                        "config.toml [xlings.overrides] {}: '{}' is not a key of an "
+                        "override; an override is a path, or a table of `program` "
+                        "or `root` and an optional `version`", key, k));
+                if (k == "version") o.version = v.as_string();
+                else { o.kind = k; o.value = v.as_string(); }
+            }
+        }
+        if (o.value.empty())
+            return std::unexpected(std::format(
+                "config.toml [xlings.overrides] {}: expected a path, or a table "
+                "naming `program` or `root`", key));
+        // The identity, as the manifest and the address set spell it: a key
+        // without a namespace names the `xim` package, and a version in the key
+        // is dropped -- an override states where a package comes from, not
+        // which version of it is wanted.
+        auto colon = key.find(':');
+        std::string ident = colon == std::string::npos ? "xim:" + key : key;
+        if (auto at = ident.find('@'); at != std::string::npos) ident.resize(at);
+        out.insert_or_assign(std::move(ident), std::move(o));
+    }
+    return out;
+}
+
 std::expected<GlobalConfig, ConfigError> load_or_init(
     bool quiet,
     BootstrapProgressCallback onBootstrapProgress,
@@ -718,6 +775,11 @@ std::expected<GlobalConfig, ConfigError> load_or_init(
     cfg.defaultJobs    = doc->get_int("build.default_jobs").value_or(0);
     cfg.defaultToolchain = doc->get_string("toolchain.default").value_or("");
     cfg.defaultTarget    = doc->get_string("toolchain.default_target").value_or("");
+    // [xlings.overrides] (mcpp#755), read by the same function the tests read.
+    if (auto overrides = parse_payload_overrides(*doc); overrides)
+        cfg.payloadOverrides = std::move(*overrides);
+    else
+        return std::unexpected(ConfigError{overrides.error()});
 
     // [log] section — re-initialize logger with config values
     {

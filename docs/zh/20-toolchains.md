@@ -348,6 +348,97 @@ mcpp 对宿主依赖的规则，并不是各条轴统一的，这个分叉是刻
 闭包会被拒绝，因为产物根本起不来。见
 [二进制分发](12-binary-distribution.md)。
 
+### `{ path = … }` —— 本机已有的工具链（2026.10.1.3+）
+
+一个不是 mcpp 安装的工具链 —— 自己构建的 LLVM、厂商的交叉工具链、手工解包的发行包 ——
+由路径命名：
+
+```toml
+[toolchain]
+default = { path = "/opt/llvm-trunk" }
+
+# 驱动与工具带前缀的交叉工具链，自带 sysroot，并点名一个不在布局位置上的工具：
+[toolchain.linux]
+path     = "/opt/acme-gcc"
+prefix   = "aarch64-none-linux-gnu-"
+sysroot  = "/opt/acme-sysroot"
+family   = "gcc"                                 # 与驱动核对
+launcher = "ccache"                              # 前置于每次编译
+tools    = { ar = "/opt/acme-gcc/bin/gcc-ar" }   # cc、cxx、ar、ranlib、nm、objcopy、strip、as
+```
+
+或者只对一次构建生效，不改清单：
+
+```bash
+MCPP_TOOLCHAIN=path:/opt/llvm-trunk mcpp build
+```
+
+**布局。** 驱动在 `<path>/bin`：`clang++`（llvm）或 `g++`（gcc），有 `prefix` 时带上它。
+族由其中哪一个存在决定，版本、目标三元组、标准库以及是否支持 `import std` 都由探测该驱动
+得到。旁边的工具按 `<prefix><tool>`、`llvm-<tool>`、`<tool>` 查找；`tools` 点名树里没有的
+那些。
+
+`tools = { ld = … }` 只对 clang 的树成立——被陈述的链接器以 `--ld-path` 进入链接。gcc 的树
+陈述 `ld` 会被拒绝：gcc 按 `-B` 给出的目录里的名字 `ld` 选链接器，叫别的名字的程序无法那样
+被选中，而一个进了声明却不参与构建的工具，正是这套机制要防的事。
+
+**mcpp 如何驱动它。** 与它自己安装的载荷相同：自己的链接行、自己的 hermetic 检查、自己
+对 `import std` 的判定。它不向该目录树写入任何东西 —— 托管载荷里生成的 `clang++.cfg` 是
+mcpp 自己的文件，而一棵不属于 mcpp 的树不会得到一份。
+
+**身份。** 驱动与 `tools` 点名的每个程序以路径、大小与修改时间进入构建指纹，因此原地重建
+工具链会重建它产出的东西；构建还把它们记在产物旁边，于是其中之一改变后快速路径会让行。
+没有这棵树的机器会被点名告知——声明在被读取的地方就被拒绝——而不是改用另一个工具链。
+
+这不是上一节的 `system` 编译器。`system` 是「`PATH` 上碰巧有什么」，而这里是工程点名的
+一棵树，由 mcpp 识别并记录，与 `msvc@system` 一直以来的形状相同。
+
+### `bootstrap` —— 构建构建程序的工具链（2026.10.1.3+）
+
+```toml
+[toolchain]
+default   = { path = "/opt/llvm-trunk" }
+bootstrap = "llvm@22.1.8"
+```
+
+构建程序（`build.mcpp`）、宿主工具与宿主模块在执行构建的那台机器上编译并运行。
+`bootstrap` 命名做这件事的工具链 —— 当它不应当是构建工程的那一个时，例如一个正在开发的
+工具链，它必须能在不妨碍选择它的那个程序运行的前提下失败。不写 `bootstrap` 时行为不变：
+原生构建用自己的工具链，交叉构建解析一个宿主的。
+
+### `{ configure = "build.mcpp" }` —— 由构建程序陈述工具链（2026.10.1.3+）
+
+清单表达不了的工具链 —— 来自多处的部件、厂商 SDK 的环境脚本、看过机器之后才定下的版本
+—— 由根构建程序陈述：
+
+```toml
+[toolchain]
+default = { configure = "build.mcpp" }
+```
+
+```cpp
+import mcpp;
+import mcpp.plugins.toolchain;             // mcpp:plugins，feature plugins-toolchain
+namespace tc = mcpp::plugins::toolchain;
+
+int main() {
+    if (tc::configure([] {
+            auto d = tc::layout(tc::env("ACME_LLVM", "/opt/acme-llvm"));
+            tc::use(tc::with_launcher(d, "ccache"));
+        }))
+        return 0;
+    // 普通的构建阶段
+}
+```
+
+该程序运行两次。它的**工具链阶段**先运行，由 bootstrap 工具链编译，在目标依赖图解析之前；
+那里 `mcpp::phase()` 为 `"toolchain"`，而它唯一可以陈述的就是工具链 —— 该阶段中的一条
+flag、一个源文件或一个 action 会被拒绝并点名该指令。随后它的**构建阶段**像任何构建程序
+一样运行，用它刚陈述的工具链。
+
+键就是 `[toolchain]` 表接受的那些（托管工具链用 `spec`，或 `path`、`prefix`、`sysroot`、
+`family`、`launcher`、`tool.<role>`），因此清单能说的与程序能说的是同一套词汇。
+
 ### `msvc@system` —— 机器自己的 Visual Studio
 
 mcpp 只负责定位并识别已安装的 Visual Studio / Build Tools，**从不**安装、
@@ -665,6 +756,49 @@ mcpp build --target aarch64-ios        # resolves llvm@22.1.8 + the iPhoneOS SDK
 mcpp build --target aarch64-ios-sim    # resolves llvm@22.1.8 + the Simulator SDK
 ```
 
+## 每个工具的来源（2026.10.1.3+）
+
+一次构建用到一个工具链、它的插件声明的载荷，以及那些插件运行的工具。每一项都有一个来源，
+而全部来源都是生态缺省的构建，输出与没有本机制时逐字相同。
+
+| 类 | 含义 |
+|---|---|
+| `managed` | 生态缺省：什么都没写 |
+| `pinned` | 清单或机器默认选定了版本的托管载荷或工具链 |
+| `custom` | 写在 `mcpp.toml`、环境变量或 `config.toml` 里的路径 |
+| `program` | 由构建程序决定 |
+| `host` | 在 `PATH` 上找到，版本无人陈述 |
+
+除前两类之外，每一项各占一行，写出它是什么、从哪里来、以及陈述它的那一处：
+
+```
+   Resolving toolchain
+   Bootstrap llvm@22.1.8 → @mcpp/registry/data/xpkgs/xim-x-llvm/22.1.8/bin/clang++
+       Using toolchain clang 23.0.0git ← /opt/acme-llvm   [program · build.mcpp:9]
+      Target x86_64-unknown-linux-gnu
+       Using xim:cmake ← /usr/bin/cmake                   [custom · mcpp.toml:22]
+   Compiling app v0.1.0 (.)
+    Finished dev [unoptimized + debuginfo] in 2.51s · custom: xim:cmake; program: toolchain
+```
+
+标签承载全部陈述，因此没有颜色时这一行读起来一样。插件从一个被覆盖的载荷取得的工具，与
+那条覆盖是同一次陈述，只报告一次。
+
+`mcpp why sources` 列出每一个来源以及为它查过什么；`mcpp why tool <name>` 与
+`mcpp why payload <ns:name>` 收窄到其中一个。`--format json` 以 `mcpp.why.sources` 回答
+同一件事，每次构建也把该记录写入
+`target/<triple>/<fingerprint>/resolution.json`。
+
+### `--managed-only` —— 拒绝生态之外的来源
+
+```bash
+mcpp build --managed-only          # 或 MCPP_MANAGED_ONLY=1
+```
+
+工具链、载荷或插件工具来自别处的构建会被拒绝，并逐条点名它是在哪里被陈述的。这是一次
+发布构建或一次可复现性审计所要的；在它之下快速路径会让行，因为来源由它跳过的那次解析
+决定。
+
 ## mcpp 保留的宿主面，以及每一项的理由
 
 这个引擎围绕的那条规矩是：**一次构建可复现，当且仅当造出它的工具来自下一台
@@ -918,6 +1052,9 @@ mcpp 的运行行为可以通过下列环境变量调整：
 | `MCPP_OFFLINE=1` | 完全不访问网络，等价于全局 `--offline` |
 | `MCPP_NO_COLOR=1` / `NO_COLOR=1` | 禁用彩色输出 |
 | `MCPP_LOG_LEVEL=debug\|info\|warn\|error\|off` | 日志级别 |
+| `MCPP_TOOLCHAIN=path:<目录>` | 本次构建使用该目录中的工具链 |
+| `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>` | 该载荷从哪里来（`path:<名字>` 在 PATH 上查找） |
+| `MCPP_MANAGED_ONLY=1` | 拒绝来源不是生态缺省的构建 |
 
 未显式设置 `MCPP_HOME` 时，mcpp 会基于二进制所在目录的上一级路径自动定位
 沙盒（一份 release tarball 解压到 `~/.mcpp/` 之后，`~/.mcpp/` 就是 home），

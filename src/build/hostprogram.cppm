@@ -799,22 +799,98 @@ inline const char* dep_linkage(const char* name) {
 // declared. Returns "" when the package was not declared or is not installed —
 // a caller that needs it should say so itself, because only it knows whether
 // the absence is fatal.
-inline const char* xpkg_dir(const char* ns, const char* name) {
+// `MCPP_XPKG_<NS>_<NAME>_<SUFFIX>`, spelled as `xpkg_dir` always spelled it.
+inline const char* xpkg_value_(const char* ns, const char* name, const char* suffix) {
     char buf[256] = "MCPP_XPKG_";
     unsigned long o = 10;
     auto put = [&](const char* s) {
-        for (const char* p = s; *p && o + 6 < sizeof buf; ++p, ++o) {
+        for (const char* p = s; *p && o + 12 < sizeof buf; ++p, ++o) {
             char c = *p;
             buf[o] = (c >= 'a' && c <= 'z') ? char(c - 'a' + 'A')
                    : ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) ? c : '_';
         }
     };
-    if (ns && *ns) { put(ns); if (o + 6 < sizeof buf) buf[o++] = '_'; }
+    if (ns && *ns) { put(ns); if (o + 12 < sizeof buf) buf[o++] = '_'; }
     put(name);
-    buf[o++] = '_'; buf[o++] = 'D'; buf[o++] = 'I'; buf[o++] = 'R'; buf[o] = 0;
+    buf[o++] = '_';
+    for (const char* p = suffix; *p && o + 1 < sizeof buf; ++p) buf[o++] = *p;
+    buf[o] = 0;
     return env_or(buf);
 }
+inline const char* xpkg_dir(const char* ns, const char* name) { return xpkg_value_(ns, name, "DIR"); }
 inline const char* xpkg_dir(const char* name) { return xpkg_dir("", name); }
+
+// WHERE A DECLARED PAYLOAD COMES FROM (protocol 15, mcpp#755).
+//
+//   "payload"   installed from the registry; `xpkg_dir` names it
+//   "override"  stated by `[xlings.overrides]`, `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>`
+//               or the global configuration; nothing was installed, and
+//               `xpkg_dir` names the root the override implies
+//   "pending"   declared `provision = "on-request"` and not installed yet;
+//               `xpkg_request` asks for it
+//   ""          not declared for this build, or not installed
+inline const char* xpkg_source(const char* ns, const char* name) { return xpkg_value_(ns, name, "SOURCE"); }
+inline const char* xpkg_source(const char* name) { return xpkg_source("", name); }
+// The program an override named, when it named one (`program = "..."`, a
+// path that is a file, or a name found on PATH); "" otherwise. A payload, and
+// an override that named a root, leave the program to the plugin's layout.
+inline const char* xpkg_program(const char* ns, const char* name) { return xpkg_value_(ns, name, "PROGRAM"); }
+inline const char* xpkg_program(const char* name) { return xpkg_program("", name); }
+
+inline bool& xpkg_pending_flag_() { static bool pending = false; return pending; }
+// The directory of a payload this program needs, installing it on request.
+//
+// A payload declared `provision = "on-request"` is not installed before build
+// programs run. This answers like `xpkg_dir` when the payload is installed or
+// overridden. When it is pending, it asks the engine for it and answers "";
+// `xpkg_pending()` is then true, and the program should return without
+// configuring what needs the payload: the engine installs every payload asked
+// for in one batch, discards this run, and runs the program again, which then
+// receives the directory. A plugin that names its own tool never calls this,
+// so its payload is never installed.
+inline const char* xpkg_request(const char* ns, const char* name) {
+    const char* dir = xpkg_dir(ns, name);
+    if (*dir) return dir;
+    const char* src = xpkg_source(ns, name);
+    if (src[0] == 'p' && src[1] == 'e') {   // "pending"
+        std::printf("mcpp:xpkg-request=%s:%s\n", (ns && *ns) ? ns : "xim", name);
+        xpkg_pending_flag_() = true;
+    }
+    return "";
+}
+inline bool xpkg_pending() { return xpkg_pending_flag_(); }
+
+// Which phase is running: "toolchain" while the root build program states the
+// build toolchain (`[toolchain] <key> = { configure = "build.mcpp" }`), "build"
+// otherwise. A program in the toolchain phase states only the toolchain.
+inline const char* phase() {
+    const char* p = env_or("MCPP_PHASE");
+    return *p ? p : "build";
+}
+
+// THE SOURCE OF A TOOL A PLUGIN RUNS, recorded with the build's other sources.
+//
+// `subject` names the tool (`tool:<module>:<name>`), `from` how it was found
+// (`choice` -- named by the build program; `env` -- by an environment variable
+// the plugin reads; `override` -- by an engine override; `payload` -- the
+// declared payload; `path` -- found on PATH), `value` the program, and
+// `file`/`line` the statement that chose it when the build program did, and
+// `payload` the declared payload (`<ns>:<name>`) the tool stands for, so an
+// override or a payload is reported with that payload's own source. Fields
+// must not contain a tab or a newline.
+inline void decision(const char* subject, const char* from, const char* value,
+                     const char* file = "", unsigned line = 0, const char* payload = "") {
+    std::printf("mcpp:decision=%s\t%s\t%s\t%s\t%u\t%s\n", subject, from, value, file,
+                line, payload);
+}
+
+// One key of the build toolchain, stated in the toolchain phase: `spec` (a
+// managed spec such as "llvm@23.1.3"), or `path`, `prefix`, `sysroot`,
+// `family`, `launcher`, `tool.<role>` -- the keys of a `[toolchain]` table --
+// and `origin` (`<file>:<line>` of the statement).
+inline void toolchain(const char* key, const char* value) {
+    std::printf("mcpp:toolchain=%s=%s\n", key, value);
+}
 
 // mcpp#355: absolute path to a HOST tool built by a dependency — the binary
 // behind one of its `kind = "bin"` targets. Returns "" unless the consumer

@@ -286,8 +286,53 @@ inline std::string library_linkage_problem(std::string_view statementHead,
 //   macos   = "llvm@20"
 //   windows = "msvc@system"
 //   default = "gcc@15.1.0"   (used when current platform isn't listed)
+// A toolchain the project names by PATH, or leaves to its build program
+// (`[toolchain] <key> = { ... }`, mcpp#755). The managed spelling is a string;
+// this is the table form, kept beside the string map so every reader of a spec
+// still reads one string: the table is recorded there as `path:<dir>` or
+// `configure:build.mcpp`, and this record carries the rest.
+//
+// THE SAME FIELDS A BUILD PROGRAM STATES in its toolchain phase
+// (`mcpp:toolchain=<key>=<value>`), so the two entry points share one
+// description and the engine reads it in one place.
+struct LocalToolchain {
+    std::string path;       // the toolchain's root: `<path>/bin/<driver>`
+    std::string prefix;     // a driver and tool prefix (`aarch64-none-linux-gnu-`)
+    std::string sysroot;    // `--sysroot` for the compiler and the linker
+    std::string family;     // "gcc" | "llvm"; empty = decided by the drivers present
+    std::string launcher;   // a compile-command prefix (`ccache`)
+    std::vector<std::pair<std::string, std::string>> tools;   // role -> program
+    bool        configure = false;   // `configure = "build.mcpp"`
+    int         line = 0;            // where the table was written, 0 = unknown
+};
+
 struct Toolchain {
     std::map<std::string, std::string> byPlatform;   // platform -> "pkg@ver"
+    // The table form of an entry, by the same key (mcpp#755).
+    std::map<std::string, LocalToolchain> localByPlatform;
+    // `[toolchain] bootstrap`: the toolchain that compiles and runs build
+    // programs when it should differ from the one that builds the project.
+    std::string bootstrap;
+    int         bootstrapLine = 0;
+    // Where each string entry was written, for the source a build reports.
+    std::map<std::string, int> lineByPlatform;
+
+    // The table behind the entry `for_platform` answers with, by the same key.
+    const LocalToolchain* local_for(std::string_view platform) const {
+        std::string key(platform);
+        if (!byPlatform.contains(key)) key = "default";
+        auto it = localByPlatform.find(key);
+        return it == localByPlatform.end() ? nullptr : &it->second;
+    }
+    int line_for(std::string_view platform) const {
+        std::string key(platform);
+        if (!byPlatform.contains(key)) key = "default";
+        if (auto it = localByPlatform.find(key); it != localByPlatform.end())
+            return it->second.line;
+        if (auto it = lineByPlatform.find(key); it != lineByPlatform.end())
+            return it->second;
+        return 0;
+    }
 
     // Returns the toolchain spec for a platform, falling back to "default".
     std::optional<std::string> for_platform(std::string_view platform) const {
@@ -893,6 +938,19 @@ struct BuildConfig : BuildInputs {
     // notarisation each couple a release to a release mcpp does not control,
     // and a name here is the whole of what the engine learns.
     std::vector<std::string>            packFormats;
+    // mcpp#755, protocol 15. What a build program stated about SOURCES, carried
+    // to prepare the way every other directive is: folded in here, read back
+    // after the program ran, replayed with it on a cache hit.
+    //
+    //   toolDecisions       `mcpp:decision=`: which tool a plugin runs and where
+    //                       it came from, `<subject>\t<from>\t<value>\t<file>\t<line>`.
+    //   xpkgRequests        `mcpp:xpkg-request=`: payloads declared
+    //                       `provision = "on-request"` that the program asked for.
+    //   toolchainStatement  `mcpp:toolchain=`: the build toolchain, `<key>=<value>`
+    //                       per line, read only from the root's toolchain phase.
+    std::vector<std::string>            toolDecisions;
+    std::vector<std::string>            xpkgRequests;
+    std::vector<std::string>            toolchainStatement;
     bool                                staticStdlib = true;
     // #336 — the C++ runtime DISTRIBUTION contract: what the artifact promises
     // about the machine that runs it ("self-contained" | "toolchain-coupled" |
@@ -1250,6 +1308,23 @@ inline std::string_view to_string(ToolWhen w) {
     }
 }
 
+// `[xlings.overrides]` (mcpp#755): where a declared payload comes from instead
+// of the registry. An overridden payload is not provisioned, and `xpkg_dir`
+// answers with the root this entry names.
+//
+// THE VALUE IS RECORDED, NOT RESOLVED. Whether a string names a file or a
+// directory, and where a bare program name is on PATH, are facts about the
+// machine the build runs on, and the manifest reader does not consult the
+// filesystem; prepare resolves them where the answer is reported.
+struct XlingsOverride {
+    enum class Kind { Path, Program, Root };
+    Kind        kind = Kind::Path;   // `Path`: a string, a file or a directory
+    std::string value;               // as written
+    std::string version;             // stated version, empty = not stated
+    std::string key;                 // the entry's key as written
+    int         line = 0;            // where it was written, 0 = unknown
+};
+
 struct XlingsConfig {
     // The install addresses `[xlings.workspace]` asks for, resolved for THIS
     // host: `[<ns>:]<target>[@<version>]`. Derived rather than authored — the
@@ -1296,10 +1371,21 @@ struct XlingsConfig {
     // explicitly written `subos = "default"` selects NamedSubos("default").
     // A string alone cannot distinguish absence from an invalid empty value.
     bool                               subosDeclared = false;
+    // The addresses declared `provision = "on-request"` (mcpp#755): installed
+    // when a build program asks for them with `xpkg_request`, not before it
+    // runs. Beside `deps` for the reason `depWhen` is: the materialised
+    // `.xlings.json` has no such axis.
+    std::set<std::string>              onRequest;
+    // `[xlings.overrides]`, keyed by package identity (`<ns>:<name>`, the
+    // namespace defaulted to `xim`). Read only from the ROOT of a build.
+    std::map<std::string, XlingsOverride> overrides;
 
     ToolWhen when_of(std::string_view address) const {
         auto it = depWhen.find(std::string(address));
         return it == depWhen.end() ? ToolWhen::Always : it->second;
+    }
+    bool on_request(std::string_view address) const {
+        return onRequest.contains(std::string(address));
     }
 
     bool empty() const {
@@ -1567,7 +1653,8 @@ inline bool is_empty(const ConditionalConfig& c) {
         && c.dependencies.empty() && c.devDependencies.empty()
         && c.buildDependencies.empty() && c.featureDeps.empty()
         && c.targetKinds.empty()
-        && c.xlings.empty() && !c.abiThreadsDeclared && !c.abiExceptionsDeclared
+        && c.xlings.empty() && c.xlings.overrides.empty()
+        && !c.abiThreadsDeclared && !c.abiExceptionsDeclared
         && !c.requiresAbiThreads && !c.requiresAbiExceptions
         && c.featureRequiresAbiThreads.empty() && c.featureRequiresAbiExceptions.empty()
         // #717: `dialect_cxxflags` is a member of ConditionalConfig, not of

@@ -115,6 +115,8 @@ step3_define_host_tc_closures_and_refresh_index(PrepareState& state) {
     // sub-build is handed when its package names no toolchain (#710), so the
     // tool is built by the compiler the store key records.
     state.host_spec_for_build_program = [&]() -> std::string {
+        // The bootstrap toolchain, when one was stated (mcpp#755).
+        if (!state.bootstrapSpec.empty()) return state.bootstrapSpec;
         if (!state.tcSpec) return {};
         if (state.overrides.target_triple.empty()) return *state.tcSpec;
         return (state.tcOrigin == TcOrigin::TargetPin && state.hostSpecBeforeRowPin.has_value()
@@ -180,7 +182,10 @@ step3_define_host_tc_closures_and_refresh_index(PrepareState& state) {
         // The CROSS branch below is a different question and deliberately
         // unchanged: there `explicit_compiler` is empty because NO host
         // toolchain was resolved at all, and its classified refusal is correct.
-        if (state.overrides.target_triple.empty())
+        // A native build compiles its build programs with its own toolchain,
+        // unless a bootstrap toolchain was stated (mcpp#755): then the
+        // resolution below serves it, exactly as it serves a cross build.
+        if (state.overrides.target_triple.empty() && state.bootstrapSpec.empty())
             return std::pair{
                 state.explicit_compiler.empty() ? state.tc->binaryPath : state.explicit_compiler,
                 as_host(*state.tc)};
@@ -294,8 +299,25 @@ step3_define_host_tc_closures_and_refresh_index(PrepareState& state) {
         auto htc = mcpp::toolchain::detect(
             frontend, state.runtimePayload, state.runtimeBindingSnapshot.contractHash);
         if (!htc) return std::unexpected(htc.error().message);
-        mcpp::ui::info("Resolved", std::format(
-            "host toolchain for build.mcpp: {}", htc->label()));
+        if (state.overrides.target_triple.empty() && !state.bootstrapSpec.empty()) {
+            // The bootstrap toolchain of a native build (mcpp#755): said with
+            // its own verb, because the line after it names another toolchain.
+            mcpp::ui::info("Bootstrap", std::format(
+                "{} → {}", hostSpecText,
+                mcpp::ui::shorten_path(frontend, mcpp::fetcher::make_path_ctx(*cfgH, *state.root))));
+            SourceDecision d;
+            d.subject = "toolchain.bootstrap";
+            d.value   = hostSpecText;
+            d.cls     = SourceClass::Pinned;
+            d.originKind = state.overrides.bootstrap_spec.empty() ? "manifest" : "build-program";
+            d.originKey  = state.overrides.bootstrap_spec.empty() ? "[toolchain] bootstrap"
+                                                                  : "the toolchain that ran the toolchain phase";
+            d.considered.push_back(frontend.generic_string());
+            record_source(state, std::move(d));
+        } else {
+            mcpp::ui::info("Resolved", std::format(
+                "host toolchain for build.mcpp: {}", htc->label()));
+        }
         state.hostTcCache = std::pair{frontend, *htc};
         return std::pair{state.hostTcCache->first, as_host(state.hostTcCache->second)};
     };
@@ -461,6 +483,45 @@ std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state)
                                 penv.workspace.emplace_back(entry.target, entry.pin());
                         }
             }
+            // ONE PACKAGE, ONE VERSION, INSIDE ONE MANIFEST TOO. The
+            // conditional merge already unified the two tool AXES by package;
+            // what it cannot see is `[xlings.workspace]` and
+            // `[feature-xlings.<f>]` naming one package at two versions, which
+            // reaches here as two addresses and used to install both.
+            std::vector<mcpp::xlings::addrset::Claim> rootClaims;
+            std::vector<char> rootOnRequest;
+            for (auto const& spec : applicable_xlings_addresses(
+                     *state.runtimeOwnerManifest,
+                     feature_closure(*state.runtimeOwnerManifest,
+                                     parse_feature_request(state.overrides.features)),
+                     state.toolPurpose, /*isRoot=*/true)) {
+                rootClaims.push_back({spec, "this project", 0});
+                rootOnRequest.push_back(state.runtimeOwnerManifest->xlings.on_request(spec));
+            }
+            auto rootUnified = mcpp::xlings::addrset::unify(rootClaims);
+            if (!rootUnified) {
+                refusal::record(refusal::Code::ToolVersionConflict);
+                return std::unexpected(rootUnified.error());
+            }
+            for (auto const& note : rootUnified->overrides)
+                mcpp::diag::warning("xlings/version-override", note);
+            // What the registry installs for the project itself: an
+            // overridden package and one declared on request are left out and
+            // recorded (mcpp#755). Decided BEFORE the environment file is
+            // written, because an overridden package is not part of it.
+            auto rootInstall = payloads_to_provision(state, *rootUnified, rootClaims,
+                                                     rootOnRequest);
+            if (!rootInstall) return std::unexpected(rootInstall.error());
+            std::vector<std::string> declaredDeps = std::move(*rootInstall);
+            if (materializeRootRuntime && !state.xlingsOverridden.empty()) {
+                namespace addrset = mcpp::xlings::addrset;
+                std::erase_if(penv.deps, [&](const std::string& a) {
+                    return state.xlingsOverridden.contains(addrset::package_key(a));
+                });
+                std::erase_if(penv.workspace, [&](const auto& kv) {
+                    return state.xlingsOverridden.contains(addrset::package_key(kv.first));
+                });
+            }
             // Two halves, two roots. The custom-indices half belongs to
             // `state.workRoot`, where this invocation writes. The runtime-
             // environment half (`penv`: deps/subos/workspace) belongs to the
@@ -524,28 +585,6 @@ std::expected<void, std::string> phase3_xlings_before_graph(PrepareState& state)
             // declared. The graph's own declarations are provisioned after
             // resolution, which is the first moment they are known — see the
             // second pass near `xlingsDepBinDirs`.
-            // ONE PACKAGE, ONE VERSION, INSIDE ONE MANIFEST TOO. The
-            // conditional merge already unified the two tool AXES by package;
-            // what it cannot see is `[xlings.workspace]` and
-            // `[feature-xlings.<f>]` naming one package at two versions, which
-            // reaches here as two addresses and used to install both.
-            std::vector<mcpp::xlings::addrset::Claim> rootClaims;
-            for (auto const& spec : applicable_xlings_addresses(
-                     *state.runtimeOwnerManifest,
-                     feature_closure(*state.runtimeOwnerManifest,
-                                     parse_feature_request(state.overrides.features)),
-                     state.toolPurpose, /*isRoot=*/true))
-                rootClaims.push_back({spec, "this project", 0});
-            auto rootUnified = mcpp::xlings::addrset::unify(rootClaims);
-            if (!rootUnified) {
-                refusal::record(refusal::Code::ToolVersionConflict);
-                return std::unexpected(rootUnified.error());
-            }
-            for (auto const& note : rootUnified->overrides)
-                mcpp::diag::warning("xlings/version-override", note);
-            std::vector<std::string> declaredDeps;
-            for (auto const& w : rootUnified->winners)
-                declaredDeps.push_back(w.address);
             if (materializeRootRuntime && !declaredDeps.empty()) {
                 if (auto pv = provision_xlings_addresses(
                         **cfg2, declaredDeps, state.runtimeSelection.ownerRoot,

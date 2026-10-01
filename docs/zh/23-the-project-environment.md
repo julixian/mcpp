@@ -356,6 +356,59 @@ hardware = {}
 它不为任何人激活，也不安装任何东西，而一个工具的缺席若只表现为
 「设备永远不可达」，那是最难诊断的一类问题。
 
+### `provision = "on-request"` —— 构建程序请求时才安装（2026.10.1.3+）
+
+一个条目可以在版本与层之外说明它何时被安装：
+
+```toml
+[feature-xlings.deps-cmake]
+"xim:cmake" = { version = ">=3.31", provision = "on-request" }
+```
+
+缺省的 `eager` 在任何构建程序运行前安装它。`on-request` 则在构建程序以
+`mcpp::xpkg_request` 请求它时安装 —— 因此一次自带 cmake 的构建，或一次计划根本没走到
+该工具的构建，什么都不下载。一次调用中的全部请求合为一次安装，只有请求过的程序会再
+运行一次。
+
+只有当声明它的每一份清单都这样写时，这个包才被推迟：有一份清单需要它立即到位，它就立即
+被安装。
+
+`mcpp emit build-database` 不因请求安装任何东西。它记一条 note
+（`MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED`）点名程序与包，并在没有它们的情况下描述计划。
+
+### `[xlings.overrides]` —— 载荷的来源（2026.10.1.3+）
+
+一个已声明的载荷可以来自本机的别处：
+
+```toml
+[xlings.overrides]
+"xim:cmake"   = "/usr/bin/cmake"              # 一个文件：程序本身
+"xim:vcpkg"   = "/opt/vcpkg"                  # 一个目录：与载荷同布局的 root
+"xim:slang"   = { program = "slangc" }        # 一个名字：在 PATH 上查找
+"xim:glslang" = { program = "/usr/bin/glslangValidator", version = "15.1.0" }
+```
+
+被覆盖的包**不会被安装**：它离开供给列表，`--offline` 也因此不会因它而拒绝。
+`mcpp::xpkg_dir` 回答该条目所指的 root，`mcpp::xpkg_program` 回答它点名的程序，
+`mcpp::xpkg_source` 回答 `override`。
+
+三个位置可以写覆盖，由高到低：
+
+| | 位置 | 面向 |
+|---|---|---|
+| 1 | `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>` | CI 与发行版打包，无需改清单。`path:cmake` 在 PATH 上查找该名字 |
+| 2 | 根清单（构建工作区成员时为工作区清单）的 `[xlings.overrides]`，也可写在 `[target.'cfg(..)']` 下 | 工程自己的陈述 |
+| 3 | `~/.mcpp/config.toml` 的 `[xlings.overrides]` | 关于这台机器的事实 |
+
+条目里的 `version` 会与依赖图中每一条要求比较，低于其中任一条则拒绝并点出两侧。没写
+`version` 时无从比较，构建会说明哪一条要求未被校验。
+
+只有正在被构建的工程可以写覆盖。依赖写了这张表会被拒绝并点名该包：一个包需要哪些载荷
+是它自己的陈述，它们从哪里来是工程的陈述。
+
+构建会报告它用到的每一条覆盖，`--managed-only` 则拒绝用到任何一条的构建：见
+[20 —— 工具链管理](20-toolchains.md)。
+
 ### 规则包自带它的环境（2026.9.6.6+）
 
 上面这张表，是工程有主张时要写的内容。大多数工程没有主张，
@@ -469,6 +522,7 @@ error: `xim:cuda-nvcc` is pinned to 12.0.0 by this project, and mcpp:plugins
 
 ## 当前边界
 
+- 覆盖陈述的是载荷从哪里来，不是要哪一个：键不带版本，包的身份仍由各处声明决定。
 - **工具不能以加速器为条件。** 加速器在依赖图之后才解析，因此这样的工具
   会被声明、却永远不会被安装——一次成功的构建里那个工具干脆缺席。
   写了这样一条的 manifest 会被拒绝。

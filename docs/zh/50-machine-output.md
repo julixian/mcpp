@@ -311,6 +311,45 @@ mcpp cache list --format json
 
 `data` 是 `{root, entries[]}`，与 `--json` 裸打印出来的一致。
 
+### `mcpp.why.sources` —— 每个工具的来源 *(mcpp 2026.10.1.3+)*
+
+```
+mcpp why sources|tool <name>|payload <ns:name> --format json
+```
+
+它解析并报告，不构建。`data` 为：
+
+| 字段 | |
+|---|---|
+| `topic` | `sources`、`tool` 或 `payload` |
+| `subject` | 问题收窄到的名字，`sources` 下为空 |
+| `status` | `ok` 或 `refused` |
+| `reason` | 一个拒绝 token，或 `none` |
+| `sources[]` | 每个主体一条 |
+
+每条为 `{subject, value, class, origin, decidedFor, considered[]}`：
+
+- `subject` 是 `toolchain.build`、`toolchain.bootstrap`、`payload:<ns>:<name>`
+  或 `tool:<module>:<name>`；
+- `class` 是 `managed`、`pinned`、`custom`、`program` 或 `host` —— 前两者属于生态，
+  其余属于某个人或某台机器；
+- `origin` 是 `{kind, file, line, key}`，其中 `kind` 为 `default`、`manifest`、`env`、
+  `config`、`build-program` 或 `graph`；
+- `decidedFor` 点名它所回应的那个包的声明；
+- `considered` 列出查过什么以及各自答了什么。
+
+```jsonc
+"sources": [ { "subject": "payload:xim:cmake", "value": "/usr/bin/cmake",
+               "class": "custom",
+               "origin": { "kind": "manifest", "file": "mcpp.toml", "line": 22,
+                           "key": "[xlings.overrides]" },
+               "decidedFor": "mcpp:plugins",
+               "considered": ["payload xim:cmake@>=3.31 (not installed: overridden)"] } ]
+```
+
+每次构建把同一份记录写入
+`target/<triple>/<fingerprint>/resolution.json` 的 `sources`。
+
 ### `mcpp.toolchain.list` —— 已安装的工具链，以及这台宿主能服务的目标
 
 ```
@@ -398,6 +437,10 @@ replaced}` —— `origin` 与构建的状态行使用的是同一句话
 | `tier-planned` | 词表里存在这一行，但还没有任何东西接线 |
 | `host-cannot-serve` | 本机没有载荷，也没有依赖供给这个系统 |
 | `capability-pin` | 这一行的工具链是一项能力陈述，不是一个偏好 |
+| `managed-only` | `--managed-only` 遇到了不属于生态的来源：消息逐条点名它与陈述它的位置 *(2026.10.1.3+)* |
+| `payload-override` | 一条 `[xlings.overrides]` 点名的路径不存在、版本被某条要求拒绝，或它由依赖写出 *(2026.10.1.3+)* |
+| `payload-request` | 构建程序请求了本次构建中没有任何清单声明 `provision = "on-request"` 的载荷，或连续三次运行都在请求 *(2026.10.1.3+)* |
+| `local-toolchain` | 由路径命名的工具链，或构建程序工具链阶段陈述的工具链无法使用：没有驱动、族与驱动矛盾、缺少某个工具或 sysroot *(2026.10.1.3+)* |
 | `convention-unreplaced` | 约定被推翻了，而没有任何东西接替它 |
 | `os-mismatch` | 请求的三元组与解析出的三元组命名不同的系统 |
 | `layer-requirement` | 某个包要求的层，解析结果没有提供 |
@@ -501,6 +544,7 @@ mcpp emit build-database [--spec s1|compile-commands] --format json
 | `MCPP_GENERATED_FILE_NOT_MATERIALIZED` | 警告 | 根包 `[build] generated_files` 中的某个文件缺失或内容已过期，命令不写这个文件 |
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | 警告 | 没有任何标准库构建命令点名它的模块源文件，该单元因此不被列出 |
 | `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | 说明 | 被请求的宿主工具不在工具库中，命令不构建它；计划给出它将被发布到的路径（2026.9.27.1+；取代 2026.9.26.2 的警告 `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`） |
+| `MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED` | 说明 | 构建程序请求了一个声明 `provision = "on-request"` 的载荷；规划不安装任何东西，点名该程序与这些包，并在没有它们的情况下描述计划（2026.10.1.3+） |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | 错误 | 构建程序失败；它所属的包被描述为不含它产生的指令 |
 | `MCPP_INDEX_REQUIRES_NEWER_MCPP` | 说明 | 本次运行刷新的某个索引要求更新的 mcpp；先前的副本被保留或恢复，或者没有可用的副本（2026.9.28.1+；终端运行以结尾的 `tip:` 行打印同一条说明） |
 

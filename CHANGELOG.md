@@ -4,6 +4,81 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.1.3] - 2026-10-01
+
+This release gives every tool a build uses a source that can be declared,
+decided by a build program, and read back (mcpp#755;
+`.agents/docs/2026-10-01-tool-and-toolchain-sources-design.md`). A project that
+writes none of the new keys builds exactly as before, and its output is
+unchanged.
+
+### Added
+
+- **`[xlings.overrides]` states where a declared payload comes from**, in the
+  root manifest (also under `[target.'cfg(..)']`), as
+  `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>`, or in `~/.mcpp/config.toml`. An
+  overridden payload is not provisioned and does not reach the offline gate;
+  `mcpp::xpkg_dir` answers the root it implies, and the new
+  `mcpp::xpkg_program` and `mcpp::xpkg_source` answer the program it named and
+  `override`. A stated `version` is checked against every requirement a package
+  of the graph made. A dependency that writes the table is refused: which
+  payloads a package needs is its own statement, where they come from is the
+  project's.
+- **`provision = "on-request"` installs a payload when a build program asks for
+  it**, with `mcpp::xpkg_request`. Every request of one invocation is installed
+  together and only the programs that asked run again, so a build whose program
+  names its own tool downloads nothing. `mcpp emit build-database` installs
+  nothing and records `MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED`.
+- **A toolchain named by path**: `[toolchain] <key> = { path = "<dir>", prefix,
+  sysroot, family, launcher, tools }`, or `MCPP_TOOLCHAIN=path:<dir>`. mcpp
+  probes the drivers in the tree, identifies them, drives them with its own
+  link model, and writes nothing into the tree. The driver and each stated tool
+  enter the fingerprint by content, and a build records them beside its output,
+  so the fast paths decline once one of them changed.
+- **`[toolchain] bootstrap`** names the toolchain that compiles and runs build
+  programs when it should not be the one building the project.
+- **`[toolchain] <key> = { configure = "build.mcpp" }`** hands the build
+  toolchain to the root build program: it runs once in a toolchain phase, where
+  `mcpp::phase()` is `"toolchain"`, and states the toolchain with
+  `mcpp::toolchain(key, value)`. That phase may state nothing else.
+- **A build reports its sources.** A source that is not the ecosystem's gets a
+  line of its own (`Using … [custom · mcpp.toml:22]`, `Bootstrap …`), the
+  `Finished` line summarises them, and the record is written to
+  `resolution.json`. `mcpp why sources`, `mcpp why tool <name>` and
+  `mcpp why payload <ns:name>` report it, including as `mcpp.why.sources` under
+  `--format json`.
+- **`--managed-only` / `MCPP_MANAGED_ONLY=1`** refuses a build whose toolchain,
+  payload or plugin tool came from anywhere but the ecosystem, naming each.
+- **Protocol 15** for build programs: `xpkg_source`, `xpkg_program`,
+  `xpkg_request`, `xpkg_pending`, `phase`, `decision` and `toolchain`.
+
+### Changed
+
+- `mcpp why toolchain` states the source of the toolchain and the origin the
+  resolution recorded, in place of a sentence listing every way one can be
+  chosen.
+
+### Fixed
+
+- **A build program's compile command goes through a response file when it
+  outgrows the channel it travels.** The command carries one
+  `-fmodule-file=<name>=<path>` per host module the program imports, with
+  absolute paths, and on Windows it reaches a shell that tolerates 8191 bytes: a
+  program importing fifteen modules reported only `The command line is too
+  long.`, naming neither the length nor the cause. The file is written in the
+  grammar its driver reads -- single quotes for clang and GCC, which treat a
+  backslash as an escape, Windows quoting for cl and clang-cl -- and stays beside
+  the program for a failed compile to show.
+- **A manifest key this engine does not know says which engine the package
+  needs.** A package written for a newer mcpp was refused with `unknown key
+  '<key>'` and nothing about the version, because the engine floor is checked on
+  the document that very parse failed to produce. The refusal now names the
+  floor, this engine and the upgrade, which is what a reader meets first after a
+  plugin collection raises it.
+- **`which()` resolves a name that is also a shell builtin.** `command -v true`
+  prints `true`, not a path, so a bare-name payload override of such a name was
+  refused as not found on a machine carrying `/usr/bin/true`.
+
 ## [2026.10.1.2] - 2026-10-01
 
 This release implements the design for a pack's build and a compile that does

@@ -65,6 +65,11 @@ struct CompileFlags {
     // artifact loaded a different build of a library than it linked against.
     // It reaches the line through `link_line::UnitTail::runtimeFallback`.
     std::string ldRuntimeFallback;
+    // A compile-command prefix stated with a toolchain named by path
+    // (`launcher = "ccache"`, mcpp#755): written in front of the compiler in
+    // the build graph, and not into the compile database, whose consumers
+    // want the driver.
+    std::string launcher;
     std::filesystem::path cxxBinary;  // g++ / clang++ / cl.exe
     std::filesystem::path ccBinary;   // gcc / clang (derived; cl.exe = same)
     std::filesystem::path arBinary;   // ar / llvm-ar / lib.exe (empty → PATH)
@@ -693,6 +698,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         targetIsMacos, plan.manifest.buildConfig.macosDeploymentTarget);
 
     f.cxxBinary = plan.toolchain.binaryPath;
+    f.launcher  = plan.toolchain.launcher;
     f.ccBinary = mcpp::toolchain::derive_c_compiler(plan.toolchain);
 
     const bool isMsvcDialect = (d.id == "msvc");
@@ -2386,6 +2392,27 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             }
         }
     }
+
+    // A LINKER STATED BY ROLE (mcpp#755, `tools = { ld = ... }`), AFTER EVERY
+    // SHAPE HAS BUILT ITS LINE.
+    //
+    // It was appended inside the Linux clang branch, the only one that consumes
+    // `link_toolchain_flags`: on macOS the stated linker entered the fingerprint
+    // -- the fast path declined when the wrapper changed -- and took no part in
+    // the link, with nothing said (measured in the toolchain lab on macos-15,
+    // where `build.ninja` held no `--ld-path`). The flag belongs to the driver,
+    // not to a platform, so it is added once here, for every shape.
+    //
+    // Clang only: `--ld-path` is clang's. GCC chooses its linker by name inside a
+    // `-B` directory, so a program named anything else could not be selected that
+    // way, and a silent `-B` would be the same defect in the other direction. A
+    // gcc toolchain that states `ld` is refused where the declaration is read.
+    if (plan.toolchain.compiler == mcpp::toolchain::CompilerId::Clang)
+        if (auto* ld = plan.toolchain.tool_override("ld")) {
+            const auto opt = " --ld-path=" + escape_path(*ld);
+            if (f.ld.find("--ld-path=") == std::string::npos)  f.ld  += opt;
+            if (f.ldC.find("--ld-path=") == std::string::npos) f.ldC += opt;
+        }
 
     return f;
 }

@@ -111,7 +111,14 @@ export namespace mcpp::build::program_protocol {
 // together with the batched placement and structured diagnostics of the same
 // release. No directive of v13 changes spelling, so a program that uses none of
 // these serialises to the bytes it did under v13.
-inline constexpr int kProtocolVersion = 14;
+// v15 (mcpp#755): sources. `xpkg_program`, `xpkg_source` and `xpkg_request`
+// answer where a declared payload comes from (an `[xlings.overrides]` entry,
+// the payload, or "pending" for one declared `provision = "on-request"` that
+// is not installed yet); `mcpp:xpkg-request=` asks for such a payload,
+// `mcpp:decision=` records which tool a plugin runs, `mcpp:toolchain=` states
+// the build toolchain from the root's toolchain phase, and `mcpp::phase()`
+// says which phase is running. No directive of v14 changes spelling.
+inline constexpr int kProtocolVersion = 15;
 
 // ── Cache-format epoch ─────────────────────────────────────────────────────
 //

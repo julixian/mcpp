@@ -18,7 +18,7 @@ superseded_by: 2026-09-07-....md  # when status is superseded
 ---
 ```
 
-322 records.
+323 records.
 
 ## By subject
 
@@ -30,6 +30,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### design
 
+- [工具与工具链的来源：声明、编程决定、可观察](2026-10-01-tool-and-toolchain-sources-design.md) — landed
 - [A pack's build reported as a build, and a unit's compile independent of the member selection: triage and design (#753, #751)](2026-10-01-pack-drive-and-selection-independent-compile-design.md) — landed
 - [Member selection, build programs prepared once, a pack over several members, and the output streams of `mcpp run`: the plan for the release after 2026.9.30.2 (#748, #749, #750)](2026-09-30-member-selection-and-build-program-cost-plan.md) — landed
 - [The build's wall time, its progress count, a hang after the build, and #732 and #744: measurements and a remediation plan](2026-09-30-build-wall-time-progress-count-and-hang-plan.md) — landed
@@ -113,6 +114,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### 2026-10
 
+- [工具与工具链的来源：声明、编程决定、可观察](2026-10-01-tool-and-toolchain-sources-design.md) — landed
 - [A pack's build reported as a build, and a unit's compile independent of the member selection: triage and design (#753, #751)](2026-10-01-pack-drive-and-selection-independent-compile-design.md) — landed
 ### 2026-09
 
