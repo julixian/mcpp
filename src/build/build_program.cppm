@@ -23,6 +23,7 @@ import mcpp.platform.process;
 import mcpp.toolchain.cppfly;        // std_flag (dialect- and c++fly-aware -std= spelling)
 import mcpp.toolchain.dialect;       // CommandDialect — gnu vs cl.exe spellings
 import mcpp.toolchain.fingerprint;   // hash_file / hash_string (FNV-1a, 16 hex)
+import mcpp.build.cmdlimits;
 import mcpp.build.directives;        // the directive definition table (own module: see its header)
 import mcpp.build.progress;          // the program's line (build progress design 2026-09-29)
 import mcpp.build.refusal;           // the machine-readable identity of a refusal
@@ -425,6 +426,30 @@ struct BuildProgramEnv {
 // The suffix selects the fact: `DIR` (the payload directory), `SOURCE` and
 // `PROGRAM` (where it came from, mcpp#755), read back by `xpkg_source` and
 // `xpkg_program`.
+std::string response_file_body(std::span<const std::string> args) {
+    std::string body;
+    for (auto const& a : args) {
+        if (a.find_first_of(" \t\"") == std::string::npos) {
+            body += a;
+            body.push_back('\n');
+            continue;
+        }
+        body.push_back('"');
+        std::size_t slashes = 0;
+        for (char c : a) {
+            if (c == '\\') { ++slashes; body.push_back(c); continue; }
+            if (c == '"') { body.append(slashes, '\\'); body += "\\\""; }
+            else body.push_back(c);
+            slashes = 0;
+        }
+        // A run of backslashes that ends the argument would escape the closing
+        // quote, so it is doubled.
+        body.append(slashes, '\\');
+        body += "\"\n";
+    }
+    return body;
+}
+
 inline std::string xpkg_env_var(std::string_view ns, std::string_view name,
                                 std::string_view suffix = "DIR") {
     std::string out = "MCPP_XPKG_";
@@ -439,6 +464,17 @@ inline std::string xpkg_env_var(std::string_view ns, std::string_view name,
     out += suffix;
     return out;
 }
+
+// THE ARGV THAT PASSES `args` THROUGH A RESPONSE FILE, and the file's content.
+//
+// Every compiler driver mcpp supports reads `@file` with one argument per line.
+// An argument that carries whitespace or a quote is quoted, and the backslashes
+// before a quote -- including a run that would otherwise escape the closing one
+// -- are escaped, which is what makes a Windows path safe to write here.
+//
+// Exported because its quoting is the part worth testing, and the command it
+// serves cannot be run on a host whose limit it does not cross.
+std::string response_file_body(std::span<const std::string> args);
 
 // Does a compiler's output say the program asked for something the bundled
 // `mcpp` module does not have?
@@ -1854,6 +1890,42 @@ std::expected<void, std::string> run_build_program_impl(
         // module", e2e 807 under GCC). Otherwise the project root is fine.
         const bool needsBmiCwd = usesModule || stdStagedInBdir || !env.hostModules.empty();
         std::string compileCwd = needsBmiCwd ? bdir.string() : root.string();
+        // A COMMAND THAT OUTGREW ITS CHANNEL GOES THROUGH A RESPONSE FILE.
+        //
+        // The engine's rule for an unbounded payload is a response file
+        // (mcpp.build.cmdlimits, and the architecture record it names), and this
+        // command carries one: a `-fmodule-file=<name>=<path>` for every host
+        // module the program imports, with absolute paths. A collection that
+        // offers many rules through features is the case -- mcpp-plugins'
+        // `all-rules-compile` imports fifteen -- and on Windows
+        // `capture_exec` reaches the shell, whose 8191 bytes this crossed the
+        // moment that collection gained one more module:
+        //
+        //     The command line is too long.
+        //     build.mcpp failed to compile (exit 1)
+        //
+        // Every driver mcpp supports reads `@file`, one argument per line, and
+        // the file is written beside the program it compiles, so a failed
+        // compile leaves it to read.
+        {
+            std::string flat;
+            for (auto const& a : compileArgv) { flat += a; flat.push_back(' '); }
+            if (mcpp::build::cmdlimits::check_inline(
+                    flat, mcpp::platform::is_windows, /*needsShell=*/true)) {
+                const auto rsp = bdir / "build.mcpp.compile.rsp";
+                const auto body = response_file_body(
+                    std::span<const std::string>(compileArgv).subspan(1));
+                std::ofstream out(rsp, std::ios::binary | std::ios::trunc);
+                out << body;
+                out.close();
+                if (out) {
+                    mcpp::log::verbose("buildmcpp-host", std::format(
+                        "build.mcpp {}: the compile command is {} bytes and goes through {}",
+                        who, flat.size(), rsp.string()));
+                    compileArgv = { compileArgv.front(), "@" + rsp.string() };
+                }
+            }
+        }
         auto cres = mcpp::platform::process::capture_exec(compileArgv, compileEnv,
                                                          compileCwd);
         mcpp::log::verbose("buildmcpp-host", std::format("build.mcpp {}: compile end", who));
