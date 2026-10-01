@@ -190,6 +190,9 @@ enum class ProgramOutcome { Ran, Cached, Failed };
 void open(bool verbose);
 // Closes it: the region is erased. Idempotent.
 void close();
+// Whether the command opened the report and has not closed it. A drive whose
+// caller supplies no report is reported by the backend exactly then.
+bool is_open();
 // The status row as the region would draw it now.
 std::string status_row();
 // The number of configurations the command builds: with more than one, a
@@ -217,6 +220,7 @@ void programs_done();
 void checking();
 
 // `Finished` (design §4.5): the whole command's time, and how it was spent.
+// Written once per command; a later call does nothing.
 void finished(std::string_view profile, std::string_view descriptor);
 // A command that builds several configurations writes one `Finished`, after
 // all of them: `finished` then only records what it was given, and
@@ -736,6 +740,8 @@ struct Report {
     bool failureReported = false;
     bool deferred = false;
     std::optional<std::pair<std::string, std::string>> deferredFinish;
+    // `Finished` was written: a command states it once.
+    bool finishedWritten = false;
     // The status row's screen (revision 3, §5.9 to §5.13): an animation fed
     // by the build, or none.
     std::unique_ptr<screen::Animation> animation;
@@ -1233,6 +1239,12 @@ void close() {
     r.keys.reset();   // the terminal's mode is restored here
 }
 
+bool is_open() {
+    auto& r = report();
+    std::lock_guard lock(r.m);
+    return r.open;
+}
+
 void configurations(std::size_t n) {
     auto& r = report();
     std::lock_guard lock(r.m);
@@ -1353,6 +1365,13 @@ void finished(std::string_view profile, std::string_view descriptor) {
             r.deferredFinish.emplace(std::string(profile), std::string(descriptor));
             return;
         }
+        // ONCE PER COMMAND. `mcpp run --format <name>` packs, which states its
+        // build and writes `Finished`, and then drives the build again to
+        // resolve the runner, a scan that finds nothing to do and would write
+        // a second `Finished` counting the first's time again (pack drive and
+        // selection design 2026-10-01, A3).
+        if (r.finishedWritten) return;
+        r.finishedWritten = true;
         // The breakdown and the longest step explain a wait; a command shorter
         // than a minute has none worth a longer line (build output design
         // revision 3, §7.3).
