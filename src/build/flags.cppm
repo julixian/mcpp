@@ -65,6 +65,11 @@ struct CompileFlags {
     // artifact loaded a different build of a library than it linked against.
     // It reaches the line through `link_line::UnitTail::runtimeFallback`.
     std::string ldRuntimeFallback;
+    // A compile-command prefix stated with a toolchain named by path
+    // (`launcher = "ccache"`, mcpp#755): written in front of the compiler in
+    // the build graph, and not into the compile database, whose consumers
+    // want the driver.
+    std::string launcher;
     std::filesystem::path cxxBinary;  // g++ / clang++ / cl.exe
     std::filesystem::path ccBinary;   // gcc / clang (derived; cl.exe = same)
     std::filesystem::path arBinary;   // ar / llvm-ar / lib.exe (empty → PATH)
@@ -693,6 +698,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         targetIsMacos, plan.manifest.buildConfig.macosDeploymentTarget);
 
     f.cxxBinary = plan.toolchain.binaryPath;
+    f.launcher  = plan.toolchain.launcher;
     f.ccBinary = mcpp::toolchain::derive_c_compiler(plan.toolchain);
 
     const bool isMsvcDialect = (d.id == "msvc");
@@ -968,6 +974,14 @@ CompileFlags compute_flags(const BuildPlan& plan) {
             + std::string(mcpp::toolchain::ClangDriverModel::kLinkDriverFlagsC);
         link_toolchain_flags +=
             mcpp::toolchain::ClangDriverModel::kLinkDriverFlags;
+        }
+        // A LINKER STATED BY ROLE (mcpp#755, `tools = { ld = ... }`): clang's
+        // `--ld-path` names the program, after `-fuse-ld` has chosen the
+        // flavour, so the flags that follow still speak to the same linker.
+        if (auto* ld = plan.toolchain.tool_override("ld")) {
+            const auto opt = " --ld-path=" + escape_path(*ld);
+            link_toolchain_flags += opt;
+            link_toolchain_flags_c += opt;
         }
         f.sysroot = link_toolchain_flags;
     } else if (lm.mode != mcpp::toolchain::CLibMode::None) {

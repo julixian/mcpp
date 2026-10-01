@@ -121,7 +121,20 @@ mcpp pack --toolchain llvm@22.1.8 --format dir
 $ mcpp why toolchain
 toolchain: gcc 16.1.0 (x86_64-linux-gnu)
   abi(libc)=glibc  cxxstdlib=libstdc++  arch=x86_64  os=linux  triple=x86_64-linux-gnu
-  reason: [toolchain] in mcpp.toml if set, else platform-native default
+  source: pinned · [toolchain]
+  reason: [toolchain] in mcpp.toml
+```
+
+`mcpp why sources` 报告一次构建用到的每个工具从哪里来（2026.10.1.3+）：工具链、每个载荷，
+以及每个插件运行的工具，连同为它查过什么。`mcpp why tool <name>` 与
+`mcpp why payload <ns:name>` 收窄到其中一个：
+
+```
+$ mcpp why payload cmake
+sources:
+  payload:xim:cmake  /usr/bin/cmake
+      custom · mcpp.toml:22  for mcpp:plugins
+      considered: payload xim:cmake@>=3.31 (not installed: overridden)
 ```
 
 `mcpp why deps` 在 `mcpp.lock` 各行之前列出解析出的依赖图（2026.9.14.2+）:
@@ -535,8 +548,8 @@ side_effect = false
 
 ## 当前边界
 
-- `mcpp why --format json` 只对 `toolchain` 话题有定义。其余话题报
-  `'<topic>' has no machine-readable shape yet` 并以非零退出。
+- `mcpp why --format json` 对 `toolchain`、`sources`、`tool` 与 `payload` 话题有定义。
+  其余话题报 `'<topic>' has no machine-readable shape yet` 并以非零退出。
 - `mcpp search` 按子串匹配；没有字段选择器，也没有把搜索限定到单个命名
   空间的办法。
 - `mcpp clean --stale` 读 `target/.build_cache`，它保存的近期条目数量

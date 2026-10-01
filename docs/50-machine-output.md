@@ -350,6 +350,45 @@ mcpp cache list --format json
 
 `data` is `{root, entries[]}`, the same document `--json` prints bare.
 
+### `mcpp.why.sources` — the source of each tool *(mcpp 2026.10.1.3+)*
+
+```
+mcpp why sources|tool <name>|payload <ns:name> --format json
+```
+
+It resolves and reports; it does not build. `data` is:
+
+| field | |
+|---|---|
+| `topic` | `sources`, `tool` or `payload` |
+| `subject` | the name the question narrowed to, empty for `sources` |
+| `status` | `ok` or `refused` |
+| `reason` | a refusal token, or `none` |
+| `sources[]` | one entry per subject |
+
+Each entry is `{subject, value, class, origin, decidedFor, considered[]}`:
+
+- `subject` is `toolchain.build`, `toolchain.bootstrap`, `payload:<ns>:<name>`
+  or `tool:<module>:<name>`;
+- `class` is `managed`, `pinned`, `custom`, `program` or `host` — the first two
+  are the ecosystem's, the rest are a person's or a machine's;
+- `origin` is `{kind, file, line, key}`, where `kind` is `default`, `manifest`,
+  `env`, `config`, `build-program` or `graph`;
+- `decidedFor` names the package whose declaration it answers;
+- `considered` lists what was consulted and what each answered.
+
+```jsonc
+"sources": [ { "subject": "payload:xim:cmake", "value": "/usr/bin/cmake",
+               "class": "custom",
+               "origin": { "kind": "manifest", "file": "mcpp.toml", "line": 22,
+                           "key": "[xlings.overrides]" },
+               "decidedFor": "mcpp:plugins",
+               "considered": ["payload xim:cmake@>=3.31 (not installed: overridden)"] } ]
+```
+
+Every build writes the same record into
+`target/<triple>/<fingerprint>/resolution.json` under `sources`.
+
 ### `mcpp.toolchain.list` — the installed toolchains and the targets this host serves
 
 ```
@@ -444,6 +483,10 @@ a program classifying the outcome reads `reason`:
 | `tier-planned` | the row exists in the vocabulary; nothing is wired yet |
 | `host-cannot-serve` | no payload here, and no dependency supplied the system |
 | `capability-pin` | the row's toolchain is a capability, not a preference |
+| `managed-only` | `--managed-only` met a source that is not the ecosystem's: the message names each one and where it was stated *(2026.10.1.3+)* |
+| `payload-override` | an `[xlings.overrides]` entry names a path that does not exist, a version a requirement refuses, or is stated by a dependency *(2026.10.1.3+)* |
+| `payload-request` | a build program asked for a payload no manifest of this build declares `provision = "on-request"`, or asked again in three consecutive runs *(2026.10.1.3+)* |
+| `local-toolchain` | a toolchain named by path, or stated by a build program's toolchain phase, cannot be used: no driver, a contradicting family, a missing tool or sysroot *(2026.10.1.3+)* |
 | `convention-unreplaced` | the convention was overridden and nothing replaced it |
 | `os-mismatch` | the requested and resolved triples name different systems |
 | `layer-requirement` | a package requires a layer the resolution did not give it |
@@ -561,6 +604,7 @@ fails there still fails the build.
 | `MCPP_GENERATED_FILE_NOT_MATERIALIZED` | warning | a root `[build] generated_files` entry is missing or stale on disk, and the command does not write it |
 | `MCPP_BUILD_DATABASE_STD_UNIT_UNDESCRIBED` | warning | no standard-library build command names its module source, so that unit is not listed |
 | `MCPP_BUILD_DATABASE_HOST_TOOL_DEFERRED` | note | a requested host tool is not in the tool store and is not built by the command; the plan names the path it will be published at (2026.9.27.1+; replaces the 2026.9.26.2 warning `MCPP_BUILD_DATABASE_HOST_TOOL_UNBUILT`) |
+| `MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED` | note | a build program asked for a payload declared `provision = "on-request"`; planning installs nothing, names the program and the packages, and describes the plan without them (2026.10.1.3+) |
 | `MCPP_BUILD_DATABASE_PROGRAM_FAILED` | error | a build program failed; its package is described without its directives |
 | `MCPP_INDEX_REQUIRES_NEWER_MCPP` | note | an index refreshed by this run requires a newer mcpp; the previous copy was kept or restored, or none is usable (2026.9.28.1+; the same notice a terminal run prints as its closing `tip:` line) |
 

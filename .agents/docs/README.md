@@ -18,7 +18,7 @@ superseded_by: 2026-09-07-....md  # when status is superseded
 ---
 ```
 
-322 records.
+323 records.
 
 ## By subject
 
@@ -113,6 +113,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### 2026-10
 
+- [工具与工具链的来源：声明、编程决定、可观察](2026-10-01-tool-and-toolchain-sources-design.md)
 - [A pack's build reported as a build, and a unit's compile independent of the member selection: triage and design (#753, #751)](2026-10-01-pack-drive-and-selection-independent-compile-design.md) — landed
 ### 2026-09
 

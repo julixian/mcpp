@@ -196,6 +196,12 @@ void merge_conditional_xlings(mcpp::manifest::Manifest& m,
     // same reason: the address that survived above is the conditional one.
     for (auto const& [addr, w] : cc.xlings.depWhen)
         m.xlings.depWhen.insert_or_assign(addr, w);
+    m.xlings.onRequest.insert(cc.xlings.onRequest.begin(), cc.xlings.onRequest.end());
+    // An override written under a selector is the more specific statement of
+    // where this package comes from for that target, so it replaces the
+    // top-level one for the same package (mcpp#755).
+    for (auto const& [pkg, o] : cc.xlings.overrides)
+        m.xlings.overrides.insert_or_assign(pkg, o);
     for (auto const& [f, addrs] : cc.xlings.featureDeps) {
         auto& dst = m.xlings.featureDeps[f];
         for (auto const& a : addrs) {

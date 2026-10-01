@@ -110,6 +110,9 @@ is ignored, so diagnostics may be logged freely.
 | `mcpp:warning=<text>` *(2026.8.21.2+)* | say something to the user and **keep going**. The one directive that changes no compile line, no link line and no source set. Survives the build cache — see below |
 | `mcpp:fact=<name>=<version>` *(2026.9.5.2+)* | state something the program **established about the machine** (`cuda.driver=12.4`). Compared against floors before anything is compiled; see below |
 | `mcpp:floor=<name> >= <version>` *(2026.9.5.2+)* | state what this package **needs** of that quantity. Unmet ⇒ the build is refused with both values (`version-floor-unmet`); a floor nobody stated a fact for is silent |
+| `mcpp:decision=<subject>\t<from>\t<value>\t<file>\t<line>\t<payload>` *(protocol 15)* | state which tool this plugin runs and where it came from; it joins the build's record of sources and changes nothing the build does |
+| `mcpp:xpkg-request=<ns>:<name>` *(protocol 15)* | ask for a payload declared `provision = "on-request"`. Every request of one invocation is installed together and the program runs again; the run that asked is discarded, so it must configure nothing else |
+| `mcpp:toolchain=<key>=<value>` *(protocol 15)* | state the build toolchain, in the toolchain phase of a root program whose manifest says `configure = "build.mcpp"`. The keys are a `[toolchain]` table's (`spec`, `path`, `prefix`, `sysroot`, `family`, `launcher`, `tool.<role>`, `origin`) |
 | `mcpp:rerun-if-changed=<path>`     | re-run `build.mcpp` when this file changes |
 | `mcpp:rerun-if-env-changed=<VAR>`  | re-run `build.mcpp` when this env var changes |
 
@@ -178,6 +181,11 @@ int main() {
 | `mcpp::link_script(p)` *(2026.8.19+)* | `mcpp:link-script=` |
 | `mcpp::runner(tok)` *(2026.8.19.2+)* | `mcpp:runner=` — see below |
 | `mcpp::xpkg_dir(ns, name)` / `mcpp::xpkg_dir(name)` *(2026.8.19+)* | the payload directory of a package declared in `[xlings.workspace]` — by this manifest, or by a dependency compiled into this build program *(2026.9.6.6+)*; `""` when it was not declared or is not installed (see below) |
+| `mcpp::xpkg_source(ns, name)` / `mcpp::xpkg_program(ns, name)` *(protocol 15)* | where that payload comes from — `payload`, `override`, `pending`, or `""` — and the program an override named |
+| `mcpp::xpkg_request(ns, name)` / `mcpp::xpkg_pending()` *(protocol 15)* | the directory of a payload declared `provision = "on-request"`, asking for it when it is not installed yet; `xpkg_pending()` is then true and the program should return (see below) |
+| `mcpp::phase()` *(protocol 15)* | `"toolchain"` while a root program states the build toolchain, `"build"` otherwise |
+| `mcpp::decision(subject, from, value, file, line, payload)` *(protocol 15)* | `mcpp:decision=` — record where a tool came from. `mcpp.plugins.tool` states it for every member |
+| `mcpp::toolchain(key, value)` *(protocol 15)* | `mcpp:toolchain=` — state the build toolchain in the toolchain phase. `mcpp.plugins.toolchain` builds the statement |
 | `mcpp::warning(text)` *(2026.8.21.2+)* | `mcpp:warning=` — see below |
 | `mcpp::action{…}.submit()` *(2026.8.5.1+)* | `mcpp:action=` — declares a **build-graph node** instead of doing the work here (see below) |
 
@@ -449,6 +457,49 @@ naming one downloads and installs it -- but the build program's environment was
 filled from `[xlings.workspace]` alone, so `xpkg_dir` returned `""` for a
 payload that was on disk. The only sensible thing a program can print then is
 "declare this package", naming a declaration its author had already written.
+
+### A payload installed when the program asks: `xpkg_request` (protocol 15)
+
+A payload a plugin needs for only some builds is declared
+`provision = "on-request"` (docs/23) and asked for here:
+
+```cpp
+const char* dir = mcpp::xpkg_request("xim", "cmake");
+if (mcpp::xpkg_pending()) return 0;    // the engine installs it and runs this again
+```
+
+`xpkg_request` answers like `xpkg_dir` when the payload is installed or
+overridden. When it is not, it asks the engine for it and answers `""`: every
+request of that invocation is installed in one batch, and the programs that
+asked run again with the directories. The run that asked is **discarded** — so a
+program must return without configuring what needs the tool, and anything it
+printed is not applied.
+
+A program that names its own tool never calls this, which is what makes a build
+that states its own cmake download none.
+
+Under `mcpp emit build-database` nothing is installed: the plan records a
+`MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED` note and describes the rest.
+
+### Stating the build toolchain: the toolchain phase (protocol 15)
+
+A root program whose manifest says `[toolchain] default = { configure =
+"build.mcpp" }` runs twice. In the first run `mcpp::phase()` is `"toolchain"`,
+and the program states the toolchain the project is built with:
+
+```cpp
+if (std::string_view(mcpp::phase()) == "toolchain") {
+    mcpp::toolchain("path", "/opt/acme-llvm");
+    mcpp::toolchain("origin", "build.mcpp:7");   // the line a build reports
+    return 0;
+}
+```
+
+That phase runs before the dependency graph is resolved, so the toolchain is
+the only thing it may state: a flag, a source or an action there is refused by
+name. `mcpp.plugins.toolchain` (mcpp:plugins, feature `plugins-toolchain`)
+builds the statement, including from a vendor SDK's environment script. See
+[20 — Toolchain Management](20-toolchains.md).
 
 ### Host tools from a dependency (2026.8.5.1+)
 

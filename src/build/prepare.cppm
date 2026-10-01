@@ -246,6 +246,7 @@ export enum class TcOrigin {
     TargetPin,          // triple.cppm vocabulary convention
     GraphRequirement,   // `requires = ["mcpp:compiler=…"]` in the graph
     FirstRun,           // chosen and persisted by this very invocation
+    BuildProgram,       // the root build program's toolchain phase (mcpp#755) — user explicit
 };
 
 // `GlobalDefault` IS DELIBERATELY NOT LISTED, AND THE REASON IS A MEASURED
@@ -270,7 +271,8 @@ export enum class TcOrigin {
 // pin the way the target side itself was deferred — resolve it after the graph,
 // where the question it answers has an answer.
 export inline bool tc_origin_is_user_explicit(TcOrigin o) {
-    return o == TcOrigin::ManifestToolchain || o == TcOrigin::TargetSection;
+    return o == TcOrigin::ManifestToolchain || o == TcOrigin::TargetSection
+        || o == TcOrigin::BuildProgram;
 }
 
 // MAY A BUILD THAT RESOLVED THIS WAY WRITE THE MACHINE'S DEFAULT?
@@ -302,6 +304,7 @@ export constexpr std::string_view tc_origin_name(TcOrigin o) {
         case TcOrigin::TargetPin:         return "target default";
         case TcOrigin::GraphRequirement:  return "required by the dependency graph";
         case TcOrigin::FirstRun:          return "first-run default";
+        case TcOrigin::BuildProgram:      return "the build program's toolchain phase";
         case TcOrigin::None:              break;
     }
     return {};
@@ -323,6 +326,73 @@ export enum class CacheMode { Global, Local, Off };
 export std::optional<CacheMode> parse_cache_mode(std::string_view v);
 
 export std::string_view cache_mode_name(CacheMode m);
+
+// ── Sources (mcpp#755) ─────────────────────────────────────────────────────
+//
+// WHERE EACH THING THIS BUILD USES CAME FROM: the build toolchain, the
+// toolchain that runs build programs, every xlings payload, and every tool a
+// plugin runs. One record per subject, decided once and read by everything
+// that reports it -- the status lines, the `Finished` summary, `mcpp why`,
+// `resolution.json` and `--managed-only` -- so no two of them can disagree.
+//
+// THE CLASS IS A CLOSED VOCABULARY, and the line it draws is the one a reader
+// needs: whether the ecosystem chose (managed, pinned) or a person or a
+// machine did (custom, program, host). A build whose every source is managed
+// or pinned prints exactly what it printed before this record existed.
+export enum class SourceClass {
+    Managed,   // the ecosystem's default: nothing was written
+    Pinned,    // a managed payload or toolchain at a version a manifest chose
+    Custom,    // a path stated in mcpp.toml, an environment variable or config.toml
+    Program,   // decided by a build program
+    Host,      // found on PATH or on the host, its version stated by nobody
+};
+
+export constexpr std::string_view source_class_name(SourceClass c) {
+    switch (c) {
+        case SourceClass::Managed: return "managed";
+        case SourceClass::Pinned:  return "pinned";
+        case SourceClass::Custom:  return "custom";
+        case SourceClass::Program: return "program";
+        case SourceClass::Host:    return "host";
+    }
+    return "managed";
+}
+
+export constexpr bool source_class_is_default(SourceClass c) {
+    return c == SourceClass::Managed || c == SourceClass::Pinned;
+}
+
+export struct SourceDecision {
+    // `toolchain.build`, `toolchain.bootstrap`, `payload:<ns>:<name>`,
+    // `tool:<module>:<name>`.
+    std::string subject;
+    // What was used: a spec, a directory, a program.
+    std::string value;
+    // What it is, when the value is only where it is: `clang 22.1.8` for a
+    // toolchain named by path. Shown before the value on a `Using` line.
+    std::string detail;
+    SourceClass cls = SourceClass::Managed;
+    // Who said so: `default`, `manifest`, `env`, `config`, `build-program`,
+    // `graph`; with the file and line, or the variable, that said it.
+    std::string originKind = "default";
+    std::string originFile;
+    int         originLine = 0;
+    std::string originKey;
+    // The package whose declaration this answers, when it answers one.
+    std::string decidedFor;
+    // The candidates in priority order and what became of each, for `mcpp why`.
+    std::vector<std::string> considered;
+    // A tool that stands for a payload (`<ns>:<name>`): the statement that
+    // chose it is the payload's own when it took an override or the payload,
+    // and then the payload's line is the one reported.
+    std::string payload;
+    bool announce = true;
+};
+
+// `custom · mcpp.toml:22`, `program · build.mcpp:9`, `host · PATH`: the tag a
+// status line and `mcpp why` print after a non-default source.
+export std::string source_tag(const SourceDecision& d,
+                              const std::filesystem::path& relativeTo = {});
 
 // A condition a planning pass reports instead of acting on (plan_only): the
 // code is stable and the message is for people. Emitted as diagnostics by the
@@ -446,6 +516,9 @@ export struct BuildContext {
         std::string replaced;    // the spec displaced, when one was
     };
     CompilerChoice                  compilerChoice;
+    // THE SOURCES THIS BUILD USED (mcpp#755), one entry per subject. See
+    // SourceDecision.
+    std::vector<SourceDecision>     sources;
     // Resolved global-cache mode. Read side is honored in prepare_build; write
     // side in run_build_plan.
     CacheMode                       cacheMode = CacheMode::Global;
@@ -788,6 +861,17 @@ export struct BuildOverrides {
     // none of them, and receives no stage at all, which is what lets one run of
     // its program serve every member.
     std::map<std::string, PackStage> pack_stages;
+    // ── Sources (mcpp#755) ──────────────────────────────────────────────────
+    // `--managed-only` / `MCPP_MANAGED_ONLY=1`: refuse a build any of whose
+    // sources is not the ecosystem's (custom, program or host), naming each.
+    bool        managed_only = false;
+    // THE TOOLCHAIN THE ROOT BUILD PROGRAM STATED, when this prepare is the
+    // second pass of a project whose `[toolchain]` says `configure =
+    // "build.mcpp"`: the `<key>=<value>` lines of its toolchain phase, and the
+    // spec of the toolchain that ran it. Empty on every other prepare. Set by
+    // `prepare_build` itself, never by a caller.
+    std::vector<std::string> toolchain_statement;
+    std::string              bootstrap_spec;
 };
 
 // ── git dependency helpers ──────────────────────────────────────────────────

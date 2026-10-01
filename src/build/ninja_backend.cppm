@@ -1424,7 +1424,15 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // The macOS initializer-ordering shim (#336) is a C translation unit, so
     // it needs the C driver bindings even in a project with no .c sources.
     const bool need_ios_init_shim = flags.needsStreamInitShim;
-    append(std::format("cxx       = {}\n", escape_ninja_path(flags.cxxBinary)));
+    // The launcher (mcpp#755) prefixes the compiler in every rule that runs it;
+    // a link through ccache is passed to the compiler unchanged.
+    const std::string launch = flags.launcher.empty() ? std::string{}
+        : escape_ninja_path(std::filesystem::path(flags.launcher)) + " ";
+    append(std::format("cxx       = {}{}\n", launch, escape_ninja_path(flags.cxxBinary)));
+    // The driver alone, for the dependency scan: `clang-scan-deps` reads its
+    // argv[0] as the compiler (and the resource directory beside it), and a
+    // launcher there is not one.
+    append(std::format("cxx_driver = {}\n", escape_ninja_path(flags.cxxBinary)));
     append(std::format("cxxflags  = {}\n", flags.cxx));
     // ALWAYS emitted, for the reason `c_ldflags` is, 26 lines below — and the
     // two are referenced by the SAME rules. mcpp#426 recorded that reasoning
@@ -1447,7 +1455,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // static case, which goes to `ar` and produces an empty archive with exit
     // 0, it does not touch at all. `check_undefined_ninja_variables` below is
     // what stops the class.
-    append(std::format("cc        = {}\n", escape_ninja_path(flags.ccBinary)));
+    append(std::format("cc        = {}{}\n", launch, escape_ninja_path(flags.ccBinary)));
     if (need_c_rule || need_ios_init_shim) {
         append(std::format("cflags    = {}\n", flags.cc));
     }
@@ -2217,7 +2225,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
         if (msvcDeps) {
             // MSVC: compiler-integrated P1689 via /scanDependencies (scan
             // only — no codegen); /TP because our module units are .cppm.
-            append(std::format("  command = $cxx{} $cxxflags $unit_cxxflags "
+            append(std::format("  command = $cxx_driver{} $cxxflags $unit_cxxflags "
                    "/scanDependencies $out /TP /c $in /Fo:$compile_target\n",
                    rsp_ref(scanPayload)));
             // No $unit_lang here: /TP above already applies to every input,
@@ -2226,7 +2234,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             // the scan does not do.
         } else if (plan.scanDepsPath.empty()) {
             // GCC path: compiler-integrated P1689 scanning.
-            append(std::format("  command = $cxx{} $cxxflags $unit_cxxflags -fmodules "
+            append(std::format("  command = $cxx_driver{} $cxxflags $unit_cxxflags -fmodules "
                    "-fdeps-format=p1689r5 "
                    "-fdeps-file=$out -fdeps-target=$deps_target "
                    "-M -MM -MF $out.dep $unit_lang -E $in -o $compile_target\n",
@@ -2241,7 +2249,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             // overruns (#261: 48 -I entries at a deep consumer path).
             append(std::format(
                    "  command = $scan_deps -format=p1689 -o $out -- "
-                   "$cxx{} $cxxflags $unit_cxxflags $unit_lang -c $in "
+                   "$cxx_driver{} $cxxflags $unit_cxxflags $unit_lang -c $in "
                    "-o $compile_target\n",
                    rsp_ref(scanPayload)));
         }

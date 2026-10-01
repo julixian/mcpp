@@ -406,6 +406,65 @@ A feature name no `[features]` table declares is reported as a schema warning:
 it activates for nobody and installs nothing, and a tool whose absence is only
 visible as *"the device is never reachable"* is the hardest kind to diagnose.
 
+### `provision = "on-request"` — installed when a build program asks (2026.10.1.3+)
+
+An entry may say when it is installed, beside the version and the tier:
+
+```toml
+[feature-xlings.deps-cmake]
+"xim:cmake" = { version = ">=3.31", provision = "on-request" }
+```
+
+`eager`, the default, installs the package before any build program runs.
+`on-request` installs it when a build program asks for it with
+`mcpp::xpkg_request` — so a build that names its own cmake, or one whose plan
+never reaches the tool, downloads nothing. Every request of one mcpp invocation
+is installed together, and only the programs that asked run again.
+
+A package is deferred only when every declaration of it says so: one manifest
+that needs it eagerly installs it eagerly.
+
+`mcpp emit build-database` installs nothing on request. It records a note
+(`MCPP_BUILD_DATABASE_PAYLOAD_DEFERRED`) naming the program and the packages,
+and describes the plan without them.
+
+### `[xlings.overrides]` — the source of a payload (2026.10.1.3+)
+
+A declared payload may come from somewhere else on this machine:
+
+```toml
+[xlings.overrides]
+"xim:cmake"   = "/usr/bin/cmake"              # a file: the program
+"xim:vcpkg"   = "/opt/vcpkg"                  # a directory: a root laid out like the payload
+"xim:slang"   = { program = "slangc" }        # a name: found on PATH
+"xim:glslang" = { program = "/usr/bin/glslangValidator", version = "15.1.0" }
+```
+
+An overridden package is **not installed**: it leaves the provisioning list, so
+`--offline` does not refuse it either. `mcpp::xpkg_dir` answers the root the
+entry implies, `mcpp::xpkg_program` the program it named, and
+`mcpp::xpkg_source` answers `override`.
+
+Three places may state an override, highest first:
+
+| | place | purpose |
+|---|---|---|
+| 1 | `MCPP_XLINGS_OVERRIDE_<NS>_<NAME>` | CI and distribution packaging, without editing the manifest. `path:cmake` looks the name up on PATH |
+| 2 | `[xlings.overrides]` in the root manifest, also under `[target.'cfg(..)']` | the project's own statement |
+| 3 | `[xlings.overrides]` in `~/.mcpp/config.toml` | a fact about this machine |
+
+A `version` in the entry is checked against every requirement a package of the
+graph stated, and a version below one is refused naming both sides. Without a
+`version` nothing can be compared, and the build says which requirement went
+unchecked.
+
+Only the project being built states an override. A dependency that writes the
+table is refused, naming the package: which payloads a package needs is its own
+statement, where they come from is the project's.
+
+A build reports every override it used, and `--managed-only` refuses a build
+that uses any: see [20 — Toolchain Management](20-toolchains.md).
+
 ### A rule package brings its own environment (2026.9.6.6+)
 
 The table above is what a project writes when it has an opinion. Most projects
@@ -529,6 +588,8 @@ used it.
 
 ## Current limitations
 
+- An override states where a payload comes from, not which one: the key names
+  no version, and the package's identity stays what the declarations say.
 - **A tool cannot be conditioned on the accelerator.** The accelerator is
   resolved after the dependency graph, so such a tool would be declared and never
   installed — a build that succeeds with the tool simply absent. A manifest that

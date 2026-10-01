@@ -343,6 +343,17 @@ ClangDriverModel resolve_clang_driver(const Toolchain& tc) {
     dm.cfgPath = tc.binaryPath.parent_path()
                / (tc.binaryPath.stem().string() + ".cfg");
     dm.hasCfg = std::filesystem::exists(dm.cfgPath);
+    // A TOOLCHAIN NAMED BY PATH HAS NO GENERATED CFG (mcpp#755). The cfg of a
+    // managed payload is an OUTPUT of this machinery (docs/91 §5.1), written
+    // so a direct invocation of the payload's clang works; mcpp's own
+    // invocations bypass it and state every path themselves. A tree mcpp does
+    // not own is not written into, so the model is opened by what the cfg
+    // would have pointed at instead: libc++ beside the driver.
+    if (!dm.hasCfg && !tc.localRoot.empty()) {
+        std::error_code ec;
+        const auto root = tc.binaryPath.parent_path().parent_path();
+        dm.hasCfg = std::filesystem::exists(root / "include" / "c++" / "v1", ec);
+    }
     if (!dm.hasCfg) return dm;
     dm.llvmRoot = tc.binaryPath.parent_path().parent_path();
     auto libcxxInclude = dm.llvmRoot / "include" / "c++" / "v1";

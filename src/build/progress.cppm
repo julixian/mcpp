@@ -222,6 +222,12 @@ void checking();
 // `Finished` (design §4.5): the whole command's time, and how it was spent.
 // Written once per command; a later call does nothing.
 void finished(std::string_view profile, std::string_view descriptor);
+// The sources of a build directory that are not the ecosystem's default
+// (mcpp#755), read from `<buildDir>/sources.summary`, which prepare writes.
+// Merged across the configurations of a command and appended to `Finished`;
+// a directory without the file adds nothing, so a default build's line is
+// unchanged.
+void note_sources(const std::filesystem::path& buildDir);
 // A command that builds several configurations writes one `Finished`, after
 // all of them: `finished` then only records what it was given, and
 // `finish_deferred` writes it.
@@ -742,6 +748,8 @@ struct Report {
     std::optional<std::pair<std::string, std::string>> deferredFinish;
     // `Finished` was written: a command states it once.
     bool finishedWritten = false;
+    // Non-default sources by class, in the order first noted (mcpp#755).
+    std::vector<std::pair<std::string, std::vector<std::string>>> sources;
     // The status row's screen (revision 3, §5.9 to §5.13): an animation fed
     // by the build, or none.
     std::unique_ptr<screen::Animation> animation;
@@ -1355,6 +1363,33 @@ void finish_deferred() {
     if (f) finished(f->first, f->second);
 }
 
+void note_sources(const std::filesystem::path& buildDir) {
+    std::ifstream f(buildDir / "sources.summary", std::ios::binary);
+    std::string line;
+    if (!f || !std::getline(f, line) || line.empty()) return;
+    auto& r = report();
+    std::lock_guard lock(r.m);
+    // `custom: a, b; host: c`
+    std::size_t at = 0;
+    while (at < line.size()) {
+        auto end = line.find("; ", at);
+        auto group = line.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        at = end == std::string::npos ? line.size() : end + 2;
+        auto colon = group.find(": ");
+        if (colon == std::string::npos) continue;
+        auto cls = group.substr(0, colon);
+        auto it = std::ranges::find(r.sources, cls, &decltype(r.sources)::value_type::first);
+        if (it == r.sources.end()) { r.sources.emplace_back(cls, std::vector<std::string>{}); it = r.sources.end() - 1; }
+        std::size_t n = colon + 2;
+        while (n < group.size()) {
+            auto comma = group.find(", ", n);
+            auto name = group.substr(n, comma == std::string::npos ? std::string::npos : comma - n);
+            n = comma == std::string::npos ? group.size() : comma + 2;
+            if (std::ranges::find(it->second, name) == it->second.end()) it->second.push_back(name);
+        }
+    }
+}
+
 void finished(std::string_view profile, std::string_view descriptor) {
     auto& r = report();
     std::string detail;
@@ -1397,6 +1432,20 @@ void finished(std::string_view profile, std::string_view descriptor) {
                 detail += std::format("{}longest {} {}", detail.empty() ? "" : " · ", label,
                                       mcpp::ui::format_duration(ms(longest)));
         }
+    }
+    // THE NON-DEFAULT SOURCES, LAST (mcpp#755): the one place a reader who
+    // missed the `Using` lines learns that this build was not the ecosystem's
+    // default.
+    {
+        std::lock_guard lock(r.m);
+        std::string src;
+        for (auto const& [cls, names] : r.sources) {
+            if (names.empty()) continue;
+            if (!src.empty()) src += "; ";
+            src += cls + ": ";
+            for (std::size_t i = 0; i < names.size(); ++i) src += (i ? ", " : "") + names[i];
+        }
+        if (!src.empty()) detail += (detail.empty() ? "" : " · ") + src;
     }
     // `Finished` ends the report: the region is erased before it, and not
     // drawn again below it.

@@ -104,10 +104,14 @@ export int cmd_why(const mcpplibs::cmdline::ParsedArgs& parsed) {
             return 2;
         }
         const std::string topic = parsed.positional(0);
+        if (topic == "sources" || topic == "tool" || topic == "payload")
+            return mcpp::doctor::why_sources_json(topic, parsed.positional(1),
+                                                  parsed.option_or_empty("features").value());
         if (!topic.empty() && topic != "toolchain") {
             std::println(stderr,
-                "error: --format json is defined for `mcpp why toolchain`; "
-                "'{}' has no machine-readable shape yet", topic);
+                "error: --format json is defined for `mcpp why toolchain` and "
+                "`mcpp why sources|tool|payload`; '{}' has no machine-readable "
+                "shape yet", topic);
             return 2;
         }
         return mcpp::doctor::why_toolchain_json(
@@ -115,7 +119,8 @@ export int cmd_why(const mcpplibs::cmdline::ParsedArgs& parsed) {
             parsed.option_or_empty("toolchain").value());
     }
     return mcpp::doctor::why_report(parsed.positional(0),
-                                    parsed.option_or_empty("features").value());
+                                    parsed.option_or_empty("features").value(),
+                                    parsed.positional(1));
 }
 
 // Also called directly by the dispatcher for the legacy `--explain CODE` form.

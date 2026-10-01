@@ -2109,77 +2109,13 @@ step4b_define_provisioning_closures(PrepareState& state) {
     // a NAMED runner inherits it per name, because a board may legitimately
     // supply `flash` while a different package supplies `monitor`.
 
+    // The payload facts a build program receives: where each declared payload
+    // is, and where it came from (mcpp#755). One definition, in sources.cpp,
+    // beside the override and on-request rules it reads.
     state.fillXpkgDirs = [&](mcpp::build::BuildProgramEnv& e,
                             const mcpp::manifest::Manifest& owner,
                             std::size_t consumer) {
-        // `[feature-xlings.<f>]` is provisioned when `<f>` is active, so it has
-        // to be answerable here too. Before this, a tool a feature declared was
-        // downloaded and installed and then `mcpp::xpkg_dir` returned "" for it
-        // — the build program was told to declare a package it had already
-        // declared, which is a diagnostic pointing at the wrong file.
-        //
-        // The set is taken from the SAME env the caller already computed, so
-        // "which features are on" is answered once. Installation stays the
-        // filter below: a declared address whose payload is absent answers "",
-        // which is what a `when = "dev"` entry looks like to a consumer.
-        std::vector<std::string> declared = owner.xlings.deps;
-        for (auto const& f : e.features)
-            if (auto it = owner.xlings.featureDeps.find(f);
-                it != owner.xlings.featureDeps.end())
-                for (auto const& address : it->second)
-                    if (std::ranges::find(declared, address) == declared.end())
-                        declared.push_back(address);
-        // …and what the rule packages compiled INTO this build program
-        // declared. Their own active features, not the consumer's: the
-        // consumer asked for `features = ["rules-cuda"]` on the edge, and that
-        // is what decides which of the rule's `[feature-xlings]` tables apply.
-        if (auto pit = state.hostModuleProvidersByConsumer.find(consumer);
-            pit != state.hostModuleProvidersByConsumer.end()) {
-            for (auto q : pit->second) {
-                if (q >= state.packages.size()) continue;
-                auto const& pm = state.packages[q].manifest;
-                auto want = [&](const std::string& address) {
-                    if (std::ranges::find(declared, address) == declared.end())
-                        declared.push_back(address);
-                };
-                for (auto const& address : pm.xlings.deps) want(address);
-                const auto& pf = q < state.activeFeaturesByPackage.size()
-                    ? state.activeFeaturesByPackage[q] : std::vector<std::string>{};
-                for (auto const& f : pf)
-                    if (auto it = pm.xlings.featureDeps.find(f);
-                        it != pm.xlings.featureDeps.end())
-                        for (auto const& address : it->second) want(address);
-            }
-        }
-        if (declared.empty()) return;
-        auto cfg = state.get_cfg(true);
-        if (!cfg) return;
-        auto xlEnv = mcpp::config::make_xlings_env(**cfg);
-        std::set<std::string> answered;
-        for (auto const& raw : declared) {
-            // THE VERSION THIS BUILD INSTALLED, NOT THE ONE THIS MANIFEST
-            // WROTE. Both statements are about one package, and only one
-            // version of it exists on disk; answering from the local spelling
-            // is how a rule package could declare `>=8.5.0`, have the project's
-            // exact pin installed instead, and then be told nothing is there.
-            // `xlingsWinner` is empty only before the split has run, and every
-            // caller of this lambda runs after it — the fallback keeps that a
-            // fact about ordering rather than a crash.
-            const auto key = mcpp::xlings::addrset::package_key(raw);
-            if (!answered.insert(key).second) continue;
-            auto wit = state.xlingsWinner.find(key);
-            const std::string spec = wit == state.xlingsWinner.end() ? raw : wit->second;
-            auto ref = mcpp::xlings::paths::parse_xpkg_ref(spec);
-            auto dir = mcpp::xlings::paths::xpkg_payload(xlEnv, ref);
-            if (!dir) continue;   // declared but not installed: "" is the answer
-            // Namespaced first — it is the exact spelling, and the bare form
-            // below must not shadow it (the receiver keeps the first value it
-            // is given for a name).
-            e.xpkgDirs.emplace_back(
-                mcpp::build::xpkg_env_var(ref.ns, ref.name), dir->string());
-            e.xpkgDirs.emplace_back(
-                mcpp::build::xpkg_env_var("", ref.name), dir->string());
-        }
+        fill_xpkg_env(state, e, owner, consumer);
     };
 
     // `linkForms` (#642 E2): when given, each dependency that has a resolved

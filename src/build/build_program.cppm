@@ -307,6 +307,19 @@ struct BuildProgramEnv {
     // instead of reconstructing `<home>/data/xpkgs/<ns>-x-<name>/<version>`
     // — the same reason depDirs exists for mcpp dependencies.
     std::vector<std::pair<std::string, std::string>> xpkgDirs;
+    // THE PHASE THIS RUN BELONGS TO (mcpp#755). Empty for every ordinary run,
+    // and then `MCPP_PHASE` is not set, so the contract of a program that
+    // never asks is unchanged. "toolchain" for the root program's toolchain
+    // phase, whose only accepted statements are the build toolchain, re-run
+    // keys and messages.
+    std::string phase;
+    // A run that asked for a payload (`mcpp:xpkg-request=`) is normally
+    // DISCARDED: the requests are handed back in `xpkgRequests`, nothing else
+    // is applied and nothing is cached, because the engine installs the
+    // payloads and runs the program again. Under `plan_only` no payload is
+    // installed, so the run is kept -- applied, reported, and still not cached,
+    // so the next build asks again.
+    bool keepRequestingRun = false;
     // #355: HOST tools this package asked its dependencies for, as
     // (env var name → absolute path to the executable) pairs. The caller has
     // already resolved them (built, taken from the store, or an override), so
@@ -408,7 +421,12 @@ struct BuildProgramEnv {
 // The env-var name `hostprogram::xpkg_dir` reads back. One spelling of the
 // sanitizer, shared by both sides — the two drifting apart would make the
 // interface answer "" for a package that is right there.
-inline std::string xpkg_env_var(std::string_view ns, std::string_view name) {
+//
+// The suffix selects the fact: `DIR` (the payload directory), `SOURCE` and
+// `PROGRAM` (where it came from, mcpp#755), read back by `xpkg_source` and
+// `xpkg_program`.
+inline std::string xpkg_env_var(std::string_view ns, std::string_view name,
+                                std::string_view suffix = "DIR") {
     std::string out = "MCPP_XPKG_";
     auto put = [&](std::string_view s) {
         for (char c : s)
@@ -417,7 +435,8 @@ inline std::string xpkg_env_var(std::string_view ns, std::string_view name) {
     };
     if (!ns.empty()) { put(ns); out += '_'; }
     put(name);
-    out += "_DIR";
+    out += '_';
+    out += suffix;
     return out;
 }
 
@@ -847,6 +866,7 @@ contract_env(const fs::path& root, const fs::path& outDir, const BuildProgramEnv
         auto [it, inserted] = depVarValue.try_emplace(var, dir);
         if (inserted) e.emplace_back(var, dir);
     }
+    if (!env.phase.empty()) e.emplace_back("MCPP_PHASE", env.phase);
     // #355: MCPP_DEP_<PKG>_BIN_<TOOL> — absolute path to a host tool the
     // consumer declared via `tools = [...]`. A PATH rather than a directory:
     // the store keys an entry per (package, target), the typed reader can
@@ -1968,6 +1988,50 @@ std::expected<void, std::string> run_build_program_impl(
             mcpp::ui::warning(std::format(
                 "build.mcpp: ignoring unknown directive 'mcpp:{}'", k));
     }
+    // THE TOOLCHAIN PHASE STATES THE TOOLCHAIN AND NOTHING ELSE (mcpp#755).
+    // It runs before the dependency graph is resolved, so a flag, a source or
+    // an action stated here would describe a build that does not exist yet; a
+    // payload request cannot be answered either, because the payloads are
+    // declared by a graph that has not been read. Refused rather than
+    // dropped, naming the first directive that does not belong.
+    if (env.phase == "toolchain") {
+        for (auto const& def : dirs::kTable) {
+            switch (def.slot) {
+                case Slot::ToolchainStatement: case Slot::RerunFiles:
+                case Slot::RerunEnv: case Slot::RerunGlobs:
+                case Slot::Warnings: case Slot::Diagnostics:
+                    continue;
+                default: break;
+            }
+            if (d.at(def.slot).empty()) continue;
+            return std::unexpected(std::format(
+                "build.mcpp stated `mcpp:{}=` in its toolchain phase.\n"
+                "       That phase runs before the dependency graph is resolved, and\n"
+                "       it states the build toolchain only (`mcpp::toolchain`,\n"
+                "       `mcpp::plugins::toolchain::use`). Return from main() after\n"
+                "       stating it: `mcpp::phase()` is \"toolchain\" there, and\n"
+                "       `mcpp::plugins::toolchain::configure` returns true.",
+                def.wire));
+        }
+    } else if (!d.at(Slot::ToolchainStatement).empty()) {
+        return std::unexpected(std::string(
+            "build.mcpp stated `mcpp:toolchain=` outside the toolchain phase.\n"
+            "       The build toolchain is stated by the root build program of a\n"
+            "       project whose manifest says\n"
+            "         [toolchain]\n"
+            "         default = { configure = \"build.mcpp\" }\n"
+            "       and only while `mcpp::phase()` is \"toolchain\"."));
+    }
+    // A PAYLOAD REQUEST (mcpp#755). The payloads are installed by the caller,
+    // in one batch with every other program's, and this program runs again
+    // with their directories -- so this run is discarded: nothing applied,
+    // nothing cached, and no line of its own (the run that answers reports).
+    if (!d.at(Slot::XpkgRequests).empty() && !env.keepRequestingRun) {
+        m.buildConfig.xpkgRequests = d.at(Slot::XpkgRequests);
+        programReport.reported = true;
+        return {};
+    }
+    const bool cacheThisRun = d.at(Slot::XpkgRequests).empty();
 
     // Dependency mode (genBase set): relative `generated=` paths resolve
     // against OUT_DIR-style genBase, not the (possibly read-only, shared)
@@ -2004,7 +2068,9 @@ std::expected<void, std::string> run_build_program_impl(
     for (auto const& a : dirs::advisories(m.package.name, d))
         mcpp::ui::warning(a);
     report_stated_diagnostics(m.package.name, d);
-    write_cache(bdir, root, programHash, compilerHash, ctxHash, d);
+    // A run kept although it asked for a payload (`plan_only`) is never
+    // cached: replaying it would keep the build from ever asking again.
+    if (cacheThisRun) write_cache(bdir, root, programHash, compilerHash, ctxHash, d);
     return {};
 }
 

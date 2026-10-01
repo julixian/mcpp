@@ -168,6 +168,14 @@ std::filesystem::path binutils_prefix_dir(const Toolchain& tc) {
     // at all, so answering with one would describe a flag nobody passes.
     if (tc.compiler != CompilerId::GCC) return {};
     if (is_musl_target(tc) || is_mingw_target(tc)) return {};
+    // A GCC named by path (mcpp#755) finds its own assembler and linker, as
+    // every self-contained GCC does; it is pointed elsewhere only when the
+    // project stated where `as` (or `ld`) is.
+    if (!tc.localRoot.empty()) {
+        if (auto* as = tc.tool_override("as")) return as->parent_path();
+        if (auto* ld = tc.tool_override("ld")) return ld->parent_path();
+        return {};
+    }
     if (auto bin = find_binutils_bin(tc.binaryPath)) return *bin;
     return {};
 }

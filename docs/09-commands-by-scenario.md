@@ -131,7 +131,21 @@ recorded build is replayed only for the toolchain request that recorded it.
 $ mcpp why toolchain
 toolchain: gcc 16.1.0 (x86_64-linux-gnu)
   abi(libc)=glibc  cxxstdlib=libstdc++  arch=x86_64  os=linux  triple=x86_64-linux-gnu
-  reason: [toolchain] in mcpp.toml if set, else platform-native default
+  source: pinned · [toolchain]
+  reason: [toolchain] in mcpp.toml
+```
+
+`mcpp why sources` reports where each tool a build uses came from
+(2026.10.1.3+): the toolchain, every payload, and every tool a plugin runs, with
+what was consulted for it. `mcpp why tool <name>` and
+`mcpp why payload <ns:name>` narrow it to one:
+
+```
+$ mcpp why payload cmake
+sources:
+  payload:xim:cmake  /usr/bin/cmake
+      custom · mcpp.toml:22  for mcpp:plugins
+      considered: payload xim:cmake@>=3.31 (not installed: overridden)
 ```
 
 `mcpp why deps` lists the resolved dependency graph before the lines of
@@ -633,8 +647,9 @@ mcpp is involved and its documentation will not help.
 
 ## Current limitations
 
-- `mcpp why --format json` is defined for the `toolchain` topic only. The other
-  topics report `'<topic>' has no machine-readable shape yet` and exit non-zero.
+- `mcpp why --format json` is defined for the `toolchain`, `sources`, `tool` and
+  `payload` topics. The other topics report `'<topic>' has no machine-readable
+  shape yet` and exit non-zero.
 - `mcpp search` matches a substring; there is no field selector, and no way to
   restrict a search to one namespace.
 - `mcpp clean --stale` reads `target/.build_cache`, which holds a bounded number

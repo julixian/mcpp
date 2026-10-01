@@ -162,6 +162,15 @@ enum class Code {
     // about a toolset that cannot deliver a copy: here a copy is asked for
     // where the contract says there is none.
     CrtDeclaredUnderHostCoupled,
+    // Sources (mcpp#755). `--managed-only` met a source that is not the
+    // ecosystem's; an override names a path that does not exist, or is stated
+    // by a dependency; a build program asked for a payload no manifest
+    // declared on request; a toolchain named by path, or stated by the
+    // toolchain phase, cannot be used.
+    ManagedOnly,
+    PayloadOverride,
+    PayloadRequest,
+    LocalToolchain,
     Other,                 // a refusal that has not been given a code yet
 };
 
@@ -210,6 +219,10 @@ constexpr std::string_view name(Code c) {
             return "msvc-redist-unavailable";
         case Code::CrtDeclaredUnderHostCoupled:
             return "crt-declared-under-host-coupled";
+        case Code::ManagedOnly:          return "managed-only";
+        case Code::PayloadOverride:      return "payload-override";
+        case Code::PayloadRequest:       return "payload-request";
+        case Code::LocalToolchain:       return "local-toolchain";
         case Code::Other:                return "other";
     }
     return "other";

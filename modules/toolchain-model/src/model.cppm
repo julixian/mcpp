@@ -310,6 +310,25 @@ struct Toolchain {
     // kept finding: "it did not happen" and "it succeeded" producing identical
     // output.
     std::string                         resolutionNote;
+    // A TOOLCHAIN NAMED BY PATH (mcpp#755): its root, empty for a managed one.
+    // Set, mcpp drives the compiler as it drives a managed payload (its own
+    // link line, `--no-default-config` for clang) without writing into the
+    // tree, which is not mcpp's.
+    std::filesystem::path               localRoot;
+    // A compile-command prefix (`ccache`), stated with the toolchain. It runs
+    // the compiler and changes no output, so it is not part of the identity.
+    std::string                         launcher;
+    // Tools stated by role where the layout does not have them
+    // (`tools = { ld = ... }`): `ld`, `ar`, `ranlib`, `nm`, `objcopy`,
+    // `strip`, `as`. Read before any derivation from the driver's directory.
+    std::vector<std::pair<std::string, std::filesystem::path>> toolOverrides;
+    // The driver-and-tool prefix of a cross toolchain (`aarch64-none-linux-gnu-`).
+    std::string                         toolPrefix;
+
+    const std::filesystem::path* tool_override(std::string_view role) const {
+        for (auto const& [r, p] : toolOverrides) if (r == role) return &p;
+        return nullptr;
+    }
 
     std::string label() const {
         return std::format("{} {} ({})", compiler_name(), version, targetTriple);

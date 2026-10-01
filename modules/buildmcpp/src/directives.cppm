@@ -187,6 +187,15 @@ enum class Slot : std::size_t {
     // `--strict` for a degradation) and is replayed on a cache hit as a
     // warning is.
     Diagnostics,
+    // mcpp#755, protocol 15: SOURCES. A plugin's tool decision
+    // (`<subject>\t<from>\t<value>\t<file>\t<line>`), a payload a build
+    // program asks to have installed (`<ns>:<name>`), and the root build
+    // program's statement of the build toolchain (`<key>=<value>`, one line
+    // per key, read only in the toolchain phase). None reaches a compile or
+    // link line; prepare reads each after the run.
+    ToolDecisions,
+    XpkgRequests,
+    ToolchainStatement,
     Count
 };
 inline constexpr std::size_t kSlotCount = static_cast<std::size_t>(Slot::Count);
@@ -285,7 +294,7 @@ struct Def {
     int              sinceProtocol;
 };
 
-inline constexpr std::array<Def, 28> kTable{{
+inline constexpr std::array<Def, 31> kTable{{
     //  wire                    tag                  slot                    scope                  transform                must   missingPrefix                 missingSuffix                                    since
     {"cxxflag",             "cxxflag",           Slot::CxxFlags,         Scope::PackagePrivate, Transform::Verbatim,      false, "",                           "",                                              1},
     {"cflag",               "cflag",             Slot::CFlags,           Scope::PackagePrivate, Transform::Verbatim,      false, "",                           "",                                              1},
@@ -463,6 +472,17 @@ inline constexpr std::array<Def, 28> kTable{{
     // the entry is still correct. An older engine reading a newer entry
     // already discards the whole record through the unknown-tag path.
     {"runtime-search-dir",  "runtime-search-dir", Slot::RuntimeSearchDir, Scope::LinkGlobal, Transform::AbsPath,       false, "",                           "",                                              12},
+    // v15 (mcpp#755): sources. `decision` is ADVISORY -- it changes no build
+    // input and reaches the user through the decision record -- and is
+    // persisted so a cached run reports the same sources a fresh one did.
+    // `xpkg-request` and `toolchain` are CLAIMS prepare acts on after the run.
+    // A request is never replayed in practice: a run that asked for a payload
+    // returns before its result is cached, and the run after the installation
+    // receives the directory instead of asking. kCacheEpoch is not bumped, for
+    // the reason `runtime-search-dir` states above.
+    {"decision",            "decision",          Slot::ToolDecisions,    Scope::Advisory,       Transform::Verbatim,      false, "",                           "",                                              15},
+    {"xpkg-request",        "xpkg-request",      Slot::XpkgRequests,     Scope::Claim,          Transform::Verbatim,      false, "",                           "",                                              15},
+    {"toolchain",           "toolchain",         Slot::ToolchainStatement, Scope::Claim,        Transform::Verbatim,      false, "",                           "",                                              15},
 }};
 
 // ── Collected output of one run ────────────────────────────────────────────
@@ -1060,6 +1080,13 @@ void apply(mcpp::manifest::Manifest& m, const Directives& d) {
     // engine than a language does, and Slang is already supported without one.
     for (auto const& f : d.at(Slot::PackFormats))
         bc.packFormats.push_back(f);
+
+    // Sources (mcpp#755). Carried, not interpreted: prepare turns decisions
+    // into the decision record, requests into one installation, and the
+    // toolchain statement into the build toolchain.
+    for (auto const& v : d.at(Slot::ToolDecisions))      bc.toolDecisions.push_back(v);
+    for (auto const& v : d.at(Slot::XpkgRequests))       bc.xpkgRequests.push_back(v);
+    for (auto const& v : d.at(Slot::ToolchainStatement)) bc.toolchainStatement.push_back(v);
 
     // A named executable's subsystem and entry. `target_directive_error` has
     // refused every value that names no executable, so the conditions below

@@ -186,6 +186,11 @@ int run(int argc, char** argv) {
         // half that reproducibility needs first.
         else if (a == "--locked" || a == "--frozen")
             mcpp::platform::env::set("MCPP_LOCKED", "1");
+        // `--managed-only` (mcpp#755) rides the same channel: its consumer is
+        // the decision record at the end of prepare, for every command that
+        // prepares, and the fast paths that would skip that record.
+        else if (a == "--managed-only")
+            mcpp::platform::env::set("MCPP_MANAGED_ONLY", "1");
         // --jobs rides the same side channel as --offline, for the same reason
         // recorded there: its consumer is deep in mcpp.build.execute and
         // threading a parameter down would touch every caller in between.
@@ -346,6 +351,9 @@ int run(int argc, char** argv) {
             .global())
         .option(cl::Option("frozen")
             .help("Alias for --locked")
+            .global())
+        .option(cl::Option("managed-only")
+            .help("Fail if a toolchain, payload or plugin tool does not come from the ecosystem")
             .global())
         // Answers "what do you speak" without spawning a command that might
         // fail. An optimisation, NOT the client's detection rule: on any mcpp
@@ -563,8 +571,9 @@ int run(int argc, char** argv) {
                 .help("Keep unrecorded directories written more recently than this, e.g. 12h, 3d (default 1d; 0 keeps none; implies --stale)"))
             .action(wrap_rc(cmd_clean)))
         .subcommand(cl::App("why")
-            .description("Explain how the toolchain / runtime / deps / runners were resolved")
-            .arg(cl::Arg("topic").help("toolchain | runtime | deps | runners (default: all)"))
+            .description("Explain how the toolchain / runtime / deps / runners / sources were resolved")
+            .arg(cl::Arg("topic").help("toolchain | runtime | deps | runners | sources | tool | payload (default: all)"))
+            .arg(cl::Arg("subject").help("for `tool` and `payload`: the name to look up"))
             // `--target` / `--toolchain` make this a QUERY rather than a
             // report on the current directory's default: "what would a build
             // for THIS pair resolve to" is the question the target matrix asks
@@ -1365,6 +1374,10 @@ int run(int argc, char** argv) {
             // omission here is a safety claim that is not true. Over-declaring
             // costs one prompt; under-declaring costs the gate.
             {"why toolchain",  {Effect::InitMcppHome, Effect::ReadProject,
+                                Effect::Network, Effect::WriteGlobalCache,
+                                Effect::ExecBuildScript}},
+            // The same prepare, read for its decision record (mcpp#755).
+            {"why sources",    {Effect::InitMcppHome, Effect::ReadProject,
                                 Effect::Network, Effect::WriteGlobalCache,
                                 Effect::ExecBuildScript}},
             // The same resolution as `why toolchain` and as `build

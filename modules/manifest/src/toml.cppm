@@ -338,6 +338,128 @@ inline XlingsEntry parse_address(std::string_view address) {
     return XlingsEntry{ ns, target, std::string(version) };
 }
 
+// The identity an `[xlings.overrides]` key names: `<ns>:<name>`, the namespace
+// defaulted to `xim` -- the identity mcpp.xlings.address_set gives a package,
+// restated here because the manifest reader cannot import it.
+inline std::string override_package_key(std::string_view key) {
+    const auto e = parse_address(key);
+    return (e.ns.empty() ? std::string("xim") : e.ns) + ":" + e.target;
+}
+
+// One `[xlings.overrides]` entry (mcpp#755). The value is a path, or a table
+// naming exactly one of `program` and `root`, with an optional `version`.
+//
+// A VERSION IN THE KEY IS REFUSED. The key names the package whose source is
+// being stated; a version there would read as "override only this version",
+// which is not a statement the override can keep -- one version of a package
+// is used per build, and the entry replaces where it comes from.
+inline std::expected<std::pair<std::string, XlingsOverride>, std::string>
+read_xlings_override(std::string_view key, const mcpp::libs::toml::Value& val) {
+    const auto entry = parse_address(key);
+    if (entry.target.empty()) return std::unexpected(std::string("names no package"));
+    if (!entry.version.empty())
+        return std::unexpected(std::format(
+            "the key names a version ('{}'); an override states where the "
+            "package comes from, so write the package alone and put the version "
+            "the program has in `version`", entry.version));
+    XlingsOverride o;
+    o.key  = std::string(key);
+    o.line = static_cast<int>(val.position.line);
+    if (val.is_string()) {
+        o.value = val.as_string();
+    } else if (val.is_table()) {
+        const auto& t = val.as_table();
+        for (auto const& [k, v] : t) {
+            if (k != "program" && k != "root" && k != "version")
+                return std::unexpected(std::format(
+                    "unknown key '{}'; an override is a path, or a table of "
+                    "`program` or `root` and an optional `version`", k));
+            if (!v.is_string())
+                return std::unexpected(std::format("'{}' must be a string", k));
+        }
+        auto prog = t.find("program");
+        auto root = t.find("root");
+        if ((prog == t.end()) == (root == t.end()))
+            return std::unexpected(std::string(
+                "an override names exactly one of `program` (a file, or a "
+                "program name looked up on PATH) and `root` (a directory laid "
+                "out like the payload)"));
+        o.kind  = prog != t.end() ? XlingsOverride::Kind::Program : XlingsOverride::Kind::Root;
+        o.value = (prog != t.end() ? prog : root)->second.as_string();
+        if (auto v = t.find("version"); v != t.end()) o.version = v->second.as_string();
+    } else {
+        return std::unexpected(std::string(
+            "expected a path, or a table of `program` or `root` and `version`"));
+    }
+    if (o.value.empty()) return std::unexpected(std::string("the path is empty"));
+    return std::pair{ override_package_key(key), std::move(o) };
+}
+
+// One `[toolchain]` table (mcpp#755): a toolchain named by path, or left to
+// the root build program. Every key is optional except `path`, and `configure`
+// excludes the rest -- a table that both names a toolchain and hands the
+// choice to the build program states two answers to one question.
+inline std::expected<LocalToolchain, std::string>
+read_local_toolchain(const mcpp::libs::toml::Value& val) {
+    LocalToolchain lt;
+    lt.line = static_cast<int>(val.position.line);
+    const auto& t = val.as_table();
+    for (auto const& [k, v] : t) {
+        if (k == "tools") {
+            if (!v.is_table())
+                return std::unexpected(std::string(
+                    "`tools` must be a table of role = program, e.g. "
+                    "`tools = { ld = \"/opt/lld/bin/ld.lld\" }`"));
+            for (auto const& [role, prog] : v.as_table()) {
+                if (!prog.is_string())
+                    return std::unexpected(std::format("tools.{} must be a string", role));
+                static constexpr std::string_view kRoles[] = {
+                    "cc", "cxx", "ld", "ar", "ranlib", "nm", "objcopy", "strip", "as",
+                };
+                if (std::ranges::find(kRoles, std::string_view(role)) == std::end(kRoles))
+                    return std::unexpected(std::format(
+                        "tools.{} is not a tool role; the roles are cc, cxx, ld, "
+                        "ar, ranlib, nm, objcopy, strip and as", role));
+                lt.tools.emplace_back(role, prog.as_string());
+            }
+            continue;
+        }
+        if (!v.is_string())
+            return std::unexpected(std::format("'{}' must be a string", k));
+        const auto& sv = v.as_string();
+        if      (k == "path")     lt.path = sv;
+        else if (k == "prefix")   lt.prefix = sv;
+        else if (k == "sysroot")  lt.sysroot = sv;
+        else if (k == "launcher") lt.launcher = sv;
+        else if (k == "family") {
+            if (sv != "gcc" && sv != "llvm")
+                return std::unexpected(std::format(
+                    "family = '{}': a toolchain named by path is \"gcc\" or \"llvm\"", sv));
+            lt.family = sv;
+        } else if (k == "configure") {
+            if (sv != "build.mcpp")
+                return std::unexpected(std::format(
+                    "configure = '{}': the one value is \"build.mcpp\", which "
+                    "hands the choice to the root build program's toolchain phase", sv));
+            lt.configure = true;
+        } else {
+            return std::unexpected(std::format(
+                "unknown key '{}'; a toolchain table has `path`, `prefix`, "
+                "`sysroot`, `family`, `launcher` and `tools`, or `configure`", k));
+        }
+    }
+    if (lt.configure && t.size() != 1)
+        return std::unexpected(std::string(
+            "`configure = \"build.mcpp\"` hands the choice to the build program, "
+            "so the table names nothing else; the build program states the "
+            "toolchain with the same keys"));
+    if (!lt.configure && lt.path.empty())
+        return std::unexpected(std::string(
+            "a toolchain table names its root with `path`, or hands the choice "
+            "to the build program with `configure = \"build.mcpp\"`"));
+    return lt;
+}
+
 // An entry's value, split into the part that names a version and the tier that
 // part belongs to.
 //
@@ -356,6 +478,9 @@ inline XlingsEntry parse_address(std::string_view address) {
 struct WhenSplit {
     const mcpp::libs::toml::Value* value = nullptr;   // string, or platform table
     ToolWhen                       when  = ToolWhen::Always;
+    // `provision = "on-request"` (mcpp#755): installed when a build program
+    // asks for it, not before the program runs. `"eager"` is the default.
+    bool                           onRequest = false;
 };
 
 inline std::expected<ToolWhen, std::string> parse_when(std::string_view w) {
@@ -374,7 +499,8 @@ split_when(const mcpp::libs::toml::Value& v) {
     const auto& t = v.as_table();
     auto itVer  = t.find("version");
     auto itWhen = t.find("when");
-    if (itVer == t.end() && itWhen == t.end())
+    auto itProv = t.find("provision");
+    if (itVer == t.end() && itWhen == t.end() && itProv == t.end())
         return WhenSplit{ &v, ToolWhen::Always };   // a platform table
     // A SCOPED ENTRY MUST NAME ITS VERSION KEY EVEN TO LEAVE IT EMPTY.
     // `{ when = "run" }` alone reads as "present, unconstrained, run tier",
@@ -382,10 +508,10 @@ split_when(const mcpp::libs::toml::Value& v) {
     // the two would be indistinguishable. The key is required, `""` says
     // unconstrained, and a table carrying anything else is refused by name.
     for (auto const& [k, _] : t)
-        if (k != "version" && k != "when")
+        if (k != "version" && k != "when" && k != "provision")
             return std::unexpected(std::format(
-                "unknown key '{}' in a scoped entry; expected 'version' and "
-                "'when'", k));
+                "unknown key '{}' in a scoped entry; expected 'version', "
+                "'when' and 'provision'", k));
     if (itVer == t.end())
         return std::unexpected(std::string(
             "a scoped entry needs 'version' (write version = \"\" for "
@@ -397,6 +523,17 @@ split_when(const mcpp::libs::toml::Value& v) {
         auto w = parse_when(itWhen->second.as_string());
         if (!w) return std::unexpected(w.error());
         out.when = *w;
+    }
+    if (itProv != t.end()) {
+        if (!itProv->second.is_string())
+            return std::unexpected(std::string("'provision' must be a string"));
+        const auto& p = itProv->second.as_string();
+        if (p == "on-request")  out.onRequest = true;
+        else if (p != "eager")
+            return std::unexpected(std::format(
+                "provision = '{}' is not a provisioning mode; expected "
+                "'on-request' (installed when a build program asks for it) or "
+                "'eager' (the default: installed before build programs run)", p));
     }
     return out;
 }
@@ -2384,13 +2521,39 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
     }
 
     // [toolchain] — platform → "pkg@version" map (docs/21)
+    //
+    // An entry is a managed spec (`"gcc@16.1.0"`) or a table (mcpp#755): a
+    // toolchain named by path, or `configure = "build.mcpp"`. The table is
+    // recorded in the string map as `path:<dir>` / `configure:build.mcpp`, so a
+    // reader that only needs the spelling reads one string; the rest of the
+    // table rides `localByPlatform` under the same key. `bootstrap` is not a
+    // platform: it names the toolchain that builds the build programs.
     if (auto* tt = doc->get_table("toolchain")) {
         for (auto& [platform, val] : *tt) {
+            if (platform == "bootstrap") {
+                if (!val.is_string())
+                    return std::unexpected(error(origin,
+                        "[toolchain].bootstrap must be a managed spec like \"llvm@22.1.8\""));
+                m.toolchain.bootstrap     = val.as_string();
+                m.toolchain.bootstrapLine = static_cast<int>(val.position.line);
+                continue;
+            }
+            if (val.is_table()) {
+                auto lt = read_local_toolchain(val);
+                if (!lt) return std::unexpected(error(origin,
+                    std::format("[toolchain].{}: {}", platform, lt.error())));
+                m.toolchain.byPlatform[platform] = lt->configure
+                    ? std::string("configure:build.mcpp") : "path:" + lt->path;
+                m.toolchain.localByPlatform[platform] = std::move(*lt);
+                continue;
+            }
             if (!val.is_string()) {
-                return std::unexpected(error(origin,
-                    std::format("[toolchain].{} must be a string like \"gcc@15.1.0\"", platform)));
+                return std::unexpected(error(origin, std::format(
+                    "[toolchain].{} must be a string like \"gcc@15.1.0\", or a "
+                    "table `{{ path = \"<dir>\" }}` naming a toolchain by path", platform)));
             }
             m.toolchain.byPlatform[platform] = val.as_string();
+            m.toolchain.lineByPlatform[platform] = static_cast<int>(val.position.line);
         }
     }
 
@@ -2587,6 +2750,7 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
             m.xlings.deps.push_back(entry->address());
             if (scoped->when != ToolWhen::Always)
                 m.xlings.depWhen[entry->address()] = scoped->when;
+            if (scoped->onRequest) m.xlings.onRequest.insert(entry->address());
         }
     }
     // `[feature-xlings.<feature>]` — the same table, gated on a feature of the
@@ -2643,7 +2807,25 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                 m.xlings.featurePins[entry->address()] = entry->pin();
                 if (scoped->when != ToolWhen::Always)
                     m.xlings.depWhen[entry->address()] = scoped->when;
+                if (scoped->onRequest) m.xlings.onRequest.insert(entry->address());
             }
+        }
+    }
+    // `[xlings.overrides]` (mcpp#755): where a declared payload comes from on
+    // this machine instead of the registry. Read for every manifest and
+    // honoured only for the root of a build; a dependency's is refused where
+    // the root is known.
+    if (auto* ot = doc->get_table("xlings.overrides")) {
+        for (auto& [k, val] : *ot) {
+            auto o = read_xlings_override(k, val);
+            if (!o) return std::unexpected(error(origin,
+                std::format("[xlings.overrides] {}: {}", k, o.error())));
+            if (auto prev = m.xlings.overrides.find(o->first);
+                prev != m.xlings.overrides.end())
+                return std::unexpected(error(origin, std::format(
+                    "[xlings.overrides] names '{}' twice, as '{}' and as '{}'; "
+                    "write it once", o->first, prev->second.key, k)));
+            m.xlings.overrides.emplace(std::move(o->first), std::move(o->second));
         }
     }
     if (doc->get("xlings.subos")) {
@@ -3943,6 +4125,7 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                     writtenAs.emplace(entry->target, k);
                     if (scoped->when != ToolWhen::Always)
                         cc.xlings.depWhen[entry->address()] = scoped->when;
+                    if (scoped->onRequest) cc.xlings.onRequest.insert(entry->address());
                     out.push_back(*entry);
                 }
                 return {};
@@ -3971,6 +4154,20 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                         }
                         continue;
                     }
+                    if (k == "overrides") {
+                        if (!v.is_table())
+                            return std::unexpected(error(origin, std::format(
+                                "[target.{}.xlings.overrides] must be a table of "
+                                "package = path", triple)));
+                        for (auto& [ok, ov] : v.as_table()) {
+                            auto o = read_xlings_override(ok, ov);
+                            if (!o) return std::unexpected(error(origin, std::format(
+                                "[target.{}.xlings.overrides] {}: {}", triple, ok, o.error())));
+                            cc.xlings.overrides.insert_or_assign(std::move(o->first),
+                                                                 std::move(o->second));
+                        }
+                        continue;
+                    }
                     // `subos` names the project's environment, of which there
                     // is one per project rather than one per target. Refused
                     // rather than ignored: a silently dropped environment is
@@ -3989,8 +4186,10 @@ std::expected<Manifest, ManifestError> parse_string(std::string_view content,
                         "target needs is declared under "
                         "[target.{}.xlings.workspace] as `\"<package>\" = "
                         "\"<version>\"`, and is installed only when this target "
-                        "is built. `subos` names the project's environment and "
-                        "belongs in the top-level [xlings].", triple, k, triple)));
+                        "is built; where it comes from instead is "
+                        "[target.{}.xlings.overrides]. `subos` names the "
+                        "project's environment and belongs in the top-level "
+                        "[xlings].", triple, k, triple, triple)));
                 }
             }
             if (auto fit = body.find("feature-xlings");

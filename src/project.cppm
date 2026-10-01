@@ -247,18 +247,24 @@ export void inherit_workspace_xlings(mcpp::manifest::Manifest& member,
                 to.workspace.try_emplace(pin->first, pin->second);
             if (auto w = from.depWhen.find(a); w != from.depWhen.end())
                 to.depWhen.try_emplace(a, w->second);
+            if (from.onRequest.contains(a)) to.onRequest.insert(a);
         }
         to.deps.insert(to.deps.begin(), taken.begin(), taken.end());
+        // `[xlings.overrides]` states where a payload comes from on THIS
+        // machine, so a member built as the root of its own build takes the
+        // workspace's statement unless it makes its own (mcpp#755).
+        for (auto const& [pkg, o] : from.overrides) to.overrides.try_emplace(pkg, o);
     };
     take(workspace.xlings, member.xlings);
 
     std::vector<mcpp::manifest::ConditionalConfig> rows;
     for (auto const& cc : workspace.conditionalConfigs) {
-        if (cc.xlings.deps.empty()) continue;
+        if (cc.xlings.deps.empty() && cc.xlings.overrides.empty()) continue;
         mcpp::manifest::ConditionalConfig row;
         row.predicate = cc.predicate;
         take(cc.xlings, row.xlings);
-        if (!row.xlings.deps.empty()) rows.push_back(std::move(row));
+        if (!row.xlings.deps.empty() || !row.xlings.overrides.empty())
+            rows.push_back(std::move(row));
     }
     member.conditionalConfigs.insert(member.conditionalConfigs.begin(),
                                      std::make_move_iterator(rows.begin()),

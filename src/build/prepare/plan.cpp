@@ -278,10 +278,17 @@ static std::expected<void, std::string> step13_runner_and_xlings(PrepareState& s
                 for (auto const& spec : applicable_xlings_addresses(
                          man, feats, ToolPurpose::Run, /*isRoot=*/i == 0
                          || state.packages[i].selectedMember))
-                    if (std::ranges::find(xlingsSpecs, spec) == xlingsSpecs.end())
+                    if (std::ranges::find(xlingsSpecs, spec) == xlingsSpecs.end()
+                        && !state.xlingsSkipped.contains(spec))
                         { ctx.runTierPending = true; break; }
             }
         }
+        // An overridden payload's programs are looked up where the override
+        // put them (mcpp#755), first: the project said that is where they are.
+        for (auto const& key : state.xlingsOverridden)
+            if (auto ov = payload_override(state, key); ov && *ov)
+                for (auto& d : mcpp::build::runner_lookup::payload_search_dirs((*ov)->root))
+                    ctx.xlingsDepBinDirs.push_back(std::move(d));
         if (!xlingsSpecs.empty()) {
             if (auto cfg = state.get_cfg(true)) {
                 auto xlEnv = mcpp::config::make_xlings_env(**cfg);
@@ -2296,6 +2303,8 @@ std::expected<BuildContext, std::string> phase13_finish(PrepareState& state) {
         return r;
     };
 
+    if (auto r = timed("sources", [&] { return step13_sources(state, ctx); }); !r)
+        return std::unexpected(r.error());
     if (auto r = timed("source packages", [&] { return step13_source_packages(state, ctx); }); !r)
         return std::unexpected(r.error());
     if (auto r = timed("runner and xlings", [&] { return step13_runner_and_xlings(state, ctx); }); !r)

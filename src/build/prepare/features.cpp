@@ -875,6 +875,8 @@ static std::expected<void, std::string> step6_xlings_workspace_from_graph(Prepar
             for (auto const& pkg : state.packages)
                 if (auto why = layer_predicated_xlings_refusal(pkg.manifest))
                     return std::unexpected(*why);
+            if (auto why = dependency_override_refusal(state))
+                return std::unexpected(*why);
             auto split = state.graph_xlings_split();
             if (!split) {
                 refusal::record(refusal::Code::ToolVersionConflict);
@@ -1956,9 +1958,12 @@ static std::expected<void, std::string> step6_dependency_build_programs(PrepareS
             const auto runnerN = bcDep.runner.size();
             auto namedBefore = bcDep.namedRunners;   // by value: the delta below
             const bool exclusiveBefore = bcDep.runExclusive;
-            if (auto r = mcpp::build::run_build_program(
-                    pkg.manifest, pkg.root, host->first, host->second,
-                    pkg.manifest.cppStandard, bpEnv);
+            if (auto r = run_answering_requests(state, pkg.manifest, bpEnv, i,
+                    pkg.manifest.package.name, [&] {
+                        return mcpp::build::run_build_program(
+                            pkg.manifest, pkg.root, host->first, host->second,
+                            pkg.manifest.cppStandard, bpEnv);
+                    });
                 !r) {
                 // #699 item 2 (E3): under `emit build-database` (`plan_only`),
                 // a failing build program describes its package without that
@@ -2239,6 +2244,10 @@ std::expected<void, std::string> phase6_features_and_host_tools(PrepareState& st
 
     auto toolRequests = step6_host_module_registration(state);
     if (!toolRequests) return std::unexpected(toolRequests.error());
+    // The root build program's toolchain phase (mcpp#755): its host modules
+    // are registered, and nothing that depends on the build toolchain has
+    // been built. A statement ends this pass; prepare starts again with it.
+    if (auto r = step6_toolchain_phase(state); !r) return std::unexpected(r.error());
     if (auto r = step6_provision_host_tools(state, *toolRequests); !r)
         return std::unexpected(r.error());
 

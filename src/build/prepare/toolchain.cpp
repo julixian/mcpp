@@ -351,6 +351,10 @@ static std::expected<void, std::string> step1_define_early_toolchain_closures(Pr
             state.tcOrigin = TcOrigin::GlobalDefault;
         }
     }
+    // A toolchain named by path, the toolchain phase's statement, and the
+    // bootstrap toolchain (mcpp#755). Rewrites `tcSpec` into the one spelling
+    // every later reader parses: a managed spec, or `path:<absolute dir>`.
+    if (auto r = step1_local_toolchain(state); !r) return std::unexpected(r.error());
 
     // ─── Windows first run without Visual Studio ────────────────────────
     // The host triple on Windows is MSVC-ABI, so the historical default
@@ -2205,6 +2209,9 @@ std::expected<void, std::string> phase2_define_toolchain_resolver(PrepareState& 
         step2_use_installed_pin(state, ctx);
       } else if (state.tcSpecIsMsvc) {
         if (auto r = step2_use_system_msvc(state); !r) return std::unexpected(r.error());
+      } else if (ctx.parsedSpec && !ctx.parsedSpec->localRoot.empty()) {
+        if (auto r = step2_use_local_toolchain(state, *ctx.parsedSpec); !r)
+            return std::unexpected(r.error());
       } else if (ctx.parsedSpec) {
         if (auto r = step2_resolve_explicit_spec(state, ctx); !r) return std::unexpected(r.error());
       } else if (state.tcSpec.has_value() && *state.tcSpec == "system") {
@@ -2261,6 +2268,7 @@ std::expected<void, std::string> phase2_define_toolchain_resolver(PrepareState& 
       }
 
       if (auto r = step2_detect_toolchain(state); !r) return std::unexpected(r.error());
+      if (auto r = step2_apply_local_toolchain(state); !r) return std::unexpected(r.error());
       if (auto r = step2_retarget_for_retargetable_driver(state); !r) return std::unexpected(r.error());
       if (auto r = step2_bind_msvc_toolset(state); !r) return std::unexpected(r.error());
       step2_windows_runtime_identity(state);

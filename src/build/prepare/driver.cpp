@@ -22,6 +22,7 @@ import mcpp.build.backend;      // BuildOptions for the tool sub-build
 import mcpp.build.ninja;        // make_ninja_backend — driving that sub-build
 import mcpp.platform;
 import mcpp.log;
+import mcpp.ui;
 
 namespace mcpp::build {
 
@@ -41,11 +42,49 @@ std::vector<PlanNote> take_notes_on_failure() {
     return notes;
 }
 
+namespace {
+std::expected<BuildContext, std::string>
+prepare_build_pass(bool print_fingerprint,
+                   bool includeDevDeps,
+                   std::vector<mcpp::manifest::Target> extraTargets,
+                   BuildOverrides overrides);
+} // namespace
+
+// TWO PASSES WHEN THE BUILD PROGRAM STATES THE TOOLCHAIN (mcpp#755).
+//
+// `[toolchain] <key> = { configure = "build.mcpp" }` hands the choice of the
+// build toolchain to the root build program. The program needs its host
+// modules, and they come from the dependency graph; the graph's resolution
+// needs the toolchain (`cfg(compiler = ...)`, `requires`). So the first pass
+// prepares with the bootstrap toolchain as far as the host modules, runs the
+// program's toolchain phase, and stops; the second prepares with the stated
+// toolchain from the start, the bootstrap compiling and running the build
+// programs. The first pass narrates nothing: everything it would say, the
+// second says about the build that happens.
 std::expected<BuildContext, std::string>
 prepare_build(bool print_fingerprint,
               bool includeDevDeps,
               std::vector<mcpp::manifest::Target> extraTargets,
               BuildOverrides overrides) {
+    if (!overrides.toolchain_statement.empty())
+        return prepare_build_pass(print_fingerprint, includeDevDeps,
+                                  std::move(extraTargets), std::move(overrides));
+    auto first = prepare_build_pass(print_fingerprint, includeDevDeps, extraTargets, overrides);
+    if (first) { (void)take_toolchain_restart(); return first; }
+    auto restart = take_toolchain_restart();
+    if (!restart) return first;
+    overrides.toolchain_statement = std::move(restart->first);
+    overrides.bootstrap_spec      = std::move(restart->second);
+    return prepare_build_pass(print_fingerprint, includeDevDeps,
+                              std::move(extraTargets), std::move(overrides));
+}
+
+namespace {
+std::expected<BuildContext, std::string>
+prepare_build_pass(bool print_fingerprint,
+                   bool includeDevDeps,
+                   std::vector<mcpp::manifest::Target> extraTargets,
+                   BuildOverrides overrides) {
     PrepareState state(print_fingerprint, includeDevDeps,
                         std::move(extraTargets), std::move(overrides));
     pending_flag_words_notes().clear();
@@ -84,6 +123,16 @@ prepare_build(bool print_fingerprint,
     if (auto r = check_engine_floors(state, /*rootOnly=*/true); !r) return fail(r.error());
     if (auto r = timed("toolchain request", [&] { return phase1_toolchain_spec_and_axes(state); }); !r)
         return fail(r.error());
+    // The first pass of a toolchain phase says nothing (see prepare_build).
+    struct QuietPass {
+        bool active = false, prev = false;
+        ~QuietPass() { if (active) mcpp::ui::set_quiet(prev); }
+    } quietPass;
+    if (state.toolchainConfigure && state.overrides.toolchain_statement.empty()) {
+        quietPass.active = true;
+        quietPass.prev   = mcpp::ui::is_quiet();
+        mcpp::ui::set_quiet(true);
+    }
     if (auto r = timed("toolchain resolver", [&] { return phase2_define_toolchain_resolver(state); }); !r)
         return fail(r.error());
     if (auto r = timed("xlings", [&] { return phase3_xlings_before_graph(state); }); !r)
@@ -105,6 +154,7 @@ prepare_build(bool print_fingerprint,
     g_notesOnFailure.clear();
     return timed("finish", [&] { return phase13_finish(state); });
 }
+} // namespace
 
 
 } // namespace mcpp::build

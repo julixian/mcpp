@@ -371,6 +371,27 @@ target-conditional declaration does:
 "xim:android-build-tools" = ""
 ```
 
+**One order for where a tool comes from** (2026.10.1.3+). A rule's tool is
+resolved in the order every member uses: the build program's own option, the
+variable that member has always read, the engine's override
+(`[xlings.overrides]`), then the declared payload. A tool the build program
+named must not make the payload be installed, so a rule asks for a payload only
+in the last step — and a payload only some builds need is declared
+`provision = "on-request"` and asked for with `mcpp::xpkg_request` (docs/23,
+docs/30).
+
+`mcpp.plugins.tool` (mcpp:plugins, in `plugins-core`) implements that order,
+including the one refusal text that lists every way to name the tool, and
+records the answer with `mcpp::decision`, so a build reports the source and
+`mcpp why tool <name>` can answer. A rule that resolves its tool itself owes the
+same order and the same record.
+
+A rule **must not** search `PATH` unless someone said so: a tool found there is
+reachable through the build program's own choice
+(`mcpp::plugins::tool::on_path()`) or an override, and a rule that falls back to
+it on its own has to say which program it used and how to state it (SPEC-007
+R6.2).
+
 **A build must not reach the network, and a wrapped tool may.** Measured on
 `appimagetool` 1.9.1: it downloads its type-2 runtime stub from a GitHub
 release on every invocation unless `--runtime-file` names a local copy. A member

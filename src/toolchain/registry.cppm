@@ -103,7 +103,15 @@ struct ToolchainSpec {
     // `msvc@<version>` takes an installed toolset of that version first.
     bool ecosystemOnly = false;
 
+    // A TOOLCHAIN NAMED BY PATH (mcpp#755): `path:<dir>`, the spelling a
+    // `[toolchain]` table and `MCPP_TOOLCHAIN=path:<dir>` reach the resolver
+    // as. Empty for every managed spec. The family is the drivers' (a
+    // `clang++` is llvm, a `g++` gcc) and the version is unknown until the
+    // driver is probed, so nothing here is a payload address.
+    std::filesystem::path localRoot;
+
     std::string spec_str() const {
+        if (!localRoot.empty()) return "path:" + localRoot.generic_string();
         auto base = std::format("{}@{}",
                                 payloadName.empty() ? family_name(family)
                                                     : std::string_view(payloadName),
@@ -113,6 +121,8 @@ struct ToolchainSpec {
 
     // "gcc@16.1.0" or "gcc@16.1.0 → x86_64-windows-gnu" — user-facing.
     std::string display() const {
+        if (!localRoot.empty())
+            return std::format("{} at {}", family_name(family), localRoot.generic_string());
         if (target.empty()) return spec_str();
         return std::format("{} → {}", spec_str(), target.str());
     }
@@ -524,10 +534,48 @@ std::filesystem::path derive_c_compiler_path(const std::filesystem::path& cxxPat
     return parent / (cc_stem + ext.string());
 }
 
+// The family of a toolchain named by path, from the drivers in `<root>/bin`:
+// any `*clang++` is llvm, any `*g++` gcc, llvm first when both are present
+// (an LLVM tree may carry a `g++` compatibility link; a GCC tree carries no
+// clang). Nothing is run.
+std::optional<Family> family_of_local_toolchain(const std::filesystem::path& root) {
+    std::error_code ec;
+    bool clang = false, gnu = false;
+    for (auto const& e : std::filesystem::directory_iterator(root / "bin", ec)) {
+        auto name = e.path().filename().string();
+        if (name.ends_with(".exe")) name.resize(name.size() - 4);
+        if (name.ends_with("clang++")) clang = true;
+        else if (name.ends_with("g++")) gnu = true;
+    }
+    if (clang) return Family::Llvm;
+    if (gnu)   return Family::Gcc;
+    return std::nullopt;
+}
+
 std::expected<ToolchainSpec, std::string>
 parse_toolchain_spec(std::string compilerArg,
                      std::string versionArg,
                      bool requireCompiler) {
+    // `path:<dir>` (mcpp#755): the family from the drivers present; the
+    // version, the triple and the rest from probing them, later.
+    if (compilerArg.starts_with("path:")) {
+        ToolchainSpec spec;
+        spec.localRoot = std::filesystem::path(compilerArg.substr(5)).lexically_normal();
+        if (spec.localRoot.empty())
+            return std::unexpected(std::string("'path:' names no directory"));
+        auto fam = family_of_local_toolchain(spec.localRoot);
+        if (!fam)
+            return std::unexpected(std::format(
+                "'{}' has no C++ driver in bin/ (a `clang++` or a `g++`, optionally with a "
+                "prefix); a toolchain named by path keeps its drivers in `<path>/bin`",
+                spec.localRoot.generic_string()));
+        spec.family = *fam;
+        return spec;
+    }
+    if (compilerArg.starts_with("configure:"))
+        return std::unexpected(std::string(
+            "`configure = \"build.mcpp\"` is answered by the root build program's "
+            "toolchain phase, which has not stated a toolchain here"));
     if (auto at = compilerArg.find('@'); at != std::string::npos) {
         if (versionArg.empty()) versionArg = compilerArg.substr(at + 1);
         compilerArg = compilerArg.substr(0, at);
@@ -1453,6 +1501,21 @@ std::filesystem::path binutils_tool(const Toolchain& tc, std::string_view name) 
 
     std::error_code ec;
     auto dir = tc.binaryPath.parent_path();
+
+    // A TOOL STATED BY ROLE WINS (mcpp#755): `tools = { ar = ... }` is the
+    // project saying where this one is, because the layout does not have it.
+    if (auto* o = tc.tool_override(name)) return *o;
+    // A toolchain named by path keeps its tools beside the driver, under its
+    // prefix if it has one: `<prefix>ar`, then the LLVM spelling `llvm-ar`.
+    if (!tc.localRoot.empty()) {
+        for (auto const& cand : {tc.toolPrefix + std::string(name),
+                                 std::string("llvm-") + std::string(name),
+                                 std::string(name)}) {
+            auto p = dir / (cand + std::string(mcpp::platform::exe_suffix));
+            if (std::filesystem::exists(p, ec)) return p;
+        }
+        return {};
+    }
 
     // Clang ships the whole family as `llvm-<name>` beside the frontend.
     if (is_clang(tc)) {

@@ -1057,6 +1057,7 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
     // manifest, which `compute_flags` reads. It once read the declared level
     // while the compile used another, and said `[optimized]` over `-Og`. The
     // step record's header carries the same value for the fast path.
+    mcpp::build::progress::note_sources(ctx.plan.outputDir);
     mcpp::build::progress::finished(
         ctx.profile, mcpp::build::profile_descriptor(ctx.plan.manifest.buildConfig));
     report_freestanding_size(ctx);
@@ -1553,6 +1554,31 @@ bool xlings_payloads_present(const BuildCacheEntry& e) {
     });
 }
 
+// A toolchain named by path (mcpp#755) is unchanged since the entry's build:
+// each of its programs has the size and modification time prepare recorded
+// beside the build. A managed toolchain never changes in place, and a build
+// without the record used none.
+bool local_toolchain_unchanged(const std::filesystem::path& outputDir) {
+    std::ifstream in(outputDir / "local-toolchain.stamp", std::ios::binary);
+    if (!in) return true;
+    std::string line;
+    while (std::getline(in, line)) {
+        auto t1 = line.find('\t');
+        auto t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) return false;
+        const std::filesystem::path p(line.substr(t2 + 1));
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(p, ec);
+        if (ec) return false;
+        const auto time = std::filesystem::last_write_time(p, ec);
+        if (ec) return false;
+        if (std::to_string(size) != line.substr(0, t1)
+            || std::to_string(time.time_since_epoch().count()) != line.substr(t1 + 1, t2 - t1 - 1))
+            return false;
+    }
+    return true;
+}
+
 // Why the project fast path declined, under `-v` (#734 E5). Each refusal names
 // its condition, so a platform on which the fast path never serves shows which
 // precondition it fails instead of only the slower build.
@@ -1579,6 +1605,10 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     // builds, audits and CI, none of which are the case the fast path serves.
     if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
         return fast_path_declined("build", "MCPP_LOCKED=1 asks for a locked resolution");
+    // `--managed-only` is checked against the sources prepare decides, which
+    // a fast path does not run (mcpp#755).
+    if (auto v = mcpp::platform::env::get("MCPP_MANAGED_ONLY"); v && *v != "0")
+        return fast_path_declined("build", "MCPP_MANAGED_ONLY asks for the sources to be checked");
 
     auto want = fast_path_identity(projectRoot);
     if (!want) return fast_path_declined("build", "the manifest or the request could not be read");
@@ -1674,6 +1704,8 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
         return fast_path_declined("build", "a path dependency's manifest or source is newer than build.ninja");
     if (!xlings_payloads_present(*match)) return fast_path_declined("build", "a recorded xlings payload is missing");
+    if (!local_toolchain_unchanged(match->outputDir))
+        return fast_path_declined("build", "a program of the toolchain named by path changed");
 
     auto validatedBefore =
         mcpp::build::runtime_validation::validated_artifact_snapshot(
@@ -1697,6 +1729,7 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
 
     // The descriptor the plan recorded (revision 3, §7.3); empty for a record
     // written before it was carried.
+    mcpp::build::progress::note_sources(outputDir);
     mcpp::build::progress::finished(want->profile,
                                     mcpp::build::progress::read_descriptor(outputDir));
     return 0;
@@ -1716,6 +1749,10 @@ export std::optional<int> try_fast_workspace_build(
     if (no_cache) return fast_path_declined("workspace", "the build cache is off (--no-cache)");
     if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
         return fast_path_declined("workspace", "MCPP_LOCKED=1 asks for a locked resolution");
+    // `--managed-only` is checked against the sources prepare decides, which
+    // a fast path does not run (mcpp#755).
+    if (auto v = mcpp::platform::env::get("MCPP_MANAGED_ONLY"); v && *v != "0")
+        return fast_path_declined("workspace", "MCPP_MANAGED_ONLY asks for the sources to be checked");
     auto join = [](const std::vector<std::string>& v) {
         std::string out;
         for (auto const& x : v) { if (!out.empty()) out += '\x1e'; out += x; }
@@ -1778,6 +1815,8 @@ export std::optional<int> try_fast_workspace_build(
             return fast_path_declined("workspace", "a member's or a path dependency's manifest or source is newer than build.ninja");
         if (!xlings_payloads_present(*match))
             return fast_path_declined("workspace", "a recorded xlings payload is missing");
+        if (!local_toolchain_unchanged(match->outputDir))
+            return fast_path_declined("workspace", "a program of the toolchain named by path changed");
         auto validated = mcpp::build::runtime_validation::validated_artifact_snapshot(
             outputDir, *match->runtimeBinding);
         if (!validated)
@@ -1807,6 +1846,7 @@ export std::optional<int> try_fast_workspace_build(
         if (*rc != 0) return rc;
         if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(r.validated))
             return fast_path_declined("workspace", "ninja relinked an artifact, whose closure the full path validates");
+        mcpp::build::progress::note_sources(r.outputDir);
     }
     // The groups share the profile, and so its descriptor.
     mcpp::build::progress::finished(
@@ -1844,6 +1884,10 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // `--locked` is an assertion about resolution.
     if (mcpp::platform::env::get("MCPP_LOCKED").value_or("") == "1")
         return fast_path_declined("run", "MCPP_LOCKED=1 asks for a locked resolution");
+    // `--managed-only` is checked against the sources prepare decides, which
+    // a fast path does not run (mcpp#755).
+    if (auto v = mcpp::platform::env::get("MCPP_MANAGED_ONLY"); v && *v != "0")
+        return fast_path_declined("run", "MCPP_MANAGED_ONLY asks for the sources to be checked");
     auto want = fast_path_identity(projectRoot);
     if (!want) return fast_path_declined("run", "the manifest or the request could not be read");
 
@@ -1963,6 +2007,8 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
         return fast_path_declined("run", "a path dependency's manifest or source is newer than build.ninja");
     if (!xlings_payloads_present(*match)) return fast_path_declined("run", "a recorded xlings payload is missing");
+    if (!local_toolchain_unchanged(match->outputDir))
+        return fast_path_declined("run", "a program of the toolchain named by path changed");
 
     auto validatedBefore =
         mcpp::build::runtime_validation::validated_artifact_snapshot(

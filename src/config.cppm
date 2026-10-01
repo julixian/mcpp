@@ -129,6 +129,19 @@ struct GlobalConfig {
     // target = triple are orthogonal axes). Empty means host.
     std::string                     defaultTarget;
 
+    // From config.toml [xlings.overrides] (mcpp#755): where a declared xlings
+    // payload comes from on THIS MACHINE. The same entries a root manifest's
+    // `[xlings.overrides]` writes, below it in precedence: the environment
+    // variable, then the project, then this file. Keyed by package identity,
+    // `<ns>:<name>` with the namespace defaulted to `xim`.
+    struct PayloadOverride {
+        std::string kind = "path";   // "path" | "program" | "root"
+        std::string value;
+        std::string version;
+        int         line = 0;
+    };
+    std::map<std::string, PayloadOverride> payloadOverrides;
+
     // Resolved xlings home (registryDir unless overridden)
     std::filesystem::path xlingsHome() const {
         return xlingsHomeOverride.empty() ? registryDir : xlingsHomeOverride;
@@ -718,6 +731,36 @@ std::expected<GlobalConfig, ConfigError> load_or_init(
     cfg.defaultJobs    = doc->get_int("build.default_jobs").value_or(0);
     cfg.defaultToolchain = doc->get_string("toolchain.default").value_or("");
     cfg.defaultTarget    = doc->get_string("toolchain.default_target").value_or("");
+    // [xlings.overrides] (mcpp#755). Read in the manifest's two shapes -- a
+    // path, or a table of `program` or `root` and `version` -- and refused by
+    // name when it is neither, as a malformed config.toml key always is.
+    if (auto* ot = doc->get_table("xlings.overrides")) {
+        for (auto const& [key, val] : *ot) {
+            GlobalConfig::PayloadOverride o;
+            o.line = static_cast<int>(val.position.line);
+            if (val.is_string()) {
+                o.value = val.as_string();
+            } else if (val.is_table()) {
+                for (auto const& [k, v] : val.as_table()) {
+                    if ((k != "program" && k != "root" && k != "version") || !v.is_string())
+                        return std::unexpected(ConfigError{std::format(
+                            "config.toml [xlings.overrides] {}: '{}' is not a key of an "
+                            "override; an override is a path, or a table of `program` "
+                            "or `root` and an optional `version`", key, k)});
+                    if (k == "version") o.version = v.as_string();
+                    else { o.kind = k; o.value = v.as_string(); }
+                }
+            }
+            if (o.value.empty())
+                return std::unexpected(ConfigError{std::format(
+                    "config.toml [xlings.overrides] {}: expected a path, or a table "
+                    "naming `program` or `root`", key)});
+            auto colon = key.find(':');
+            std::string ident = colon == std::string::npos ? "xim:" + key : key;
+            if (auto at = ident.find('@'); at != std::string::npos) ident.resize(at);
+            cfg.payloadOverrides.insert_or_assign(std::move(ident), std::move(o));
+        }
+    }
 
     // [log] section — re-initialize logger with config values
     {
