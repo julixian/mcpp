@@ -426,9 +426,27 @@ struct BuildProgramEnv {
 // The suffix selects the fact: `DIR` (the payload directory), `SOURCE` and
 // `PROGRAM` (where it came from, mcpp#755), read back by `xpkg_source` and
 // `xpkg_program`.
-std::string response_file_body(std::span<const std::string> args) {
+std::string response_file_body(std::span<const std::string> args, bool gnuQuoting) {
     std::string body;
     for (auto const& a : args) {
+        if (gnuQuoting) {
+            // GNU TOKENIZATION TREATS A BACKSLASH AS AN ESCAPE, everywhere but
+            // inside single quotes. A Windows path written plainly therefore
+            // arrives with its separators eaten -- clang read
+            // `D:\a\mcpp-plugins\...` back as `D:amcpp-plugins...` and
+            // reported `no such file or directory`. Inside single quotes every
+            // character is literal, so each argument is wrapped, and an embedded
+            // single quote is closed, escaped and reopened.
+            body.push_back('\'');
+            for (char c : a) {
+                if (c == '\'') body += "'\\''";
+                else body.push_back(c);
+            }
+            body += "'\n";
+            continue;
+        }
+        // Windows tokenization (cl, clang-cl): a backslash is literal except
+        // before a quote, so only whitespace and quotes need handling.
         if (a.find_first_of(" \t\"") == std::string::npos) {
             body += a;
             body.push_back('\n');
@@ -465,16 +483,17 @@ inline std::string xpkg_env_var(std::string_view ns, std::string_view name,
     return out;
 }
 
-// THE ARGV THAT PASSES `args` THROUGH A RESPONSE FILE, and the file's content.
+// THE CONTENT OF A RESPONSE FILE CARRYING `args`, one argument per line.
 //
-// Every compiler driver mcpp supports reads `@file` with one argument per line.
-// An argument that carries whitespace or a quote is quoted, and the backslashes
-// before a quote -- including a run that would otherwise escape the closing one
-// -- are escaped, which is what makes a Windows path safe to write here.
+// Every compiler driver mcpp supports reads `@file`, but not with one grammar:
+// clang and GCC tokenize it the GNU way, where a backslash escapes the next
+// character, and cl and clang-cl tokenize it the Windows way, where a backslash
+// is literal. `gnuQuoting` picks between them -- single quotes, inside which
+// nothing is special, or Windows quoting of whitespace and quotes.
 //
 // Exported because its quoting is the part worth testing, and the command it
 // serves cannot be run on a host whose limit it does not cross.
-std::string response_file_body(std::span<const std::string> args);
+std::string response_file_body(std::span<const std::string> args, bool gnuQuoting);
 
 // Does a compiler's output say the program asked for something the bundled
 // `mcpp` module does not have?
@@ -1914,7 +1933,7 @@ std::expected<void, std::string> run_build_program_impl(
                     flat, mcpp::platform::is_windows, /*needsShell=*/true)) {
                 const auto rsp = bdir / "build.mcpp.compile.rsp";
                 const auto body = response_file_body(
-                    std::span<const std::string>(compileArgv).subspan(1));
+                    std::span<const std::string>(compileArgv).subspan(1), !msvcHost);
                 std::ofstream out(rsp, std::ios::binary | std::ios::trunc);
                 out << body;
                 out.close();

@@ -235,25 +235,38 @@ TEST(Sources, OverrideVersionIsCheckedAgainstRequirements) {
 
 // ── The response file a long compile command goes through ───────────────────
 
-TEST(Sources, ResponseFileWritesOneArgumentPerLineAndQuotesWhatNeedsIt) {
+TEST(Sources, ResponseFileQuotesForTheWindowsTokenizer) {
     const std::vector<std::string> args{
         "-std=c++23",
-        "-fmodule-file=mcpp=/home/u/p/mcpp.pcm",
         "/Tp C:/Program Files/x/build.mcpp",
         R"(-DNAME="v")",
         "C:\\with space\\dir\\",
     };
-    const auto body = mcpp::build::response_file_body(args);
-    EXPECT_EQ(std::ranges::count(body, '\n'), 5);
+    const auto body = mcpp::build::response_file_body(args, /*gnuQuoting=*/false);
+    EXPECT_EQ(std::ranges::count(body, '\n'), 4);
     EXPECT_NE(body.find("-std=c++23\n"), std::string::npos) << body;
-    // Quoted only where it has to be.
-    EXPECT_NE(body.find("-fmodule-file=mcpp=/home/u/p/mcpp.pcm\n"), std::string::npos) << body;
     EXPECT_NE(body.find("\"/Tp C:/Program Files/x/build.mcpp\"\n"), std::string::npos) << body;
-    // A quote inside the argument survives as one.
     EXPECT_NE(body.find("\"-DNAME=\\\"v\\\"\"\n"), std::string::npos) << body;
     // The run of backslashes that ends the argument is doubled, so it does not
     // escape the closing quote.
     EXPECT_NE(body.find("\"C:\\with space\\dir\\\\\"\n"), std::string::npos) << body;
+}
+
+TEST(Sources, ResponseFileKeepsBackslashesLiteralForTheGnuTokenizer) {
+    // clang and GCC read a backslash as an escape, so a Windows path written
+    // plainly comes back with its separators eaten; inside single quotes
+    // nothing is special.
+    const std::vector<std::string> args{
+        "-fmodule-file=mcpp=D:\\a\\p\\mcpp.pcm",
+        "D:\\a\\obj\\x.o",
+        "-DNAME=it's",
+    };
+    const auto body = mcpp::build::response_file_body(args, /*gnuQuoting=*/true);
+    EXPECT_EQ(std::ranges::count(body, '\n'), 3);
+    EXPECT_NE(body.find("'-fmodule-file=mcpp=D:\\a\\p\\mcpp.pcm'\n"), std::string::npos) << body;
+    EXPECT_NE(body.find("'D:\\a\\obj\\x.o'\n"), std::string::npos) << body;
+    // A single quote in the argument closes, escapes and reopens.
+    EXPECT_NE(body.find("'-DNAME=it'\\''s'\n"), std::string::npos) << body;
 }
 
 // ── [xlings.overrides] in config.toml ───────────────────────────────────────
