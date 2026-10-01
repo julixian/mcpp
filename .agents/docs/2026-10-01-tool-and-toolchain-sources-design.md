@@ -146,5 +146,9 @@ action 描述的是一次还不存在的构建;一个载荷请求也无法回答
 - 覆盖与按需供给都只作用于 xlings 载荷。依赖包 `kind = "bin"` 的宿主工具仍走
   `[tools.overrides]`:两者的键空间与语义不同(一个是 `<pkg>:<tool>` 的程序,一个是
   `ns:name` 的目录),合并会让一张表有两种键。
+- 构建程序的编译命令在超过预算时走响应文件。这条路径在本仓库的 CI 里**到不了**:Linux 与 macOS
+  的预算是 128 KiB,而只有 Windows 上 `capture_exec` 所经的 shell 是 8191 字节。覆盖它的是
+  mcpp-plugins 的 `all-rules-compile`(导入十五个宿主模块)与两个单测——每种 tokenize 语法
+  一个,因为 clang 与 GCC 把反斜杠当转义,cl 与 clang-cl 不当。
 - 工具链描述数据化(核心读描述文件、不再硬编码 `to_xim_package`)不在本次范围;
   `[toolchain] { path }` 的字段已经与那份描述同形,所以它是后续的第三种载体,而不是改写。
