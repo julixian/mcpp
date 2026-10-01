@@ -1378,7 +1378,9 @@ void note_sources(const std::filesystem::path& buildDir) {
         auto colon = group.find(": ");
         if (colon == std::string::npos) continue;
         auto cls = group.substr(0, colon);
-        auto it = std::ranges::find(r.sources, cls, &decltype(r.sources)::value_type::first);
+        auto it = std::ranges::find_if(r.sources,
+            [&](const std::pair<std::string, std::vector<std::string>>& e) {
+                return e.first == cls; });
         if (it == r.sources.end()) { r.sources.emplace_back(cls, std::vector<std::string>{}); it = r.sources.end() - 1; }
         std::size_t n = colon + 2;
         while (n < group.size()) {

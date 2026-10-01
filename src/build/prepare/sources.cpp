@@ -111,7 +111,15 @@ void record_source(PrepareState& state, SourceDecision d) {
         mcpp::ui::source("Using", std::format("{} ← {}", what, d.value),
                          source_tag(d, root), d.cls == SourceClass::Host);
     }
-    auto it = std::ranges::find(state.sources, d.subject, &SourceDecision::subject);
+    // A PREDICATE, NOT A PROJECTION BY POINTER-TO-MEMBER. The latter into a
+    // type this module imports makes clang 20.1.7 crash while generating code,
+    // and the report names an unrelated function (measured on windows-2022,
+    // 2026-10-01; `mcpp.toolchain.model`'s `ToolOverride` records the same
+    // hazard for an exported `std::pair`).
+    auto by_subject = [](std::string_view subject) {
+        return [subject](const SourceDecision& o) { return o.subject == subject; };
+    };
+    auto it = std::ranges::find_if(state.sources, by_subject(d.subject));
     if (it == state.sources.end()) state.sources.push_back(std::move(d));
     else *it = std::move(d);
 }
@@ -446,7 +454,9 @@ answer_payload_requests(PrepareState& state, mcpp::manifest::Manifest& m,
         state.requestedPayloads.insert(keys[i]);
         state.xlingsDeferred.erase(keys[i]);
         state.xlingsSkipped.erase(addresses[i]);
-        auto it = std::ranges::find(state.sources, "payload:" + keys[i], &SourceDecision::subject);
+        const auto subject = "payload:" + keys[i];
+        auto it = std::ranges::find_if(state.sources, [&](const SourceDecision& o) {
+            return o.subject == subject; });
         if (it != state.sources.end()) {
             it->considered.clear();
             it->considered.push_back(std::format("installed on request of `{}`", who));
@@ -518,8 +528,9 @@ void record_tool_decisions(PrepareState& state) {
                 const auto payload = f.size() > 5 ? f[5] : std::string{};
                 d.payload  = payload;
                 d.announce = false;
-                auto it = std::ranges::find(state.sources, "payload:" + payload,
-                                            &SourceDecision::subject);
+                const auto psubject = "payload:" + payload;
+                auto it = std::ranges::find_if(state.sources, [&](const SourceDecision& o) {
+                    return o.subject == psubject; });
                 if (it != state.sources.end()) {
                     d.cls = it->cls; d.originKind = it->originKind;
                     d.originFile = it->originFile; d.originLine = it->originLine;
@@ -539,8 +550,9 @@ void record_tool_decisions(PrepareState& state) {
                 d.announce = false;
                 if (f.size() > 5) {
                     d.payload = f[5];
-                    auto it = std::ranges::find(state.sources, "payload:" + f[5],
-                                                &SourceDecision::subject);
+                    const auto psubject = "payload:" + f[5];
+                    auto it = std::ranges::find_if(state.sources, [&](const SourceDecision& o) {
+                        return o.subject == psubject; });
                     if (it != state.sources.end()) d.cls = it->cls;
                 }
             }
@@ -558,7 +570,7 @@ std::expected<void, std::string> step13_sources(PrepareState& state, BuildContex
     // managed payload, and how it was chosen. A toolchain named by path or by
     // the build program was recorded where it was resolved, and announced
     // there, next to the `Resolving toolchain` line.
-    if (std::ranges::none_of(state.sources, [](auto const& d) {
+    if (std::ranges::none_of(state.sources, [](const SourceDecision& d) {
             return d.subject == "toolchain.build"; })) {
         SourceDecision d;
         d.subject = "toolchain.build";

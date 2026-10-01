@@ -1318,8 +1318,9 @@ export int why_report(const std::string& topic, const std::string& features,
                      prof.libc, prof.cxxStdlib, prof.arch, prof.os, tc.targetTriple);
         // The reason the decision record states (mcpp#755), not a sentence
         // describing every way a toolchain can be chosen.
-        if (auto it = std::ranges::find(ctx->sources, std::string("toolchain.build"),
-                                        &mcpp::build::SourceDecision::subject);
+        if (auto it = std::ranges::find_if(ctx->sources,
+                [](const mcpp::build::SourceDecision& d) {
+                    return d.subject == "toolchain.build"; });
             it != ctx->sources.end())
             std::println("  source: {}", mcpp::build::source_tag(*it, ctx->projectRoot));
         if (!ctx->compilerChoice.origin.empty())
