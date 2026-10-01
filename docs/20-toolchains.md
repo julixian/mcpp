@@ -386,7 +386,7 @@ prefix   = "aarch64-none-linux-gnu-"
 sysroot  = "/opt/acme-sysroot"
 family   = "gcc"                                 # checked against the drivers
 launcher = "ccache"                              # prefixes every compile
-tools    = { ld = "/opt/lld-dev/bin/ld.lld" }    # cc, cxx, ld, ar, ranlib, nm, objcopy, strip, as
+tools    = { ar = "/opt/acme-gcc/bin/gcc-ar" }   # cc, cxx, ar, ranlib, nm, objcopy, strip, as
 ```
 
 Or for one build, without editing the manifest:
@@ -401,6 +401,12 @@ two is present, and the version, the target triple, the standard library and
 whether `import std` is available are read from the driver itself. The tools
 beside them are found as `<prefix><tool>`, then `llvm-<tool>`, then `<tool>`;
 `tools` names any the tree does not have.
+
+`tools = { ld = … }` is read by a clang tree, where the linker reaches the link
+as `--ld-path`. A gcc tree that states `ld` is refused: gcc chooses its linker by
+the name `ld` inside a directory it is given with `-B`, so a program under any
+other name could not be selected, and a stated tool that took no part in the
+build is what this mechanism exists to prevent.
 
 **What mcpp does with it.** The same as with a payload it installed: its own
 link line, its own hermetic check, its own `import std` decision. It writes

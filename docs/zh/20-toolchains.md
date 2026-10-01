@@ -364,7 +364,7 @@ prefix   = "aarch64-none-linux-gnu-"
 sysroot  = "/opt/acme-sysroot"
 family   = "gcc"                                 # 与驱动核对
 launcher = "ccache"                              # 前置于每次编译
-tools    = { ld = "/opt/lld-dev/bin/ld.lld" }    # cc、cxx、ld、ar、ranlib、nm、objcopy、strip、as
+tools    = { ar = "/opt/acme-gcc/bin/gcc-ar" }   # cc、cxx、ar、ranlib、nm、objcopy、strip、as
 ```
 
 或者只对一次构建生效，不改清单：
@@ -377,6 +377,10 @@ MCPP_TOOLCHAIN=path:/opt/llvm-trunk mcpp build
 族由其中哪一个存在决定，版本、目标三元组、标准库以及是否支持 `import std` 都由探测该驱动
 得到。旁边的工具按 `<prefix><tool>`、`llvm-<tool>`、`<tool>` 查找；`tools` 点名树里没有的
 那些。
+
+`tools = { ld = … }` 只对 clang 的树成立——被陈述的链接器以 `--ld-path` 进入链接。gcc 的树
+陈述 `ld` 会被拒绝：gcc 按 `-B` 给出的目录里的名字 `ld` 选链接器，叫别的名字的程序无法那样
+被选中，而一个进了声明却不参与构建的工具，正是这套机制要防的事。
 
 **mcpp 如何驱动它。** 与它自己安装的载荷相同：自己的链接行、自己的 hermetic 检查、自己
 对 `import std` 的判定。它不向该目录树写入任何东西 —— 托管载荷里生成的 `clang++.cfg` 是
