@@ -226,7 +226,18 @@ payload_override(PrepareState& state, std::string_view key) {
             if (!isDir) return refuse(std::format("'{}' is not a directory", p.generic_string()));
             out.root = p.generic_string();
         } else {
-            if (!isFile) return refuse(std::format("'{}' does not exist", p.generic_string()));
+            // THE EXECUTABLE SUFFIX A HOST APPENDS ITSELF. A shell on Windows
+            // answers `C:/Program Files/CMake/bin/cmake` for a `cmake.exe`, and
+            // process creation there appends `.exe`, so a path stated without it
+            // names a program the machine would run. Refusing it would be an
+            // answer about spelling, not about the machine (the same rule the
+            // plugin-side resolver applies to a stated path).
+            if (!isFile) {
+                auto withExe = p;
+                withExe += ".exe";
+                if (fs::is_regular_file(withExe, ec)) p = withExe;
+                else return refuse(std::format("'{}' does not exist", p.generic_string()));
+            }
             out.program = p.generic_string();
             out.root    = root_of_program(p).generic_string();
         }
