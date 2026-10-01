@@ -1572,8 +1572,12 @@ bool local_toolchain_unchanged(const std::filesystem::path& outputDir) {
         if (ec) return false;
         const auto time = std::filesystem::last_write_time(p, ec);
         if (ec) return false;
-        if (std::to_string(size) != line.substr(0, t1)
-            || std::to_string(time.time_since_epoch().count()) != line.substr(t1 + 1, t2 - t1 - 1))
+        // `std::format`, not `std::to_string`: the clock's rep and
+        // `uintmax_t` both convert to two integer overloads of the latter, and
+        // libc++ calls that ambiguous.
+        if (std::format("{}", static_cast<std::uint64_t>(size)) != line.substr(0, t1)
+            || std::format("{}", static_cast<std::int64_t>(time.time_since_epoch().count()))
+                   != line.substr(t1 + 1, t2 - t1 - 1))
             return false;
     }
     return true;

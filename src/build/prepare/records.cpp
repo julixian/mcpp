@@ -598,7 +598,10 @@ void step13_resolution_json(PrepareState& state, BuildContext& ctx) {
                     std::error_code fe;
                     const auto size = std::filesystem::file_size(p, fe);
                     const auto time = std::filesystem::last_write_time(p, fe);
-                    st << size << '\t' << time.time_since_epoch().count() << '\t'
+                    // The same two spellings the fast path compares against.
+                    st << std::format("{}", static_cast<std::uint64_t>(size)) << '\t'
+                       << std::format("{}", static_cast<std::int64_t>(
+                              time.time_since_epoch().count())) << '\t'
                        << p.string() << '\n';
                 };
                 put(ctx.tc.binaryPath);

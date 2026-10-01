@@ -100,9 +100,9 @@ std::string local_identity(const mcpp::toolchain::Toolchain& tc) {
     auto stamp = [&](const fs::path& p) {
         std::error_code ec;
         mix(p.generic_string());
-        mix(std::to_string(fs::file_size(p, ec)));
+        mix(std::format("{}", static_cast<std::uint64_t>(fs::file_size(p, ec))));
         auto t = fs::last_write_time(p, ec);
-        mix(std::to_string(t.time_since_epoch().count()));
+        mix(std::format("{}", static_cast<std::int64_t>(t.time_since_epoch().count())));
     };
     stamp(tc.binaryPath);
     for (auto const& [role, p] : tc.toolOverrides) { mix(role); stamp(p); }
