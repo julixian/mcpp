@@ -54,14 +54,29 @@ if ! out=$("$bin" --version 2>&1); then
 fi
 echo "this commit's mcpp: $out ($bin)"
 
+# The mirror first: the runners are outside CN, and the install below and
+# every later download read it.
+if [ -n "${XLINGS_BIN:-}" ]; then
+    "$XLINGS_BIN" config --mirror "$mirror" 2>/dev/null || true
+fi
+MCPP_VENDORED_XLINGS="${XLINGS_BIN:-}" "$bin" self config --mirror "$mirror"
+
+# THE TOOLCHAIN THE BUILD USED IS INSTALLED, AS IT WAS WHEN EVERY JOB BUILT.
+# A job that built mcpp itself installed this toolchain as a side effect, and
+# the steps after the build relied on it without saying so: measured on the
+# first run of this action, the aarch64 leg of the target matrix restored no
+# sandbox, its binary ran without any payload, and the invariants that list the
+# host's toolchains found none ("gcc is not installed here"). Installing it here
+# keeps every consumer's environment what it was. It is a lookup when the
+# toolchain is present.
+tc="$(manifest_toolchain)"
+if [ -n "$tc" ]; then
+    MCPP_VENDORED_XLINGS="${XLINGS_BIN:-}" "$bin" toolchain install "${tc%@*}" "${tc#*@}"
+fi
+
 {
     echo "MCPP_BOOT=$boot"
     echo "MCPP=$bin"
     echo "MCPP_FRESH=$bin"
     if [ -n "${XLINGS_BIN:-}" ]; then echo "MCPP_VENDORED_XLINGS=$XLINGS_BIN"; fi
 } >> "$GITHUB_ENV"
-
-if [ -n "${XLINGS_BIN:-}" ]; then
-    "$XLINGS_BIN" config --mirror "$mirror" 2>/dev/null || true
-fi
-MCPP_VENDORED_XLINGS="${XLINGS_BIN:-}" "$bin" self config --mirror "$mirror"

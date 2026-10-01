@@ -16,6 +16,9 @@ description: >
   them; when it does not, the bootstrap installs that toolchain and the binary
   is run again. A binary that still does not run fails this step.
 
+  The toolchain mcpp.toml names for the host is then installed with the
+  binary, as a job that built mcpp used to install it as a side effect.
+
 inputs:
   host:
     description: >
