@@ -88,4 +88,21 @@ write_manifest "$work/empty" ''
 out="$("$MCPP" build 2>&1 || true)"
 grep -q "no C++ driver in bin/" <<<"$out" || fail "a tree without a driver was accepted"
 
+# A gcc tree that states `ld` is refused: the role reaches a link through clang's
+# `--ld-path`, and gcc selects a linker by the name `ld` in a `-B` directory, so a
+# program under another name could not be chosen. Refused at the declaration
+# rather than ignored in the link.
+gcc_base="$HOME/.mcpp/registry/data/xpkgs/xim-x-gcc"
+[[ -d "$gcc_base" && -n "${USERPROFILE:-}" ]] || true
+gcc_ver="$(ls -1 "$gcc_base" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -V | tail -1)"
+if [[ -n "$gcc_ver" && -x "$gcc_base/$gcc_ver/bin/g++" ]]; then
+    write_manifest "$gcc_base/$gcc_ver" ', tools = { ld = "'"$work/ld-wrapper"'" }'
+    rm -rf target
+    out="$("$MCPP" build 2>&1 || true)"
+    grep -q "this is a gcc toolchain" <<<"$out" \
+        || fail "a gcc toolchain that states ld was accepted: $out"
+else
+    echo "note: no gcc payload installed, so the gcc refusal is not exercised here"
+fi
+
 echo "PASS: a toolchain named by path builds, is reported, and is identified"
