@@ -6,6 +6,8 @@
 
 import std;
 import mcpp.manifest;
+import mcpp.config;
+import mcpp.libs.toml;
 import mcpp.build.directives;
 import mcpp.toolchain.dialect;
 import mcpp.toolchain.registry;
@@ -228,6 +230,47 @@ TEST(Sources, OverrideVersionIsCheckedAgainstRequirements) {
     auto reqs = addrset::requirements_for(claims, "xim:cmake");
     ASSERT_EQ(reqs.size(), 1u);
     EXPECT_EQ(reqs[0], ">=3.31 by mcpp:plugins");
+}
+
+// ── [xlings.overrides] in config.toml ───────────────────────────────────────
+
+TEST(Sources, ConfigOverridesParseWithTheManifestsTwoShapes) {
+    auto doc = mcpp::libs::toml::parse(R"(
+[xlings.overrides]
+"xim:cmake" = "/usr/bin/cmake"
+vcpkg       = { root = "/opt/vcpkg" }
+"xim:slang" = { program = "slangc", version = "2026.14.1" }
+)");
+    ASSERT_TRUE(doc.has_value());
+    auto o = mcpp::config::parse_payload_overrides(*doc);
+    ASSERT_TRUE(o.has_value()) << o.error();
+    ASSERT_EQ(o->size(), 3u);
+    EXPECT_EQ(o->at("xim:cmake").kind, "path");
+    EXPECT_EQ(o->at("xim:cmake").value, "/usr/bin/cmake");
+    // A key without a namespace names the `xim` package, as everywhere else.
+    EXPECT_EQ(o->at("xim:vcpkg").kind, "root");
+    EXPECT_EQ(o->at("xim:slang").kind, "program");
+    EXPECT_EQ(o->at("xim:slang").version, "2026.14.1");
+    EXPECT_GT(o->at("xim:cmake").line, 0);
+}
+
+TEST(Sources, ConfigOverrideWithAnUnknownKeyIsRefused) {
+    auto doc = mcpp::libs::toml::parse(R"(
+[xlings.overrides]
+cmake = { programme = "/usr/bin/cmake" }
+)");
+    ASSERT_TRUE(doc.has_value());
+    auto o = mcpp::config::parse_payload_overrides(*doc);
+    ASSERT_FALSE(o.has_value());
+    EXPECT_NE(o.error().find("programme"), std::string::npos) << o.error();
+}
+
+TEST(Sources, ConfigWithoutTheTableHasNoOverrides) {
+    auto doc = mcpp::libs::toml::parse("[toolchain]\ndefault = \"gcc@16.1.0\"\n");
+    ASSERT_TRUE(doc.has_value());
+    auto o = mcpp::config::parse_payload_overrides(*doc);
+    ASSERT_TRUE(o.has_value()) << o.error();
+    EXPECT_TRUE(o->empty());
 }
 
 // ── A toolchain named by path ───────────────────────────────────────────────
