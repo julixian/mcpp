@@ -28,11 +28,11 @@ class ClassifyChanges(unittest.TestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.root = Path(self._dir.name)
         (self.root / "docs").mkdir()
-        (self.root / "docs" / "10-guide.md").write_text("guide\n")
-        (self.root / "docs" / "03-examples.md").write_text("examples\n")
+        (self.root / "docs" / "guide.md").write_text("guide\n")
+        (self.root / "docs" / "examples.md").write_text("examples\n")
         (self.root / "tests" / "e2e").mkdir(parents=True)
         (self.root / "tests" / "e2e" / "616_examples.sh").write_text(
-            'grep -q x "$ROOT/docs/03-examples.md"\n')
+            'grep -q x "$ROOT/docs/examples.md"\n')
         (self.root / "src").mkdir()
         (self.root / "src" / "main.cpp").write_text("int main() {}\n")
 
@@ -40,18 +40,18 @@ class ClassifyChanges(unittest.TestCase):
         self._dir.cleanup()
 
     def test_documentation_that_nothing_names_is_not_code(self) -> None:
-        self.assertEqual(classify(self.root, ["docs/10-guide.md", ".agents/docs/x.md",
+        self.assertEqual(classify(self.root, ["docs/guide.md", ".agents/docs/x.md",
                                               "README.md", "LICENSE"]), "code=false")
 
     def test_a_document_a_test_reads_is_code(self) -> None:
-        self.assertEqual(classify(self.root, ["docs/03-examples.md"]), "code=true")
+        self.assertEqual(classify(self.root, ["docs/examples.md"]), "code=true")
 
     def test_the_translation_of_a_document_a_test_reads_is_code(self) -> None:
-        # The test names docs/03-examples.md; docs/zh/03-examples.md is its translation.
-        self.assertEqual(classify(self.root, ["docs/zh/03-examples.md"]), "code=true")
+        # The test names docs/examples.md; docs/zh/examples.md is its translation.
+        self.assertEqual(classify(self.root, ["docs/zh/examples.md"]), "code=true")
 
     def test_any_other_path_is_code(self) -> None:
-        self.assertEqual(classify(self.root, ["docs/10-guide.md", "src/main.cpp"]), "code=true")
+        self.assertEqual(classify(self.root, ["docs/guide.md", "src/main.cpp"]), "code=true")
 
     def test_an_empty_change_is_code(self) -> None:
         self.assertEqual(classify(self.root, []), "code=true")
