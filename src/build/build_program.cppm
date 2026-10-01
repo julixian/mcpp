@@ -430,19 +430,24 @@ std::string response_file_body(std::span<const std::string> args, bool gnuQuotin
     std::string body;
     for (auto const& a : args) {
         if (gnuQuoting) {
-            // GNU TOKENIZATION TREATS A BACKSLASH AS AN ESCAPE, everywhere but
-            // inside single quotes. A Windows path written plainly therefore
-            // arrives with its separators eaten -- clang read
+            // GNU TOKENIZATION TREATS A BACKSLASH AS AN ESCAPE, INCLUDING INSIDE
+            // QUOTES -- which is where this differs from a POSIX shell, and where
+            // the first attempt at this function was wrong. A Windows path
+            // written plainly arrives with its separators eaten: clang read
             // `D:\a\mcpp-plugins\...` back as `D:amcpp-plugins...` and
-            // reported `no such file or directory`. Inside single quotes every
-            // character is literal, so each argument is wrapped, and an embedded
-            // single quote is closed, escaped and reopened.
-            body.push_back('\'');
+            // reported `no such file or directory`, and single-quoting it changed
+            // nothing. Measured with clang 22.1.8: a response file holding
+            // `'-DX=a\b'` yields `X=ab`, and one holding `-DX=a\\b` yields
+            // `X=a\b`. So every backslash is doubled and every quote escaped,
+            // and whitespace is handled by quoting the whole argument.
+            const bool quote = a.find_first_of(" \t") != std::string::npos;
+            if (quote) body.push_back('"');
             for (char c : a) {
-                if (c == '\'') body += "'\\''";
-                else body.push_back(c);
+                if (c == '\\' || c == '"') body.push_back('\\');
+                body.push_back(c);
             }
-            body += "'\n";
+            if (quote) body.push_back('"');
+            body.push_back('\n');
             continue;
         }
         // Windows tokenization (cl, clang-cl): a backslash is literal except

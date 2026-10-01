@@ -253,20 +253,25 @@ TEST(Sources, ResponseFileQuotesForTheWindowsTokenizer) {
 }
 
 TEST(Sources, ResponseFileKeepsBackslashesLiteralForTheGnuTokenizer) {
-    // clang and GCC read a backslash as an escape, so a Windows path written
-    // plainly comes back with its separators eaten; inside single quotes
-    // nothing is special.
+    // clang and GCC read a backslash as an escape, inside quotes as well as
+    // outside, so a Windows path survives only when every backslash is doubled.
+    // Measured with clang 22.1.8: `'-DX=a\b'` in a response file yields `X=ab`,
+    // and `-DX=a\\b` yields `X=a\b`.
     const std::vector<std::string> args{
         "-fmodule-file=mcpp=D:\\a\\p\\mcpp.pcm",
         "D:\\a\\obj\\x.o",
-        "-DNAME=it's",
+        "/Tp D:\\a\\b c\\build.mcpp",
+        R"(-DNAME="v")",
     };
     const auto body = mcpp::build::response_file_body(args, /*gnuQuoting=*/true);
-    EXPECT_EQ(std::ranges::count(body, '\n'), 3);
-    EXPECT_NE(body.find("'-fmodule-file=mcpp=D:\\a\\p\\mcpp.pcm'\n"), std::string::npos) << body;
-    EXPECT_NE(body.find("'D:\\a\\obj\\x.o'\n"), std::string::npos) << body;
-    // A single quote in the argument closes, escapes and reopens.
-    EXPECT_NE(body.find("'-DNAME=it'\\''s'\n"), std::string::npos) << body;
+    EXPECT_EQ(std::ranges::count(body, '\n'), 4);
+    EXPECT_NE(body.find("-fmodule-file=mcpp=D:\\\\a\\\\p\\\\mcpp.pcm\n"), std::string::npos) << body;
+    EXPECT_NE(body.find("D:\\\\a\\\\obj\\\\x.o\n"), std::string::npos) << body;
+    // Whitespace is handled by quoting the whole argument; the doubling holds
+    // inside the quotes too.
+    EXPECT_NE(body.find("\"/Tp D:\\\\a\\\\b c\\\\build.mcpp\"\n"), std::string::npos) << body;
+    // A quote of the argument's own is escaped.
+    EXPECT_NE(body.find("-DNAME=\\\"v\\\"\n"), std::string::npos) << body;
 }
 
 // ── [xlings.overrides] in config.toml ───────────────────────────────────────
