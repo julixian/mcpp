@@ -7,6 +7,7 @@
 import std;
 import mcpp.manifest;
 import mcpp.config;
+import mcpp.build.build_program;
 import mcpp.libs.toml;
 import mcpp.build.directives;
 import mcpp.toolchain.dialect;
@@ -230,6 +231,29 @@ TEST(Sources, OverrideVersionIsCheckedAgainstRequirements) {
     auto reqs = addrset::requirements_for(claims, "xim:cmake");
     ASSERT_EQ(reqs.size(), 1u);
     EXPECT_EQ(reqs[0], ">=3.31 by mcpp:plugins");
+}
+
+// ── The response file a long compile command goes through ───────────────────
+
+TEST(Sources, ResponseFileWritesOneArgumentPerLineAndQuotesWhatNeedsIt) {
+    const std::vector<std::string> args{
+        "-std=c++23",
+        "-fmodule-file=mcpp=/home/u/p/mcpp.pcm",
+        "/Tp C:/Program Files/x/build.mcpp",
+        R"(-DNAME="v")",
+        "C:\\with space\\dir\\",
+    };
+    const auto body = mcpp::build::response_file_body(args);
+    EXPECT_EQ(std::ranges::count(body, '\n'), 5);
+    EXPECT_NE(body.find("-std=c++23\n"), std::string::npos) << body;
+    // Quoted only where it has to be.
+    EXPECT_NE(body.find("-fmodule-file=mcpp=/home/u/p/mcpp.pcm\n"), std::string::npos) << body;
+    EXPECT_NE(body.find("\"/Tp C:/Program Files/x/build.mcpp\"\n"), std::string::npos) << body;
+    // A quote inside the argument survives as one.
+    EXPECT_NE(body.find("\"-DNAME=\\\"v\\\"\"\n"), std::string::npos) << body;
+    // The run of backslashes that ends the argument is doubled, so it does not
+    // escape the closing quote.
+    EXPECT_NE(body.find("\"C:\\with space\\dir\\\\\"\n"), std::string::npos) << body;
 }
 
 // ── [xlings.overrides] in config.toml ───────────────────────────────────────
