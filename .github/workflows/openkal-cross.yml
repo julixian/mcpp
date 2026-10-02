@@ -55,17 +55,7 @@ name: openkal cross-build (3 hosts × 3 targets)
 # means the unwinder found this image's own frame descriptions.
 
 on:
-  pull_request:
-  workflow_dispatch:
-    inputs:
-      openkal_ref:
-        description: "Branch of the openkal packages to build against (empty = main)"
-        required: false
-        default: ""
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 env:
   # No mcpp or xlings version here. `bootstrap-mcpp` owns both, and a second
@@ -138,7 +128,22 @@ jobs:
 
       # THE mcpp UNDER TEST. Everything after this uses the binary this step
       # produces; the bootstrapped one above is only what compiles it.
+      # This commit's mcpp: the one build.yml produced (use-built-mcpp, rule R1
+      # of the 2026-10-02 CI record), except on the macOS leg. That leg runs on
+      # macos-14 and the macOS artifact is built on macos-15; whether it runs on
+      # macos-14 is not measured (the record's Part VII), so the leg builds its
+      # own until it is.
+      - if: matrix.host != 'macos'
+        uses: ./.github/actions/use-built-mcpp
+        with:
+          host: ${{ matrix.host == 'linux' && 'linux-x86_64' || 'windows-x86_64' }}
+
+      - name: Name this commit's mcpp MCPP_UNDER_TEST
+        if: matrix.host != 'macos'
+        run: echo "MCPP_UNDER_TEST=$MCPP_FRESH" >> "$GITHUB_ENV"
+
       - name: Build the mcpp in this pull request
+        if: matrix.host == 'macos'  # ci-lint: allow-r1: the macOS leg builds its own mcpp until the artifact is measured on macos-14
         run: |
           set -euo pipefail
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
@@ -481,26 +486,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap-mcpp
 
-      - name: Build the mcpp in this pull request
-        run: |
-          set -euo pipefail
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$XLINGS_BIN" config --mirror GLOBAL 2>/dev/null || true
-          "$MCPP" self config --mirror GLOBAL 2>/dev/null || true
-          "$MCPP" build --dev
-          # NEWEST BY MTIME, NOT FIRST BY DIRECTORY ORDER. `target/` holds one
-          # directory per fingerprint and the runner restores a cache of it, so
-          # `find … | head -1` can return a binary an earlier run left behind.
-          # Measured: it reported the right VERSION STRING — the stale copy was
-          # built from an earlier push of this same release — while missing the
-          # last two commits, so one new test passed and two failed for reasons
-          # that were nowhere in the source.
-          BUILT=$(find target -type f -name 'mcpp' -printf '%T@ %p\n' \
-                  | sort -rn | head -1 | cut -d' ' -f2)
-          [ -n "$BUILT" ] || { echo "::error::mcpp did not build"; exit 1; }
-          BUILT=$(cd "$(dirname "$BUILT")" && pwd)/$(basename "$BUILT")
-          echo "MCPP_UNDER_TEST=$BUILT" >> "$GITHUB_ENV"
-          "$BUILT" --version
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: linux-x86_64
+
+      - name: Name this commit's mcpp MCPP_UNDER_TEST
+        run: echo "MCPP_UNDER_TEST=$MCPP_FRESH" >> "$GITHUB_ENV"
 
       - name: Install what the scripts declare
         run: |

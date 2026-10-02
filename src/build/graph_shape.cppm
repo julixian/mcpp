@@ -133,6 +133,36 @@ std::string read_request(const std::filesystem::path& ninjaPath) {
     return {};
 }
 
+// The engine this graph runs as `$mcpp`, the binding every graph carries (see
+// the emitter in ninja_backend.cppm), unescaped and in generic form; empty when
+// the file cannot be read or binds no engine. The record of a build names the
+// engine that wrote the record, and that is not always the one that wrote the
+// graph: another engine's `--configure-only` rewrites build.ninja and leaves the
+// record as it was. The graph is the authority on what it will run.
+std::string read_engine_binding(const std::filesystem::path& ninjaPath) {
+    std::ifstream input(ninjaPath);
+    if (!input) return {};
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.starts_with("mcpp ") && !line.starts_with("mcpp=")) continue;
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string_view value = std::string_view(line).substr(eq + 1);
+        while (!value.empty() && value.front() == ' ') value.remove_prefix(1);
+        while (!value.empty() && (value.back() == '\r' || value.back() == ' '))
+            value.remove_suffix(1);
+        // The inverse of escape_ninja_path: `$$`, `$:` and `$ ` stand for the
+        // character after the dollar.
+        std::string out;
+        for (std::size_t i = 0; i < value.size(); ++i) {
+            if (value[i] == '$' && i + 1 < value.size()) { out += value[++i]; continue; }
+            out += value[i];
+        }
+        return out;
+    }
+    return {};
+}
+
 // Read the shape back. `nullopt` means "this file does not say" — a build.ninja
 // written before this line existed, an unreadable file, or something that is
 // not a mcpp graph at all. Callers must treat that as a MISS, never as

@@ -12,7 +12,7 @@
 | [文档](docs/zh/) · [快速开始](docs/zh/01-getting-started.md) · [mcpp.toml 指南](docs/zh/04-mcpp-toml.md) · [示例项目](docs/zh/03-examples.md) · [工具链管理](docs/zh/20-toolchains.md) |
 |:---:|
 | [包索引 mcpp-index](https://mcpplibs.github.io/mcpp-index/) · [模块化库 mcpplibs](https://github.com/mcpplibs) · [社区论坛](https://forum.d2learn.org/category/20) · [Issues](https://github.com/mcpp-community/mcpp/issues) · [Releases](https://github.com/mcpp-community/mcpp/releases) |
-| [![ci-linux](https://github.com/mcpp-community/mcpp/actions/workflows/ci-linux.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci-linux.yml) [![ci-macos](https://github.com/mcpp-community/mcpp/actions/workflows/ci-macos.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci-macos.yml) [![ci-windows](https://github.com/mcpp-community/mcpp/actions/workflows/ci-windows.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci-windows.yml) |
+| [![ci](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml) |
 | 支持的插件 · [mcpp-language-server（mcppls）](https://github.com/Sunrisepeak/mcpp-language-server) —— C++20/23 模块语言服务器，面向 VS Code、Zed、CLion、Neovim、AI Agent（MCP）与 CI |
 
 <p align="center">

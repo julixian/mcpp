@@ -14,15 +14,7 @@ name: ci-macos-ios
 # assertion before.
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-macos-ios-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   # THE PREMISES, AS A PROBE THAT RUNS ON REQUEST.
@@ -168,11 +160,9 @@ jobs:
           submodules: recursive
       - uses: ./.github/actions/setup-macos-llvm
 
-      - name: Build mcpp from source (self-host)
-        run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP" build
-          echo "MCPP_DEV=$(ls -td "$PWD"/target/*/*/bin/mcpp | head -1)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: macos-arm64
 
       # NO TOOLCHAIN IS DECLARED, AND THAT IS WHAT MAKES THIS THE USER'S PATH.
       #
@@ -288,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/iostest
-          "$MCPP_DEV" build --target aarch64-ios
+          "$MCPP_FRESH" build --target aarch64-ios
           /tmp/assert-artefact.sh aarch64-ios arm64 2 18.0
 
       # `platform 7` is IOSSIMULATOR. The number is what separates this row from
@@ -297,7 +287,7 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/iostest
-          "$MCPP_DEV" build --target aarch64-ios-sim 2>&1 | tee build-sim.log
+          "$MCPP_FRESH" build --target aarch64-ios-sim 2>&1 | tee build-sim.log
           /tmp/assert-artefact.sh aarch64-ios-sim arm64 7 18.0
 
       # THE TWO LAYERS THE PACKAGES SUPPLY, READ FROM THE REPORT AND FROM THE
@@ -335,14 +325,14 @@ jobs:
           version = "0.1.0"
           TOML
           printf 'import std;\nint main() { std::print("x\\n"); }\n' > src/main.cpp
-          "$MCPP_DEV" build --target aarch64-ios-sim > mixed.log 2>&1 || { echo "FAIL: import std without llvm.libcxx no longer builds"; cat mixed.log; exit 1; }
+          "$MCPP_FRESH" build --target aarch64-ios-sim > mixed.log 2>&1 || { echo "FAIL: import std without llvm.libcxx no longer builds"; cat mixed.log; exit 1; }
           # A degradation renders its `what` text, not its domain, so the
           # sentence is what a log can be asked for.
           grep -q "links the SDK's libc++ under the toolchain payload's libc++ headers" mixed.log || { echo "FAIL: no degradation named the mixed libc++"; cat mixed.log; exit 1; }
           grep -q 'llvm.libcxx' mixed.log || { echo "FAIL: the degradation does not name llvm.libcxx"; cat mixed.log; exit 1; }
           printf '#include <cstdio>\n#include <string>\nint main() { std::string s = "1-2-3"; std::puts(s.c_str()); }\n' > src/main.cpp
           rm -rf target
-          "$MCPP_DEV" build --target aarch64-ios-sim 2>&1 | tee plain.log
+          "$MCPP_FRESH" build --target aarch64-ios-sim 2>&1 | tee plain.log
           grep -q 'carries no compiler runtime for aarch64-ios-sim' plain.log || { echo "FAIL: no degradation named the missing compiler runtime"; exit 1; }
           grep -q "links the SDK's libc++ under" plain.log && { echo "FAIL: a program without import std was reported as mixing libc++"; exit 1; }
           ninja=$(ls target/aarch64-ios-sim/*/build.ninja | head -1)
@@ -365,7 +355,7 @@ jobs:
         run: |
           set -uo pipefail
           cd /tmp/iostest
-          out=$("$MCPP_DEV" run --target aarch64-ios-sim 2>&1) && rc=0 || rc=$?
+          out=$("$MCPP_FRESH" run --target aarch64-ios-sim 2>&1) && rc=0 || rc=$?
           printf '%s\n' "$out" | tail -20
           if [ "$rc" -ne 0 ]; then
             echo "FAIL: mcpp run --target aarch64-ios-sim exited $rc"
@@ -384,5 +374,5 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/iostest
-          "$MCPP_DEV" build --target x86_64-ios-sim
+          "$MCPP_FRESH" build --target x86_64-ios-sim
           /tmp/assert-artefact.sh x86_64-ios-sim x86_64 7 18.0

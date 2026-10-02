@@ -31,15 +31,7 @@ name: ci-windows-msvc-xlings
 # Paired workflows: ci-windows.yml, ci-windows-e2e.yml.
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   xlings-msvc:
@@ -52,21 +44,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap-mcpp
 
-      - name: Build mcpp from source (self-host)
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: windows-x86_64
+
+      - name: Name this commit's mcpp MCPP_SELF
         shell: bash
         run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP" build
-          # Newest mcpp.exe, not an arbitrary one — `target/` is restored from
-          # cache and keeps a directory per build fingerprint. Same reasoning
-          # as ci-windows-e2e.yml, where picking wrong ran the previous
-          # release's binary.
-          MCPP_SELF=$(find target -name "mcpp.exe" -path "*/bin/*" -printf "%T@ %p\n" \
-              | sort -rn | head -1 | cut -d" " -f2-)
-          test -n "$MCPP_SELF" || { echo "FAIL: no mcpp.exe"; exit 1; }
-          MCPP_SELF=$(cd "$(dirname "$MCPP_SELF")" && pwd)/$(basename "$MCPP_SELF")
-          "$MCPP_SELF" --version
-          echo "MCPP_SELF=$MCPP_SELF" >> "$GITHUB_ENV"
+          "$MCPP_FRESH" --version
+          echo "MCPP_SELF=$MCPP_FRESH" >> "$GITHUB_ENV"
 
       - name: xlings-managed msvc e2e
         shell: bash

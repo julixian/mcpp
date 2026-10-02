@@ -182,14 +182,16 @@ gh pr checks <pr-number>           # 查看状态
 gh run view <run-id> --log-failed  # 查看失败日志
 ```
 
-CI 由分平台的基础构建/单元集成检查与独立 E2E 检查组成：
-| Workflow | 平台 | 内容 |
-|----------|------|------|
-| `ci-linux` / `ci-linux-e2e` | Linux x86_64 | 自举构建、unit/integration / 分片 E2E |
-| `ci-macos` / `ci-macos-e2e` | macOS ARM64 | 自举构建、unit/integration / E2E |
-| `ci-windows` / `ci-windows-e2e` | Windows x86_64 | 自举构建、toolchain 回归 / E2E |
-| `cross-build-test` | Linux/Windows cross targets | 交叉构建、产物运行与 MinGW/Wine 检查 |
-| `ci-aarch64-fresh-install` | Linux ARM64 native | path-filtered fresh install、原生自举与 musl `build.mcpp` host-helper 回归 |
+一次提交的 CI 是 `ci.yml` 的一次运行，分段执行（设计见 `.agents/docs/2026-10-02-pr-ci-acceleration-and-the-toolchain-specification-design.md` 第二部分）：
+| 阶段 | 内容 |
+|------|------|
+| `changes` | 按改动路径分类；只改了没有任何脚本、测试或源码读取的文档时，只跑 `docs` |
+| `docs` | 不需要二进制的检查（版本钉、文档风格与结构、工作流断言等） |
+| `build-*` | 每个宿主构建一次 mcpp（`build.yml`），上传为 `mcpp-built-<host>` |
+| `linux` / `linux-e2e`、`macos` / `macos-e2e` / `macos-ios`、`windows` / `windows-e2e` / `windows-msvc-xlings`、`cross`、`target-matrix`、`openkal` | 各领域的可复用工作流（原来的 `ci-*.yml`），通过 `.github/actions/use-built-mcpp` 使用上面那次构建，不再各自构建 |
+| `e2e-coverage` | 每个 e2e 测试都在某个宿主上运行、由专门 job 运行，或在 `tests/e2e/coverage-exceptions.tsv` 中写明原因 |
+
+`ci-aarch64-fresh-install`、`measure-windows-tool-crt` 与 `pypi-publish` 仍是按路径触发的独立工作流。缓存只在 main 上由一个 job 保存；PR 只恢复。
 
 **以 PR 实际 required checks 为准，所有未跳过的 required checks 必须通过。** 如果某个平台失败：
 1. 下载日志分析原因

@@ -1,13 +1,21 @@
 name: bootstrap-mcpp
 description: >
-  Restore the shared CI cache lineage (mcpp sandbox + xlings + target/) and
-  bootstrap a released mcpp via xlings. Exports MCPP and XLINGS_BIN.
+  Restore the shared CI cache lineage (mcpp sandbox and xlings) and bootstrap
+  a released mcpp via xlings. Exports MCPP and XLINGS_BIN.
 
-  Extracted so the split CI jobs (build / toolchain legs / e2e shards /
-  integration) share ONE definition instead of copy-pasting a 40-line
-  preamble per job. Every job that uses it lands on the same cache keys,
-  which is what makes splitting cheap: each job restores a warm sandbox
-  and only pays one incremental `mcpp build`.
+  The caches are RESTORED here and never saved. One job per host writes them,
+  the build job of .github/workflows/build.yml, and only on a push to main
+  (rule R3 of .agents/docs/2026-10-02-pr-ci-acceleration-and-the-toolchain-
+  specification-design.md). Before that rule every job that used this action
+  saved the same key on success: thirty-four to forty-two saves per pull
+  request against a 10 GB repository limit, parallel saves of one key racing
+  each other, and the main lineage evicted within forty minutes (measured
+  2026-10-01). The keys are outputs so that the one writer saves exactly what
+  was restored.
+
+  `target/` is no longer cached. A restored `target/` made no build
+  incremental: on an exact hit ninja still ran 830 of 830 edges, while the
+  caches themselves were up to 3.3 GB each.
 
 inputs:
   xlings-version:
@@ -26,10 +34,20 @@ inputs:
     # depended on the machine, which is why CI failed on `compat:lua` on
     # Windows and `mcpplibs.capi:lua` on Linux. Never pin below that.
     default: '2026.9.30.1'
-  cache-target:
-    description: also restore/save target/ (build artifacts + BMIs)
-    required: false
-    default: 'true'
+
+outputs:
+  sandbox-key:
+    description: the exact key of the mcpp sandbox cache
+    value: ${{ steps.sandbox.outputs.cache-primary-key }}
+  sandbox-hit:
+    description: "'true' when the sandbox was restored by its exact key"
+    value: ${{ steps.sandbox.outputs.cache-hit }}
+  xlings-key:
+    description: the exact key of the xlings cache
+    value: ${{ steps.xlings.outputs.cache-primary-key }}
+  xlings-hit:
+    description: "'true' when xlings was restored by its exact key"
+    value: ${{ steps.xlings.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -38,8 +56,9 @@ runs:
     # "-release-" caches. A bare "mcpp-sandbox-<os>-" restore prefix used to
     # match the release sandbox too, silently swapping in a differently
     # populated registry (issue #120).
-    - name: Cache mcpp sandbox
-      uses: actions/cache@v4
+    - name: Restore the mcpp sandbox
+      id: sandbox
+      uses: actions/cache/restore@v4
       with:
         path: ~/.mcpp
         # `runner.arch` IS PART OF EVERY KEY, AND WAS NOT.
@@ -66,12 +85,16 @@ runs:
         # sandbox — which is what actually resolves dependencies — would
         # silently stay behind (observed: a 0.4.30 sandbox surviving under a
         # 0.4.69 bootstrap for weeks).
-        key: mcpp-sandbox-${{ runner.os }}-${{ runner.arch }}-ci-xl${{ inputs.xlings-version }}-${{ hashFiles('mcpp.toml', '.xlings.json') }}
+        # ci.yml is part of the key because it names the toolchains the build
+        # job installs before it saves (`prewarm`): a sandbox saved under an
+        # unchanged key would never gain one added there.
+        key: mcpp-sandbox-${{ runner.os }}-${{ runner.arch }}-ci-xl${{ inputs.xlings-version }}-${{ hashFiles('mcpp.toml', '.xlings.json', '.github/workflows/ci.yml') }}
         restore-keys: |
           mcpp-sandbox-${{ runner.os }}-${{ runner.arch }}-ci-xl${{ inputs.xlings-version }}-
 
-    - name: Cache xlings
-      uses: actions/cache@v4
+    - name: Restore xlings
+      id: xlings
+      uses: actions/cache/restore@v4
       with:
         path: ~/.xlings
         key: xlings-${{ runner.os }}-${{ runner.arch }}-v2-xl${{ inputs.xlings-version }}-${{ hashFiles('.xlings.json') }}
@@ -109,6 +132,37 @@ runs:
             esac
             tarball="xlings-${XLINGS_VERSION}-linux-${xa}.tar.gz" ;;
         esac
+        # FAST PATH: the xlings cache already holds the pinned version, so the
+        # tarball fetch + extract + `self install` are skipped. Without this
+        # guard every job of every CI run paid the download and the extract,
+        # measured at 5 to 30 seconds per job on Linux and ~30 seconds on
+        # Windows, across thirty jobs per run — about half the bootstrap-mcpp
+        # step on Windows, more the 7 seconds the unix leg pays. The cache key
+        # is `xl$VER` already; the check is the one case this guard would
+        # otherwise miss: a stale `xlings` cache from BEFORE the pin was
+        # bumped (a partial restore-key match hands the same OS/ARCH cache
+        # back, but with the previous release), or a binary that no longer runs
+        # because its dynamic loader is gone.
+        XL_BIN_PATH="$HOME/.xlings/subos/default/bin/xlings"
+        if [ -x "$XL_BIN_PATH" ]; then
+          xl_ver="$("$XL_BIN_PATH" --version 2>/dev/null | head -1 || true)"
+          if [ -n "$xl_ver" ] && echo "$xl_ver" | grep -qF "$XLINGS_VERSION"; then
+            export PATH="$HOME/.xlings/subos/default/bin:$PATH"
+            echo "$HOME/.xlings/subos/default/bin" >> "$GITHUB_PATH"
+            "$XL_BIN_PATH" --version
+            MCPP=$(bash "$REPO_DIR/.github/tools/install_pinned_mcpp.sh" "$REPO_DIR")
+            echo "system  xlings: $("$XL_BIN_PATH" --version 2>/dev/null | head -1)"
+            if [ -x "$HOME/.mcpp/registry/bin/xlings" ]; then
+              echo "sandbox xlings: $("$HOME/.mcpp/registry/bin/xlings" --version 2>/dev/null | head -1)"
+            else
+              echo "sandbox xlings: (not initialised yet)"
+            fi
+            echo "MCPP=$MCPP" >> "$GITHUB_ENV"
+            echo "XLINGS_BIN=$XL_BIN_PATH" >> "$GITHUB_ENV"
+            exit 0
+          fi
+        fi
+
         WORK=$(mktemp -d)
         # Retried and verified — see .github/tools/fetch_release.sh. A bare curl
         # here was the single largest source of unexplained CI red on this repo
@@ -179,6 +233,37 @@ runs:
         XLINGS_VERSION: ${{ inputs.xlings-version }}
       run: |
         REPO_DIR="$(pwd)"
+        # FAST PATH: see the unix leg for the reasoning. The cost on Windows is
+        # larger (the zip is bigger and the runner's network path to
+        # github.com is slower), measured at ~30 s per job.
+        #
+        # The fast path addresses xlings by ABSOLUTE PATH, not by bare
+        # `xlings.exe`. The cold path runs `xlings self install` first, which
+        # writes the dir into Windows PATH via `[Environment]::SetEnvironmentVariable`;
+        # without that step a bare `xlings.exe` call depends on the bash
+        # export PATH, which Git Bash re-derives from Windows on every child
+        # shell and drops the mixed-separator entry. install_pinned_mcpp.sh
+        # carries the same note.
+        XL_BIN_PATH="$USERPROFILE/.xlings/subos/default/bin/xlings.exe"
+        if [ -x "$XL_BIN_PATH" ]; then
+          xl_ver="$("$XL_BIN_PATH" --version 2>/dev/null | head -1 || true)"
+          if [ -n "$xl_ver" ] && echo "$xl_ver" | grep -qF "$XLINGS_VERSION"; then
+            export PATH="$USERPROFILE/.xlings/subos/default/bin:$PATH"
+            echo "$USERPROFILE/.xlings/subos/default/bin" >> "$GITHUB_PATH"
+            "$XL_BIN_PATH" --version
+            MCPP=$(bash "$REPO_DIR/.github/tools/install_pinned_mcpp.sh" "$REPO_DIR")
+            echo "system  xlings: $("$XL_BIN_PATH" --version 2>/dev/null | head -1)"
+            if [ -x "$USERPROFILE/.mcpp/registry/bin/xlings.exe" ]; then
+              echo "sandbox xlings: $("$USERPROFILE/.mcpp/registry/bin/xlings.exe" --version 2>/dev/null | head -1)"
+            else
+              echo "sandbox xlings: (not initialised yet)"
+            fi
+            echo "MCPP=$MCPP" >> "$GITHUB_ENV"
+            echo "XLINGS_BIN=$(cygpath -w "$XL_BIN_PATH")" >> "$GITHUB_ENV"
+            exit 0
+          fi
+        fi
+
         WORK=$(mktemp -d)
         zipfile="xlings-${XLINGS_VERSION}-windows-x86_64.zip"
         # Same helper as the unix leg. This is the leg that kept failing, and a
@@ -207,17 +292,3 @@ runs:
     # Precise key on src/ + manifest so a no-source-change run lands on a full
     # hit; layered restore-keys let partial hits keep BMI/dyndep state for a
     # proper incremental build.
-    - name: Cache target/ (build artifacts + BMIs)
-      if: inputs.cache-target == 'true'
-      uses: actions/cache@v4
-      with:
-        path: target
-        # `modules/**` belongs here as much as `src/**` does. mcpp's own
-        # source lives in both since the subsystem split, and a key that hashed
-        # only one of them would restore a target/ built from different sources
-        # and report success — the failure mode a cache key exists to prevent,
-        # arriving silently.
-        key: mcpp-target-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('src/**', 'modules/**', 'tests/**', 'mcpp.toml', 'mcpp.lock') }}
-        restore-keys: |
-          mcpp-target-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          mcpp-target-${{ runner.os }}-${{ runner.arch }}-

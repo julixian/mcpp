@@ -6,14 +6,7 @@ name: target matrix
 # 装了某个载荷」而通过,或因为没装而跳过,而两者在退出码上与「全部正确」没有区别。
 # 三个宿主各扫一遍,把结果与仓库里的期望表比对,差异即失败。
 on:
-  pull_request:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 env:
   XLINGS_NON_INTERACTIVE: '1'
@@ -50,7 +43,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap-mcpp
 
+      # This commit's mcpp: the one build.yml produced (use-built-mcpp, rule R1
+      # of the 2026-10-02 CI record), except on the macOS leg. That leg runs on
+      # macos-14 and the macOS artifact is built on macos-15; whether it runs on
+      # macos-14 is not measured (the record's Part VII), so the leg builds its
+      # own until it is.
+      - if: matrix.host != 'macos-arm64'
+        uses: ./.github/actions/use-built-mcpp
+        with:
+          host: ${{ matrix.host }}
+
+      - name: Name this commit's mcpp MCPP_UNDER_TEST
+        if: matrix.host != 'macos-arm64'
+        run: echo "MCPP_UNDER_TEST=$MCPP_FRESH" >> "$GITHUB_ENV"
+
       - name: Build the mcpp in this pull request
+        if: matrix.host == 'macos-arm64'  # ci-lint: allow-r1: the macOS leg builds its own mcpp until the artifact is measured on macos-14
         run: |
           set -euo pipefail
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
@@ -258,7 +266,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap-mcpp
 
+      # This commit's mcpp: the one build.yml produced (use-built-mcpp, rule R1
+      # of the 2026-10-02 CI record), except on the macOS leg. That leg runs on
+      # macos-14 and the macOS artifact is built on macos-15; whether it runs on
+      # macos-14 is not measured (the record's Part VII), so the leg builds its
+      # own until it is.
+      - if: matrix.host != 'macos-arm64'
+        uses: ./.github/actions/use-built-mcpp
+        with:
+          host: ${{ matrix.host }}
+
+      - name: Name this commit's mcpp MCPP_UNDER_TEST
+        if: matrix.host != 'macos-arm64'
+        run: echo "MCPP_UNDER_TEST=$MCPP_FRESH" >> "$GITHUB_ENV"
+
       - name: Build the mcpp in this pull request
+        if: matrix.host == 'macos-arm64'  # ci-lint: allow-r1: the macOS leg builds its own mcpp until the artifact is measured on macos-14
         run: |
           set -euo pipefail
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"

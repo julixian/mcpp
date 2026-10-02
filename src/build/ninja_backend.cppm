@@ -283,9 +283,19 @@ std::optional<std::string> ninja_encoding_mismatch(std::string_view reported,
                                                    unsigned processCodePage,
                                                    std::string_view ninjaProgram);
 
+// Where this engine is: the absolute path the emitter writes into build.ninja
+// for the `$mcpp` rules and the `__action` wrapper. It is exported so that the
+// record of a build (`.build_cache`) states the engine by the same function the
+// graph does; two spellings of "where am I" would be one decision derived twice.
+std::filesystem::path mcpp_exe_path();
+
 }  // namespace mcpp::build
 
 namespace mcpp::build {
+
+std::filesystem::path mcpp_exe_path() {
+    return mcpp::platform::fs::self_exe_path();
+}
 
 namespace {
 
@@ -653,10 +663,6 @@ bool dyndep_mode_enabled() {
         return true;
     std::string_view sv(v);
     return !(sv == "0" || sv == "off" || sv == "false");
-}
-
-std::filesystem::path mcpp_exe_path() {
-    return mcpp::platform::fs::self_exe_path();
 }
 
 bool is_c_source(const mcpp::build::CompileUnit& cu) {
@@ -3504,10 +3510,12 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             // the same decision derived twice.
             //
             // The absolute path is baked into build.ninja, as every other tool
-            // path in it is. A version change regenerates the file (the version
-            // is in the fingerprint); moving the binary without changing its
-            // version would leave a stale path here, exactly as it would for
-            // the compiler.
+            // path in it is. A version change moves the build directory (the
+            // version is in the fingerprint), but that is not what keeps a
+            // stale path out of a replayed graph: the fast paths compute no
+            // fingerprint. They compare the engine the build record names (its
+            // version and `mcpp_exe_path()`, see `admit_recorded_build`), and a
+            // different engine plans the graph again (#757).
             const auto q = [](const std::string& v) {
                 return shell_quote_arg(escape_ninja_chars(v));
             };

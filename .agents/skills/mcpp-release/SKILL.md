@@ -73,9 +73,9 @@ gh run list --branch main --limit 3
 ```
 
 以分支保护和 `gh pr checks <pr-number>` 显示的 actual required checks 为准。
-在 main 上监控当前运行时，检查 `ci-linux`、`ci-linux-e2e`、`ci-macos`、
-`ci-macos-e2e`、`ci-windows`、`ci-windows-e2e` 与 `cross-build-test` 的结果；
-跳过或非 required 的 workflow 不是合入 gate。不要在 required CI 红的时候发版。
+在 main 上监控当前运行时，检查 `ci` 这一个工作流的运行（它包含各平台、e2e 分片、
+交叉构建与 `e2e-coverage`）；known-red 的腿（名字里带 issue 号）允许失败。跳过或
+非 required 的 workflow 不是合入 gate。不要在 `ci` 红的时候发版。
 
 ### 2. bump 版本号（第一组两处，单个 commit，走 PR）
 

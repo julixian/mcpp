@@ -63,6 +63,12 @@ cabi_probe_asm_marker:
     ret
 EOF
 
+# THE ROOT IS A LIBRARY, SO NOTHING LINKS. With the inferred binary target the
+# build linked `cabi-probe.exe` for x86_64-windows-gnu, which needs a MinGW
+# runtime: it passed on a machine with the host's mingw-w64 installed and failed
+# on every CI runner, and nothing noticed because no runner ever ran this test
+# (it declared `llvm`, which no runner granted, until 2026-10-02). Its subject
+# is the compile lines, which a library has as well.
 cat > mcpp.toml <<'EOF'
 [package]
 name    = "cabi-probe"
@@ -71,6 +77,10 @@ version = "0.1.0"
 [dependencies]
 fakemusl  = { path = "fakemusl" }
 openkalwin = { path = "openkalwin" }
+
+[targets.cabi-probe]
+kind    = "lib"
+sources = ["src/*.cpp", "src/*.S"]
 
 [build]
 allow_host_libs = true

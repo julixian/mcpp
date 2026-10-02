@@ -164,3 +164,4 @@ downstream tooling.
   - [SPEC-006 — Toolchain management: identity, origin, selection and the payload contract](specs/toolchain-management.md)
   - [SPEC-007 — Build plugins: configuration, construction and verification, and the runtime and planning obligations](specs/build-plugins.md)
   - [SPEC-008 — A library's interface: public modules, the published closure, and one interface in both forms](specs/library-interface.md)
+  - [SPEC-009 — The support and maintenance of toolchains: lines, defaults, provenance, moves and retirement](specs/toolchain-maintenance.md)

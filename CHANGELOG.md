@@ -4,6 +4,70 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.2.1] - 2026-10-02
+
+This release repairs two fast-path defects (mcpp#756, mcpp#757), publishes the
+specification by which toolchains are supported and maintained (SPEC-009), and
+restructures the repository's CI so that a commit builds mcpp once per host
+(`.agents/docs/2026-10-02-pr-ci-acceleration-and-the-toolchain-specification-design.md`).
+No default toolchain changes.
+
+### Fixed
+
+- **An upgraded mcpp no longer replays a graph that names the previous one**
+  (mcpp#757). The record of a build names the engine that wrote it, its version
+  and the path of its executable, and the fast paths of `mcpp build`, of a
+  workspace build and of `mcpp run` decline a record that another engine wrote.
+  The graph's own `$mcpp` binding is asked as well, since `--configure-only`
+  from another install rewrites the graph without the record. Before, the fast
+  path compared the recorded fingerprint with the recorded directory, and after
+  an upgrade that removed the old install every action that starts mcpp failed
+  with `CreateProcess failed` or `not found`. A record written by an earlier
+  release declines once.
+- **One predicate admits a recorded build for all three fast paths**, so a
+  property of the record is checked in one place rather than three.
+- **A path dependency's sources are classified by its own package** (mcpp#756).
+  A provider that declares `.ixx` in `[build] module_extensions` has its edits
+  seen by the fast path whatever the consumer declares; before, the sweep used
+  the consumer's table, and the edit of a `.ixx` host module was replayed as
+  "no work to do".
+
+### Added
+
+- **SPEC-009, the support and maintenance of toolchains**
+  (`docs/specs/toolchain-maintenance.md`). It states the support tiers, the one
+  table every default is read from, how a toolchain line moves as a whole, the
+  provenance of a payload and when a patched payload may be published, what it
+  means that mcpp supports a line, the compiler-defect register, the handling
+  of a new host platform release, the mirror rule, and the order in which a
+  default moves. A default moves only after the candidate passes a measured
+  gate: the module experience is not worse. SPEC-006 §7 now refers to it. Most
+  rules are not implemented yet, and each says so.
+
+### Changed (repository CI)
+
+- **One build of mcpp per host.** `ci.yml` runs a commit's CI in stages.
+  `changes` classifies the changed paths, and a change of documentation that
+  nothing reads runs the documentation checks only. `docs` runs the checks that
+  need no binary. `build.yml` builds mcpp once per host, and the per-area
+  workflows, now reusable, take that binary through
+  `.github/actions/use-built-mcpp`. Measured before this change, 30 to 37 jobs
+  of a commit built mcpp from source, which was 44 to 49 percent of its runner
+  minutes.
+- **One writer per cache.** Every job restores. One job per key saves, on a
+  push to `main` only, and `target/` is no longer cached, because a restored
+  `target/` made no build incremental.
+- **E2E shards by measured duration**, four on Linux, three on Windows and two
+  on macOS, from `tests/e2e/timings/`. `run_all.sh` takes `E2E_TIMINGS`,
+  `E2E_REPORT` and `E2E_LIST`.
+- **Every e2e test runs somewhere.** The `e2e-coverage` job fails when a test
+  ran on no host, is named by no workflow, and is not excused in
+  `tests/e2e/coverage-exceptions.tsv`. Before it, 24 tests ran on no runner.
+  `run_all.sh` grants `llvm` on Linux, and it probes `musl` and `mingw-cross`
+  by family rather than by one release.
+- The legs that are known red (#669) run on `main`, on dispatch, and on a pull
+  request labelled `macos-27` (the label is read on the next push).
+
 ## [2026.10.1.3] - 2026-10-01
 
 This release gives every tool a build uses a source that can be declared,

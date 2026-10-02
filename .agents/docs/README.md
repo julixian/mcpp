@@ -18,7 +18,7 @@ superseded_by: 2026-09-07-....md  # when status is superseded
 ---
 ```
 
-323 records.
+324 records.
 
 ## By subject
 
@@ -30,6 +30,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### design
 
+- [PR CI acceleration and the toolchain specification (#756, #757, #669)](2026-10-02-pr-ci-acceleration-and-the-toolchain-specification-design.md) — active
 - [工具与工具链的来源：声明、编程决定、可观察](2026-10-01-tool-and-toolchain-sources-design.md) — landed
 - [A pack's build reported as a build, and a unit's compile independent of the member selection: triage and design (#753, #751)](2026-10-01-pack-drive-and-selection-independent-compile-design.md) — landed
 - [Member selection, build programs prepared once, a pack over several members, and the output streams of `mcpp run`: the plan for the release after 2026.9.30.2 (#748, #749, #750)](2026-09-30-member-selection-and-build-program-cost-plan.md) — landed
@@ -114,6 +115,7 @@ Records that declare one. Everything else is listed by date below.
 
 ### 2026-10
 
+- [PR CI acceleration and the toolchain specification (#756, #757, #669)](2026-10-02-pr-ci-acceleration-and-the-toolchain-specification-design.md) — active
 - [工具与工具链的来源：声明、编程决定、可观察](2026-10-01-tool-and-toolchain-sources-design.md) — landed
 - [A pack's build reported as a build, and a unit's compile independent of the member selection: triage and design (#753, #751)](2026-10-01-pack-drive-and-selection-independent-compile-design.md) — landed
 ### 2026-09

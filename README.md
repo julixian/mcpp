@@ -12,7 +12,7 @@
 | [Documentation](docs/) · [Getting Started](docs/01-getting-started.md) · [mcpp.toml Guide](docs/04-mcpp-toml.md) · [Examples](docs/03-examples.md) · [Toolchains](docs/20-toolchains.md) |
 |:---:|
 | [Package index mcpp-index](https://mcpplibs.github.io/mcpp-index/) · [Module libraries mcpplibs](https://github.com/mcpplibs) · [Community Forum](https://forum.d2learn.org/category/20) · [Issues](https://github.com/mcpp-community/mcpp/issues) · [Releases](https://github.com/mcpp-community/mcpp/releases) |
-| [![ci-linux](https://github.com/mcpp-community/mcpp/actions/workflows/ci-linux.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci-linux.yml) [![ci-macos](https://github.com/mcpp-community/mcpp/actions/workflows/ci-macos.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci-macos.yml) [![ci-windows](https://github.com/mcpp-community/mcpp/actions/workflows/ci-windows.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci-windows.yml) |
+| [![ci](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml) |
 | Plugins · [mcpp-language-server (mcppls)](https://github.com/Sunrisepeak/mcpp-language-server) — a C++20/23 modules language server for VS Code, Zed, CLion, Neovim, AI agents (MCP) and CI |
 
 <p align="center">

@@ -52,15 +52,7 @@ name: cross-build-test
 #                         xlings-res + xim-pkgindex.
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 jobs:
   cross-build:
@@ -81,21 +73,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache mcpp sandbox
-        uses: actions/cache@v4
+      # Restored here and saved by this job alone, on main, after its last
+      # step (rule R3 of the 2026-10-02 CI record).
+      - name: Restore mcpp sandbox
+        id: sandbox
+        uses: actions/cache/restore@v4
         with:
           path: ~/.mcpp
-          key: mcpp-sandbox-${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('mcpp.toml', '.xlings.json') }}
+          key: mcpp-sandbox-${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('mcpp.toml', '.xlings.json', '.github/workflows/cross-build-test.yml') }}
           restore-keys: |
             mcpp-sandbox-${{ runner.os }}-cross-${{ matrix.target }}-
 
-      - name: Cache xlings
-        uses: actions/cache@v4
+      - name: Restore xlings
+        id: xlings
+        uses: actions/cache/restore@v4
         with:
           path: ~/.xlings
-          key: xlings-${{ runner.os }}-v2-${{ hashFiles('.xlings.json') }}
+          key: xlings-${{ runner.os }}-cross-v3-${{ hashFiles('.xlings.json') }}
           restore-keys: |
-            xlings-${{ runner.os }}-v2-
+            xlings-${{ runner.os }}-cross-v3-
 
       - name: Install qemu-user-static
         run: |
@@ -161,16 +157,9 @@ jobs:
           echo "XLINGS_BIN=$HOME/.xlings/subos/default/bin/xlings" >> "$GITHUB_ENV"
           echo "MCPP_BOOT=$MCPP_BOOT" >> "$GITHUB_ENV"
 
-      - name: Self-host build (bootstrap mcpp -> fresh host mcpp)
-        run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$XLINGS_BIN" config --mirror GLOBAL 2>/dev/null || true
-          "$MCPP_BOOT" self config --mirror GLOBAL 2>/dev/null || true
-          "$MCPP_BOOT" build
-          MCPP=$(realpath "$(find target -type f -name mcpp -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)")
-          test -x "$MCPP"
-          "$MCPP" self config --mirror GLOBAL
-          echo "MCPP=$MCPP" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: linux-x86_64
 
       - name: "Cross-build mcpp -> ${{ matrix.target }}"
         run: |
@@ -216,6 +205,20 @@ jobs:
           xver=$($RUN "$XLINGS_XBIN" --version 2>&1 || true)
           echo "$xver"
 
+      - name: Save mcpp sandbox
+        if: ${{ github.event_name == 'push' && steps.sandbox.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.mcpp
+          key: ${{ steps.sandbox.outputs.cache-primary-key }}
+
+      - name: Save xlings
+        if: ${{ github.event_name == 'push' && steps.xlings.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.xlings
+          key: ${{ steps.xlings.outputs.cache-primary-key }}
+
   # ── Linux → Windows MinGW cross (OS-cross, same arch: ELF→PE) ─────────────
   # Builds a demo project for x86_64-w64-mingw32 with the from-source GCC-16
   # MSVCRT cross toolchain, asserts the artefact is a fully-static PE, and runs
@@ -232,32 +235,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache mcpp sandbox
-        uses: actions/cache@v4
+      # Restored here and saved by this job alone, on main, after its last
+      # step (rule R3). The Wine packages were evicted with everything else
+      # while the repository's caches exceeded their limit, and `apt` then
+      # took 26 to 50 minutes (2026-10-01); with one writer per key they stay.
+      - name: Restore mcpp sandbox
+        id: sandbox
+        uses: actions/cache/restore@v4
         with:
           path: ~/.mcpp
-          key: mcpp-sandbox-${{ runner.os }}-mingw-cross-${{ hashFiles('mcpp.toml', '.xlings.json') }}
+          key: mcpp-sandbox-${{ runner.os }}-mingw-cross-${{ hashFiles('mcpp.toml', '.xlings.json', '.github/workflows/cross-build-test.yml') }}
           restore-keys: |
             mcpp-sandbox-${{ runner.os }}-mingw-cross-
 
-      - name: Cache xlings
-        uses: actions/cache@v4
+      - name: Restore xlings
+        id: xlings
+        uses: actions/cache/restore@v4
         with:
           path: ~/.xlings
-          key: xlings-${{ runner.os }}-v2-${{ hashFiles('.xlings.json') }}
+          key: xlings-${{ runner.os }}-mingw-cross-v3-${{ hashFiles('.xlings.json') }}
           restore-keys: |
-            xlings-${{ runner.os }}-v2-
+            xlings-${{ runner.os }}-mingw-cross-v3-
 
       # wine 的包集固定不变 —— 缓存整个 .deb 依赖闭包,命中时跳过 apt update
       # 与下载(每轮省 ~1-2min)。镜像月度更新可能改变依赖缺口,dpkg -i 失败时
       # 由 apt-get -f 兜底并重新回填缓存。
-      - name: Cache wine debs
-        uses: actions/cache@v4
+      - name: Restore wine debs
+        id: wine
+        uses: actions/cache/restore@v4
         with:
           path: ~/wine-debs
           key: wine-debs-${{ runner.os }}-ubuntu24.04-v1
 
       - name: Install wine
+        timeout-minutes: 20
         run: |
           sudo dpkg --add-architecture i386 || true
           if ls ~/wine-debs/*.deb >/dev/null 2>&1; then
@@ -311,15 +322,9 @@ jobs:
           echo "XLINGS_BIN=$HOME/.xlings/subos/default/bin/xlings" >> "$GITHUB_ENV"
           echo "MCPP_BOOT=$MCPP_BOOT" >> "$GITHUB_ENV"
 
-      - name: Self-host build (fresh host mcpp)
-        run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP_BOOT" self config --mirror GLOBAL 2>/dev/null || true
-          "$MCPP_BOOT" build
-          MCPP=$(realpath "$(find target -type f -name mcpp -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)")
-          test -x "$MCPP"
-          "$MCPP" self config --mirror GLOBAL
-          echo "MCPP=$MCPP" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: linux-x86_64
 
       - name: Install mingw-cross toolchain
         run: |
@@ -402,6 +407,40 @@ jobs:
             grep -qxF "$line" "$log" || { echo "::error::797 did not print: $line"; exit 1; }
           done
 
+      # 257 needs a Linux-hosted MinGW compiler AND wine, which only this job
+      # has; on the shards it skipped, and it had run on no runner (finding F9
+      # of the 2026-10-02 CI record).
+      - name: "e2e: a shared library across the PE boundary (257)"
+        run: |
+          set -o pipefail
+          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
+          log="$RUNNER_TEMP/257.log"
+          bash tests/e2e/257_shared_library_pe.sh 2>&1 | tee "$log"
+          if grep -q '^SKIP' "$log"; then
+            echo "::error::257 skipped on the job that can run it"; exit 1
+          fi
+
+      - name: Save mcpp sandbox
+        if: ${{ github.event_name == 'push' && steps.sandbox.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.mcpp
+          key: ${{ steps.sandbox.outputs.cache-primary-key }}
+
+      - name: Save xlings
+        if: ${{ github.event_name == 'push' && steps.xlings.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.xlings
+          key: ${{ steps.xlings.outputs.cache-primary-key }}
+
+      - name: Save wine debs
+        if: ${{ github.event_name == 'push' && steps.wine.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/wine-debs
+          key: ${{ steps.wine.outputs.cache-primary-key }}
+
   # ── windows → linux ───────────────────────────────────────────────────────
   # The mirror of mingw-cross-wine. Two jobs because a Windows runner cannot
   # execute the ELF it produces; the artefact is handed to a Linux job and
@@ -412,41 +451,20 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      # No job restores target/ any more. This one was the first to stop: a
+      # restored BMI tree beside a fresh one made GCC report
+      # `import 'std' has CRC mismatch` on the second of its two builds.
       - uses: ./.github/actions/bootstrap-mcpp
-        with:
-          # Do NOT restore target/ in a cross job. This job builds twice — once
-          # for the host, then once for x86_64-linux-musl — and a restored BMI
-          # tree makes the second build read `std` BMIs that no longer match
-          # what the dependency BMIs were compiled against:
-          #
-          #   mcpplibs.cmdline: error: import 'std' has CRC mismatch
-          #
-          # GCC bakes a CRC of each imported module's BMI into the importer, so
-          # the two have to come from the same build round; a cache that
-          # restores one without the other is not a partial speedup, it is an
-          # unbuildable tree. It reproduced on rerun, and only in this job —
-          # the other two cross jobs below cache ~/.mcpp and ~/.xlings but
-          # deliberately never target/, which is the convention this now follows.
-          #
-          # It stayed hidden until a PR touched neither mcpp.toml nor
-          # .xlings.json: those two files key the sandbox cache, so every
-          # earlier run had been a cold miss.
-          cache-target: 'false'
 
-      - name: Build mcpp from source (self-host)
+      - uses: ./.github/actions/use-built-mcpp
+        with:
+          host: windows-x86_64
+
+      - name: Name this commit's mcpp MCPP_SELF
         shell: bash
         run: |
-          export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP" build
-          # Newest, not first: target/ is cache-restored and keeps a directory
-          # per build fingerprint, so `find | head -1` can hand back the
-          # PREVIOUS release's binary (that is how a 0.0.106 build ran 0.0.105).
-          MCPP_SELF=$(find target -name "mcpp.exe" -path "*/bin/*" -printf "%T@ %p\n" \
-              | sort -rn | head -1 | cut -d" " -f2-)
-          test -n "$MCPP_SELF" || { echo "FAIL: no mcpp.exe"; exit 1; }
-          MCPP_SELF=$(cd "$(dirname "$MCPP_SELF")" && pwd)/$(basename "$MCPP_SELF")
-          "$MCPP_SELF" --version
-          echo "MCPP_SELF=$MCPP_SELF" >> "$GITHUB_ENV"
+          "$MCPP_FRESH" --version
+          echo "MCPP_SELF=$MCPP_FRESH" >> "$GITHUB_ENV"
 
       - name: Install the linux-musl cross toolchain (windows-hosted canadian)
         shell: bash

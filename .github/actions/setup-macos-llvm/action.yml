@@ -24,11 +24,22 @@ inputs:
     required: false
     default: 'macos-15'
 
+outputs:
+  xlings-key:
+    description: the exact key of the xlings cache
+    value: ${{ steps.xlings.outputs.cache-primary-key }}
+  xlings-hit:
+    description: "'true' when xlings was restored by its exact key"
+    value: ${{ steps.xlings.outputs.cache-hit }}
+
 runs:
   using: composite
   steps:
-    - name: Cache xlings
-      uses: actions/cache@v4
+    # Restored, never saved here: the macOS build job of
+    # .github/workflows/build.yml is the one writer, on a push to main (rule R3).
+    - name: Restore xlings
+      id: xlings
+      uses: actions/cache/restore@v4
       with:
         path: ~/.xlings
         key: xlings-${{ inputs.image }}-arm64-v3-xl${{ inputs.xlings-version }}-${{ hashFiles('.xlings.json') }}

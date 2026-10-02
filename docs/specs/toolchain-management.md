@@ -4,10 +4,10 @@
 |---|---|
 | 规范编号 | SPEC-006 |
 | 标题 | 工具链管理:身份、来源、选择与载荷契约 |
-| 状态 | 草案 v0.5 |
-| 最后修改 | 2026-10-01 |
+| 状态 | 草案 v0.6 |
+| 最后修改 | 2026-10-02 |
 | 对应实现 | 逐条标注;标为「已实现」的条款对应 mcpp >= 2026.9.24.1。标为「未实现」的条款计划与下一批 LLVM 工具链一同落地,届时按实测修订本规范 |
-| 相关设计文档 | `.agents/docs/2026-09-24-toolchain-selection-and-payload-trust-design.md`、`.agents/docs/2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md`、`.agents/docs/2026-09-28-ecosystem-design-and-optimisation-plan.md` |
+| 相关设计文档 | `.agents/docs/2026-09-24-toolchain-selection-and-payload-trust-design.md`、`.agents/docs/2026-09-24-685-687-msvc-stl-and-toolchain-payloads.md`、`.agents/docs/2026-09-28-ecosystem-design-and-optimisation-plan.md`、`.agents/docs/2026-10-02-pr-ci-acceleration-and-the-toolchain-specification-design.md` |
 | 相关 issue | mcpp#685、mcpp#687、mcpp#718、mcpp#755 |
 | 使用文档 | [docs/20 - 工具链](../zh/20-toolchains.md)、[docs/32 - 编写载荷](../zh/32-authoring-a-payload.md)、[docs/91 - 工具链内部](../zh/91-toolchain-internals.md) |
 
@@ -304,7 +304,8 @@ xim-pkgindex 的准入脚本 `verify-toolchain.sh` 对一个载荷归档做一�
 
 ## 7. 发布顺序 未实现
 
-移动 C 库绑定或某个载荷的 `latest` 之前,§6.2 的矩阵**必须**在新版本上全部通过。
+移动一个默认版本或一个 C 库绑定的顺序,由 [SPEC-009](toolchain-maintenance.md) §10 规定;§6.2 的矩阵是该顺序中的一道要求。
+本节不再自有条款,实现状态同 SPEC-009 §10:未实现。
 
 ---
 
@@ -317,3 +318,4 @@ xim-pkgindex 的准入脚本 `verify-toolchain.sh` 对一个载荷归档做一�
 | v0.3 | 2026-09-28 | 随 mcpp 2026.9.28.1:新增 §3.7,MSVC ABI 的 CRT 模型是目标 ABI 的性质,cl 与 clang++ 同样收到,默认 `toolchain-coupled`(mcpp#718)。 |
 | v0.5 | 2026-10-01 | 随 mcpp 2026.10.1.3(mcpp#755):新增 §2.2.1,工具链可由路径命名,并说明 `bootstrap` 与 `configure = "build.mcpp"`;§3.3 增加非缺省来源的陈述、汇总、记录与 `--managed-only`。 |
 | v0.4 | 2026-09-28 | 随 mcpp 2026.9.28.2:新增 §3.7.1,程序旁的文件由一个解析器决定;MSVC C++ 运行时是一个带版本的集合;契约决定种类;声明的运行时文件与 toolset 的版本比较;读不出的版本不作决定;action 的 `PATH` 首位是 toolset 的运行时目录(2026-09-28 设计 WS1)。 |
+| v0.6 | 2026-10-02 | §7 移入 SPEC-009(工具链的支持与维护):移动默认版本或 C 库绑定的顺序、门与撤销由 SPEC-009 §10 规定,本节改为引用。 |
