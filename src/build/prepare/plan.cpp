@@ -139,17 +139,12 @@ static std::expected<void, std::string> step13_source_packages(PrepareState& sta
         std::vector<std::filesystem::path> owned = state.storeRoots;
         owned.push_back(mcpp::home::root());
         std::vector<DepSourceRoot> roots;
-        // A root is recorded with its own package's extension tables, from the
-        // package's effective manifest (see DepSourceRoot).
-        auto rootOf = [&](std::size_t i, std::filesystem::path normalized) {
+        auto rootOf = [&](std::size_t i, std::filesystem::path n) {
             const auto& bc = state.packages[i].manifest.buildConfig;
-            return DepSourceRoot{std::move(normalized), bc.moduleExtensions,
-                                 bc.deviceExtensions};
+            return DepSourceRoot{std::move(n), bc.moduleExtensions, bc.deviceExtensions};
         };
-        auto recorded = [&](const std::filesystem::path& normalized) {
-            return std::ranges::any_of(roots, [&](const DepSourceRoot& r) {
-                return r.root == normalized;
-            });
+        auto recorded = [&](const std::filesystem::path& n) {
+            return std::ranges::any_of(roots, [&](const DepSourceRoot& r) { return r.root == n; });
         };
         // The same enumeration answers a second reader: which packages were
         // read from an editable tree, with their source globs (the build

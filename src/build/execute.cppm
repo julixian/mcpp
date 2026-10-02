@@ -186,7 +186,7 @@ export EngineIdentity running_engine() {
 export std::optional<std::string>
 engine_declined_because(const std::optional<EngineIdentity>& recorded,
                         const EngineIdentity& running) {
-    if (!recorded) return "the recorded build predates the engine identity";
+    if (!recorded) return std::string("the recorded build predates the engine identity");
     if (recorded->version != running.version)
         return std::format("the recorded build was written by mcpp {}, and this is mcpp {}",
                            recorded->version, running.version);
