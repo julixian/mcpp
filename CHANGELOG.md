@@ -4,6 +4,50 @@
 > Each `## [<version>]` section is that release's notes. Entries are written in English
 > from 2026.9.28.3 on; earlier entries remain as written.
 
+## [2026.10.3.1] - 2026-10-03
+
+This release is identical to 2026.10.2.1 in code; the bump exists to publish a
+fresh GitHub Release and a fresh index entry, because the 2026.10.2.1 release
+ran while the canary runners on ubuntu-24.04 were unavailable and the publish
+itself could not complete. It carries no behavioural change and is **wire-
+and-cache-compatible** with 2026.10.2.1: a record written by 2026.10.2.1 is
+still admitted by 2026.10.3.1, and a record written by 2026.10.3.1 is admitted
+by 2026.10.2.1 (the engine field exists in both; its value `2026.10.x` matches
+its own self).
+
+### CI
+
+- **Bootstrap fast path.** `bootstrap-mcpp` skips the xlings tarball fetch,
+  extract and `self install` when the restored cache already holds the pinned
+  xlings version. The check is the one case the guard would otherwise miss:
+  a stale xlings cache from before the pin was bumped, or a binary that no
+  longer runs because its dynamic loader is gone. On Linux it shaved the
+  `Run ./.github/actions/bootstrap-mcpp` step from ~5 s to ~2 s on the
+  bootstrap-mcpp invocation per job, summed over ~30 jobs per run; on Windows
+  from ~68 s to ~30–60 s. The fast path addresses xlings by `$XL_BIN_PATH`
+  rather than by the bare name, because Git Bash re-derives `PATH` from the
+  Windows environment on every child shell and drops the mixed-separator
+  entry the `export PATH` writes; `xlings self install` would write it back
+  via `[Environment]::SetEnvironmentVariable`, but the fast path skips that
+  step.
+- **Windows e2e MinGW prewarm guard.** Each `ci-windows-e2e` shard now
+  probes the two locations `run_all.sh` looks at for `g++.exe` before
+  invoking `mcpp toolchain install mingw 16.1.0`, so a sandbox restored
+  from the build job's prewarm does not pay the install call again.
+  Measured 68 s → 45 s on shard 1/3; the other two shards were already
+  cheaper. The install is still run when the probe finds no payload, so
+  a missing-prewarm shard is unchanged.
+
+### Operator-facing note (transient)
+
+- `release.yml` carries a `skip_canaries` `workflow_dispatch` input,
+  documented in the workflow, kept on the main branch during the
+  ubuntu-24.04 runner outage of 2026-10-02. The canaries design (WS10) is
+  intact: the input is `if: ${{ !inputs.skip_canaries }}` on the
+  `canaries` job, and the gate is otherwise unchanged. This release's
+  GitHub Release was created via the input. The input is removed by the
+  commit that follows the next successful canary run.
+
 ## [2026.10.2.1] - 2026-10-02
 
 This release repairs two fast-path defects (mcpp#756, mcpp#757), publishes the
