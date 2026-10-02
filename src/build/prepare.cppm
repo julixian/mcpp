@@ -412,6 +412,24 @@ export struct PlanNote {
     std::string path;
 };
 
+// A source tree outside the project that a build read, with the classification
+// of its own package.
+//
+// WHICH FILES OF A TREE CAN CHANGE THE GRAPH IS A PROPERTY OF THE PACKAGE THAT
+// OWNS THEM. `.ixx` is a module interface only where a package declares it in
+// `[build] module_extensions` (the built-in table is `.cppm`), and a provider
+// declares it for its own sources without the consumer having a `.ixx` file at
+// all. The freshness sweep used the consumer's table for every tree and so
+// classified a provider's `.ixx` as a file of no interest (#756). The tables
+// are recorded with the root, from the package's effective manifest, so the
+// sweep asks each tree the question its owner answers.
+export struct DepSourceRoot {
+    std::filesystem::path    root;
+    std::vector<std::string> moduleExtensions;
+    std::vector<std::string> deviceExtensions;
+    bool operator==(const DepSourceRoot&) const = default;
+};
+
 export struct BuildContext {
     // THE PER-MACHINE JOB DEFAULT, carried so it is read once.
     //
@@ -451,7 +469,7 @@ export struct BuildContext {
     // cannot resolve dependencies without becoming prepare_build, and a second
     // derivation would drift from the first exactly when a resolution rule
     // changes. Written into `.build_cache`; see BuildCacheEntry::depSourceRoots.
-    std::vector<std::filesystem::path> depSourceRoots;
+    std::vector<DepSourceRoot> depSourceRoots;
     // `<payload>/bin` and then `<payload>` of every installed `[xlings] deps`
     // payload of the runtime-owner manifest, in declaration order (#544); the
     // pair comes from runner_lookup::payload_search_dirs. Read by

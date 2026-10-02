@@ -123,6 +123,13 @@ For that invocation the option takes the place of `[toolchain] default` in
 `MCPP_TOOLCHAIN`. Each toolchain builds into its own output directory, and a
 recorded build is replayed only for the toolchain request that recorded it.
 
+A recorded build is replayed only by the engine that recorded it. The record
+names the engine by version and by the path of its executable, because the
+build graph names that executable and starts it. After an upgrade, or once the
+executable has moved or been removed, the next `mcpp build` plans the graph
+again and writes the record anew; nothing under `target/` needs to be deleted
+by hand.
+
 ## Explaining a resolution
 
 `mcpp why` reports what a build would resolve, and builds nothing:

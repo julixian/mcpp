@@ -39,6 +39,7 @@ import mcpp.source_kind;
 import mcpp.modgraph.scanner;
 import mcpp.toolchain.post_install;
 import mcpp.toolchain.stdmod;
+import mcpp.version;               // MCPP_VERSION — the engine a build record names
 import mcpp.xlings;
 import mcpp.xlings.subos_info;
 import mcpp.runtime.binding;
@@ -147,7 +148,55 @@ std::string toolchain_request_identity() {
     return std::format("cli={};default={}", cli, machineDefault);
 }
 
-struct BuildCacheEntry {
+// THE ENGINE THAT WROTE A BUILD RECORD.
+//
+// build.ninja names the engine that wrote it by absolute path: the `$mcpp`
+// rules (dyndep, stage, the BMI schedule), and the `__action` wrapper of an
+// action that declares an environment or a stamp, all start that executable.
+// The emitter said a version change regenerates the file, because the version
+// is a fingerprint input, and the fast paths never computed a fingerprint: they
+// matched an entry by target, profile, cache mode, features and toolchain
+// request, and compared its recorded fingerprint with its own directory's name.
+// After an upgrade that removed the previous install the entry was replayed, and
+// every action started a program that no longer existed (#757). When the old
+// executable still exists the failure is silent instead: a newer front end
+// drives the actions, and the graph, of an older engine.
+//
+// So the record carries the engine itself, and the one admission predicate
+// below compares it. The version and the executable's path are both kept: the
+// same version at another path (a moved or reinstalled binary) leaves the same
+// stale text in the graph that a new version leaves, and only the path says so.
+export struct EngineIdentity {
+    std::string version;   // MCPP_VERSION
+    std::string exe;       // mcpp_exe_path(), the spelling the graph uses
+    bool operator==(const EngineIdentity&) const = default;
+};
+
+// The engine this process is: the one that would write a record now, and the
+// one that would replay it.
+export EngineIdentity running_engine() {
+    return {std::string(mcpp::MCPP_VERSION), mcpp_exe_path().string()};
+}
+
+// Why a record written by `recorded` is not replayed by `running`; nullopt when
+// they are the same engine. `recorded` is empty for an entry written before the
+// field existed, which is not the same answer as an engine that happens to
+// match -- the entry then declines once and the next write records it, the
+// discipline of every field of the entry below.
+export std::optional<std::string>
+engine_declined_because(const std::optional<EngineIdentity>& recorded,
+                        const EngineIdentity& running) {
+    if (!recorded) return "the recorded build predates the engine identity";
+    if (recorded->version != running.version)
+        return std::format("the recorded build was written by mcpp {}, and this is mcpp {}",
+                           recorded->version, running.version);
+    if (recorded->exe != running.exe)
+        return std::format("the recorded build was written by the engine at {}, and this one is at {}",
+                           recorded->exe, running.exe);
+    return std::nullopt;
+}
+
+export struct BuildCacheEntry {
     std::string targetTriple;    // "" for default target
     std::string outputDir;
     std::string ninjaProgram;
@@ -204,7 +253,14 @@ struct BuildCacheEntry {
     // invisible: ninja has no edge for a file that did not exist when
     // build.ninja was written, so `mcpp build` replays the stale graph and
     // reports success. See BuildContext::depSourceRoots.
-    std::vector<std::string> depSourceRoots;
+    //
+    // Each root carries the extension tables of its own package, which is what
+    // the sweep classifies the root's files with (#756): the consumer's table
+    // says nothing about a provider's `.ixx`. Written as `depSources=`; the
+    // block of an engine that recorded the paths alone (`depSourceRoots=`) is
+    // read past and counts as absent, since a root without its tables cannot
+    // be swept.
+    std::vector<DepSourceRoot> depSourceRoots;
     // Was the block present at all? An EMPTY list is a legitimate answer — a
     // project with no path dependencies has none — so it cannot stand in for
     // "this cache predates the field", and the two need opposite treatment:
@@ -271,9 +327,41 @@ struct BuildCacheEntry {
     // fast path matches every entry of its selection.
     std::string              selection;
     std::string              group;
+    // The engine that wrote the graph this entry records, absent for an entry
+    // written before the field (see EngineIdentity). Optional rather than an
+    // empty identity, because an engine whose version is the empty string does
+    // not exist and "no record" must not be representable as a value.
+    std::optional<EngineIdentity> engine;
 };
 
-std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& projectRoot) {
+// One list of extensions as a line of the record carries it: joined by a unit
+// separator. An extension is a dot and a name, so it holds neither that
+// character nor a tab or a newline, which the line's own structure relies on.
+// The two directions are kept together so that the reader and the writer cannot
+// disagree about the separator.
+constexpr char kExtensionSeparator = '\x1f';
+
+std::vector<std::string> split_extensions(std::string_view joined) {
+    std::vector<std::string> out;
+    while (!joined.empty()) {
+        const auto at = joined.find(kExtensionSeparator);
+        out.emplace_back(joined.substr(0, at));
+        if (at == std::string_view::npos) break;
+        joined.remove_prefix(at + 1);
+    }
+    return out;
+}
+
+std::string join_extensions(const std::vector<std::string>& extensions) {
+    std::string out;
+    for (auto const& x : extensions) {
+        if (!out.empty()) out += kExtensionSeparator;
+        out += x;
+    }
+    return out;
+}
+
+export std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& projectRoot) {
     auto path = projectRoot / kBuildCacheFile;
     std::ifstream f(path);
     if (!f) return {};
@@ -368,12 +456,38 @@ std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& proje
         // zero-length list and an absent block must not read the same. Absent
         // means the cache predates the field, and the fast path then declines
         // once so the next write records it.
+        //
+        // The block that listed the paths alone is read past and left
+        // unrecorded: its roots have no tables, so the entry declines once and
+        // the next write records both.
         if (haveNextLine && line.starts_with("depSourceRoots=")) {
             std::size_t n = 0;
             try { n = std::stoul(line.substr(15)); } catch (...) { n = 0; }
-            for (std::size_t i = 0; i < n && std::getline(f, line); ++i)
-                e.depSourceRoots.push_back(line);
-            e.depSourceRootsRecorded = true;
+            for (std::size_t i = 0; i < n && std::getline(f, line); ++i) {}
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
+        // `depSources=<n>`, then one line per root: the path, the module
+        // extensions and the device extensions of the root's package, separated
+        // by a tab, the extensions of one list by a unit separator. A line that
+        // is not of that shape makes the whole block unrecorded rather than
+        // read with a table nobody wrote.
+        if (haveNextLine && line.starts_with("depSources=")) {
+            std::size_t n = 0;
+            try { n = std::stoul(line.substr(11)); } catch (...) { n = 0; }
+            bool wellFormed = true;
+            std::vector<DepSourceRoot> roots;
+            for (std::size_t i = 0; i < n && std::getline(f, line); ++i) {
+                const auto t1 = line.find('\t');
+                const auto t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+                if (t2 == std::string::npos) { wellFormed = false; continue; }
+                roots.push_back({std::filesystem::path(line.substr(0, t1)),
+                                 split_extensions(std::string_view(line).substr(t1 + 1, t2 - t1 - 1)),
+                                 split_extensions(std::string_view(line).substr(t2 + 1))});
+            }
+            if (wellFormed && roots.size() == n) {
+                e.depSourceRoots = std::move(roots);
+                e.depSourceRootsRecorded = true;
+            }
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
         // Optional `runner=0|1` (#544). Absent ⇒ false; see the field.
@@ -417,6 +531,15 @@ std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& proje
             e.group = line.substr(6);
             haveNextLine = static_cast<bool>(std::getline(f, line));
         }
+        // `engine=<version>`, a tab, and the executable's path; see
+        // EngineIdentity. The version holds no tab, so the path is everything
+        // after the first one. Absent, or without the tab, the entry declines
+        // once.
+        if (haveNextLine && line.starts_with("engine=")) {
+            if (const auto tab = line.find('\t'); tab != std::string::npos)
+                e.engine = EngineIdentity{line.substr(7, tab - 7), line.substr(tab + 1)};
+            haveNextLine = static_cast<bool>(std::getline(f, line));
+        }
         entries.push_back(std::move(e));
         if (!haveNextLine || line.empty()) break;
     }
@@ -425,8 +548,8 @@ std::vector<BuildCacheEntry> read_build_cache(const std::filesystem::path& proje
 
 // Serialize the P3 format. Declared ahead of its single caller so the reader
 // and the writer of this file sit next to each other.
-void write_build_cache_entries(const std::filesystem::path& path,
-                               const std::vector<BuildCacheEntry>& entries);
+export void write_build_cache_entries(const std::filesystem::path& path,
+                                      const std::vector<BuildCacheEntry>& entries);
 
 // `a, b` and `b a` are one request. Normalised on both sides of the comparison
 // — the entry stores this form and the fast path computes it — so a cache hit
@@ -460,7 +583,7 @@ void write_build_cache(const std::filesystem::path& projectRoot,
                        const std::string& profile = "",
                        const std::string& cacheMode = "",
                        const mcpp::platform::runtime::RuntimeBinding& runtimeBinding = {},
-                       std::vector<std::string> depSourceRoots = {},
+                       std::vector<DepSourceRoot> depSourceRoots = {},
                        bool runnerDeclared = false,
                        bool runTierPending = false,
                        const std::string& features = {},
@@ -503,6 +626,9 @@ void write_build_cache(const std::filesystem::path& projectRoot,
     newEntry.xlingsPayloadsRecorded = true;
     newEntry.selection = selection;
     newEntry.group = group;
+    // The engine that wrote the graph is the one writing the record: both
+    // happen in this process, after the graph was emitted.
+    newEntry.engine = running_engine();
     entries.insert(entries.begin(), std::move(newEntry));
 
     // Trim to LRU capacity.
@@ -541,8 +667,10 @@ void write_build_cache_entries(const std::filesystem::path& path,
               << '\n';
         f << "profile=" << e.profile << '\n';
         f << "cacheMode=" << e.cacheMode << '\n';
-        f << "depSourceRoots=" << e.depSourceRoots.size() << '\n';
-        for (auto& r : e.depSourceRoots) f << r << '\n';
+        f << "depSources=" << e.depSourceRoots.size() << '\n';
+        for (auto& r : e.depSourceRoots)
+            f << r.root.generic_string() << '\t' << join_extensions(r.moduleExtensions)
+              << '\t' << join_extensions(r.deviceExtensions) << '\n';
         f << "runner=" << (e.runnerDeclared ? 1 : 0) << '\n';
         f << "runtier=" << (e.runTierPending ? 1 : 0) << '\n';
         f << "features=" << e.features << '\n';
@@ -553,6 +681,8 @@ void write_build_cache_entries(const std::filesystem::path& path,
             f << "selection=" << e.selection << '\n';
             f << "group=" << e.group << '\n';
         }
+        if (e.engine)
+            f << "engine=" << e.engine->version << '\t' << e.engine->exe << '\n';
     }
 }
 
@@ -1012,13 +1142,7 @@ export int run_build_plan(BuildContext& ctx, bool verbose, bool no_cache,
                           std::move(runTargets), runEnvKey, runEnvValue,
                           ctx.profile, std::string(cache_mode_name(ctx.cacheMode)),
                           ctx.plan.runtimeBinding,
-                          [&] {
-                              std::vector<std::string> v;
-                              v.reserve(ctx.depSourceRoots.size());
-                              for (auto const& r : ctx.depSourceRoots)
-                                  v.push_back(r.generic_string());
-                              return v;
-                          }(),
+                          ctx.depSourceRoots,
                           // #544: the run fast path declines an entry whose
                           // target has a runner declared — see the field.
                           !choose_runner(ctx).tmpl.empty(),
@@ -1169,12 +1293,21 @@ bool sources_newer_than(const std::filesystem::path& projectRoot,
 // The dependency's own manifest is swept too. A member that gains a target, a
 // `[modules] sources` glob or a `[build]` flag changes what the graph SHOULD
 // be, and none of that is visible from its source files' timestamps.
-bool dep_sources_newer_than(const std::vector<std::string>& depSourceRoots,
-                            std::filesystem::file_time_type ninjaTime,
-                            const mcpp::ExtensionTable& extTable) {
+//
+// EACH ROOT IS CLASSIFIED BY ITS OWN PACKAGE (#756). Which of a tree's files can
+// change the graph depends on the extensions the package that owns the tree
+// declares: a provider's `.ixx` is a module interface because the provider says
+// so, whatever the consumer declares, and a consumer with only `.cpp` sources
+// has no reason to. The sweep used the consumer's table for every root, so an
+// edit to the provider's host module was classified as a file of no interest and
+// replayed as "no work". The tables are the ones prepare recorded with the root.
+export bool dep_sources_newer_than(const std::vector<DepSourceRoot>& depSourceRoots,
+                                   std::filesystem::file_time_type ninjaTime) {
     std::error_code ec;
-    for (auto const& rootStr : depSourceRoots) {
-        std::filesystem::path depRoot(rootStr);
+    for (auto const& dep : depSourceRoots) {
+        const std::filesystem::path& depRoot = dep.root;
+        const auto extTable = mcpp::extension_table_for(dep.moduleExtensions,
+                                                        dep.deviceExtensions);
         // A dependency directory that has gone away is a resolution question,
         // not a staleness one: fall through to prepare_build, which reports it
         // with the dependency's name instead of a bare missing path.
@@ -1583,12 +1716,137 @@ bool local_toolchain_unchanged(const std::filesystem::path& outputDir) {
     return true;
 }
 
-// Why the project fast path declined, under `-v` (#734 E5). Each refusal names
-// its condition, so a platform on which the fast path never serves shows which
+// Why a fast path declined, under `-v` (#734 E5). Each refusal names its
+// condition, so a platform on which the fast path never serves shows which
 // precondition it fails instead of only the slower build.
 std::optional<int> fast_path_declined(std::string_view path, std::string_view why) {
     mcpp::log::verbose("fast-path", std::format("{} declined: {}", path, why));
     return std::nullopt;
+}
+
+// WHAT A RECORDED BUILD MUST SATISFY BEFORE ANY FAST PATH REPLAYS IT.
+//
+// `try_fast_build`, `try_fast_workspace_build` and `try_fast_run` each carried
+// a list of declines of their own, 23, 30 and 30 of them, and a property added
+// to one had to be added to the others by hand. #757 is the case in which no
+// path received the property at all: the engine that wrote a graph was recorded
+// nowhere and compared nowhere. The gates the three share are this one
+// function, and a path keeps only what is its own: the selection a workspace
+// command matches, a program to run, a runner, the run tier, and the project's
+// own sources. A field added to the record is then checked in one place.
+//
+// The order is the cost of the question: the record itself first, then the
+// files it names, then the sweeps of the trees it names, and last the snapshot
+// of the artifacts, which reads the build directory.
+export struct ReplayAsk {
+    // What the graph must have been planned for (`request_tag`): a project's
+    // features, or a workspace group's members.
+    std::string request;
+    // The manifest whose edit re-plans, and how a decline names it: the
+    // project's, or the workspace's.
+    std::filesystem::path manifest;
+    std::string_view      manifestName = "mcpp.toml";
+    // How a decline names the trees the recorded roots stand for: a project
+    // has path dependencies, a workspace has members besides.
+    std::string_view      treesName = "a path dependency's";
+    // The project's own tree, for the paths that sweep one: asked with the time
+    // of build.ninja, true when a source of it is newer. Empty for a path whose
+    // trees are all recorded roots, which is what a workspace's members are.
+    std::function<bool(std::filesystem::file_time_type)> projectSourcesNewer;
+};
+
+// What a path needs of an admitted record to go on: where the graph is, the
+// ninja that drives it, and the artifacts' state before ninja runs, which is
+// what tells afterwards whether an artifact was relinked.
+export struct ReplayableBuild {
+    std::filesystem::path outputDir;
+    std::filesystem::path ninjaPath;
+    std::string           ninjaProgram;
+    mcpp::build::runtime_validation::ArtifactSnapshot validated;
+};
+
+export std::expected<ReplayableBuild, std::string>
+admit_recorded_build(const BuildCacheEntry& e, const ReplayAsk& ask) {
+    // The engine that wrote the graph is the engine that replays it (#757).
+    // First, because every later question is about a graph this engine did not
+    // write when this one fails.
+    if (auto why = engine_declined_because(e.engine, running_engine())) return std::unexpected(*why);
+
+    // The runtime the recorded build ran under. An entry written before the
+    // immutable snapshot cannot say which environment the program needs, and
+    // running it with another is worse than not using the cache: it works once
+    // and then silently stops finding its runtime data (mcpp#352).
+    if (!e.runtimeBinding) return std::unexpected("the recorded build predates the runtime binding");
+    if (e.runtimeEnvKey.empty())
+        return std::unexpected("the recorded build predates the runtime environment key"); // regenerate build.ninja once
+
+    // P1: verify fingerprint matches the outputDir basename.
+    const std::filesystem::path outputDir(e.outputDir);
+    if (!e.fingerprint.empty() && outputDir.filename().string() != e.fingerprint)
+        return std::unexpected("the recorded build directory is not the one for this fingerprint");
+
+    std::error_code ec;
+    const auto ninjaPath = outputDir / "build.ninja";
+    if (!std::filesystem::exists(ninjaPath, ec)) return std::unexpected("build.ninja does not exist");
+
+    // #407. Freshness is measured against the SOURCES, which says nothing
+    // about what kind of graph this is. `mcpp test` and
+    // `mcpp build --configure-only` write their plan -- dev-deps, test targets,
+    // `default` naming the test binaries and NOT the package's target -- into
+    // this same file, because the fingerprint covers neither input. Replaying
+    // that for a plain build linked the tests, never linked the target, and
+    // printed `Finished`; and a broken file under tests/ (never scanned here)
+    // failed a plain `mcpp build` outright.
+    if (!mcpp::build::is_plain_build_graph(ninjaPath))
+        return std::unexpected("build.ninja was written by another mode (test, pack or a named target)");
+    // What the graph was planned for (workspace design 2026-09-29 §3): the
+    // features no longer name the directory, so the graph says which it has.
+    if (mcpp::build::read_request(ninjaPath) != ask.request)
+        return std::unexpected("build.ninja was written for another request (features or workspace members)");
+
+    const auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
+    if (ec) return std::unexpected("the time of build.ninja cannot be read");
+
+    const auto runtimeTime = std::filesystem::last_write_time(
+        e.runtimeBinding->subosDir / ".xlings.json", ec);
+    if (ec || runtimeTime > ninjaTime)
+        return std::unexpected("the runtime's .xlings.json is newer than build.ninja");
+
+    const auto manifestTime = std::filesystem::last_write_time(ask.manifest, ec);
+    if (ec || manifestTime > ninjaTime)
+        return std::unexpected(std::format("{} is newer than build.ninja", ask.manifestName));
+
+    // mcpp#225: bounded + vcs/build-dir-excluded walk (see sources_newer_than)
+    // instead of a hand-rolled recursive_directory_iterator over src/.
+    if (ask.projectSourcesNewer && ask.projectSourcesNewer(ninjaTime))
+        return std::unexpected("a project source, build.mcpp, a build-program input or a resource script is newer than build.ninja");
+
+    // A cache written before this field existed cannot say whether the build
+    // had `path` dependencies, and answering "assume none" is the wrong half of
+    // that guess: it would keep replaying a stale graph for exactly the projects
+    // the field was added for. Decline once; the write below records the list
+    // and every later invocation is fast again. It has to be every path: `mcpp
+    // run` reaches its binary through the same check, and a `run` that skipped
+    // it would execute an artifact built from a source set that no longer
+    // exists.
+    if (!e.depSourceRootsRecorded)
+        return std::unexpected("the recorded build predates the list of path-dependency roots and their extension tables");
+    if (dep_sources_newer_than(e.depSourceRoots, ninjaTime))
+        return std::unexpected(std::format("{} manifest or source is newer than build.ninja", ask.treesName));
+    if (!xlings_payloads_present(e)) return std::unexpected("a recorded xlings payload is missing");
+    if (!local_toolchain_unchanged(e.outputDir))
+        return std::unexpected("a program of the toolchain named by path changed");
+
+    auto validated = mcpp::build::runtime_validation::validated_artifact_snapshot(
+        outputDir, *e.runtimeBinding);
+    if (!validated) return std::unexpected("no validated artifact snapshot is recorded for this build");
+
+    auto ninjaProgram = e.ninjaProgram;
+    // Legacy caches stored a shell-quoted path; execvp needs the raw path.
+    if (ninjaProgram.size() >= 2 && ninjaProgram.front() == '\''
+                                 && ninjaProgram.back() == '\'')
+        ninjaProgram = ninjaProgram.substr(1, ninjaProgram.size() - 2);
+    return ReplayableBuild{outputDir, ninjaPath, std::move(ninjaProgram), std::move(*validated)};
 }
 
 export std::optional<int> try_fast_build(const std::filesystem::path& projectRoot,
@@ -1641,80 +1899,23 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
         }
     }
     if (!match) return fast_path_declined("build", "no recorded build matches this request");
-    if (!match->runtimeBinding) return fast_path_declined("build", "the recorded build predates the runtime binding");
 
-    auto outputDirStr = match->outputDir;
-    auto ninjaProgram = match->ninjaProgram;
-    // Legacy caches stored a shell-quoted path; execvp needs the raw path.
-    if (ninjaProgram.size() >= 2 && ninjaProgram.front() == '\''
-                                 && ninjaProgram.back() == '\'')
-        ninjaProgram = ninjaProgram.substr(1, ninjaProgram.size() - 2);
-    auto cachedFingerprint = match->fingerprint;
+    // The gates every fast path shares (see admit_recorded_build); what is left
+    // here is the project's own tree.
+    auto admitted = admit_recorded_build(*match, {
+        .request = mcpp::build::request_tag({}, want->features),
+        .manifest = projectRoot / "mcpp.toml",
+        .projectSourcesNewer = [&](std::filesystem::file_time_type ninjaTime) {
+            return sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,
+                                      want->extTable);
+        },
+    });
+    if (!admitted) return fast_path_declined("build", admitted.error());
+    const auto& outputDir = admitted->outputDir;
+    const auto& ninjaPath = admitted->ninjaPath;
+    const auto& validatedBefore = admitted->validated;
     auto runtimeEnvKey = match->runtimeEnvKey;
     auto runtimeEnvValue = match->runtimeEnvValue;
-    if (runtimeEnvKey.empty())
-        return fast_path_declined("build", "the recorded build predates the runtime environment key"); // old cache entry; regenerate build.ninja once
-
-    // P1: verify fingerprint matches the outputDir basename.
-    if (!cachedFingerprint.empty()) {
-        auto dirBasename = std::filesystem::path(outputDirStr).filename().string();
-        if (dirBasename != cachedFingerprint) {
-            return fast_path_declined("build", "the recorded build directory is not the one for this fingerprint");
-        }
-    }
-
-    std::error_code ec;
-    std::filesystem::path outputDir(outputDirStr);
-
-    auto ninjaPath = outputDir / "build.ninja";
-    if (!std::filesystem::exists(ninjaPath, ec)) return fast_path_declined("build", "build.ninja does not exist");
-
-    // #407. Freshness is measured against the SOURCES, which says nothing
-    // about what kind of graph this is. `mcpp test` and
-    // `mcpp build --configure-only` write their plan — dev-deps, test targets,
-    // `default` naming the test binaries and NOT the package's target — into
-    // this same file, because the fingerprint covers neither input. Replaying
-    // that for a plain build linked the tests, never linked the target, and
-    // printed `Finished`; and a broken file under tests/ (never scanned here)
-    // failed a plain `mcpp build` outright.
-    if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("build", "build.ninja was written by another mode (test, pack or a named target)");
-    // What the graph was planned for (workspace design 2026-09-29 §3): the
-    // features no longer name the directory, so the graph says which it has.
-    if (mcpp::build::read_request(ninjaPath) != mcpp::build::request_tag({}, want->features))
-        return fast_path_declined("build", "build.ninja was written for another request (features or workspace members)");
-
-    auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
-    if (ec) return fast_path_declined("build", "the time of build.ninja cannot be read");
-
-    auto runtimeManifest = match->runtimeBinding->subosDir / ".xlings.json";
-    auto runtimeTime = std::filesystem::last_write_time(runtimeManifest, ec);
-    if (ec || runtimeTime > ninjaTime) return fast_path_declined("build", "the runtime's .xlings.json is newer than build.ninja");
-
-    // Check mcpp.toml
-    auto tomlPath = projectRoot / "mcpp.toml";
-    auto tomlTime = std::filesystem::last_write_time(tomlPath, ec);
-    if (ec || tomlTime > ninjaTime) return fast_path_declined("build", "mcpp.toml is newer than build.ninja");
-
-    // mcpp#225: bounded + vcs/build-dir-excluded walk (see sources_newer_than)
-    // instead of a hand-rolled recursive_directory_iterator over src/.
-    if (sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,
-                           want->extTable)) return fast_path_declined("build", "a project source, build.mcpp, a build-program input or a resource script is newer than build.ninja");
-    // A cache written before this field existed cannot say whether the build
-    // had `path` dependencies, and answering "assume none" is the wrong
-    // half of that guess: it would keep replaying a stale graph for exactly
-    // the projects the field was added for. Decline once; the write below
-    // records the list and every later invocation is fast again.
-    if (!match->depSourceRootsRecorded) return fast_path_declined("build", "the recorded build predates the list of path-dependency roots");
-    if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
-        return fast_path_declined("build", "a path dependency's manifest or source is newer than build.ninja");
-    if (!xlings_payloads_present(*match)) return fast_path_declined("build", "a recorded xlings payload is missing");
-    if (!local_toolchain_unchanged(match->outputDir))
-        return fast_path_declined("build", "a program of the toolchain named by path changed");
-
-    auto validatedBefore =
-        mcpp::build::runtime_validation::validated_artifact_snapshot(
-            outputDir, *match->runtimeBinding);
-    if (!validatedBefore) return fast_path_declined("build", "no validated artifact snapshot is recorded for this build");
 
     // All inputs are older than build.ninja → fast-path: just run ninja.
     // C1: this configuration is confirmed current, so the root database is
@@ -1723,12 +1924,12 @@ export std::optional<int> try_fast_build(const std::filesystem::path& projectRoo
     // see it back.
     restore_root_compile_commands(projectRoot, outputDir);
     std::chrono::milliseconds elapsed{};
-    auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, verbose,
+    auto rc = run_ninja_fast(admitted->ninjaProgram, outputDir, ninjaPath, verbose,
                              runtimeEnvKey, runtimeEnvValue, &elapsed);
     if (!rc) return fast_path_declined("build", "ninja reported a stale graph");
     if (*rc != 0) return rc;
     if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(
-            *validatedBefore))
+            validatedBefore))
         return fast_path_declined("build", "ninja relinked an artifact, whose closure the full path validates"); // relinked: full path reconstructs + validates closure
 
     // The descriptor the plan recorded (revision 3, §7.3); empty for a record
@@ -1794,43 +1995,18 @@ export std::optional<int> try_fast_workspace_build(
                 && e.toolchainRecorded && e.toolchainRequest == want->toolchainRequest
                 && e.selection == selection && e.group == group) { match = &e; break; }
         if (!match) return fast_path_declined("workspace", "no recorded build matches this selection");
-        if (!match->runtimeBinding || match->runtimeEnvKey.empty())
-            return fast_path_declined("workspace", "the recorded build predates the runtime binding");
-        const std::filesystem::path outputDir(match->outputDir);
-        if (!match->fingerprint.empty() && outputDir.filename().string() != match->fingerprint)
-            return fast_path_declined("workspace", "the recorded build directory is not the one for this fingerprint");
-        const auto ninjaPath = outputDir / "build.ninja";
-        if (!std::filesystem::exists(ninjaPath, ec))
-            return fast_path_declined("workspace", "build.ninja does not exist");
-        if (!mcpp::build::is_plain_build_graph(ninjaPath))
-            return fast_path_declined("workspace", "build.ninja was written by another mode (test, pack or a named target)");
-        if (mcpp::build::read_request(ninjaPath) != mcpp::build::request_tag(group, {}))
-            return fast_path_declined("workspace", "build.ninja was written for another request (features or workspace members)");
-        const auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
-        if (ec) return fast_path_declined("workspace", "the time of build.ninja cannot be read");
-        const auto runtimeTime = std::filesystem::last_write_time(
-            match->runtimeBinding->subosDir / ".xlings.json", ec);
-        if (ec || runtimeTime > ninjaTime)
-            return fast_path_declined("workspace", "the runtime's .xlings.json is newer than build.ninja");
-        if (wsToml > ninjaTime)
-            return fast_path_declined("workspace", "the workspace's mcpp.toml is newer than build.ninja");
-        if (!match->depSourceRootsRecorded
-            || dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
-            return fast_path_declined("workspace", "a member's or a path dependency's manifest or source is newer than build.ninja");
-        if (!xlings_payloads_present(*match))
-            return fast_path_declined("workspace", "a recorded xlings payload is missing");
-        if (!local_toolchain_unchanged(match->outputDir))
-            return fast_path_declined("workspace", "a program of the toolchain named by path changed");
-        auto validated = mcpp::build::runtime_validation::validated_artifact_snapshot(
-            outputDir, *match->runtimeBinding);
-        if (!validated)
-            return fast_path_declined("workspace", "no validated artifact snapshot is recorded for this build");
-        auto ninjaProgram = match->ninjaProgram;
-        if (ninjaProgram.size() >= 2 && ninjaProgram.front() == '\''
-                                     && ninjaProgram.back() == '\'')
-            ninjaProgram = ninjaProgram.substr(1, ninjaProgram.size() - 2);
-        ready.push_back({outputDir, ninjaProgram, match->runtimeEnvKey,
-                         match->runtimeEnvValue, std::move(*validated)});
+        // The gates every fast path shares (see admit_recorded_build). A
+        // workspace has no project tree of its own to sweep: its members are
+        // recorded roots, each classified by its own package.
+        auto admitted = admit_recorded_build(*match, {
+            .request = mcpp::build::request_tag(group, {}),
+            .manifest = wsRoot / "mcpp.toml",
+            .manifestName = "the workspace's mcpp.toml",
+            .treesName = "a member's or a path dependency's",
+        });
+        if (!admitted) return fast_path_declined("workspace", admitted.error());
+        ready.push_back({admitted->outputDir, admitted->ninjaProgram, match->runtimeEnvKey,
+                         match->runtimeEnvValue, std::move(admitted->validated)});
         profile = want->profile;
     }
 
@@ -1941,33 +2117,6 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     // declared tool absent. prepare_build provisions the difference.
     if (match->runTierPending) return fast_path_declined("run", "the run tier is not yet decided");
 
-    auto outputDirStr = match->outputDir;
-    auto ninjaProgram = match->ninjaProgram;
-    // Legacy caches stored a shell-quoted path; execvp needs the raw path.
-    if (ninjaProgram.size() >= 2 && ninjaProgram.front() == '\''
-                                 && ninjaProgram.back() == '\'')
-        ninjaProgram = ninjaProgram.substr(1, ninjaProgram.size() - 2);
-    if (match->runtimeEnvKey.empty())
-        return fast_path_declined("run", "the recorded build predates the runtime environment key"); // old cache entry; go through prepare_build once
-    // Written before this mcpp knew about subos environments (mcpp#352). Taking
-    // the fast path here would run the program without them -- which is the
-    // defect this field exists to fix, surviving an upgrade.
-    //
-    // It survives it for a long time, too: the fast path's identity is the
-    // profile, the cache mode and the resource list, and its fingerprint check
-    // compares a cached entry against ITSELF. Neither notices that a different
-    // mcpp wrote the entry, so without this line an upgraded mcpp would reuse a
-    // pre-upgrade build until something else happened to invalidate it. Measured
-    // on a real upgrade from 2026.8.7.1, not reasoned about.
-    if (!match->runtimeBinding)
-        return fast_path_declined("run", "the recorded build predates the runtime binding"); // predates the immutable snapshot; rebuild once
-
-    // P1: verify fingerprint matches the outputDir basename.
-    if (!match->fingerprint.empty()) {
-        auto dirBasename = std::filesystem::path(outputDirStr).filename().string();
-        if (dirBasename != match->fingerprint) return fast_path_declined("run", "the recorded build directory is not the one for this fingerprint");
-    }
-
     // Locate the requested run-target before doing any filesystem freshness
     // work — an unrecognized name falls back to prepare_build, which gives
     // a proper "no binary target 'x' found" error instead of a silent miss.
@@ -1979,55 +2128,35 @@ std::optional<int> try_fast_run(const std::filesystem::path& projectRoot,
     }
     if (!chosen) return fast_path_declined("run", "the requested program is not among the recorded ones");
 
-    std::error_code ec;
-    std::filesystem::path outputDir(outputDirStr);
-    auto ninjaPath = outputDir / "build.ninja";
-    if (!std::filesystem::exists(ninjaPath, ec)) return fast_path_declined("run", "build.ninja does not exist");
-    // #407, same reason as try_fast_build: a test-shaped graph does not build
-    // the run target at all, so running ninja against it would report success
-    // and then exec a stale (or absent) binary.
-    if (!mcpp::build::is_plain_build_graph(ninjaPath)) return fast_path_declined("run", "build.ninja was written by another mode (test, pack or a named target)");
-    // What the graph was planned for (workspace design 2026-09-29 §3): the
-    // features no longer name the directory, so the graph says which it has.
-    if (mcpp::build::read_request(ninjaPath) != mcpp::build::request_tag({}, want->features))
-        return fast_path_declined("run", "build.ninja was written for another request (features or workspace members)");
-    auto ninjaTime = std::filesystem::last_write_time(ninjaPath, ec);
-    if (ec) return fast_path_declined("run", "the time of build.ninja cannot be read");
-
-    auto runtimeManifest = match->runtimeBinding->subosDir / ".xlings.json";
-    auto runtimeTime = std::filesystem::last_write_time(runtimeManifest, ec);
-    if (ec || runtimeTime > ninjaTime) return fast_path_declined("run", "the runtime's .xlings.json is newer than build.ninja");
-
-    auto tomlPath = projectRoot / "mcpp.toml";
-    auto tomlTime = std::filesystem::last_write_time(tomlPath, ec);
-    if (ec || tomlTime > ninjaTime) return fast_path_declined("run", "mcpp.toml is newer than build.ninja");
-
-    if (sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,
-                           want->extTable)) return fast_path_declined("run", "a project source, build.mcpp, a build-program input or a resource script is newer than build.ninja");
-    // Same gate as try_fast_build's, and it has to be BOTH places: `mcpp run`
-    // reaches its binary through this path, so a `run` that skipped the check
-    // would execute an artifact built from a source set that no longer exists.
-    if (!match->depSourceRootsRecorded) return fast_path_declined("run", "the recorded build predates the list of path-dependency roots");
-    if (dep_sources_newer_than(match->depSourceRoots, ninjaTime, want->extTable))
-        return fast_path_declined("run", "a path dependency's manifest or source is newer than build.ninja");
-    if (!xlings_payloads_present(*match)) return fast_path_declined("run", "a recorded xlings payload is missing");
-    if (!local_toolchain_unchanged(match->outputDir))
-        return fast_path_declined("run", "a program of the toolchain named by path changed");
-
-    auto validatedBefore =
-        mcpp::build::runtime_validation::validated_artifact_snapshot(
-            outputDir, *match->runtimeBinding);
-    if (!validatedBefore) return fast_path_declined("run", "no validated artifact snapshot is recorded for this build");
+    // The gates every fast path shares (see admit_recorded_build), for the
+    // reason `mcpp run` is among the paths that need them: it execs the
+    // artifact itself, so an entry that cannot say which engine wrote it, or
+    // which runtime the program needs, must not be taken. What is left here is
+    // the project's own tree, as for try_fast_build; a graph that is not the
+    // plain build's does not build the run target at all (#407), so ninja
+    // against it would report success and then exec a stale or absent binary.
+    auto admitted = admit_recorded_build(*match, {
+        .request = mcpp::build::request_tag({}, want->features),
+        .manifest = projectRoot / "mcpp.toml",
+        .projectSourcesNewer = [&](std::filesystem::file_time_type ninjaTime) {
+            return sources_newer_than(projectRoot, ninjaTime, want->resourceScripts,
+                                      want->extTable);
+        },
+    });
+    if (!admitted) return fast_path_declined("run", admitted.error());
+    const auto& outputDir = admitted->outputDir;
+    const auto& ninjaPath = admitted->ninjaPath;
+    const auto& validatedBefore = admitted->validated;
 
     // Fresh → run ninja (picks up any incremental object/link work) then
     // exec the cached exe path directly. C1, same reason as try_fast_build's.
     restore_root_compile_commands(projectRoot, outputDir);
-    auto rc = run_ninja_fast(ninjaProgram, outputDir, ninjaPath, /*verbose=*/false,
+    auto rc = run_ninja_fast(admitted->ninjaProgram, outputDir, ninjaPath, /*verbose=*/false,
                              match->runtimeEnvKey, match->runtimeEnvValue);
     if (!rc) return fast_path_declined("run", "ninja reported a stale graph");
     if (*rc != 0) return kRunBuildFailed;
     if (!mcpp::build::runtime_validation::artifact_snapshot_unchanged(
-            *validatedBefore))
+            validatedBefore))
         return fast_path_declined("run", "ninja relinked an artifact, whose closure the full path validates"); // never execute an artifact not validated for this binding
 
     auto exe = outputDir / chosen->second;

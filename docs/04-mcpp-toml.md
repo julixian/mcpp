@@ -906,7 +906,11 @@ one key rather than several:
 2. those units compile with the **module** rule — they emit a BMI and their
    objects are linked unconditionally;
 3. the freshness fast path watches them, so adding an `import` to one
-   invalidates the build graph instead of silently reusing a stale one.
+   invalidates the build graph instead of silently reusing a stale one. A
+   package's files are classified by that package's own table: a `path`
+   dependency that declares `.ixx` for its sources is watched for `.ixx`
+   whatever its consumer declares, and the consumer needs no entry of its own
+   for it.
 
 Any extension is accepted **except** ones that already name a non-module role
 (`.cpp` `.cc` `.cxx` `.c` `.m` `.mm` `.h` `.hpp` `.hh` `.hxx` `.S` `.s`
