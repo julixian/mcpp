@@ -149,9 +149,9 @@ runs:
           if [ -n "$xl_ver" ] && echo "$xl_ver" | grep -qF "$XLINGS_VERSION"; then
             export PATH="$HOME/.xlings/subos/default/bin:$PATH"
             echo "$HOME/.xlings/subos/default/bin" >> "$GITHUB_PATH"
-            xlings --version
+            "$XL_BIN_PATH" --version
             MCPP=$(bash "$REPO_DIR/.github/tools/install_pinned_mcpp.sh" "$REPO_DIR")
-            echo "system  xlings: $(xlings --version 2>/dev/null | head -1)"
+            echo "system  xlings: $("$XL_BIN_PATH" --version 2>/dev/null | head -1)"
             if [ -x "$HOME/.mcpp/registry/bin/xlings" ]; then
               echo "sandbox xlings: $("$HOME/.mcpp/registry/bin/xlings" --version 2>/dev/null | head -1)"
             else
@@ -236,15 +236,23 @@ runs:
         # FAST PATH: see the unix leg for the reasoning. The cost on Windows is
         # larger (the zip is bigger and the runner's network path to
         # github.com is slower), measured at ~30 s per job.
+        #
+        # The fast path addresses xlings by ABSOLUTE PATH, not by bare
+        # `xlings.exe`. The cold path runs `xlings self install` first, which
+        # writes the dir into Windows PATH via `[Environment]::SetEnvironmentVariable`;
+        # without that step a bare `xlings.exe` call depends on the bash
+        # export PATH, which Git Bash re-derives from Windows on every child
+        # shell and drops the mixed-separator entry. install_pinned_mcpp.sh
+        # carries the same note.
         XL_BIN_PATH="$USERPROFILE/.xlings/subos/default/bin/xlings.exe"
         if [ -x "$XL_BIN_PATH" ]; then
           xl_ver="$("$XL_BIN_PATH" --version 2>/dev/null | head -1 || true)"
           if [ -n "$xl_ver" ] && echo "$xl_ver" | grep -qF "$XLINGS_VERSION"; then
             export PATH="$USERPROFILE/.xlings/subos/default/bin:$PATH"
             echo "$USERPROFILE/.xlings/subos/default/bin" >> "$GITHUB_PATH"
-            xlings.exe --version
+            "$XL_BIN_PATH" --version
             MCPP=$(bash "$REPO_DIR/.github/tools/install_pinned_mcpp.sh" "$REPO_DIR")
-            echo "system  xlings: $(xlings.exe --version 2>/dev/null | head -1)"
+            echo "system  xlings: $("$XL_BIN_PATH" --version 2>/dev/null | head -1)"
             if [ -x "$USERPROFILE/.mcpp/registry/bin/xlings.exe" ]; then
               echo "sandbox xlings: $("$USERPROFILE/.mcpp/registry/bin/xlings.exe" --version 2>/dev/null | head -1)"
             else
