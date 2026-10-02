@@ -3,6 +3,7 @@
 import std;
 import mcpp.build.execute;
 import mcpp.build.prepare;
+import mcpp.build.graph_shape;
 
 using namespace mcpp::build;
 
@@ -274,4 +275,26 @@ TEST(DepSourcesNewerThan, ANewerManifestCounts) {
     EditedProvider p;
     std::filesystem::last_write_time(p.tmp.path / "mcpp.toml", p.ninjaTime + std::chrono::seconds(20));
     EXPECT_TRUE(dep_sources_newer_than({{p.tmp.path, {}, {}}}, p.ninjaTime));
+}
+
+// The graph names the engine it runs as `$mcpp`, escaped for ninja; the reader
+// returns the path the emitter escaped, so that it compares with
+// `mcpp_exe_path()` in generic form.
+TEST(ReadEngineBinding, TheEscapedPathIsReadBack) {
+    Tmp tmp;
+    write_file(tmp.path / "build.ninja",
+               "# mcpp:graph=normal\ncxx       = /opt/llvm/bin/clang++\n"
+               "mcpp      = C$:/Program$ Files/mcpp$$1/mcpp.exe\n\nrule cxx\n");
+    EXPECT_EQ(read_engine_binding(tmp.path / "build.ninja"), "C:/Program Files/mcpp$1/mcpp.exe");
+}
+
+TEST(ReadEngineBinding, AGraphWithoutTheBindingSaysNothing) {
+    Tmp tmp;
+    write_file(tmp.path / "build.ninja", "cxx = clang++\nmcpp_extra = x\nrule cxx\n");
+    EXPECT_EQ(read_engine_binding(tmp.path / "build.ninja"), "");
+}
+
+TEST(ReadEngineBinding, AMissingFileSaysNothing) {
+    Tmp tmp;
+    EXPECT_EQ(read_engine_binding(tmp.path / "absent.ninja"), "");
 }

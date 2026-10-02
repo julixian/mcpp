@@ -28,7 +28,10 @@
 #      starts the engine has to run) succeeds with the new content in place;
 #   C  a record written before the engine was recorded declines once (under -v
 #      the reason is printed), and the build after it is replayed;
-#   D  `mcpp run` is asked the same question, and runs the program.
+#   D  `mcpp run` is asked the same question, and runs the program;
+#   E  a graph that another engine rewrote while the record still names this
+#      one (what `--configure-only` from another install does) is not replayed:
+#      the graph's own `$mcpp` binding is asked as well.
 set -e
 
 TMP=$(mktemp -d)
@@ -106,5 +109,17 @@ mv "$TMP/engine-three/mcpp$EXE" "$TMP/engine-one/mcpp$EXE"
 grep -q '^hello$' d1.log || fail "D: the program did not run" d1.log
 grep -q "fast-path: run declined" d1.log || fail "D: the run did not say that the fast path declined" d1.log
 names "engine-three" && fail "D: a graph still names the path the engine was moved from"
+
+# E. The graph names its engine itself. Another engine rewrote the graph and
+#    left the record: the fast path asks the graph, declines, and plans again.
+"$ONE" build > e0.log 2>&1 || fail "E: the build before the rewrite failed" e0.log
+for g in $(find target -name build.ninja); do
+    awk -v p="$TMP/engine-gone/mcpp$EXE" '/^mcpp *=/ { print "mcpp      = " p; next } { print }' \
+        "$g" > "$g.rewritten" && mv "$g.rewritten" "$g"
+done
+names "engine-gone" || fail "E: the rewrite did not take"
+"$ONE" build -v > e1.log 2>&1 || fail "E: the build of a graph another engine wrote failed" e1.log
+grep -q "runs another engine" e1.log || fail "E: the decline did not name the graph's engine" e1.log
+names "engine-gone" && fail "E: a graph still names the engine that rewrote it"
 
 echo "OK"

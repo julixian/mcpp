@@ -1789,6 +1789,13 @@ admit_recorded_build(const BuildCacheEntry& e, const ReplayAsk& ask) {
     const auto ninjaPath = outputDir / "build.ninja";
     if (!std::filesystem::exists(ninjaPath, ec)) return std::unexpected("build.ninja does not exist");
 
+    // The graph names the engine it runs, and that is asked of the graph, not
+    // only of the record: another engine's `--configure-only` rewrites the
+    // graph and leaves the record that names this one.
+    if (const auto named = mcpp::build::read_engine_binding(ninjaPath);
+        !named.empty() && named != mcpp_exe_path().generic_string())
+        return std::unexpected(std::format("build.ninja runs another engine ({})", named));
+
     // #407. Freshness is measured against the SOURCES, which says nothing
     // about what kind of graph this is. `mcpp test` and
     // `mcpp build --configure-only` write their plan -- dev-deps, test targets,
