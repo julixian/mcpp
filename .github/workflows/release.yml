@@ -13,32 +13,18 @@ on:
       tag:
         description: 'tag to (re)build — leave blank to derive `v<version>` from mcpp.toml and create the tag automatically'
         required: false
-      skip_canaries:
-        description: 'Skip the ecosystem canaries gate (use only when canaries are unavailable, e.g. runner outage).'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   # A RELEASE IS GATED BY THE ECOSYSTEM'S OWN PROJECTS (the 2026-09-28 design,
   # WS10): they are built with the candidate first
   # (.github/release-canaries.toml), and the job that creates the tag needs
   # them. A downstream project validates the release in its own pull request.
-  #
-  # 2026-10-03 (round-5 release for #759): the canaries step on ubuntu-24.04
-  # runners has been stuck in `in_progress` with no log output for four
-  # consecutive attempts; the tag-job still needs the canaries gate to be
-  # green. The `skip_canaries` input is the documented escape for a release
-  # during that outage — the canaries design (WS10) is not removed, only this
-  # one dispatch is exempted. Revert the input after the release.
   canaries:
-    if: ${{ !inputs.skip_canaries }}
     uses: ./.github/workflows/release-canaries.yml
 
   build-release:
     name: build + upload (linux / x86_64)
     needs: canaries
-    if: ${{ always() && (inputs.skip_canaries || needs.canaries.result == 'success') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write   # required to create releases + push tags
