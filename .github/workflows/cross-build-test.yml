@@ -80,7 +80,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.mcpp
-          key: mcpp-sandbox-${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('mcpp.toml', '.xlings.json') }}
+          key: mcpp-sandbox-${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('mcpp.toml', '.xlings.json', '.github/workflows/cross-build-test.yml') }}
           restore-keys: |
             mcpp-sandbox-${{ runner.os }}-cross-${{ matrix.target }}-
 
@@ -244,7 +244,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.mcpp
-          key: mcpp-sandbox-${{ runner.os }}-mingw-cross-${{ hashFiles('mcpp.toml', '.xlings.json') }}
+          key: mcpp-sandbox-${{ runner.os }}-mingw-cross-${{ hashFiles('mcpp.toml', '.xlings.json', '.github/workflows/cross-build-test.yml') }}
           restore-keys: |
             mcpp-sandbox-${{ runner.os }}-mingw-cross-
 

@@ -85,7 +85,10 @@ runs:
         # sandbox — which is what actually resolves dependencies — would
         # silently stay behind (observed: a 0.4.30 sandbox surviving under a
         # 0.4.69 bootstrap for weeks).
-        key: mcpp-sandbox-${{ runner.os }}-${{ runner.arch }}-ci-xl${{ inputs.xlings-version }}-${{ hashFiles('mcpp.toml', '.xlings.json') }}
+        # ci.yml is part of the key because it names the toolchains the build
+        # job installs before it saves (`prewarm`): a sandbox saved under an
+        # unchanged key would never gain one added there.
+        key: mcpp-sandbox-${{ runner.os }}-${{ runner.arch }}-ci-xl${{ inputs.xlings-version }}-${{ hashFiles('mcpp.toml', '.xlings.json', '.github/workflows/ci.yml') }}
         restore-keys: |
           mcpp-sandbox-${{ runner.os }}-${{ runner.arch }}-ci-xl${{ inputs.xlings-version }}-
 

@@ -667,10 +667,21 @@ void write_build_cache_entries(const std::filesystem::path& path,
               << '\n';
         f << "profile=" << e.profile << '\n';
         f << "cacheMode=" << e.cacheMode << '\n';
-        f << "depSources=" << e.depSourceRoots.size() << '\n';
-        for (auto& r : e.depSourceRoots)
-            f << r.root.generic_string() << '\t' << join_extensions(r.moduleExtensions)
-              << '\t' << join_extensions(r.deviceExtensions) << '\n';
+        // A root whose path holds a tab or a line break cannot be written in
+        // this line format: read back, the path would be cut at the tab, and a
+        // directory that happened to exist under the shorter name would be
+        // swept with the wrong table. Such an entry records no roots, which
+        // reads as "predates the list" and declines the fast path, the safe
+        // direction.
+        const bool writable = std::ranges::none_of(e.depSourceRoots, [](auto const& r) {
+            return r.root.generic_string().find_first_of("\t\n\r") != std::string::npos;
+        });
+        if (writable) {
+            f << "depSources=" << e.depSourceRoots.size() << '\n';
+            for (auto& r : e.depSourceRoots)
+                f << r.root.generic_string() << '\t' << join_extensions(r.moduleExtensions)
+                  << '\t' << join_extensions(r.deviceExtensions) << '\n';
+        }
         f << "runner=" << (e.runnerDeclared ? 1 : 0) << '\n';
         f << "runtier=" << (e.runTierPending ? 1 : 0) << '\n';
         f << "features=" << e.features << '\n';

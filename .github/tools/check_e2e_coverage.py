@@ -18,9 +18,11 @@ It reads the per-test reports the shards write (`E2E_REPORT` of run_all.sh, one
 under tests/e2e:
 
   ran        some report says pass, fail or timeout;
-  job        no report ran it, but a workflow names it (by file name, or by its
-             number as an `E2E_ONLY` pattern such as `239_*.sh`): a dedicated job
-             runs it and asserts its result itself;
+  job        no report ran it, but a workflow names it outside a comment, as a
+             whole token: by file name, by name without `.sh`, or by its number
+             as an `E2E_ONLY` pattern such as `239_*.sh`. A dedicated job runs it
+             and asserts its result itself. A name in a comment does not count,
+             and neither does a longer name that contains it;
   excused    tests/e2e/coverage-exceptions.tsv lists it with the reason no hosted
              runner can run it;
   uncovered  none of these. The check fails.
@@ -74,9 +76,25 @@ def read_exceptions(path: Path) -> dict[str, str]:
     return out
 
 
-def named_by_a_workflow(test: str, workflows: str) -> bool:
-    number = test.split("_", 1)[0]
-    return test in workflows or test[:-3] in workflows or f"{number}_*" in workflows
+TOKEN = re.compile(r"(?<![A-Za-z0-9_.-])(\d+[a-z]?_(?:\*|[A-Za-z0-9_]+))(?:\.sh)?(?![A-Za-z0-9_])")
+
+
+def workflow_tokens(texts: list[str]) -> set[str]:
+    """Every test name or `<number>_*` pattern named outside a comment."""
+    tokens: set[str] = set()
+    for text in texts:
+        for line in text.splitlines():
+            code = line.split("#", 1)[0] if line.lstrip().startswith("#") else line
+            if not code.strip():
+                continue
+            tokens.update(m.group(1) for m in TOKEN.finditer(code))
+    return tokens
+
+
+def named_by_a_workflow(test: str, tokens: set[str]) -> bool:
+    stem = test[:-3]
+    number = stem.split("_", 1)[0]
+    return stem in tokens or f"{number}_*" in tokens
 
 
 def main() -> int:
@@ -88,8 +106,8 @@ def main() -> int:
     root = Path(args.root).resolve()
 
     tests = sorted(p.name for p in (root / "tests" / "e2e").glob("[0-9]*.sh"))
-    workflows = "\n".join(p.read_text(encoding="utf-8")
-                          for p in sorted((root / ".github" / "workflows").glob("*.yml")))
+    workflows = workflow_tokens([p.read_text(encoding="utf-8")
+                                 for p in sorted((root / ".github" / "workflows").glob("*.yml"))])
     exceptions = read_exceptions(root / "tests" / "e2e" / "coverage-exceptions.tsv")
 
     ran: dict[str, set[str]] = defaultdict(set)

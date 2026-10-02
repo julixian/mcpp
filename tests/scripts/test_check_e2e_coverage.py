@@ -48,6 +48,21 @@ class E2ECoverage(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("1 ran on a shard, 2 run by a dedicated job, 1 excused, 0 uncovered", r.stdout)
 
+    def test_a_name_in_a_comment_or_inside_a_longer_name_does_not_count(self) -> None:
+        e2e = self.root / "tests" / "e2e"
+        (e2e / "60_commented.sh").write_text("# x\n# requires: llvm\n")
+        (e2e / "70_short.sh").write_text("# x\n# requires: llvm\n")
+        with (self.root / ".github" / "workflows" / "ci.yml").open("a") as f:
+            f.write("      # 60_commented.sh is mentioned in a comment only\n"
+                    "run: bash tests/e2e/170_short_but_longer.sh\n")
+        (self.reports / "e2e-report-linux-2.tsv").write_text(
+            "skip\t60_commented.sh\t0\tmissing capability: llvm\n"
+            "skip\t70_short.sh\t0\tmissing capability: llvm\n")
+        r = self.run_check()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("UNCOVERED: 60_commented.sh", r.stdout)
+        self.assertIn("UNCOVERED: 70_short.sh", r.stdout)
+
     def test_a_test_that_runs_nowhere_fails(self) -> None:
         (self.root / "tests" / "e2e" / "50_nowhere.sh").write_text("# x\n# requires: llvm\n")
         (self.reports / "e2e-report-linux-2.tsv").write_text(

@@ -150,6 +150,23 @@ TEST(BuildCacheRecord, TheEngineAndEachRootsTablesSurviveAWriteAndARead) {
     EXPECT_EQ(read[0].toolchainRequest, e.toolchainRequest);
 }
 
+// A path the line format cannot hold is not written at all, so the entry reads
+// as one that predates the list and declines, rather than as a shorter path.
+TEST(BuildCacheRecord, ARootWithATabInItsPathIsLeftUnrecorded) {
+    Tmp tmp;
+    auto e = minimal_entry();
+    e.depSourceRoots = {{"/work/a\tb", {".ixx"}, {}}};
+    e.depSourceRootsRecorded = true;
+    e.toolchainRecorded = true;
+    e.toolchainRequest = "cli=;default=gcc@16.1.0";
+    write_build_cache_entries(tmp.path / "target" / ".build_cache", {e});
+    const auto read = read_build_cache(tmp.path);
+    ASSERT_EQ(read.size(), 1u);
+    EXPECT_FALSE(read[0].depSourceRootsRecorded);
+    EXPECT_TRUE(read[0].depSourceRoots.empty());
+    EXPECT_TRUE(read[0].toolchainRecorded);
+}
+
 TEST(BuildCacheRecord, AnEmptyListOfRootsIsRecordedNotAbsent) {
     Tmp tmp;
     auto e = minimal_entry();

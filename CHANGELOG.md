@@ -57,7 +57,7 @@ No default toolchain changes.
 - **One writer per cache.** Every job restores. One job per key saves, on a
   push to `main` only, and `target/` is no longer cached, because a restored
   `target/` made no build incremental.
-- **E2E shards by measured duration**, three on Linux, three on Windows and two
+- **E2E shards by measured duration**, four on Linux, three on Windows and two
   on macOS, from `tests/e2e/timings/`. `run_all.sh` takes `E2E_TIMINGS`,
   `E2E_REPORT` and `E2E_LIST`.
 - **Every e2e test runs somewhere.** The `e2e-coverage` job fails when a test
@@ -66,7 +66,7 @@ No default toolchain changes.
   `run_all.sh` grants `llvm` on Linux, and it probes `musl` and `mingw-cross`
   by family rather than by one release.
 - The legs that are known red (#669) run on `main`, on dispatch, and on a pull
-  request labelled `macos-27`.
+  request labelled `macos-27` (the label is read on the next push).
 
 ## [2026.10.1.3] - 2026-10-01
 

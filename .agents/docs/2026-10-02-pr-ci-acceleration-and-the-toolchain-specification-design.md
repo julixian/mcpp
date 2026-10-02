@@ -421,8 +421,13 @@ repository has paid for that before.
   are the main cause of F3. They return only if the build becomes incremental across checkouts. That needs
   a measured cause (Part VII) and a fix that keeps the stale-object hazards already recorded in
   `.agents/docs/2026-05-15-stdcompat-restat-e2e.md` and `cross-build-test.yml:416-434` out of the result.
-- **Concurrency.** `cancel-in-progress` becomes `${{ github.event_name == 'pull_request' }}`. A push to
-  `main` runs to completion and writes its caches; a superseded pull-request run is still cancelled.
+- **Concurrency.** `cancel-in-progress` becomes `${{ github.event_name == 'pull_request' }}`, and a push
+  to `main` has a group of its own commit. A push to `main` runs to completion and writes its caches; a
+  superseded pull-request run is still cancelled. One group for all pushes to `main` would not be enough,
+  because GitHub keeps one pending run per group and cancels the older pending run when another arrives.
+- **Keys name what fills the cache.** The sandbox key hashes `ci.yml` as well as `mcpp.toml` and
+  `.xlings.json`, because `ci.yml` lists what the build job installs before it saves. A cache saved under
+  an unchanged key is never saved again, so a toolchain added to that list would otherwise never reach it.
 - **Wine.** The Wine packages come from one pinned archive, published once as a release asset of this
   repository, instead of from the `apt` mirrors with a cache that eviction removes (F7). The archive's
   sha256 is checked before installation.
@@ -620,6 +625,18 @@ reading taken while building it.
   machine that has them and failed on every runner, and nothing noticed, because
   no runner ran it. The fixture's root is now a library, which is what the test
   says it is: "this test compiles only".
+- **The review of the change** (a code review of mcpp#759) found eight defects. Each was repaired before
+  merging:
+  - the coverage check matched test names inside comments and inside longer names, and now matches whole
+    tokens outside comments;
+  - `changes` failed, rather than running the whole CI, when the GitHub API did not answer;
+  - pushes to `main` shared a concurrency group;
+  - the cache keys did not name the install list;
+  - the Linux shards' toolchain installs shared the suite's time limit, and now have a step of their own;
+  - the `macos-27` label's effect was undocumented (it is read on the next push);
+  - the CHANGELOG gave three Linux shards;
+  - a path-dependency root with a tab in its path could be cut short in the build record, and is now left
+    unrecorded, which declines the fast path.
 - **Coverage found more than F9.** Classifying the tests of the 2026-10-01
   logs found 24 that ran on no runner and were named by no workflow. The
   seven `llvm` tests are among them, and so are three `musl` tests: the probe

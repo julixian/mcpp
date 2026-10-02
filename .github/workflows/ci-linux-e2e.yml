@@ -48,6 +48,29 @@ jobs:
         with:
           host: linux-x86_64
 
+      # Its own step and its own limit, so that downloads on a cold sandbox are
+      # not taken from the suite's budget.
+      - name: The toolchains the suite probes
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # Pin the global default so test 28 (default-toolchain path) gets a
+          # deterministic GNU answer instead of an auto-install pick. Installed
+          # explicitly, not assumed: the restored sandbox is the build job's,
+          # and a toolchain that only happens to be in it is a dependency on a
+          # cache.
+          "$MCPP" toolchain install gcc 16.1.0
+          "$MCPP" toolchain default gcc@16.1.0
+          # The toolchains whose capabilities the suite probes (run_all.sh):
+          # musl, llvm (which also yields scan-deps and import-std-libcxx) and
+          # the Linux-hosted MinGW cross compiler. Without them their tests
+          # skip on every runner; measured 2026-10-01, seventeen such tests ran
+          # nowhere. Warm runs re-install nothing.
+          "$MCPP" toolchain install gcc 16.1.0-musl
+          "$MCPP" toolchain install llvm 22.1.8
+          "$MCPP" toolchain install mingw-cross 16.1.0
+          XLINGS_HOME="$MCPP_HOME/registry" "$MCPP_VENDORED_XLINGS" install xim:nasm -y
+
       - name: E2E suite
         # About twice the shard's budget of ten minutes (R4): reached only by a
         # hang. The per-test 600 s limit in run_all.sh names the test that hung.
@@ -65,22 +88,6 @@ jobs:
           # sandboxes. E2E tests with their own MCPP_HOME read this variable.
           export MCPP_E2E_TOOLCHAIN_MIRROR=GLOBAL
           "$MCPP" self config
-          # Pin the global default so test 28 (default-toolchain path) gets a
-          # deterministic GNU answer instead of an auto-install pick. Installed
-          # explicitly, not assumed: the restored sandbox is the build job's,
-          # and a toolchain that only happens to be in it is a dependency on a
-          # cache.
-          "$MCPP" toolchain install gcc 16.1.0
-          "$MCPP" toolchain default gcc@16.1.0
-          # The toolchains whose capabilities the suite probes (run_all.sh):
-          # musl, llvm (which also yields scan-deps and import-std-libcxx) and
-          # the Linux-hosted MinGW cross compiler. Without them their tests
-          # skip on every runner; measured 2026-10-01, seventeen such tests ran
-          # nowhere. Warm runs re-install nothing.
-          "$MCPP" toolchain install gcc 16.1.0-musl
-          "$MCPP" toolchain install llvm 22.1.8
-          "$MCPP" toolchain install mingw-cross 16.1.0
-          XLINGS_HOME="$MCPP_HOME/registry" "$MCPP_VENDORED_XLINGS" install xim:nasm -y
           bash tests/e2e/run_all.sh
 
       # One file, no glob: the report the e2e-coverage job of ci.yml reads.
@@ -346,7 +353,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.mcpp
-          key: mcpp-hermetic-${{ hashFiles('mcpp.toml') }}
+          key: mcpp-hermetic-${{ hashFiles('mcpp.toml', '.github/workflows/ci-linux-e2e.yml') }}
           restore-keys: |
             mcpp-hermetic-
 
