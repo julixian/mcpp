@@ -66,16 +66,30 @@ jobs:
       - name: "Toolchain: MinGW payload for the fat-package e2e"
         shell: bash
         run: |
+          # The build job's prewarm installs `mingw 16.1.0` on `main` and saves
+          # it into the sandbox cache, so every PR restores a sandbox that
+          # already holds it. The install call is then a no-op but still pays
+          # the mcpp-toolchain startup cost; measured 68 s on three shards per
+          # PR. Skip the call when the payload is already reachable, and keep
+          # the verification that names the missing-capability case (the whole
+          # reason this step exists is so a skipped shard does not read like a
+          # passing one).
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"
-          "$MCPP_SELF" toolchain install mingw 16.1.0
-          # Verified through the SAME two locations run_all.sh probes — checking
-          # only one of them would let the step pass while the capability stays
-          # ungranted, which is the shape of a green run that tested nothing.
           found=""
           for c in "${MCPP_HOME:-$HOME/.mcpp}"/registry/data/xpkgs/xim-x-mingw-gcc/*/bin/g++.exe \
                    "$HOME"/.xlings/data/xpkgs/xim-x-mingw-gcc/*/bin/g++.exe; do
             [[ -x "$c" ]] && { found="$c"; break; }
           done
+          if [ -z "$found" ]; then
+            "$MCPP_SELF" toolchain install mingw 16.1.0
+            for c in "${MCPP_HOME:-$HOME/.mcpp}"/registry/data/xpkgs/xim-x-mingw-gcc/*/bin/g++.exe \
+                     "$HOME"/.xlings/data/xpkgs/xim-x-mingw-gcc/*/bin/g++.exe; do
+              [[ -x "$c" ]] && { found="$c"; break; }
+            done
+          fi
+          # Verified through the SAME two locations run_all.sh probes — checking
+          # only one of them would let the step pass while the capability stays
+          # ungranted, which is the shape of a green run that tested nothing.
           test -n "$found" || { echo "FAIL: mingw installed but not where run_all.sh looks"; exit 1; }
           echo "mingw payload: $found"
 

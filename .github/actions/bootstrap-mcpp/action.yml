@@ -132,6 +132,37 @@ runs:
             esac
             tarball="xlings-${XLINGS_VERSION}-linux-${xa}.tar.gz" ;;
         esac
+        # FAST PATH: the xlings cache already holds the pinned version, so the
+        # tarball fetch + extract + `self install` are skipped. Without this
+        # guard every job of every CI run paid the download and the extract,
+        # measured at 5 to 30 seconds per job on Linux and ~30 seconds on
+        # Windows, across thirty jobs per run — about half the bootstrap-mcpp
+        # step on Windows, more the 7 seconds the unix leg pays. The cache key
+        # is `xl$VER` already; the check is the one case this guard would
+        # otherwise miss: a stale `xlings` cache from BEFORE the pin was
+        # bumped (a partial restore-key match hands the same OS/ARCH cache
+        # back, but with the previous release), or a binary that no longer runs
+        # because its dynamic loader is gone.
+        XL_BIN_PATH="$HOME/.xlings/subos/default/bin/xlings"
+        if [ -x "$XL_BIN_PATH" ]; then
+          xl_ver="$("$XL_BIN_PATH" --version 2>/dev/null | head -1 || true)"
+          if [ -n "$xl_ver" ] && echo "$xl_ver" | grep -qF "$XLINGS_VERSION"; then
+            export PATH="$HOME/.xlings/subos/default/bin:$PATH"
+            echo "$HOME/.xlings/subos/default/bin" >> "$GITHUB_PATH"
+            xlings --version
+            MCPP=$(bash "$REPO_DIR/.github/tools/install_pinned_mcpp.sh" "$REPO_DIR")
+            echo "system  xlings: $(xlings --version 2>/dev/null | head -1)"
+            if [ -x "$HOME/.mcpp/registry/bin/xlings" ]; then
+              echo "sandbox xlings: $("$HOME/.mcpp/registry/bin/xlings" --version 2>/dev/null | head -1)"
+            else
+              echo "sandbox xlings: (not initialised yet)"
+            fi
+            echo "MCPP=$MCPP" >> "$GITHUB_ENV"
+            echo "XLINGS_BIN=$XL_BIN_PATH" >> "$GITHUB_ENV"
+            exit 0
+          fi
+        fi
+
         WORK=$(mktemp -d)
         # Retried and verified — see .github/tools/fetch_release.sh. A bare curl
         # here was the single largest source of unexplained CI red on this repo
@@ -202,6 +233,29 @@ runs:
         XLINGS_VERSION: ${{ inputs.xlings-version }}
       run: |
         REPO_DIR="$(pwd)"
+        # FAST PATH: see the unix leg for the reasoning. The cost on Windows is
+        # larger (the zip is bigger and the runner's network path to
+        # github.com is slower), measured at ~30 s per job.
+        XL_BIN_PATH="$USERPROFILE/.xlings/subos/default/bin/xlings.exe"
+        if [ -x "$XL_BIN_PATH" ]; then
+          xl_ver="$("$XL_BIN_PATH" --version 2>/dev/null | head -1 || true)"
+          if [ -n "$xl_ver" ] && echo "$xl_ver" | grep -qF "$XLINGS_VERSION"; then
+            export PATH="$USERPROFILE/.xlings/subos/default/bin:$PATH"
+            echo "$USERPROFILE/.xlings/subos/default/bin" >> "$GITHUB_PATH"
+            xlings.exe --version
+            MCPP=$(bash "$REPO_DIR/.github/tools/install_pinned_mcpp.sh" "$REPO_DIR")
+            echo "system  xlings: $(xlings.exe --version 2>/dev/null | head -1)"
+            if [ -x "$USERPROFILE/.mcpp/registry/bin/xlings.exe" ]; then
+              echo "sandbox xlings: $("$USERPROFILE/.mcpp/registry/bin/xlings.exe" --version 2>/dev/null | head -1)"
+            else
+              echo "sandbox xlings: (not initialised yet)"
+            fi
+            echo "MCPP=$MCPP" >> "$GITHUB_ENV"
+            echo "XLINGS_BIN=$(cygpath -w "$XL_BIN_PATH")" >> "$GITHUB_ENV"
+            exit 0
+          fi
+        fi
+
         WORK=$(mktemp -d)
         zipfile="xlings-${XLINGS_VERSION}-windows-x86_64.zip"
         # Same helper as the unix leg. This is the leg that kept failing, and a
