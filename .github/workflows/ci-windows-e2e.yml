@@ -81,15 +81,13 @@ jobs:
 
       - name: E2E suite
         shell: bash
-        # Fail-fast on hung tests instead of burning the whole job budget.
-        # Per-test 600s timeout lives in run_all.sh.
-        timeout-minutes: 25
+        # About twice the shard's budget of fifteen minutes (R4): reached only by
+        # a hang. The per-test 600 s limit in run_all.sh names the test that hung.
+        timeout-minutes: 30
         run: |
-          # The RELEASED mcpp this job bootstrapped from, kept for e2e 252: the
-          # claim that an older client can still build against a package the PR
-          # produces is only worth making if something checks it against a real
-          # old binary. Captured before $MCPP is repointed at the fresh build.
-          # MCPP_BOOT is the released bootstrap (use-built-mcpp), for e2e 252.
+          # MCPP_BOOT is the released bootstrap (use-built-mcpp). e2e 252 checks
+          # an older client against a package this commit produces, so it needs
+          # a real old binary.
           export MCPP_BOOT
           export MCPP="$MCPP_SELF"
           export MCPP_VENDORED_XLINGS="$XLINGS_BIN"

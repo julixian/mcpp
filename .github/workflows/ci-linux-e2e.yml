@@ -1,7 +1,7 @@
 name: ci-linux-e2e
 
 # The e2e suite (tests/e2e/run_all.sh) on Linux, called by ci.yml beside
-# ci-linux.yml after the Linux build. Three shards, assigned by measured
+# ci-linux.yml after the Linux build. Four shards, assigned by measured
 # duration (tests/e2e/timings/linux.tsv, rule R4 of the 2026-10-02 CI record),
 # each running the one binary build.yml produced (use-built-mcpp, rule R1).
 # Each shard writes a per-test report that the e2e-coverage job of ci.yml reads
@@ -15,15 +15,15 @@ on:
 
 jobs:
   e2e:
-    name: e2e ${{ matrix.shard }}/3 (linux x86_64, self-host)
+    name: e2e ${{ matrix.shard }}/4 (linux x86_64, self-host)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     env:
-      E2E_SHARD: ${{ matrix.shard }}/3
+      E2E_SHARD: ${{ matrix.shard }}/4
       E2E_TIMINGS: tests/e2e/timings/linux.tsv
       E2E_REPORT: ${{ github.workspace }}/e2e-report-linux-${{ matrix.shard }}.tsv
       MCPP_HOME: /home/runner/.mcpp
@@ -49,9 +49,9 @@ jobs:
           host: linux-x86_64
 
       - name: E2E suite
-        # Twice the shard's budget of about ten minutes (R4): reached only by a
+        # About twice the shard's budget of ten minutes (R4): reached only by a
         # hang. The per-test 600 s limit in run_all.sh names the test that hung.
-        timeout-minutes: 25
+        timeout-minutes: 22
         run: |
           set -euo pipefail
           # MCPP is this commit's binary and MCPP_BOOT the released bootstrap

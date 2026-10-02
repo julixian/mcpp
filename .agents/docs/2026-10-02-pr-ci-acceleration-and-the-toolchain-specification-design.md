@@ -564,6 +564,74 @@ measurement uses the same scripts as §2.1.
 - Cache usage below 8 GB.
 - A documentation-only pull request finishing under 5 minutes.
 
+### 2.7 What was built, and where it departs from §2.4
+
+Implemented in mcpp#759. Each departure below was decided by a measurement or a
+reading taken while building it.
+
+- **The artifact is the binary itself, not a packed copy (§2.4.1).** The Linux
+  self-host binary has the interpreter
+  `~/.mcpp/registry/data/xpkgs/xim-x-glibc/2.44/lib64/ld-linux-x86-64.so.2`, needs
+  `libgcc_s.so.1` from the `xim-x-gcc/16.1.0` payload, and links libstdc++
+  statically (measured locally, `readelf`). A consumer that restores the
+  sandbox runs it as it is. Packing it would test a different binary from the
+  one every self-host build produces. `use-built-mcpp` runs the binary first,
+  and only when it does not run does the bootstrap install the toolchain
+  `mcpp.toml` names for the host; a binary that still does not run fails the
+  step. The binary is 25 MB.
+- **The Wine packages keep their cache (§2.4.4).** Their eviction was a
+  consequence of F3, not a property of the cache. With one writer per key, the
+  `wine-debs` cache is saved only by `mingw-cross-wine` on main and is no longer
+  displaced. A release asset would have added a second thing to publish and
+  keep current.
+- **The timing tables are in the repository (§2.4.5).** They live under
+  `tests/e2e/timings/<host>.tsv`, seeded from the per-test lines of the
+  2026-10-01 logs. A shard's membership is then a function of the commit,
+  which makes it reproducible (`E2E_LIST=1` prints it). The `e2e-coverage` job
+  uploads the merged durations of each run as the artifact `e2e-timings`, and
+  refreshing a table is copying a file. The tables were seeded from the
+  2026-10-01 logs, then replaced by the durations of the first run of this
+  change, in which 515 Linux tests ran instead of 466. Linux therefore has four
+  shards rather than three, each budgeted at 9.9 minutes. Windows has three at
+  14.4 to 14.5, and macOS two at 9.1 and 9.3. The step limits are about twice
+  the budgets: 22, 30 and 20 minutes.
+- **The classifier searches exact paths (§2.4.3).** It searches for the
+  changed path and for its translation (`docs/X` and `docs/zh/X`), and not for
+  a bare file name. A search on the name made `.agents/docs/README.md`, which
+  every new record regenerates, a code change, because release packaging names
+  `README.md`. The checks of the `docs` job do not count as readers, because
+  they run on every change. A document that any other script or source names
+  starts the whole CI rather than a subset of it, which is simpler and errs
+  towards running more.
+- **The macOS legs of the target matrix and of openkal still build (§2.4.1).**
+  They run on `macos-14`, and the artifact is built on `macos-15`. release.yml
+  records that a bootstrap build linking the system libc++ with a minimum
+  version of 14 failed at launch on `macos-14`. Until the artifact is measured
+  there, those two legs build their own, and the gate carries
+  `ci-lint: allow-r1` with that reason. Their Linux and Windows legs consume the
+  artifact.
+- **`invariants` and `scan` remain two jobs (§2.4.1).** Merging them is a
+  rewrite of the target-matrix workflow beside a change that already rewrites
+  twelve; it is left for a change of its own.
+- **A test that never ran was broken.** 741, one of the seven `llvm` tests,
+  failed on its first run in CI. The root package of its fixture was a binary,
+  so the build linked `cabi-probe.exe` for `x86_64-windows-gnu`, and with
+  `allow_host_libs` the link found the host's mingw-w64 libraries. It passed on a
+  machine that has them and failed on every runner, and nothing noticed, because
+  no runner ran it. The fixture's root is now a library, which is what the test
+  says it is: "this test compiles only".
+- **Coverage found more than F9.** Classifying the tests of the 2026-10-01
+  logs found 24 that ran on no runner and were named by no workflow. The
+  seven `llvm` tests are among them, and so are three `musl` tests: the probe
+  named 15.1.0 while the runners installed 16.1.0. Seven `mingw-cross` tests
+  are in the list too, a toolchain no shard installed. The rest were 105 (nasm),
+  65 (scan-deps), 239 (named by its `E2E_ONLY` pattern, which the check now
+  reads), 257 (needs wine and a Linux-hosted MinGW), 658 (an attached Android
+  device), and 873-877 (added after the logs). The capability probes now ask for
+  a family. The Linux shards install musl, llvm, mingw-cross and nasm. 257 runs
+  in `mingw-cross-wine`. 658 is the one entry of
+  `tests/e2e/coverage-exceptions.tsv`.
+
 ## Part III. Defects repaired by the next release
 
 ### 3.1 #757: the engine's identity is part of a build record
