@@ -8,16 +8,23 @@
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![Module](https://img.shields.io/badge/module-ok-green.svg)](https://en.cppreference.com/w/cpp/language/modules)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE)
+[![ci](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml)
 
 | [Documentation](docs/) · [Getting Started](docs/01-getting-started.md) · [mcpp.toml Guide](docs/04-mcpp-toml.md) · [Examples](docs/03-examples.md) · [Toolchains](docs/20-toolchains.md) |
 |:---:|
 | [Package index mcpp-index](https://mcpplibs.github.io/mcpp-index/) · [Module libraries mcpplibs](https://github.com/mcpplibs) · [Community Forum](https://forum.d2learn.org/category/20) · [Issues](https://github.com/mcpp-community/mcpp/issues) · [Releases](https://github.com/mcpp-community/mcpp/releases) |
-| [![ci](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml) |
-| Plugins · [mcpp-language-server (mcppls)](https://github.com/Sunrisepeak/mcpp-language-server) — a C++20/23 modules language server for VS Code, Zed, CLion, Neovim, AI agents (MCP) and CI |
+| Plugins · [mcpp-language-server (mcppls)](https://github.com/Sunrisepeak/mcpp-language-server) — a C++20/23 modules language server |
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/6c85896e-9a37-4f62-acfb-d37a4eae2363" alt="mcpp demo" width="720">
-</p>
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="https://github.com/user-attachments/assets/3778c1d6-9341-43b0-b344-1d0943ec7d2a" alt="mcpp demo 2" width="460">
+    </td>
+    <td align="center" width="50%">
+      <img src="https://github.com/user-attachments/assets/6c85896e-9a37-4f62-acfb-d37a4eae2363" alt="mcpp demo 1" width="460">
+    </td>
+  </tr>
+</table>
 
 ## Highlights
 
