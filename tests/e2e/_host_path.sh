@@ -36,8 +36,9 @@ host_path() {
     # agree and Windows accepts `/` as a separator. Passing one to `cygpath -m`
     # would silently ANCHOR it at the current directory — which is not where the
     # manifest being written lives — so relative input is returned untouched.
+    # MCPP_HOME can arrive from CI as C:\Users\...; it is absolute too.
     case "$1" in
-        /*) ;;
+        /* | [A-Za-z]:[\\/]*) ;;
         *) printf '%s' "$1"; return 0 ;;
     esac
     case "$(uname -s)" in

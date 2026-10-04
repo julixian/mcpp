@@ -8,11 +8,11 @@
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![Module](https://img.shields.io/badge/module-ok-green.svg)](https://en.cppreference.com/w/cpp/language/modules)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE)
+[![ci](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml)
 
 | [文档](docs/zh/) · [快速开始](docs/zh/01-getting-started.md) · [mcpp.toml 指南](docs/zh/04-mcpp-toml.md) · [示例项目](docs/zh/03-examples.md) · [工具链管理](docs/zh/20-toolchains.md) |
 |:---:|
 | [包索引 mcpp-index](https://mcpplibs.github.io/mcpp-index/) · [模块化库 mcpplibs](https://github.com/mcpplibs) · [社区论坛](https://forum.d2learn.org/category/20) · [Issues](https://github.com/mcpp-community/mcpp/issues) · [Releases](https://github.com/mcpp-community/mcpp/releases) |
-| [![ci](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mcpp-community/mcpp/actions/workflows/ci.yml) |
 | 支持的插件 · [mcpp-language-server（mcppls）](https://github.com/Sunrisepeak/mcpp-language-server) —— C++20/23 模块语言服务器，面向 VS Code、Zed、CLion、Neovim、AI Agent（MCP）与 CI |
 
 <p align="center">
