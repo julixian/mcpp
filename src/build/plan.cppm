@@ -3087,9 +3087,12 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                         "'{}', which target '{}' of this build also produces",
                         t.name, owner, lu.output.generic_string(), other.targetName));
 
+            // A sibling shared target is another image of this member's
+            // objects, not a dependency of its executable. Only another
+            // package's shared target supplies its implementation by link.
             for (auto const& cu : plan.compileUnits) {
                 if (!closure.contains(cu.packageName)) continue;
-                if (sharedDepPackages.contains(cu.packageName)) continue;
+                if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
                 if (mcpp::links_unconditionally(cu.kind)) lu.objects.push_back(cu.object);
             }
             if (!t.main.empty() && lu.kind != LinkUnit::StaticLibrary) {
@@ -3147,7 +3150,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             const bool entryDefinesMain = lu.entryMain && source_defines_main(*lu.entryMain);
             for (auto const& cu : plan.compileUnits) {
                 if (!closure.contains(cu.packageName)) continue;
-                if (sharedDepPackages.contains(cu.packageName)) continue;
+                if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
                 if (!is_implementation_source(cu.kind)) continue;
                 if (lu.entryMain && cu.source == *lu.entryMain) continue;
                 if (entryFilesAcrossTargets.contains(cu.source)) continue;
@@ -3159,11 +3162,12 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
             if (lu.kind != LinkUnit::StaticLibrary) {
                 const auto before = lu.implicitInputs.size();
-                // The shared libraries the closure's packages link, and no
-                // other member's.
+                // The member still links its declared shared dependencies
+                // even when it also produces a shared target of its own.
                 for (auto i : closureIdx)
-                    if (!sharedDepPackages.contains(qualified_package_name(packages[i].manifest))
-                        && !placedInImage.contains(qualified_package_name(packages[i].manifest)))
+                    if (i == mi
+                        || (!sharedDepPackages.contains(qualified_package_name(packages[i].manifest))
+                            && !placedInImage.contains(qualified_package_name(packages[i].manifest))))
                         append_direct_shared_deps(lu, i);
                 // The graph-built shared libraries this unit loads are placed
                 // beside it.
