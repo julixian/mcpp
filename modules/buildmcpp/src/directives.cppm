@@ -936,19 +936,36 @@ std::string glob_fingerprint(const std::filesystem::path& root,
     namespace fs = std::filesystem;
     std::vector<std::string> hits;
     std::error_code ec;
+    const auto empty = mcpp::toolchain::hash_string("");
+    const auto prefix = mcpp::modgraph::glob_literal_prefix(pattern);
+    // Starting at the literal prefix must not bypass the exclusions applied
+    // during traversal, or target/** and symlink/subdir/** would enter them.
+    auto start = root;
+    for (const auto& component : prefix) {
+        if (component == ".git" || (!outputDirName.empty()
+                && component == mcpp::modgraph::native_path_from_generic(outputDirName)))
+            return empty;
+        start /= component;
+        if (fs::is_symlink(start, ec)) return empty;
+    }
+    start = start.lexically_normal();
+    ec.clear();
     // skip_permission_denied only: symlinked directories are NOT followed, the
     // same rule the source scan uses, so a self-referential link cannot make
     // this walk diverge.
     fs::recursive_directory_iterator it(
-        root, fs::directory_options::skip_permission_denied, ec);
-    if (ec) return {};
+        start, fs::directory_options::skip_permission_denied, ec);
+    // A missing input directory is the same empty set as an existing directory
+    // containing no matches. Its first matching file will invalidate the key.
+    if (ec) return empty;
     for (; it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) break;
         const auto& p = it->path();
         std::error_code dec;
         if (it->is_directory(dec)) {
-            auto name = p.filename().string();
-            if (name == ".git" || (!outputDirName.empty() && name == outputDirName)) {
+            const auto name = p.filename();
+            if (name == ".git" || (!outputDirName.empty()
+                    && name == mcpp::modgraph::native_path_from_generic(outputDirName))) {
                 it.disable_recursion_pending();
                 continue;
             }
@@ -956,13 +973,12 @@ std::string glob_fingerprint(const std::filesystem::path& root,
             continue;
         }
         if (!mcpp::modgraph::path_matches_glob(p, root, pattern)) continue;
-        std::string rel;
-        try {
-            rel = p.lexically_relative(root).generic_string();
-        } catch (const std::exception&) {
-            continue;   // unspellable name — see path_matches_glob
+        auto rel = mcpp::modgraph::try_narrow(p.lexically_relative(root));
+        if (!rel) {
+            mcpp::modgraph::note_unnarrowable_path(p);
+            continue;
         }
-        hits.push_back(std::move(rel));
+        hits.push_back(std::move(*rel));
     }
     std::ranges::sort(hits);
     std::string joined;

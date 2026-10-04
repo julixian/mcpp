@@ -34,6 +34,18 @@ std::filesystem::path native_path_from_generic(std::string_view s) {
     return p;
 }
 
+// The complete literal directory prefix before the first wildcard. Both the
+// source scanner and rerun-glob fingerprints use it to choose their walk root,
+// including sibling directories such as ../inputs/**/*.in.
+std::filesystem::path glob_literal_prefix(std::string_view glob) {
+    if (!glob.empty() && glob.front() == '!') glob.remove_prefix(1);
+    const auto wildcard = glob.find_first_of("*?{[");
+    const auto literal = glob.substr(0, wildcard);
+    const auto slash = literal.find_last_of('/');
+    if (slash == std::string_view::npos) return {};
+    return native_path_from_generic(literal.substr(0, slash));
+}
+
 // Whether `s` is well-formed UTF-8: no stray continuation byte, no truncated or
 // overlong sequence, no surrogate, nothing above U+10FFFF.
 bool is_valid_utf8(std::string_view s);

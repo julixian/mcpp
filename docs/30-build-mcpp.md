@@ -560,7 +560,10 @@ int main() {
 ```
 
 The pattern is relative to the manifest directory and uses the same `*` / `**`
-grammar as `sources = [...]`. Its fingerprint is the **sorted set of matching
+grammar as `sources = [...]`. A literal directory prefix can leave the package:
+`../inputs/**/*.in` watches a sibling directory, including its creation after
+the first build. Output and `.git` directories remain excluded, and directory
+symlinks are not followed. Its fingerprint is the **sorted set of matching
 paths** and nothing else:
 
 - **not contents** — a file whose bytes matter is an ordinary
