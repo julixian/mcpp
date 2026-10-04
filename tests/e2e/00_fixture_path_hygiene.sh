@@ -25,6 +25,20 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/_host_path.sh"
+
+# CI passes MCPP_HOME in native Windows spelling, not just Git Bash spelling.
+# Both must produce paths safe to interpolate into TOML basic strings.
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        [[ "$(host_path 'C:\Users\runner admin\.mcpp/registry')" == 'C:/Users/runner admin/.mcpp/registry' ]] || {
+            echo "FAIL: host_path did not normalize a native Windows absolute path"
+            exit 1
+        }
+        [[ "$(host_path 'C:/Users/runner admin/.mcpp/registry')" == 'C:/Users/runner admin/.mcpp/registry' ]] || exit 1
+        ;;
+esac
+[[ "$(host_path '../relative directory')" == '../relative directory' ]] || exit 1
 
 # A TOML `path` key: either at the start of a line, or inside an inline table
 # (`{ path = "..." }`). Anchoring this way is what keeps shell assignments such
