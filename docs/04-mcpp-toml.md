@@ -263,9 +263,10 @@ soname  = "libmydriver.so.1"
 exports = "abi/mydriver.exports"     # or inline: exports = ["vk_icd*"]
 ```
 
-**Omitting the key publishes everything, which is what both platforms already
-do** — ELF gives symbols default visibility, and PE gets an auto-generated
-`.def` listing every symbol. `exports` narrows that.
+Omitting `exports` leaves ELF and Mach-O's native visibility rules in effect.
+On the MSVC ABI, mcpp discovers exportable external definitions unless an input
+already declares exports or `auto_export = false` disables discovery. `exports`
+narrows the linker's published set.
 
 Two projects need the narrowing. A **runtime with a stable ABI** publishes a
 reviewed set and nothing else, so that what is not in the set stays free to
@@ -299,6 +300,31 @@ computes it and emits `mcpp:link-flag=` (docs/07).
 A `soname` is meaningful on `kind = "lib"` too — see
 [`dependency_linkage`](#dependency_linkage--static-or-shared-is-the-consumers-decision)
 below, where the form a library takes becomes the consumer's decision.
+
+#### `auto_export` — native export control on the MSVC ABI (unreleased)
+
+The key and LLVM bitcode discovery require an unreleased source build; they are
+not available in mcpp 2026.10.3.1. A target that supplies its own export control
+can omit the automatic export-discovery step:
+
+```toml
+[targets.plugin]
+kind = "shared"
+auto_export = false
+```
+
+The boolean defaults to `true` and applies only to PE shared libraries on the
+MSVC ABI, including clang and clang-cl. It applies when a library target is
+built as a dependency too. It has no effect on static libraries, executables,
+ELF, Mach-O or MinGW. Native `__declspec(dllexport)`, linker flags and explicit
+`exports` lists remain effective when discovery is disabled.
+
+With discovery enabled, any input's explicit export intent suppresses automatic
+exports for the whole DLL. COFF directives are checked first. LLVM bitcode is
+inspected with the selected LLVM compiler, including `dllexport` declarations
+and linker-option metadata. Only an unannotated DLL needs candidate enumeration;
+bitcode candidates come from `llvm-nm` beside that compiler. Both FullLTO and
+ThinLTO inputs can be mixed with ordinary COFF objects.
 
 #### `windows_subsystem` and `windows_entry` — a Windows GUI executable (mcpp 2026.9.12.2+)
 

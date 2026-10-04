@@ -75,6 +75,31 @@ BuildPlan minimal_plan() {
 
 }  // namespace
 
+TEST(NinjaBackend, BitcodeExportToolsComeFromTheSelectedLlvmAndAreQuotedAsWords) {
+    auto plan = minimal_plan();
+    plan.toolchain.compiler = mcpp::toolchain::CompilerId::Clang;
+    plan.toolchain.targetTriple = "x86_64-pc-windows-msvc";
+    plan.toolchain.binaryPath = "/selected llvm/$installation/bin/clang++";
+    LinkUnit dll;
+    dll.kind = LinkUnit::SharedLibrary;
+    dll.targetName = "probe";
+    dll.output = "bin/probe.dll";
+    dll.importLibrary = "bin/probe.lib";
+    dll.defFile = "bin/probe.def";
+    dll.objects = {"obj/probe.o"};
+    plan.linkUnits.push_back(dll);
+    auto text = emit_ninja_string(plan);
+    const auto nm = plan.toolchain.binaryPath.parent_path()
+        / (mcpp::platform::is_windows ? "llvm-nm.exe" : "llvm-nm");
+    EXPECT_NE(text.find("--llvm-cxx " + ninja_command_word(plan.toolchain.binaryPath.generic_string())), std::string::npos);
+    EXPECT_NE(text.find("--llvm-nm " + ninja_command_word(nm.generic_string())), std::string::npos);
+    EXPECT_NE(text.find("--llvm-target x86_64-pc-windows-msvc"), std::string::npos);
+    EXPECT_NE(text.find("build bin/probe.def : coff_def obj/probe.o"), std::string::npos);
+    plan.toolchain.compiler = mcpp::toolchain::CompilerId::MSVC;
+    plan.toolchain.binaryPath = "/native/bin/cl.exe";
+    EXPECT_EQ(emit_ninja_string(plan).find("coff_tools ="), std::string::npos);
+}
+
 TEST(NinjaBackend, ObjectiveCSourceUsesCObjectRuleAndCFlags) {
     auto plan = minimal_plan();
     plan.compileUnits.push_back({

@@ -343,9 +343,9 @@ error while loading shared libraries: libstdc++.so.6: cannot open shared object 
 
 mcpp 从对象文件生成 `.def`——这正是 CMake 的 `WINDOWS_EXPORT_ALL_SYMBOLS`
 自 3.4 起在做的事。它是构建图里的一个节点，输入就是链接所消费的那批对象，
-因此导出面不会与「实际编译了什么」发生漂移；而且它直接读 COFF，不会 shell 出去
-调用 `dumpbin`——那个工具存在于 Visual Studio 的开发者环境里，而 mcpp 在
-Windows 上的默认工具链是 clang。
+因此导出面不会与「实际编译了什么」发生漂移。普通 COFF 对象直接读取；LLVM
+bitcode 检查（尚未发布的源码构建）使用所选 LLVM 编译器和它旁边的 `llvm-nm`，
+支持 FullLTO 和 ThinLTO。
 
 **有两条限制是任何工具都消不掉的**，与 CMake 为同一机制记录的正是同样两条：
 
@@ -355,10 +355,12 @@ Windows 上的默认工具链是 clang。
 | **vtable** 被引用的类 | 整个类都要被标注，例如一个带虚函数的类的委托构造函数 |
 
 两者都靠标注来回答，而且**标注优先**：一个已经带 `/EXPORT:` 指令的对象——那
-正是 `__declspec(dllexport)` 产生的——会让 mcpp 让开，什么都不生成。在其上再
+正是 `__declspec(dllexport)` 产生的——会让 mcpp 写入空的 `EXPORTS` 节。在其上再
 叠加一份列表，会把同一批符号导出两次（`LNK4197`），还会把其余所有符号也一并
-导出，用「全部」取代作者选定的那个公开面。这件事没有任何东西需要配置：对象
-文件自己说了算。
+导出，用「全部」取代作者选定的那个公开面。bitcode 的 `dllexport` 存储类别和
+linker-option 元数据表达同样的意图。导出意图在枚举候选符号前检查。每个 target
+可以通过 [`auto_export`](04-mcpp-toml.md#auto_export--msvc-abi-上的原生导出控制尚未发布)
+完全关闭导出发现（尚未发布的源码构建）。
 
 超过 65535 个可导出符号时，mcpp 拒绝而不是截断。一个被截断的导出表能干净地
 链接完成，随后在恰好需要那个掉出去的符号的消费方那里失败。
