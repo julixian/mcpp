@@ -5,7 +5,7 @@
 #
 # A module interface, a separate implementation unit and a static dependency
 # must all reach the executable. Another member still consumes the shared
-# target. Both --workspace and an explicit member selection keep this rule.
+# target. Workspace selection, shipped artifacts and host tools keep this rule.
 set -e
 source "$(dirname "$0")/_host_path.sh"
 
@@ -110,4 +110,107 @@ fi
 
 "$MCPP" build -p dual > selected.log 2>&1 || fail "the selected member did not build" selected.log
 "$(bin_of dual)" || fail "the selected member's executable did not run"
+
+# Request the same executable as an artifact, rather than selecting its owner.
+# The feature gate must be activated by the dependency that requests it.
+cat >> dual/mcpp.toml <<'EOF'
+required_features = ["exe"]
+
+[features]
+exe = []
+EOF
+mkdir -p shipped/src
+cat > shipped/mcpp.toml <<'EOF'
+[package]
+name = "shipped"
+version = "0.1.0"
+
+[dependencies]
+dual = { path = "../dual", artifacts = ["dual"], features = ["exe"] }
+support = { path = "../support" }
+
+[targets.shipped]
+kind = "bin"
+main = "src/main.cpp"
+EOF
+printf 'import t880_support;\nint main() { return delta() == 1 ? 0 : 1; }\n' > shipped/src/main.cpp
+cat > mcpp.toml <<'EOF'
+[workspace]
+members = ["dual", "client", "support", "shipped"]
+EOF
+"$MCPP" build -p shipped > artifact.log 2>&1 || fail "the requested artifact did not build" artifact.log
+artifact=$(find target -path "*/bin/shipped/dual$EXE" -type f | head -1)
+[ -n "$artifact" ] || fail "the requested artifact was not placed beside its consumer" artifact.log
+"$artifact" || fail "the requested artifact did not run"
+"$(bin_of shipped)" || fail "the artifact's consumer did not run"
+"$MCPP" build --workspace > artifact-workspace.log 2>&1 || fail "the workspace with an artifact request did not build" artifact-workspace.log
+"$artifact" || fail "the workspace's requested artifact did not run"
+"$dual" || fail "the workspace's owner executable did not run"
+n=0
+while IFS= read -r library; do
+    n=$((n + 1))
+    mv "$library" "hidden/artifact-$n"
+done < <(find target -path '*/bin/*' \( -name '*dual_dll.dll' -o -name '*dual_dll.so*' -o -name '*dual_dll.dylib' \))
+"$artifact" || fail "the requested artifact depends on its sibling shared library"
+
+# A host tool is rooted at its own package and published separately. Use a
+# static dependency here: external shared-tool runtime deployment is a separate
+# contract, while this test checks independence from the tool's own sibling.
+mkdir -p "$TMP/tooldual/src" "$TMP/toolapp/src"
+cp dual/src/dual.cppm "$TMP/tooldual/src/dual.cppm"
+cp dual/src/main.cpp "$TMP/tooldual/src/main.cpp"
+printf 'module t880_dual;\nimport t880_base;\nint answer() { return base_value() + 1; }\n' > "$TMP/tooldual/src/impl.cpp"
+cat > "$TMP/tooldual/mcpp.toml" <<'EOF'
+[package]
+name = "tooldual"
+version = "0.1.0"
+
+[dependencies]
+common = { path = "../ws/common" }
+
+[features]
+exe = []
+
+[targets.dual_dll]
+kind = "shared"
+
+[targets.dual]
+kind = "bin"
+main = "src/main.cpp"
+required_features = ["exe"]
+EOF
+cat > "$TMP/toolapp/mcpp.toml" <<'EOF'
+[package]
+name = "toolapp"
+version = "0.1.0"
+
+[build-dependencies]
+tooldual = { path = "../tooldual", tools = ["dual"], features = ["exe"] }
+EOF
+printf 'int main() { return 0; }\n' > "$TMP/toolapp/src/main.cpp"
+cat > "$TMP/toolapp/build.mcpp" <<'EOF'
+#include <cstdlib>
+#include <string>
+import mcpp;
+int main() {
+    const char* tool = mcpp::dep_bin("tooldual", "dual");
+    if (!tool || !*tool) return 1;
+    return std::system((std::string("\"") + tool + "\"").c_str()) == 0 ? 0 : 1;
+}
+EOF
+cd "$TMP/toolapp"
+"$MCPP" build > tool.log 2>&1 || fail "the host tool did not build and run" tool.log
+"$(bin_of toolapp)" || fail "the host tool's consumer did not run"
+# A target-side edge must retain the same provider's shared product even when
+# it is also requested as a build-time tool.
+cat >> mcpp.toml <<'EOF'
+
+[dependencies]
+tooldual = { path = "../tooldual" }
+EOF
+cp "$TMP/tooldual/src/main.cpp" src/main.cpp
+"$MCPP" build > dual-role.log 2>&1 || fail "the dual-role provider did not build" dual-role.log
+"$(bin_of toolapp)" || fail "the dual-role provider's consumer did not run"
+[ -n "$(find target -path '*/bin/*' \( -name '*dual_dll.dll' -o -name '*dual_dll.so*' -o -name '*dual_dll.dylib' \) -type f | head -1)" ] || fail "the dual-role provider's shared library is missing" dual-role.log
+
 echo "PASS: 880_a_members_executable_keeps_its_own_implementation"

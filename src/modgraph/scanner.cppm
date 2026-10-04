@@ -148,6 +148,9 @@ struct PackageRoot {
     UsageRequirements               publicUsage;
     UsageRequirements               linkUsage;
     bool                            usageResolved = false;
+    // Reached only through build-time edges: resolved for host tools/rules,
+    // but neither its sources nor its products belong to the target plan.
+    bool                            buildTimeOnly = false;
     // A selected workspace member that the plan builds (workspace design
     // 2026-09-29 §15), and the directory below `bin/` its products are placed
     // in (empty: `bin/` itself). False on the plan's root and on every

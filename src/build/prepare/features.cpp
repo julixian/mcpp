@@ -1319,6 +1319,7 @@ step6_host_module_registration(PrepareState& state) {
                     // its sources would turn that gap into an undefined
                     // reference a long way from here.
                     if (viaTarget[d] || !viaAny[d]) continue;
+                    state.packages[d].buildTimeOnly = true;
                     auto& dm = state.packages[d].manifest;
                     dm.buildConfig.sources.clear();
                     dm.buildConfig.featureSources.clear();

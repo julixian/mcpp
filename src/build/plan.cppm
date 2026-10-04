@@ -2247,6 +2247,9 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     for (std::size_t i = 1; i < packages.size(); ++i) {
         auto const& p = packages[i];
         auto qname = qualified_package_name(p.manifest);
+        // Host-only packages are built by their own sub-build. Clearing their
+        // source globs does not remove the declared shared targets.
+        if (p.buildTimeOnly) continue;
         // A DISTRIBUTION PACKAGE's shared target is already built — that is what
         // the package IS. Creating a link unit for it made ninja fail outright
         // with `multiple rules generate bin/libmathkit.dll`: this loop declared
@@ -2870,9 +2873,11 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                         }
             }
         }
+        // An artifact is an independent program of its package, even when
+        // that package also provides a shared image to other consumers.
         for (auto const& cu : plan.compileUnits) {
             if (!closure.contains(cu.packageName)) continue;
-            if (sharedDepPackages.contains(cu.packageName)) continue;
+            if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
             if (mcpp::links_unconditionally(cu.kind)) lu.objects.push_back(cu.object);
         }
         if (!r.target.main.empty()) {
@@ -2920,13 +2925,20 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         }
         for (auto const& cu : plan.compileUnits) {
             if (!closure.contains(cu.packageName)) continue;
-            if (sharedDepPackages.contains(cu.packageName)) continue;
+            if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
             if (!is_implementation_source(cu.kind)) continue;
             if (lu.entryMain && cu.source == *lu.entryMain) continue;
             if (entryFilesAcrossTargets.contains(cu.source)) continue;
             lu.objects.push_back(cu.object);
         }
-        append_shared_deps_for_linked_objects(lu);
+        // Only this program's closure contributes shared links. Walking every
+        // compile unit also picked up consumers of its sibling shared image
+        // and made the artifact depend on that image instead of its own code.
+        for (auto i : seen)
+            if (i == r.packageIndex
+                || (!sharedDepPackages.contains(qualified_package_name(packages[i].manifest))
+                    && !placedInImage.contains(qualified_package_name(packages[i].manifest))))
+                append_direct_shared_deps(lu, i);
         // In a workspace plan the plan's own line pools the dependencies'
         // flags and not a member's, so the program links with its closure's
         // line, as a member's program does, in a group that places nothing.
