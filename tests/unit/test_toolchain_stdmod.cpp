@@ -71,6 +71,27 @@ TEST(ToolchainStdmod, ClangStdCompatCommandsUseRequestedStandard) {
     }
 }
 
+TEST(ToolchainStdmod, MsvcCompatSourceIsParsedAsAModuleButItsBmiIsNot) {
+    auto tc = clang_toolchain();
+    tc.stdModuleSource = "std.ixx";
+    tc.stdCompatSource = "std.compat.ixx";
+    auto cmds = clang::std_compat_build_commands(
+        tc, "cache", "cache/pcm.cache/std.compat.pcm",
+        "cache/pcm.cache/std.pcm", "", "-std=c++23", "-fms-runtime-lib=dll");
+    ASSERT_EQ(cmds.size(), 2u);
+    EXPECT_NE(cmds[0].find("-x c++-module"), std::string::npos);
+    EXPECT_EQ(cmds[1].find("-x c++-module"), std::string::npos);
+    for (auto const& cmd : cmds) {
+        EXPECT_NE(cmd.find("-fmodule-file=std="), std::string::npos);
+        EXPECT_NE(cmd.find("-fms-runtime-lib=dll"), std::string::npos);
+    }
+    tc.stdCompatSource = "std.compat.cppm";
+    cmds = clang::std_compat_build_commands(
+        tc, "cache", "cache/pcm.cache/std.compat.pcm",
+        "cache/pcm.cache/std.pcm", "", "-std=c++23");
+    EXPECT_EQ(cmds[0].find("-x c++-module"), std::string::npos);
+}
+
 // THE PRECOMPILE HAS TO KNOW WHICH MACHINE, AND ONLY ONE OF TWO SOURCES EVER
 // CARRIES IT.
 //

@@ -231,21 +231,22 @@ bind_msvc_sysroot(mcpp::toolchain::Toolchain& tc,
     // by its own search. A toolset without one leaves `import std` unavailable
     // rather than borrowing another toolset's.
     //
-    // Only `std` is rebound. Detection never gave this row a `std.compat`
-    // source, and the clang builder for it passes the file without
-    // `-x c++-module`: given `std.compat.ixx`, clang takes it for linker
-    // input, `--precompile` writes nothing and exits 0, and the next command
-    // fails on the missing BMI (measured on the Windows runners).
+    // Bind both standard modules to this toolset. A compat module from another
+    // STL cannot safely import the selected std BMI.
     std::error_code ec;
     const auto ixx = choice->toolsDir / "modules" / "std.ixx";
     const bool msvcStl = tc.stdModuleSource.empty()
                       || tc.stdModuleSource.filename() == "std.ixx";
     if (msvcStl && std::filesystem::exists(ixx, ec)) {
         tc.stdModuleSource   = ixx;
+        const auto compat = ixx.parent_path() / "std.compat.ixx";
+        tc.stdCompatSource = std::filesystem::exists(compat, ec)
+            ? compat : std::filesystem::path{};
         tc.hasImportStd      = true;
         tc.importStdMinLevel = msvc::std_module_min_level_for_stl(ixx);
     } else if (msvcStl && !tc.stdModuleSource.empty()) {
         tc.stdModuleSource.clear();
+        tc.stdCompatSource.clear();
         tc.hasImportStd = false;
     }
 
