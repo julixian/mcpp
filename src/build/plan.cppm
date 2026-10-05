@@ -2586,8 +2586,9 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
         }
     }
-    // 共享映像先于工作区成员创建，但链接配置仍属于它自己的包。
-    // 同包的多个 DLL 共用配置组；只生成链接配置，不重复安排产物部署。
+    // Shared images are created before workspace members, but their link
+    // configuration belongs to their owning package. Multiple DLLs in one
+    // package share a link-only group without scheduling duplicate deployment.
     std::map<std::size_t, int> sharedLinkGroups;
     for (auto const& dep : sharedDepTargets) {
         LinkUnit lu;
@@ -2621,7 +2622,8 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             BuildPlan::LinkGroup group;
             group.linkOnly = true;
             group.productDir = lu.output.parent_path();
-            // 虚拟根只含工作区配置；普通消费者的私有链接参数不能进入依赖 DLL。
+            // A virtual root holds workspace configuration; an ordinary
+            // consumer's private link flags must not enter dependency DLLs.
             if (manifest.package.virtualRoot) group.ldflags = packages[0].linkUsage.ldflags;
             group.ldflags.insert(group.ldflags.end(), packages[dep.packageIndex].linkUsage.ldflags.begin(),
                                  packages[dep.packageIndex].linkUsage.ldflags.end());

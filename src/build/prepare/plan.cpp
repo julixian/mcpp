@@ -422,8 +422,9 @@ static std::expected<void, std::string> step13_link_forms(PrepareState& state, B
 }
 
 static std::expected<void, std::string> step13_make_plan(PrepareState& state, BuildContext& ctx) {
-    // 每个映像都读取所属包的链接快照，包括普通 path 依赖中的 DLL。
-    // 脚本执行后统一刷新，并把搜索路径解析到声明它的包，不能只更新工作区成员。
+    // Each image reads its owner's link snapshot, including DLLs from ordinary
+    // path dependencies. Refresh all dependency snapshots after build scripts
+    // and resolve search paths against their declaring package.
     for (std::size_t i = 1; i < state.packages.size(); ++i)
         state.packages[i].linkUsage.ldflags = normalized_dependency_ldflags(
             state.packages[i].root, state.packages[i].manifest.buildConfig.ldflags);
