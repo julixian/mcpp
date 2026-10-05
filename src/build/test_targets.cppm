@@ -4,6 +4,7 @@ export module mcpp.build.test_targets;
 
 import std;
 import mcpp.manifest;
+import mcpp.modgraph.glob;
 import mcpp.modgraph.scanner;
 import mcpp.project;
 

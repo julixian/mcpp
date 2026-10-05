@@ -40,13 +40,6 @@ std::vector<std::filesystem::path> expand_glob(const std::filesystem::path& root
 std::vector<std::filesystem::path> expand_dir_glob(const std::filesystem::path& root,
                                                    std::string_view glob);
 
-// mcpp#225 (test-exposed): pure literal (non-wildcard) directory-prefix
-// derivation used to bound expand_glob/expand_dir_glob's walk start point.
-// Exported (rather than kept file-local) solely so unit tests can assert its
-// behavior directly and deterministically — see its definition below for
-// the full contract.
-std::filesystem::path glob_literal_prefix(std::string_view glob);
-
 // mcpp#228: desugar brace alternation `{a,b}` into a cartesian product of
 // plain globs, e.g. "a/{x,y}/**" -> ["a/x/**", "a/y/**"]. A glob with no `{`
 // returns itself unchanged (the common case). Multiple and nested groups are
@@ -458,38 +451,6 @@ bool is_excluded_walk_dir(const std::filesystem::path& dir,
 
 } // namespace
 
-// mcpp#225: the literal (non-wildcard) directory prefix of a glob, e.g.
-// "src/**/*.cppm" -> "src", "tests/**/*.cpp" -> "tests", "*/include" -> ""
-// (wildcard already in the first segment). Used to bound the walk's START
-// point in expand_glob/expand_dir_glob instead of always walking from root
-// and filtering lexically afterward — path_matches_glob still does the full
-// lexical match, so this only narrows WHERE the iterator begins, never
-// which files can match. Truncates back to the last complete '/' so a
-// partial segment (e.g. "src/pre*fix" -> "src/pre") is never mistaken for a
-// real directory name. Conservative about '{' (and '?'/'['): brace-expansion
-// globs are desugared into multiple plain globs before ever reaching here
-// (mcpp#225 cluster E follow-up), so any of those chars seen here is just a
-// segment boundary, never something to interpret. Declared in the exported
-// namespace above (not kept file-local) purely so unit tests can assert its
-// behavior directly, deterministically, and independently of filesystem
-// enumeration order — see Scanner.GlobLiteralPrefixDerivation.
-std::filesystem::path glob_literal_prefix(std::string_view glob) {
-    // Every current caller already strips a leading `!` (exclusion globs)
-    // before calling expand_glob/expand_dir_glob, but strip it here too —
-    // defense in depth, and a literal '!' is never a real path component.
-    if (!glob.empty() && glob.front() == '!') glob.remove_prefix(1);
-    auto wildcard = glob.find_first_of("*?{[");
-    std::string_view literal = wildcard == std::string_view::npos
-        ? glob : glob.substr(0, wildcard);
-    auto slash = literal.find_last_of('/');
-    if (slash == std::string_view::npos) return {};
-    // Native separators, not the raw generic form: MSVC keeps the input's
-    // `/` verbatim, and `root / p` plus the directory walk then propagate a
-    // MIXED `root\generated/modules` into every downstream path — which is
-    // what `compile_commands.json`'s `file` field showed on Windows for
-    // multi-segment globs. See mcpp::modgraph::native_path_from_generic.
-    return native_path_from_generic(literal.substr(0, slash));
-}
 
 // mcpp#228: `{a,b}` alternation, recursively. Finds the first top-level `{`,
 // its MATCHING `}` (brace-depth tracked, so a nested group's inner braces
