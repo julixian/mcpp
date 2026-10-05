@@ -2247,6 +2247,9 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
     for (std::size_t i = 1; i < packages.size(); ++i) {
         auto const& p = packages[i];
         auto qname = qualified_package_name(p.manifest);
+        // Host-only packages are built by their own sub-build. Clearing their
+        // source globs does not remove the declared shared targets.
+        if (p.buildTimeOnly) continue;
         // A DISTRIBUTION PACKAGE's shared target is already built — that is what
         // the package IS. Creating a link unit for it made ninja fail outright
         // with `multiple rules generate bin/libmathkit.dll`: this loop declared
@@ -2870,9 +2873,11 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                         }
             }
         }
+        // An artifact is an independent program of its package, even when
+        // that package also provides a shared image to other consumers.
         for (auto const& cu : plan.compileUnits) {
             if (!closure.contains(cu.packageName)) continue;
-            if (sharedDepPackages.contains(cu.packageName)) continue;
+            if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
             if (mcpp::links_unconditionally(cu.kind)) lu.objects.push_back(cu.object);
         }
         if (!r.target.main.empty()) {
@@ -2920,13 +2925,20 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         }
         for (auto const& cu : plan.compileUnits) {
             if (!closure.contains(cu.packageName)) continue;
-            if (sharedDepPackages.contains(cu.packageName)) continue;
+            if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
             if (!is_implementation_source(cu.kind)) continue;
             if (lu.entryMain && cu.source == *lu.entryMain) continue;
             if (entryFilesAcrossTargets.contains(cu.source)) continue;
             lu.objects.push_back(cu.object);
         }
-        append_shared_deps_for_linked_objects(lu);
+        // Only this program's closure contributes shared links. Walking every
+        // compile unit also picked up consumers of its sibling shared image
+        // and made the artifact depend on that image instead of its own code.
+        for (auto i : seen)
+            if (i == r.packageIndex
+                || (!sharedDepPackages.contains(qualified_package_name(packages[i].manifest))
+                    && !placedInImage.contains(qualified_package_name(packages[i].manifest))))
+                append_direct_shared_deps(lu, i);
         // In a workspace plan the plan's own line pools the dependencies'
         // flags and not a member's, so the program links with its closure's
         // line, as a member's program does, in a group that places nothing.
@@ -3087,9 +3099,12 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
                         "'{}', which target '{}' of this build also produces",
                         t.name, owner, lu.output.generic_string(), other.targetName));
 
+            // A sibling shared target is another image of this member's
+            // objects, not a dependency of its executable. Only another
+            // package's shared target supplies its implementation by link.
             for (auto const& cu : plan.compileUnits) {
                 if (!closure.contains(cu.packageName)) continue;
-                if (sharedDepPackages.contains(cu.packageName)) continue;
+                if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
                 if (mcpp::links_unconditionally(cu.kind)) lu.objects.push_back(cu.object);
             }
             if (!t.main.empty() && lu.kind != LinkUnit::StaticLibrary) {
@@ -3147,7 +3162,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             const bool entryDefinesMain = lu.entryMain && source_defines_main(*lu.entryMain);
             for (auto const& cu : plan.compileUnits) {
                 if (!closure.contains(cu.packageName)) continue;
-                if (sharedDepPackages.contains(cu.packageName)) continue;
+                if (cu.packageName != owner && sharedDepPackages.contains(cu.packageName)) continue;
                 if (!is_implementation_source(cu.kind)) continue;
                 if (lu.entryMain && cu.source == *lu.entryMain) continue;
                 if (entryFilesAcrossTargets.contains(cu.source)) continue;
@@ -3159,11 +3174,12 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
             if (lu.kind != LinkUnit::StaticLibrary) {
                 const auto before = lu.implicitInputs.size();
-                // The shared libraries the closure's packages link, and no
-                // other member's.
+                // The member still links its declared shared dependencies
+                // even when it also produces a shared target of its own.
                 for (auto i : closureIdx)
-                    if (!sharedDepPackages.contains(qualified_package_name(packages[i].manifest))
-                        && !placedInImage.contains(qualified_package_name(packages[i].manifest)))
+                    if (i == mi
+                        || (!sharedDepPackages.contains(qualified_package_name(packages[i].manifest))
+                            && !placedInImage.contains(qualified_package_name(packages[i].manifest))))
                         append_direct_shared_deps(lu, i);
                 // The graph-built shared libraries this unit loads are placed
                 // beside it.
