@@ -2537,35 +2537,6 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         }
     };
 
-    for (auto const& dep : sharedDepTargets) {
-        LinkUnit lu;
-        lu.targetName = dep.target.name;
-        lu.package    = dep.packageName;
-        lu.kind       = LinkUnit::SharedLibrary;
-        lu.dependencyOwned = true;
-        lu.output     = dep.output;
-        lu.importLibrary = import_library_for(dep.target, naming);
-        if (msvcTarget && !dep.target.windowsAutoExport && !dep.target.exportPatterns.empty())
-            return std::unexpected(exports_without_discovery(dep.target, dep.packageName));
-        if (msvcTarget && dep.target.windowsAutoExport && !lu.importLibrary.empty())
-            lu.defFile = std::filesystem::path("bin") / (dep.target.name + ".def");
-        lu.soname     = dep.target.soname;
-        lu.exportPatterns = dep.target.exportPatterns;
-        lu.runtimeAliases = runtime_aliases_for_target(dep.target, naming);
-        lu.loaderTagFlag = loader_tag_flag(lu.kind);
-        append_package_objects(lu, dep.packageName);
-        append_direct_shared_deps(lu, dep.packageIndex);
-        if (auto it = staticsByImagePackage.find(dep.packageIndex);
-            it != staticsByImagePackage.end()) {
-            for (auto staticIndex : it->second) {
-                append_package_objects(
-                    lu, qualified_package_name(packages[staticIndex].manifest));
-                append_direct_shared_deps(lu, staticIndex);
-            }
-        }
-        plan.linkUnits.push_back(std::move(lu));
-    }
-
     // THE PROGRAMS A CONSUMER SHIPS FROM ITS DEPENDENCIES (mcpp#711).
     //
     // An edge `x = { ..., artifacts = ["updater"] }` asks for the dependency's
@@ -2615,6 +2586,71 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             }
         }
     }
+    // 共享映像先于工作区成员创建，但链接配置仍属于它自己的包。
+    // 同包的多个 DLL 共用配置组；只生成链接配置，不重复安排产物部署。
+    std::map<std::size_t, int> sharedLinkGroups;
+    for (auto const& dep : sharedDepTargets) {
+        LinkUnit lu;
+        lu.targetName = dep.target.name;
+        lu.package    = dep.packageName;
+        lu.kind       = LinkUnit::SharedLibrary;
+        lu.dependencyOwned = true;
+        lu.output     = dep.output;
+        lu.importLibrary = import_library_for(dep.target, naming);
+        if (msvcTarget && !dep.target.windowsAutoExport && !dep.target.exportPatterns.empty())
+            return std::unexpected(exports_without_discovery(dep.target, dep.packageName));
+        if (msvcTarget && dep.target.windowsAutoExport && !lu.importLibrary.empty())
+            lu.defFile = std::filesystem::path("bin") / (dep.target.name + ".def");
+        lu.soname     = dep.target.soname;
+        lu.exportPatterns = dep.target.exportPatterns;
+        lu.runtimeAliases = runtime_aliases_for_target(dep.target, naming);
+        lu.loaderTagFlag = loader_tag_flag(lu.kind);
+        if (!sharedLinkGroups.contains(dep.packageIndex)) {
+            std::set<std::size_t> closure = {dep.packageIndex};
+            std::vector<std::size_t> pending = {dep.packageIndex};
+            while (!pending.empty()) {
+                const auto i = pending.back();
+                pending.pop_back();
+                if (auto edges = directPackageDeps.find(i); edges != directPackageDeps.end()) {
+                    for (auto j : edges->second) {
+                        if (artifactEdges.contains({i, j}) || packages[j].buildTimeOnly) continue;
+                        if (closure.insert(j).second) pending.push_back(j);
+                    }
+                }
+            }
+            BuildPlan::LinkGroup group;
+            group.linkOnly = true;
+            group.productDir = lu.output.parent_path();
+            // 虚拟根只含工作区配置；普通消费者的私有链接参数不能进入依赖 DLL。
+            if (manifest.package.virtualRoot) group.ldflags = packages[0].linkUsage.ldflags;
+            group.ldflags.insert(group.ldflags.end(), packages[dep.packageIndex].linkUsage.ldflags.begin(),
+                                 packages[dep.packageIndex].linkUsage.ldflags.end());
+            std::vector<mcpp::modgraph::PackageRoot> closurePackages;
+            closurePackages.push_back(packages[dep.packageIndex]);
+            for (auto i : closure) {
+                if (i == dep.packageIndex) continue;
+                group.ldflags.insert(group.ldflags.end(), packages[i].linkUsage.ldflags.begin(),
+                                     packages[i].linkUsage.ldflags.end());
+                closurePackages.push_back(packages[i]);
+            }
+            derive_runtime(closurePackages, group.productDir, group);
+            sharedLinkGroups[dep.packageIndex] = static_cast<int>(plan.linkGroups.size());
+            plan.linkGroups.push_back(std::move(group));
+        }
+        lu.linkGroup = sharedLinkGroups.at(dep.packageIndex);
+        append_package_objects(lu, dep.packageName);
+        append_direct_shared_deps(lu, dep.packageIndex);
+        if (auto it = staticsByImagePackage.find(dep.packageIndex);
+            it != staticsByImagePackage.end()) {
+            for (auto staticIndex : it->second) {
+                append_package_objects(
+                    lu, qualified_package_name(packages[staticIndex].manifest));
+                append_direct_shared_deps(lu, staticIndex);
+            }
+        }
+        plan.linkUnits.push_back(std::move(lu));
+    }
+
     // Reached through a non-artifact edge from the root (its dependencies,
     // dev- and build-dependencies included), versus reached only through an
     // artifact edge. Only the second set is withheld from the root's images,
