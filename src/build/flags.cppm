@@ -1955,7 +1955,7 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // ask the driver for a different CRT than the objects already have.
         const std::string msvcAbiCrtLd =
             msvcAbiCrtWord.empty() ? std::string{} : (" " + msvcAbiCrtWord);
-        // 链接驱动也必须保留目标架构，否则 clang 会按宿主架构选择 CRT。
+        // Keep the target on the driver link too, or clang selects the host CRT.
         f.ld = std::format("{}{}{} -fuse-ld=lld{}{}{}{}", full_static, crossTarget,
                            msvcAbiCrtLd, msvcSysroot, link_intent_ld,
                            user_ldflags, link_extra);

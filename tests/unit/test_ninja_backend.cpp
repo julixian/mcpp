@@ -76,7 +76,7 @@ BuildPlan minimal_plan() {
 }  // namespace
 
 TEST(NinjaBackend, WindowsDriverLinksRetainTheSelectedTargetForCAndCxx) {
-    // 本次修复针对 Windows 宿主的 PE 驱动链接分支，其他宿主走不同分支。
+    // This regression covers the Windows-host PE driver link branch.
     if constexpr (!mcpp::platform::is_windows)
         GTEST_SKIP() << "the PE driver link branch is selected on Windows hosts";
     for (const auto arch : {"i686", "x86_64", "aarch64"}) {
