@@ -16,7 +16,12 @@ TEST(BuildResources, CoffTargetFollowsTheTargetInsteadOfTheHost) {
     EXPECT_EQ(res::coff_target_flag(llvm, "aarch64-windows-msvc"),
               "--target=aarch64-pc-windows-msvc");
     const res::RcTool gnu{"/selected/bin/windres", "gnu"};
-    EXPECT_EQ(res::coff_target_flag(gnu, "i686-windows-gnu"), "--target=pe-i386");
+    for (const auto arch : {"x86", "i386", "i486", "i586", "i686"}) {
+        EXPECT_EQ(res::coff_target_flag(gnu, std::string(arch) + "-windows-gnu"),
+                  "--target=pe-i386") << arch;
+    }
+    EXPECT_EQ(res::coff_target_flag(llvm, "i386-windows-msvc"),
+              "--target=i386-pc-windows-msvc");
     EXPECT_EQ(res::coff_target_flag(gnu, "x86_64-windows-gnu"), "--target=pe-x86-64");
     EXPECT_TRUE(res::coff_target_flag({"rc.exe", "msvc"}, "i686-windows-msvc").empty());
     EXPECT_TRUE(res::coff_target_flag({"llvm-rc.exe", "msvc"}, "x86_64-windows-msvc").empty());

@@ -176,7 +176,9 @@ std::string coff_target_flag(const RcTool& tool, std::string_view targetTriple) 
     // BFD's pe-i386 denotes 32-bit x86 COFF, including i686 targets.
     if (tool.name().find("llvm-windres") != std::string::npos)
         return "--target=" + trip->llvm_triple();
-    if (trip->arch == "i686") return "--target=pe-i386";
+    if (trip->arch == "x86" || trip->arch == "i386" || trip->arch == "i486"
+        || trip->arch == "i586" || trip->arch == "i686")
+        return "--target=pe-i386";
     if (trip->arch == "x86_64") return "--target=pe-x86-64";
     return {};
 }
