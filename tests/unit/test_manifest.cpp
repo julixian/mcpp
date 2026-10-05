@@ -9,6 +9,47 @@ import mcpp.platform.axis;
 import mcpp.platform;
 import mcpp.build.prepare;   // merge_conditional_config: a row's statement replaces
 
+TEST(Manifest, PeAutoExportDefaultsOnAndAcceptsAnExplicitOptOut) {
+    for (auto const& declaration : {"", "auto_export = true", "auto_export = false"}) {
+        auto m = mcpp::manifest::parse_string(std::format(
+            "[package]\nname = \"dll\"\nversion = \"0.1.0\"\n"
+            "[targets.dll]\nkind = \"shared\"\n{}\n", declaration));
+        ASSERT_TRUE(m.has_value()) << m.error().format();
+        ASSERT_EQ(m->targets.size(), 1u);
+        EXPECT_EQ(m->targets.front().autoExport, std::string_view(declaration) != "auto_export = false");
+        EXPECT_TRUE(m->schemaWarnings.empty());
+    }
+    auto bad = mcpp::manifest::parse_string(
+        "[package]\nname = \"dll\"\nversion = \"0.1.0\"\n"
+        "[targets.dll]\nkind = \"shared\"\nauto_export = \"false\"\n");
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_NE(bad.error().format().find("auto_export must be a boolean"), std::string::npos);
+}
+
+TEST(SynthesizeFromXpkgLua, PeAutoExportHasTheSameDefaultAndBooleanContract) {
+    for (auto const& declaration : {"", "auto_export = true,", "auto_export = false,"}) {
+        auto m = mcpp::manifest::synthesize_from_xpkg_lua(std::format(R"(
+package = {{
+    spec = "1", name = "dll",
+    xpm = {{ windows = {{ ["0.1.0"] = {{ url = "u", sha256 = "h" }} }} }},
+    mcpp = {{ sources = {{ "*/api.cpp" }}, targets = {{ ["dll"] = {{ kind = "shared", {} }} }} }},
+}}
+)", declaration), "dll", "0.1.0", mcpp::platform::HostPlatform::current());
+        ASSERT_TRUE(m.has_value()) << m.error().format();
+        ASSERT_EQ(m->targets.size(), 1u);
+        EXPECT_EQ(m->targets.front().autoExport, std::string_view(declaration) != "auto_export = false,");
+    }
+    auto bad = mcpp::manifest::synthesize_from_xpkg_lua(R"(
+package = {
+    spec = "1", name = "dll",
+    xpm = { windows = { ["0.1.0"] = { url = "u", sha256 = "h" } } },
+    mcpp = { sources = { "*/api.cpp" }, targets = { ["dll"] = { kind = "shared", auto_export = "false" } } },
+}
+)", "dll", "0.1.0", mcpp::platform::HostPlatform::current());
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_NE(bad.error().format().find("auto_export must be a boolean"), std::string::npos);
+}
+
 TEST(Manifest, CppFlyStandard) {
     // standard = "c++fly": latest level + all experimental gates (design
     // 2026-07-14-std-features-experimental-gate-design.md §5.1).

@@ -74,6 +74,10 @@ bool is_supported_machine(std::uint16_t machine);
 // place to say something the objects already say, and the two could disagree.
 bool declares_exports(std::span<const std::byte> bytes);
 
+// Shared by the COFF and LLVM symbol readers so LTO does not change the
+// filtering policy or i386 calling-convention spelling.
+std::optional<std::string> export_name(std::string_view name, bool i386);
+
 // Read one object file's exportable symbols. `bytes` is a whole `.obj`.
 //
 // Returns an error string for input this reader cannot honestly interpret —
@@ -150,6 +154,15 @@ bool is_skipped_name(std::string_view n) {
 }
 
 } // namespace
+
+std::optional<std::string> export_name(std::string_view name, bool i386) {
+    if (name.empty() || is_skipped_name(name)) return std::nullopt;
+    std::string out(name);
+    if (i386 && out.starts_with('_') && out.find('@') == std::string::npos)
+        out.erase(0, 1);
+    if (out.empty()) return std::nullopt;
+    return out;
+}
 
 bool declares_exports(std::span<const std::byte> bytes) {
     if (bytes.size() < kFileHeaderSize) return false;
@@ -293,13 +306,8 @@ read_exports(std::span<const std::byte> bytes)
 
         auto nm = name_at(rec);
         if (!nm) return std::unexpected(nm.error());
-        if (nm->empty() || is_skipped_name(*nm)) continue;
-
-        // i386 (and `__cdecl` on it) carries a leading underscore that is part
-        // of the calling convention rather than of the name.
-        std::string name = *nm;
-        if (machine == kMachineI386 && name.starts_with('_') && name.find('@') == std::string::npos)
-            name.erase(0, 1);
+        auto name = export_name(*nm, machine == kMachineI386);
+        if (!name) continue;
 
         const auto flags = std::size_t(sectionNum) < sectionFlags.size()
                          ? sectionFlags[sectionNum] : 0u;
@@ -308,7 +316,7 @@ read_exports(std::span<const std::byte> bytes)
         // section (a `const`) is still data.
         const bool isData = type != kSymTypeFunction
                          && (flags & kScnMemExecute) == 0;
-        out.push_back(Export{ std::move(name), isData });
+        out.push_back(Export{ std::move(*name), isData });
     }
 
     return out;

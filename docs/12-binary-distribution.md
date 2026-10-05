@@ -372,9 +372,9 @@ exports at 65535.
 mcpp generates the `.def` from the objects, which is what CMake's
 `WINDOWS_EXPORT_ALL_SYMBOLS` has done since 3.4. It is a build-graph node whose
 inputs are the same objects the link consumes, so the exported surface cannot
-drift from what was compiled, and it reads COFF directly rather than shelling out
-to `dumpbin` — that tool lives in a Visual Studio developer environment, and
-mcpp's default Windows toolchain is clang.
+drift from what was compiled. Ordinary COFF objects are read directly. LLVM
+bitcode inspection (unreleased source builds) uses the selected LLVM compiler
+and the `llvm-nm` beside it; both FullLTO and ThinLTO are accepted.
 
 **Two limits survive that no tool can remove**, and they are the same two CMake
 documents for the same mechanism:
@@ -386,10 +386,12 @@ documents for the same mechanism:
 
 Both are answered by annotation, and **annotation wins**: an object that already
 carries `/EXPORT:` directives — which is what `__declspec(dllexport)` emits —
-makes mcpp stand down and generate nothing. Adding a list on top would export the
+makes mcpp write an empty `EXPORTS` section. Adding a list on top would export the
 same names twice (`LNK4197`) and export everything else besides, replacing a
-chosen public surface with all of it. Nothing is configured for this; the objects
-say it.
+chosen public surface with all of it. Bitcode's `dllexport` storage class and
+linker-option metadata express the same intent. Export intent is checked before
+candidate enumeration. The per-target [`auto_export`](04-mcpp-toml.md#auto_export--native-export-control-on-the-msvc-abi-unreleased)
+key disables discovery entirely (unreleased source builds).
 
 Past 65535 exportable symbols mcpp refuses rather than truncating. A truncated
 export table links cleanly and then fails at whichever consumer needed the symbol

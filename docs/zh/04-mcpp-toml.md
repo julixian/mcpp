@@ -265,9 +265,9 @@ soname  = "libmydriver.so.1"
 exports = "abi/mydriver.exports"     # or inline: exports = ["vk_icd*"]
 ```
 
-**省略这个键会发布一切，而这恰好是两个平台本来就在做的事**——ELF 给
-符号默认可见性，PE 自动生成一份列出每个符号的 `.def`。`exports` 收窄
-这个范围。
+省略 `exports` 会保留 ELF 和 Mach-O 的原生可见性规则。在 MSVC ABI 上，
+mcpp 会发现可导出的外部定义；任一输入已经声明导出，或设置了
+`auto_export = false` 时不进行这种发现。`exports` 收窄链接器发布的集合。
 
 两类工程需要这种收窄。**带稳定 ABI 的运行时**只发布一份经过审查的
 集合，其余一概不发布，让不在集合里的东西保留自由变化的空间。**与同类
@@ -299,6 +299,28 @@ script 并通过 `[build] ldflags` 传入，或者自行计算并发出
 `soname` 在 `kind = "lib"` 上同样有意义——见下文的
 [`dependency_linkage`](#dependency_linkage--静态还是动态由消费者决定)，
 在那里，一个库采取的形式变成消费者的决定。
+
+#### `auto_export` —— MSVC ABI 上的原生导出控制（尚未发布）
+
+这个键和 LLVM bitcode 导出发现需要尚未发布的源码构建，mcpp 2026.10.3.1
+不提供这些能力。自行控制导出的 target 可以省略自动导出发现步骤：
+
+```toml
+[targets.plugin]
+kind = "shared"
+auto_export = false
+```
+
+这个布尔值默认为 `true`，只作用于 MSVC ABI 上的 PE 共享库，包括 clang 和
+clang-cl；库作为依赖构建时也生效。它不影响静态库、可执行文件、ELF、Mach-O
+或 MinGW。关闭发现后，原生 `__declspec(dllexport)`、链接旗标和显式 `exports`
+列表仍然生效。
+
+开启发现时，任一输入的显式导出意图都会禁止整个 DLL 的自动导出。首先检查
+COFF 指令，再使用所选 LLVM 编译器检查 bitcode 中的 `dllexport` 声明和
+linker-option 元数据。只有没有标注的 DLL 才需要枚举候选符号，bitcode 的
+候选符号由该编译器旁的 `llvm-nm` 提供。FullLTO 和 ThinLTO 输入都可以与
+普通 COFF 对象混用。
 
 #### `windows_subsystem` 与 `windows_entry` —— Windows GUI 可执行文件（mcpp 2026.9.12.2+）
 

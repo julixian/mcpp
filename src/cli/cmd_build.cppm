@@ -17,6 +17,7 @@ import mcpp.bmi_cache.maintenance;   // parse_duration, for `clean --stale --old
 import mcpp.build.directives;      // the device-slot table
 import mcpp.build.configure;
 import mcpp.build.coff_exports;
+import mcpp.build.pe_exports;
 import mcpp.build.stage;
 import mcpp.build.schedule.detach_codegen;
 import mcpp.build.test_targets;
@@ -1449,38 +1450,23 @@ export int cmd_coff_def(const mcpplibs::cmdline::ParsedArgs& parsed) {
     std::string libName;
     if (auto v = parsed.value("name")) libName = *v;
 
-    std::vector<mcpp::build::coff::Export> all;
-    // When the AUTHOR has annotated the surface, the annotation wins and this
-    // edge writes an empty EXPORTS section — the linker then takes its export
-    // set from the objects' own `/EXPORT:` directives, exactly as if mcpp were
-    // not here. Adding a generated list on top would export the same names twice
-    // (LNK4197) and, worse, would export everything else as well, replacing a
-    // chosen public surface with all of it.
-    bool annotated = false;
-    for (std::size_t i = 0; i < parsed.positional_count(); ++i) {
-        const std::filesystem::path obj{ parsed.positional(i) };
-        std::ifstream in(mcpp::platform::fs::extended_length(obj), std::ios::binary);
-        if (!in) {
-            std::println(stderr, "error: cannot read object '{}'", obj.string());
-            return 1;
-        }
-        std::vector<std::byte> bytes;
-        for (char c; in.get(c); ) bytes.push_back(static_cast<std::byte>(c));
-        if (mcpp::build::coff::declares_exports(bytes)) annotated = true;
-        auto syms = mcpp::build::coff::read_exports(bytes);
-        if (!syms) {
-            // Named with the object, because "which one" is the whole question
-            // when one file out of two hundred is the problem.
-            std::println(stderr, "error: {}: {}", obj.string(), syms.error());
-            return 1;
-        }
-        all.insert(all.end(), syms->begin(), syms->end());
+    mcpp::build::pe::LLVMTools tools;
+    if (auto v = parsed.value("llvm-cxx")) tools.compiler = *v;
+    if (auto v = parsed.value("llvm-nm")) tools.nm = *v;
+    if (auto v = parsed.value("llvm-target")) tools.target = *v;
+    std::vector<std::filesystem::path> objects;
+    for (std::size_t i = 0; i < parsed.positional_count(); ++i)
+        objects.emplace_back(parsed.positional(i));
+    auto exports = mcpp::build::pe::read_exports(objects, tools);
+    if (!exports) {
+        std::println(stderr, "error: {}", exports.error());
+        return 1;
     }
+    auto all = std::move(*exports);
 
     // Refused, not truncated. A `.def` cut at the ceiling links cleanly and
     // then fails at whichever consumer happens to need a symbol that fell off
     // the end — a diagnostic with no path back to this decision.
-    if (annotated) all.clear();
     std::ranges::sort(all);
     all.erase(std::ranges::unique(all).begin(), all.end());
     if (all.size() > mcpp::build::coff::kMaxExports) {

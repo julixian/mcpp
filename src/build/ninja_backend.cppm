@@ -38,6 +38,8 @@ import mcpp.diag;
 import mcpp.build.advice;
 import mcpp.dyndep;
 import mcpp.toolchain.detect;
+import mcpp.toolchain.model;
+import mcpp.modgraph.glob;
 import mcpp.toolchain.dialect;
 import mcpp.toolchain.provider;
 import mcpp.toolchain.registry;
@@ -2152,7 +2154,7 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
     // POSIX-shell command is skipped entirely on Windows, the only platform this
     // edge exists for.
     append("rule coff_def\n");
-    append("  command = $mcpp coff-def --output $out --name $def_name $in\n");
+    append("  command = $mcpp coff-def --output $out --name $def_name $coff_tools $in\n");
     append("  description = DEF $out\n\n");
 
     // A WINDOWS PROGRAM'S RUNTIME DLLS, PLACED AFTER ITS LINK (SPEC-007 R4.3).
@@ -3195,8 +3197,21 @@ std::string emit_ninja_string(const BuildPlan& plan, std::string* placements,
             for (auto const& o : lu.objects) defIns += " " + escape_ninja_path(o);
             append(std::format("build {} : coff_def{}\n",
                                escape_ninja_path(lu.defFile), defIns));
-            append(std::format("  def_name = {}\n\n",
+            append(std::format("  def_name = {}\n",
                                lu.output.filename().string()));
+            if (mcpp::toolchain::is_clang(plan.toolchain)) {
+                const auto& compiler = plan.toolchain.binaryPath;
+                const auto nm = compiler.parent_path()
+                    / (mcpp::platform::is_windows ? "llvm-nm.exe" : "llvm-nm");
+                auto cxxArg = mcpp::modgraph::try_narrow(compiler);
+                auto nmArg = mcpp::modgraph::try_narrow(nm);
+                if (!cxxArg || !nmArg)
+                    throw std::runtime_error("the selected LLVM tools have no UTF-8 spelling");
+                append("  coff_tools = --llvm-cxx " + ninja_command_word(*cxxArg)
+                    + " --llvm-nm " + ninja_command_word(*nmArg)
+                    + " --llvm-target " + ninja_command_word(plan.toolchain.targetTriple) + "\n");
+            }
+            append("\n");
         }
 
         if (!lu.defFile.empty()) implicit += " " + escape_ninja_path(lu.defFile);

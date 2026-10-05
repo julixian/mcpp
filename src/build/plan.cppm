@@ -2511,7 +2511,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
         lu.dependencyOwned = true;
         lu.output     = dep.output;
         lu.importLibrary = import_library_for(dep.target, naming);
-        if (msvcTarget && !lu.importLibrary.empty())
+        if (msvcTarget && dep.target.autoExport && !lu.importLibrary.empty())
             lu.defFile = std::filesystem::path("bin") / (dep.target.name + ".def");
         lu.soname     = dep.target.soname;
         lu.exportPatterns = dep.target.exportPatterns;
@@ -2643,7 +2643,7 @@ make_plan(const mcpp::manifest::Manifest&         manifest,
             lu.importLibrary = import_library_for(t, naming);
             // MSVC only: MinGW's linker auto-exports, and generating a second
             // source of truth for what a DLL exports is how the two disagree.
-            if (msvcTarget && !lu.importLibrary.empty())
+            if (msvcTarget && t.autoExport && !lu.importLibrary.empty())
                 lu.defFile = std::filesystem::path("bin") / (t.name + ".def");
             lu.soname = t.soname;
             lu.exportPatterns = t.exportPatterns;
