@@ -568,8 +568,9 @@ std::vector<std::string> std_compat_build_commands(const Toolchain& tc,
     auto absObj    = (cacheDir / "std.compat.o").string();
     // MSVC STL ships .ixx, which Clang does not infer as C++ module input.
     // Apply the override only when parsing source, never when compiling a BMI.
-    const std::string sourceFlags = tc.stdCompatSource.extension() == ".ixx"
-        ? " -x c++-module -Wno-include-angled-in-module-purview" : "";
+    std::string ixxFlags = (tc.stdCompatSource.extension() == ".ixx")
+        ? " -x c++-module -Wno-include-angled-in-module-purview"
+        : "";
     return {
         std::format("{}{} {}{} -Wno-reserved-module-identifier{}{}{} "
                     "-fmodule-file=std={} "
@@ -580,7 +581,7 @@ std::vector<std::string> std_compat_build_commands(const Toolchain& tc,
                     crtToken,
                     sysrootFlag,
                     precompileFlags,
-                    sourceFlags,
+                    ixxFlags,
                     absStdBmi,
                     mcpp::xlings::shq(tc.stdCompatSource.string()),
                     mcpp::xlings::shq(absBmi)),
