@@ -1955,7 +1955,8 @@ CompileFlags compute_flags(const BuildPlan& plan) {
         // ask the driver for a different CRT than the objects already have.
         const std::string msvcAbiCrtLd =
             msvcAbiCrtWord.empty() ? std::string{} : (" " + msvcAbiCrtWord);
-        f.ld = std::format("{}{} -fuse-ld=lld{}{}{}{}", full_static,
+        // Keep the target on the driver link too, or clang selects the host CRT.
+        f.ld = std::format("{}{}{} -fuse-ld=lld{}{}{}{}", full_static, crossTarget,
                            msvcAbiCrtLd, msvcSysroot, link_intent_ld,
                            user_ldflags, link_extra);
         f.ldC = f.ld;   // the CRT model applies to C TUs on this ABI too

@@ -80,6 +80,8 @@ struct RcTool {
 std::optional<RcTool> find_rc_tool(const mcpp::toolchain::Toolchain& tc,
                                    std::string_view dialectId);
 
+std::string coff_target_flag(const RcTool& tool, std::string_view targetTriple);
+
 // Split a Windows environment list (PATH, INCLUDE, LIB) into its entries.
 //
 // `;` is the ONLY separator, and that is not a simplification. Every value that
@@ -165,6 +167,21 @@ compile_utf8_manifest(const mcpp::toolchain::Toolchain& tc,
 } // namespace mcpp::build::resources
 
 namespace mcpp::build::resources {
+
+std::string coff_target_flag(const RcTool& tool, std::string_view targetTriple) {
+    if (tool.style != "gnu") return {};
+    auto trip = mcpp::toolchain::triple::parse(targetTriple);
+    if (!trip) return {};
+    // LLVM accepts a full triple; GNU windres takes a BFD format name.
+    // BFD's pe-i386 denotes 32-bit x86 COFF, including i686 targets.
+    if (tool.name().find("llvm-windres") != std::string::npos)
+        return "--target=" + trip->llvm_triple();
+    if (trip->arch == "x86" || trip->arch == "i386" || trip->arch == "i486"
+        || trip->arch == "i586" || trip->arch == "i686")
+        return "--target=pe-i386";
+    if (trip->arch == "x86_64") return "--target=pe-x86-64";
+    return {};
+}
 
 namespace {
 
@@ -321,6 +338,8 @@ compile_utf8_manifest(const mcpp::toolchain::Toolchain& tc,
 
     // The same spelling as the `rc_object` rule of the ninja backend.
     std::vector<std::string> argv = {tool->path.string()};
+    if (auto target = coff_target_flag(*tool, tc.targetTriple); !target.empty())
+        argv.push_back(std::move(target));
     if (msvcStyle)
         for (auto a : {"/nologo", "/C", "65001", "/fo"}) argv.emplace_back(a);
     else

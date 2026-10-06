@@ -75,6 +75,27 @@ BuildPlan minimal_plan() {
 
 }  // namespace
 
+TEST(NinjaBackend, WindowsDriverLinksRetainTheSelectedTargetForCAndCxx) {
+    // This regression covers the Windows-host PE driver link branch.
+    if constexpr (!mcpp::platform::is_windows)
+        GTEST_SKIP() << "the PE driver link branch is selected on Windows hosts";
+    for (const auto arch : {"i686", "x86_64", "aarch64"}) {
+        auto plan = minimal_plan();
+        plan.toolchain.compiler = mcpp::toolchain::CompilerId::Clang;
+        plan.toolchain.binaryPath = "/selected/bin/clang++";
+        plan.toolchain.targetTriple = std::string(arch) + "-pc-windows-msvc";
+        plan.toolchain.crossTargetFlag = "--target=" + plan.toolchain.targetTriple;
+        plan.manifest.buildConfig.cxxRuntime = "host-coupled";
+        plan.targetSide.compiler.interfaceName = "llvm";
+        plan.targetSide.kernelAbi.interfaceName = "windows";
+        plan.targetSide.cAbi.interfaceName = "msvc";
+        plan.targetSide.cxx.interfaceName = "msvc";
+        auto flags = compute_flags(plan);
+        EXPECT_NE(flags.ld.find(plan.toolchain.crossTargetFlag), std::string::npos);
+        EXPECT_NE(flags.ldC.find(plan.toolchain.crossTargetFlag), std::string::npos);
+    }
+}
+
 TEST(NinjaBackend, BitcodeExportToolsComeFromTheSelectedLlvmAndAreQuotedAsWords) {
     auto plan = minimal_plan();
     plan.toolchain.compiler = mcpp::toolchain::CompilerId::Clang;

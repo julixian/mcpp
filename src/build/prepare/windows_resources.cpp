@@ -126,6 +126,9 @@ step13_resource_compiler(PrepareState& state, BuildContext& ctx) {
         }
     }
     for (auto& ru : ctx.plan.resourceUnits) {
+        if (auto target = rsrc::coff_target_flag(*tool, state.tc->targetTriple);
+            !target.empty())
+            ru.flags.push_back(std::move(target));
         ru.flags.push_back(msvcStyle ? "/C" : "--codepage=65001");
         if (msvcStyle) ru.flags.push_back("65001");
         for (auto const& d : ru.includeDirs) ru.flags.push_back(ip + d.string());
