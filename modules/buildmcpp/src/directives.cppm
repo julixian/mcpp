@@ -657,13 +657,27 @@ std::string target_directive_error(const mcpp::manifest::Manifest& m, const Dire
 // both the directive and the declaring package, like `target_directive_error`.
 std::string deploy_directive_error(const mcpp::manifest::Manifest& m, const Directives& d);
 
+// Own only the files created for the prepare-time source scan. They must be
+// gone before ninja checks the outputs: a new placeholder is newer than an
+// action's inputs and can otherwise hide a missing generated source (#778).
+// Scope ownership also cleans up a failed or configure-only prepare.
+struct ActionPlaceholders {
+    ActionPlaceholders() = default;
+    ActionPlaceholders(const ActionPlaceholders&) = delete;
+    ActionPlaceholders& operator=(const ActionPlaceholders&) = delete;
+    ~ActionPlaceholders();
+    void clear() noexcept;
+
+    std::vector<std::filesystem::path> files;
+};
+
 // Resolve an action's paths against `pkgRoot` and make its Source outputs
 // exist, so the ordinary source scan can see them.
 //
 // A placeholder rather than a synthesised CompileUnit, because that reuses
 // every existing mechanism: the glob finds it, the scanner reads it, the plan
-// gives it an object path, and ninja overwrites it with the real content
-// before the compile edge runs (the compile depends on the action's output).
+// gives it an object path. The owner removes the placeholder after scanning,
+// so ninja sees a missing output and runs the generator before compiling it.
 //
 // For a module interface the placeholder carries the DECLARED interface —
 // `export module X;` plus its imports — so the prepare-time scan agrees with
@@ -685,7 +699,8 @@ std::string deploy_directive_error(const mcpp::manifest::Manifest& m, const Dire
 // generator runs before anything reads it either way.
 void prepare_actions(std::vector<mcpp::manifest::BuildAction>& actions,
                      const std::filesystem::path& pkgRoot,
-                     const mcpp::ExtensionTable& extensions);
+                     const mcpp::ExtensionTable& extensions,
+                     ActionPlaceholders& placeholders);
 
 // Does this action output belong in the COMPILE set?
 //
@@ -1447,9 +1462,20 @@ bool is_compilable_output(const fs::path& p, const mcpp::ExtensionTable& t) {
     return kind != mcpp::SourceKind::Header && kind != mcpp::SourceKind::Other;
 }
 
+ActionPlaceholders::~ActionPlaceholders() { clear(); }
+
+void ActionPlaceholders::clear() noexcept {
+    for (const auto& file : files) {
+        std::error_code ec;
+        fs::remove(file, ec);
+    }
+    files.clear();
+}
+
 void prepare_actions(std::vector<mcpp::manifest::BuildAction>& actions,
                      const fs::path& pkgRoot,
-                     const mcpp::ExtensionTable& extensions) {
+                     const mcpp::ExtensionTable& extensions,
+                     ActionPlaceholders& placeholders) {
     for (auto& a : actions) {
         auto absolutize = [&](std::vector<std::string>& v) {
             for (auto& p : v) {
@@ -1494,6 +1520,7 @@ void prepare_actions(std::vector<mcpp::manifest::BuildAction>& actions,
             fs::path p(o);
             if (fs::exists(p, ec)) continue;      // real content already there
             fs::create_directories(p.parent_path(), ec);
+            placeholders.files.push_back(p);
             std::ofstream os(p, std::ios::trunc);
             if (!os) continue;
             if (!a.provides.empty()) {

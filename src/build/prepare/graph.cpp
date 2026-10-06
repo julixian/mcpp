@@ -2156,10 +2156,10 @@ step4b_define_provisioning_closures(PrepareState& state) {
     // A declared build-graph node's Source outputs must be visible to the
     // scan, so they are materialized as placeholders and joined to the source
     // set here — the same two lists `generated=` feeds, for the same reason
-    // (the scanner walks the legacy modules.sources mirror). ninja overwrites
-    // the placeholder before the compile edge runs, because that compile
-    // depends on the action's output.
-    state.adoptActionOutputs = [](mcpp::manifest::Manifest& mm,
+    // (the scanner walks the legacy modules.sources mirror). Prepare owns
+    // these temporary files until the scan finishes; ninja must see the
+    // original missing output rather than a newer placeholder (#778).
+    state.adoptActionOutputs = [&state](mcpp::manifest::Manifest& mm,
                                  const std::filesystem::path& pkgRoot,
                                  std::size_t firstNewAction) {
         if (firstNewAction >= mm.buildConfig.actions.size()) return;
@@ -2175,7 +2175,8 @@ step4b_define_provisioning_closures(PrepareState& state) {
         const auto pkgExtTable =
             mcpp::extension_table_for(mm.buildConfig.moduleExtensions,
                                       mm.buildConfig.deviceExtensions);
-        mcpp::build::directives::prepare_actions(fresh, pkgRoot, pkgExtTable);
+        mcpp::build::directives::prepare_actions(fresh, pkgRoot, pkgExtTable,
+                                               state.actionPlaceholders);
         std::copy(fresh.begin(), fresh.end(),
                   mm.buildConfig.actions.begin()
                       + static_cast<std::ptrdiff_t>(firstNewAction));

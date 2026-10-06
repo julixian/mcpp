@@ -619,6 +619,7 @@ struct PrepareState {
         std::pair<std::vector<std::string>, std::vector<std::string>>,
         std::string>()> graph_xlings_split;
     std::function<void()> computeUsageRequirements;
+    mcpp::build::directives::ActionPlaceholders actionPlaceholders;
     std::function<void(mcpp::manifest::Manifest&, const std::filesystem::path&,
                         std::size_t)> adoptActionOutputs;
     std::function<void(mcpp::build::BuildProgramEnv&, const mcpp::manifest::Manifest&,

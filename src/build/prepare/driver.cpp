@@ -151,6 +151,7 @@ prepare_build_pass(bool print_fingerprint,
     if (auto r = timed("scan", [&] { return phase11_scan(state); }); !r)
         return fail(r.error());
 
+    state.actionPlaceholders.clear();
     g_notesOnFailure.clear();
     return timed("finish", [&] { return phase13_finish(state); });
 }
