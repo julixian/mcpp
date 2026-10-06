@@ -105,7 +105,10 @@ echo "ok: configure-only leaves the missing output visible to the next build"
 
 # Generated module interfaces still need their declared provider in the scan,
 # even though the temporary interface disappears before the actual build.
-echo 'import generated; int main() { return generated_value() == 42 ? 0 : 1; }' > app/src/main.cpp
+cat > app/src/main.cpp <<'EOF'
+import generated;
+int main() { return generated_value() == 42 ? 0 : 1; }
+EOF
 printf 'export module generated;\nexport int generated_value() { return 42; }\n' > app/value.cpp.in
 python3 <<'PY'
 from pathlib import Path
