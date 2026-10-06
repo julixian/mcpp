@@ -63,27 +63,8 @@ namespace mcpp::build {
 // index is first opened, which can be hundreds of lines earlier; the message
 // that STOPS the build has to carry the cause, because that is the one a user
 // reads. See mcpp::pm::unusable_index_hint.
-// Spelling-independent `[target.<triple>]` lookup.
-//
-// A section keyed `x86_64-w64-mingw32` matches a resolved `x86_64-windows-gnu`,
-// and unparseable keys compare exactly (the escape hatch for custom triples).
-// Factored out of the toolchain-override path because the sysroot override must
-// use the SAME matching: two lookups that disagreed about spelling would give a
-// section that applies to `toolchain` and not to `sysroot`, which is a defect
-// nobody would think to look for.
-const mcpp::manifest::TargetEntry*
-find_target_entry(const mcpp::manifest::Manifest& m,
-                  const mcpp::toolchain::triple::Triple& t) {
-    if (auto it = m.targetOverrides.find(t.str()); it != m.targetOverrides.end())
-        return &it->second;
-    for (auto const& [key, entry] : m.targetOverrides) {
-        if (auto k = mcpp::toolchain::triple::parse(key); k && k->str() == t.str())
-            return &entry;
-    }
-    return nullptr;
-}
-
 // The project's `[target.<triple>].sysroot`, or nullptr when it declared none.
+// The row is found by `find_target_entry` (prepare_inputs), as every row is.
 const std::string*
 sysroot_override(const mcpp::manifest::Manifest& m,
                  const mcpp::toolchain::triple::Triple& t) {
@@ -313,9 +294,9 @@ namespace {
 
 // #734 E2: the MSVC architecture directory name of a target triple.
 std::string msvc_arch_of(std::string_view triple) {
-    if (triple.starts_with("aarch64") || triple.starts_with("arm64")) return "arm64";
-    if (triple.starts_with("i686") || triple.starts_with("i386") || triple.starts_with("x86-")) return "x86";
-    return "x64";
+    const auto tt = mcpp::toolchain::triple::parse(triple);
+    const auto arch = tt ? tt->msvc_arch() : std::string_view{};
+    return arch.empty() ? "x64" : std::string(arch);
 }
 
 // The `bin/Host<h>/<arch>` directory of an MSVC toolset that holds cl.exe,
@@ -520,9 +501,8 @@ std::string min_platform_version(const mcpp::manifest::Manifest& m,
                                  const mcpp::toolchain::triple::Triple& t,
                                  const std::filesystem::path& compilerPath) {
     if (t.is_android()) {
-        if (auto it = m.targetOverrides.find(t.str()); it != m.targetOverrides.end())
-            if (it->second.minApiLevel > 0)
-                return std::to_string(it->second.minApiLevel);
+        if (auto* row = find_target_entry(m, t); row && row->minApiLevel > 0)
+            return std::to_string(row->minApiLevel);
         // AND THERE IS NO SUCH THING AS LEAVING IT OUT. This returned an empty
         // string with the comment "the NDK's own default, which clang
         // supplies", which was never verified and is false. Measured:
