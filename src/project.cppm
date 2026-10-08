@@ -765,6 +765,14 @@ export std::string root_position_key(const mcpp::manifest::Manifest& m) {
     field("standard", m.package.standard);
     auto const& b = m.buildConfig;
     list("dialect_cxxflags", b.dialectCxxflags);
+    // Conditional dialect flags are root-position values too. Grouping runs
+    // before the target is resolved, so retain the predicate and declaration
+    // order rather than evaluating a member's rows against the host.
+    for (auto const& cc : m.conditionalConfigs) {
+        if (cc.dialectCxxflags.empty()) continue;
+        field("dialect_predicate", cc.predicate);
+        list("conditional_dialect_cxxflags", cc.dialectCxxflags);
+    }
     field("cxx_runtime", b.cxxRuntime);
     field("cxx_runtime_tests", b.cxxRuntimeTests);
     field("cxx_runtime_shared", b.cxxRuntimeShared);
@@ -846,6 +854,16 @@ virtual_workspace_root(const mcpp::manifest::Manifest& workspace,
     b.cxxRuntimeShared = f.cxxRuntimeShared;
     b.target = f.target;
     b.dialectCxxflags = f.dialectCxxflags;
+    // The virtual root is created before conditional merging. Carry only the
+    // member's graph-wide dialect declarations: its sources, flags, runtime
+    // files and dependencies still belong to the member's own node (#786).
+    for (auto const& cc : first.conditionalConfigs) {
+        if (cc.dialectCxxflags.empty()) continue;
+        mcpp::manifest::ConditionalConfig row;
+        row.predicate = cc.predicate;
+        row.dialectCxxflags = cc.dialectCxxflags;
+        v.conditionalConfigs.push_back(std::move(row));
+    }
     b.abiThreads = f.abiThreads;
     b.abiThreadsDeclared = f.abiThreadsDeclared;
     b.abiExceptions = f.abiExceptions;

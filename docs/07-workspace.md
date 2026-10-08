@@ -290,6 +290,14 @@ share it are planned and compiled together. Before 2026.10.5.2 a virtual root's
 profiles reached no member and were ignored without a diagnostic, and a rooted
 workspace's applied only when its own package was the first one selected.
 
+A selected member's `[target.<selector>.build] dialect_cxxflags` remains a
+graph-wide setting under that condition, including in a workspace plan. Matching
+rows reach the standard-library module, scanning and every C++ translation unit;
+nonmatching rows contribute nothing. Workspace grouping includes the predicates
+and flag lists, so members with different declarations use separate plans.
+Conditional sources and ordinary compile flags remain attributes of the member,
+and an ordinary dependency's dialect flags do not change its consumer's graph.
+
 **The root package is a member.** In a workspace whose root carries
 `[package]`, the root package receives `[workspace.package]` and
 `[workspace.build]` once, as every other member does (2026.10.5.2+), so its

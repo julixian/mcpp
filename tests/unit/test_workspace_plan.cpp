@@ -91,6 +91,50 @@ TEST(WorkspacePlan, TheVirtualRootHoldsNoPackageContent) {
     EXPECT_EQ(mcpp::project::root_position_key(v), mcpp::project::root_position_key(first));
 }
 
+TEST(WorkspacePlan, ConditionalDialectFlagsSeparateConfigurations) {
+    auto a = member("a");
+    auto b = member("b");
+    mcpp::manifest::ConditionalConfig row;
+    row.predicate = "i686-windows-msvc";
+    row.dialectCxxflags = {"-DARCH_FLAG=1"};
+    a.conditionalConfigs.push_back(row);
+    EXPECT_NE(mcpp::project::root_position_key(a), mcpp::project::root_position_key(b));
+    b.conditionalConfigs.push_back(row);
+    EXPECT_EQ(mcpp::project::root_position_key(a), mcpp::project::root_position_key(b));
+    b.conditionalConfigs.front().inputs.cxxflags = {"-DMEMBER_ONLY"};
+    b.conditionalConfigs.front().inputs.sources = {"arch.cpp"};
+    EXPECT_EQ(mcpp::project::root_position_key(a), mcpp::project::root_position_key(b));
+    b.conditionalConfigs.front().dialectCxxflags = {"-DARCH_FLAG=2"};
+    EXPECT_NE(mcpp::project::root_position_key(a), mcpp::project::root_position_key(b));
+    b.conditionalConfigs.front().dialectCxxflags = row.dialectCxxflags;
+    b.conditionalConfigs.front().predicate = "x86_64-windows-msvc";
+    EXPECT_NE(mcpp::project::root_position_key(a), mcpp::project::root_position_key(b));
+}
+
+TEST(WorkspacePlan, VirtualRootPreservesOnlyConditionalDialectDeclarations) {
+    mcpp::manifest::Manifest ws;
+    auto first = member("a");
+    mcpp::manifest::ConditionalConfig row;
+    row.predicate = "i686-windows-msvc";
+    row.dialectCxxflags = {"-DARCH_FLAG"};
+    row.inputs.cxxflags = {"-DMEMBER_ONLY"};
+    row.inputs.sources = {"arch.cpp"};
+    row.libraries = {"member_runtime"};
+    first.conditionalConfigs.push_back(row);
+    mcpp::manifest::ConditionalConfig packageOnly;
+    packageOnly.predicate = "windows";
+    packageOnly.inputs.cxxflags = {"-DOTHER_MEMBER_FLAG"};
+    first.conditionalConfigs.push_back(packageOnly);
+    const auto v = mcpp::project::virtual_workspace_root(ws, first, "/ws");
+    ASSERT_EQ(v.conditionalConfigs.size(), 1u);
+    EXPECT_EQ(v.conditionalConfigs.front().predicate, row.predicate);
+    EXPECT_EQ(v.conditionalConfigs.front().dialectCxxflags, row.dialectCxxflags);
+    EXPECT_TRUE(v.conditionalConfigs.front().inputs.cxxflags.empty());
+    EXPECT_TRUE(v.conditionalConfigs.front().inputs.sources.empty());
+    EXPECT_TRUE(v.conditionalConfigs.front().libraries.empty());
+    EXPECT_EQ(mcpp::project::root_position_key(v), mcpp::project::root_position_key(first));
+}
+
 // A member's products are in `bin/<package name>/`, qualified when another
 // member of the workspace has the same name; the workspace's own package
 // keeps `bin/`.
